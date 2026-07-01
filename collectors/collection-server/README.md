@@ -1,6 +1,6 @@
 # collectors/collection-server
 
-> **Status: SEEDED v0 (`collect.sh` 0.1.0).** A working collector exists and is
+> **Status: SEEDED v0 (`collect.sh` 0.2.0).** A working collector exists and is
 > owned, for now, by the Global team (framework owner). Handover transfers
 > ongoing ownership to the collection-server (backend) team (CONTRACT rule 4).
 > **Not yet run against a live production yard** — validate once on a staging
