@@ -18,15 +18,21 @@ One `.txt` report, organized into MECE domains (each fact in exactly one place):
 - **`[0]` Collection environment** — bash version, uid (root?), and which tools
   are present/absent — so every `n/a` below can be traced to a cause.
 - **A. Host & platform** — OS/kernel/arch, memory, cgroup limits, load, `java -version`.
-- **B. Storage & filesystem** — yardbase path, **its filesystem type (ZFS or
+- **B. Time & clock synchronization** — a common root-cause axis: a skewed clock
+  drops data into the wrong time buckets. Reports `timedatectl` (synchronized?
+  NTP active? RTC/UTC/local), timezone, clocksource, virtualization, each
+  server's JVM `-Duser.timezone`, and the **NTP daemon's own measured offset**
+  (chrony/ntpd/timesyncd — no network call). `--time-ref` optionally compares
+  against an external NTP/HTTP source (a network call; never sets the clock).
+- **C. Storage & filesystem** — yardbase path, **its filesystem type (ZFS or
   not)** and, on ZFS, pool/dataset/ARC properties; capacity via `df` (never a
   recursive `du` in the report); `YARDB_LOCK`; partition range (shallow).
-- **C. Deployment layout** — resolved `WHATAP_HOME` (and how it was resolved),
+- **D. Deployment layout** — resolved `WHATAP_HOME` (and how it was resolved),
   directory tree, jar versions, conf file list.
-- **D. Runtime processes** — per service: pid, jar/version, heap & GC flags,
+- **E. Runtime processes** — per service: pid, jar/version, heap & GC flags,
   RSS, start time; listening ports; systemd unit state.
-- **E. Configuration** — every `conf/*.conf` dumped **raw** (see security note).
-- **F. Logs & recent events** — log inventory, bounded ERROR/WARN/Exception
+- **F. Configuration** — every `conf/*.conf` dumped **raw** (see security note).
+- **G. Logs & recent events** — log inventory, bounded ERROR/WARN/Exception
   counts, tails, heap-dump files, journal errors.
 
 Values are **discovered, not assumed**; an absent value is reported as
@@ -39,23 +45,31 @@ A **host shell script** the field engineer runs directly on the backend host —
 one command, hand over one file (CONTRACT rule 3):
 
 ```sh
-./collect.sh                 # -> whatap-collserver-<host>-<UTC>.txt   (attach this)
+./collect.sh --file          # -> whatap-collserver-<host>-<UTC>.txt   (attach this)
 ./collect.sh --bundle        # -> whatap-collserver-<host>-<UTC>.tar.gz (report + artifacts)
 ./collect.sh --home /whatap  # force WHATAP_HOME if auto-resolution is n/a
+./collect.sh --file --quiet  # same, but no progress narration (for automation)
+./collect.sh                 # no arguments -> prints help (does not collect)
 ./collect.sh --help          # all options
 ```
 
+While it runs, each phase is narrated on **stderr** (`>> ...`) so you can see it
+working on a slow host; the report itself stays clean. A collection needs an
+explicit action flag — running `./collect.sh` with no arguments just prints help,
+so nothing starts by accident.
+
 ### Collection-load tiers (safe on a struggling server)
 
-- **Tier 0** (default report) runs only read-only, near-instant commands. It
-  never attaches to a JVM, never walks the data tree, never reads whole rotated
-  logs. Safe to run any time.
+- **Tier 0** (the `--file` / `--stdout` report) runs only read-only, near-instant
+  commands. It never attaches to a JVM, never walks the data tree, never reads
+  whole rotated logs. Safe to run any time.
 - **Tier 1** (`--bundle`) additionally copies real logs (capped by
   `--max-log-mb`, default 50), configs, filesystem/ZFS snapshots, journal
   (`--hours`, default 24) and an OS snapshot. Still no JVM pause.
 - **Tier 2** (opt-in, may add load — announced on stderr first):
   `--threads[=N]` (jstack), `--histo` (`jmap -histo`, not `:live`), `--heap`
-  (full heap dump), `--du` (recursive du of yardbase). Off by default.
+  (full heap dump), `--du` (recursive du of yardbase), `--time-ref` (external
+  time comparison — a network call). Off by default.
 
 ## (c) Security note
 

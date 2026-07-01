@@ -40,6 +40,40 @@ VERSION="0.0.0"                        # x.y.z
 DOMAIN="example"                       # k8s | server | apm | db | ...
 TARGET="host/$(hostname 2>/dev/null || echo unknown)"   # identity of what is inspected
 
+# ---- CLI harness — DO NOT EDIT ----------------------------------------------
+# Guideline 5 (../../docs/collector-engineering.md): no-args prints usage — a run
+# needs an explicit action flag (--file / --stdout) so nothing starts by accident;
+# and progress is narrated on stderr (fd 3, see main) so the operator sees it
+# working while the report on stdout stays byte-for-byte clean. --quiet silences it.
+OPT_FILE=0        # write the report to a .txt file
+OPT_STDOUT=0      # print the report to stdout
+OPT_QUIET=0       # suppress progress narration on stderr
+
+usage() {
+    cat <<EOF
+$COLLECTOR_NAME $VERSION — a WhaTap Global Groundtruth collector (facts only).
+Run with no arguments (or --help) to print this help; a collection needs an
+explicit action flag so nothing starts by accident.
+
+  $(basename "$0")            print this help (no collection)
+  $(basename "$0") --file     write the facts report -> ./$COLLECTOR_NAME-<host>-<UTC>.txt
+  $(basename "$0") --stdout   print the facts report to stdout
+  $(basename "$0") --quiet .. silence progress on stderr (add to --file / --stdout)
+EOF
+}
+
+ARGC=$#           # 0 args -> usage (handled in main, below)
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --file)    OPT_FILE=1 ;;
+        --stdout)  OPT_STDOUT=1 ;;
+        --quiet)   OPT_QUIET=1 ;;
+        -h|--help) usage; exit 0 ;;
+        *) printf 'unknown argument: %s\n' "$1" >&2; usage >&2; exit 2 ;;
+    esac
+    shift
+done
+
 # ---- emit helpers — DO NOT EDIT ---------------------------------------------
 _section_n=0
 
@@ -53,10 +87,11 @@ emit_header() {
     printf '===============================================\n'
 }
 
-# section "TITLE"  -> starts the next numbered section
+# section "TITLE"  -> starts the next numbered section (and narrates it to fd 3)
 section() {
     _section_n=$((_section_n + 1))
     printf '\n[%d] %s\n' "$_section_n" "$1"
+    progress "[$_section_n] $1"
 }
 
 # fact "text"  -> one fact line under the current section
@@ -79,6 +114,12 @@ try() {
 emit_footer() {
     printf '\n==== END OF COLLECTION (no diagnosis by design) ====\n'
 }
+
+# progress: operational narration to the terminal (fd 3, saved from stderr in main
+# before any redirection). It NEVER lands in the report — stdout stays the report
+# even in --file mode. Silenced by --quiet. Keep the text a fact about collection
+# state (no judgment words) so validate.sh keeps passing.
+progress() { [ "$OPT_QUIET" = 1 ] && return; printf '>> %s\n' "$*" >&3 2>/dev/null; }
 
 # ---- reasoned-absence helpers — recommended, keep or trim as needed ---------
 # These implement guideline 4 (../../docs/collector-engineering.md): a value you
@@ -141,31 +182,64 @@ read_proc() {
     _emit_labeled "$label" "$out"
 }
 
-# ---- report body — REPLACE THE PLACEHOLDER SECTIONS BELOW -------------------
+# ---- report body — EDIT HERE ------------------------------------------------
+# Add your fact sections inside run_report(); leave the CLI harness, the helpers,
+# and the header/footer shape alone. Each `section` also narrates itself to the
+# terminal (guideline 5), so you get progress for free.
+run_report() {
+    emit_header
+
+    # Guideline 4: a capability preamble makes every downstream "command not found"
+    # self-explanatory. List the tools your collector relies on.
+    section "Collection environment"
+    fact "bash: ${BASH_VERSION:-unknown}"
+    fact "uid: $(id -u 2>/dev/null || echo unknown)"
+    fact "tools:"
+    for t in ss findmnt systemctl; do   # <- replace with the tools you use
+        if command -v "$t" >/dev/null 2>&1; then printf '        %-12s present\n' "$t"
+        else printf '        %-12s absent\n' "$t"; fi
+    done
+
+    # Placeholder: a discovered value, reported as a fact (with a reason if absent).
+    section "Host identity"
+    probe "hostname" hostname
+    probe "kernel" uname -sr
+
+    # Placeholder: resolve rather than assume (Contract rule 2). Replace the target
+    # with whatever your domain actually needs to resolve.
+    section "Example resolved value"
+    fact "replace this section with your domain's facts"
+    fact "when a value is absent, print it as a fact with its reason — n/a (...)"
+
+    emit_footer
+}
+
+# ---- main — DO NOT EDIT -----------------------------------------------------
+# fd 3 = the terminal, saved before any redirection so progress() reaches the
+# operator even in --file mode (which redirects both stdout and stderr).
+exec 3>&2
+
+# No arguments -> print help and stop; a collection needs an explicit action flag.
+[ "$ARGC" -eq 0 ] && { usage; exit 0; }
+
+# Modifiers alone (e.g. --quiet) are not an action — say so and show help.
+if [ "$OPT_FILE" = 0 ] && [ "$OPT_STDOUT" = 0 ]; then
+    printf 'no action flag given — need --file or --stdout\n' >&2
+    usage >&2
+    exit 2
+fi
+
 _init_probe
-emit_header
-
-# Guideline 4: a capability preamble makes every downstream "command not found"
-# self-explanatory. List the tools your collector relies on.
-section "Collection environment"
-fact "bash: ${BASH_VERSION:-unknown}"
-fact "uid: $(id -u 2>/dev/null || echo unknown)"
-fact "tools:"
-for t in ss findmnt systemctl; do   # <- replace with the tools you use
-    if command -v "$t" >/dev/null 2>&1; then printf '        %-12s present\n' "$t"
-    else printf '        %-12s absent\n' "$t"; fi
-done
-
-# Placeholder: a discovered value, reported as a fact (with a reason if absent).
-section "Host identity"
-probe "hostname" hostname
-probe "kernel" uname -sr
-
-# Placeholder: resolve rather than assume (Contract rule 2). Replace the target
-# with whatever your domain actually needs to resolve.
-section "Example resolved value"
-fact "replace this section with your domain's facts"
-fact "when a value is absent, print it as a fact with its reason — n/a (...)"
-
-emit_footer
+if [ "$OPT_STDOUT" = 1 ]; then
+    progress "collecting facts (read-only) -> stdout"
+    run_report
+    progress "done."
+else
+    HOST="$(hostname 2>/dev/null || echo unknown)"
+    TS="$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null || echo unknown)"
+    OUTFILE="./$COLLECTOR_NAME-$HOST-$TS.txt"
+    progress "collecting facts (read-only) -> writing $OUTFILE"
+    run_report > "$OUTFILE" 2>/dev/null
+    progress "report written: $OUTFILE"
+fi
 _end_probe

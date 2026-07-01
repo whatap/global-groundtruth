@@ -58,6 +58,12 @@ your delivery mechanism and document it in `collectors/<domain>/README.md`:
 - **db**: a SQL script plus an agent-config dump.
 - **in-cluster (k8s)**: a Job manifest whose logs are the report.
 
+The skeleton's CLI harness already makes that "one command" explicit and visible:
+running it **bare prints usage** (a collection needs an action flag — `--file` /
+`--stdout`), and it **narrates progress on stderr** so the engineer sees it
+working on a slow host. Keep both — the exact one command goes in your README.
+See [collector-engineering.md](collector-engineering.md) guideline 5.
+
 ### 5. Validate
 
 ```sh
@@ -83,6 +89,8 @@ team.
 - [ ] Values are discovered (symlinks/mounts/args/config resolved), not hardcoded.
 - [ ] Absent values print `n/a` / `not found`, never a guessed default.
 - [ ] One command produces the whole paste.
+- [ ] No-args prints usage; a run needs an explicit action flag; progress is
+      narrated on stderr (`--quiet` to suppress). (engineering guideline 5)
 - [ ] `tools/validate.sh` passes.
 - [ ] `collectors/<domain>/README.md` describes facts, delivery, and status.
 - [ ] [collector-engineering.md](collector-engineering.md) checklist met (MECE,

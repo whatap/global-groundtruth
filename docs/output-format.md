@@ -8,6 +8,11 @@ fields and the footer line mechanically.
 This shape is the contract's Rule 1 ("facts only") made concrete: sections hold
 facts, and nothing else.
 
+This shape is **stdout** (or the `.txt` / the bundle's `report.txt`). A collector's
+usage/help text and its run-progress narration are written to **stderr** and are
+**not** part of this shape — stdout stays byte-for-byte the report so a reader or a
+script can parse it. (See collector-engineering.md guideline 5.)
+
 ---
 
 ## The shape

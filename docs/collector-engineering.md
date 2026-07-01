@@ -124,6 +124,46 @@ Keep reason strings free of judgment words (`fix`, `should`, `likely`,
 `recommend`, `diagnos`, `root cause`) so they pass `validate.sh` — describe the
 mechanical cause, not what to do about it.
 
+## 5. Operable — the operator sees it working, and discovers how to run it
+
+A collector is run by a field engineer, under stress, on a host they may not
+know well. Two conventions keep that interaction unsurprising. Both are built
+into the skeleton (`usage`, `progress`, the `section` helper, the `main`
+dispatch), so a collector that copies the skeleton gets them for free — and
+every collector must keep them.
+
+- **No arguments prints usage.** Running the collector bare prints its
+  usage/help and exits `0` — it does **not** start a collection. A run is
+  triggered by an explicit action flag (`--file` writes the `.txt`, `--stdout`
+  prints it, `--bundle` adds artifacts). This makes the interface
+  self-documenting, and stops an operator from kicking off a heavier-than-they-
+  meant run — or waiting on a silent one — just by typing the script name. It
+  does **not** weaken Contract rule 3 ("one command → paste"): the domain README
+  still names the one exact command (`./collect.sh --file`), so the engineer
+  runs one thing and copies the whole output.
+
+- **Progress on stderr, never in the report.** A collector often runs *because*
+  a host is sick, and its journal/log/filesystem scans can take many seconds;
+  silent output looks like a hang. Narrate each phase so the operator sees it
+  working — but keep it **out of the report**, which must stay byte-for-byte the
+  facts shape (a reader or a script parses stdout / the `.txt`). The mechanism:
+
+  ```sh
+  exec 3>&2   # in main, BEFORE any redirection: fd 3 = the terminal
+  progress() { [ "$OPT_QUIET" = 1 ] && return; printf '>> %s\n' "$*" >&3 2>/dev/null; }
+  ```
+
+  fd 3 is saved from stderr *before* the report redirects stdout (and, in
+  `--file` mode, stderr too), so progress still reaches the terminal while the
+  report goes to the file. The shared `section` helper calls `progress` itself,
+  so per-section progress is automatic; add explicit `progress` lines only for
+  phases outside a section (discovery, artifact copy, "writing report to …").
+  `--quiet` silences it for automation. Progress lines are facts about
+  collection *state* and carry **no judgment words**, so `validate.sh` — which
+  greps the whole file — still passes. Keep messages the operator *must* see
+  regardless of `--quiet` (Tier 2 impact/consent, a hard error, a skipped step)
+  on plain stderr (`warn`, fd 2), not on `progress`.
+
 ---
 
 ## Checklist (in addition to the authoring-guide checklist)
@@ -136,3 +176,7 @@ mechanical cause, not what to do about it.
 - [ ] Every absent value carries a classified reason; a `[0]` capability
       preamble is present.
 - [ ] Reason/label strings contain no judgment words (`validate.sh` passes).
+- [ ] No-args prints usage and exits 0; a run needs an explicit action flag
+      (`--file` / `--stdout` / `--bundle`).
+- [ ] Progress is narrated on stderr (fd 3), never into the report; `--quiet`
+      suppresses it; progress strings carry no judgment words.
