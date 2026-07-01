@@ -1,6 +1,6 @@
 # collectors/collection-server
 
-> **Status: SEEDED v0 (`collect.sh` 0.2.0).** A working collector exists and is
+> **Status: SEEDED v0 (`collect.sh` 0.3.0).** A working collector exists and is
 > owned, for now, by the Global team (framework owner). Handover transfers
 > ongoing ownership to the collection-server (backend) team (CONTRACT rule 4).
 > **Not yet run against a live production yard** — validate once on a staging
@@ -33,7 +33,9 @@ One `.txt` report, organized into MECE domains (each fact in exactly one place):
   RSS, start time; listening ports; systemd unit state.
 - **F. Configuration** — every `conf/*.conf` dumped **raw** (see security note).
 - **G. Logs & recent events** — log inventory, bounded ERROR/WARN/Exception
-  counts, tails, heap-dump files, journal errors.
+  counts, **a short tail of every base service log** (yard/proxy/gateway/keeper/
+  … , newest-mtime first; rotated + `_self`/`_api`/`access` streams excluded),
+  heap-dump files, journal errors.
 
 Values are **discovered, not assumed**; an absent value is reported as
 `n/a (<why>)` — `command not found`, `permission denied`, `path not found`,
@@ -63,8 +65,9 @@ so nothing starts by accident.
 - **Tier 0** (the `--file` / `--stdout` report) runs only read-only, near-instant
   commands. It never attaches to a JVM, never walks the data tree, never reads
   whole rotated logs. Safe to run any time.
-- **Tier 1** (`--bundle`) additionally copies real logs (capped by
-  `--max-log-mb`, default 50), configs, filesystem/ZFS snapshots, journal
+- **Tier 1** (`--bundle`) additionally copies real logs — current logs plus
+  rotated ones from the last `--log-days` (default 14), capped per file by
+  `--max-log-mb` (default 50) — configs, filesystem/ZFS/time snapshots, journal
   (`--hours`, default 24) and an OS snapshot. Still no JVM pause.
 - **Tier 2** (opt-in, may add load — announced on stderr first):
   `--threads[=N]` (jstack), `--histo` (`jmap -histo`, not `:live`), `--heap`

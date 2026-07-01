@@ -28,7 +28,7 @@ export LC_ALL=C
 
 # ---- collector metadata -----------------------------------------------------
 COLLECTOR_NAME="whatap-collection-server"
-VERSION="0.2.0"
+VERSION="0.3.0"
 DOMAIN="collection-server"
 TARGET="collection-server/$(hostname 2>/dev/null || echo unknown)"   # refined after WHATAP_HOME is resolved
 
@@ -41,6 +41,7 @@ OPT_HOME=""
 OPT_OUT="."
 OPT_HOURS=24
 OPT_MAXLOG_MB=50
+OPT_LOG_DAYS=14      # bundle: copy rotated logs only from the last N days
 OPT_THREADS=0        # Tier 2: jstack iterations (0 = off)
 OPT_HISTO=0          # Tier 2: jmap -histo (no :live)
 OPT_HEAP=0           # Tier 2: full heap dump
@@ -63,6 +64,7 @@ explicit action flag (--file / --stdout / --bundle) so nothing starts by acciden
   collect.sh --out DIR                output directory (default: .)
   collect.sh --bundle --hours N       journal window for the bundle (default: 24)
   collect.sh --bundle --max-log-mb M  per-file log copy cap (default: 50)
+  collect.sh --bundle --log-days N    copy rotated logs from the last N days (default: 14)
 
   Tier 2 (opt-in, may add load — printed to stderr before running):
   collect.sh --bundle --threads[=N]   jstack -l each JVM N times (default N=1)
@@ -89,6 +91,8 @@ while [ $# -gt 0 ]; do
         --hours=*) OPT_HOURS="${1#*=}" ;;
         --max-log-mb) OPT_MAXLOG_MB="$2"; shift ;;
         --max-log-mb=*) OPT_MAXLOG_MB="${1#*=}" ;;
+        --log-days) OPT_LOG_DAYS="$2"; shift ;;
+        --log-days=*) OPT_LOG_DAYS="${1#*=}" ;;
         --threads) OPT_THREADS=1 ;;
         --threads=*) OPT_THREADS="${1#*=}" ;;
         --histo) OPT_HISTO=1 ;;
@@ -572,21 +576,68 @@ run_report() {
     # -- G. Logs & recent events ----------------------------------------------
     section "G. Logs & recent events"
     if [ -n "$WHOME" ] && [ -d "$WHOME/logs" ]; then
-        subsection "log inventory (name / size / mtime)"
-        # shallow listing (depth<=2), no whole-file reads here
-        find "$WHOME/logs" -maxdepth 2 -type f -name '*.log' 2>/dev/null | sort | while IFS= read -r f; do
-            fact "$(printf '%s\t%s bytes\t%s' "${f#"$WHOME"/}" "$(wc -c < "$f" 2>/dev/null | tr -d ' ')" "$(date -u -r "$f" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo n/a)")"
+        # A production yard accumulates hundreds of rotated logs (logback
+        # "<base>.<yyyyMMdd>.<i>.log"). Listing each drowns the report and reading
+        # the tail of every one is real disk load — so current logs are listed
+        # individually while rotated ones are summarized per base (metadata only).
+        subsection "current logs (non-rotated) — name / size / mtime"
+        local _f _cur=0
+        for _f in $(ls -1 "$WHOME"/logs/*.log "$WHOME"/logs/*/*.log 2>/dev/null); do
+            [ -f "$_f" ] || continue
+            case "$_f" in *.[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].*.log) continue ;; esac
+            _cur=1
+            fact "$(printf '%s\t%s bytes\t%s' "${_f#"$WHOME"/}" "$(wc -c < "$_f" 2>/dev/null | tr -d ' ')" "$(date -u -r "$_f" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo n/a)")"
         done
-        subsection "recent ERROR/WARN/Exception counts (last 2MB of each current .log)"
-        find "$WHOME/logs" -maxdepth 2 -type f -name '*.log' 2>/dev/null | sort | while IFS= read -r f; do
-            local c; c="$(tail -c 2097152 "$f" 2>/dev/null | grep -cE 'ERROR|WARN|Exception' 2>/dev/null)"
-            fact "${f#"$WHOME"/}: ${c:-0}"
+        [ "$_cur" = 0 ] && fact "no non-rotated *.log found under $WHOME/logs"
+
+        subsection "rotated logs (summary per base: count / total bytes / date span)"
+        # ls -l is metadata only (no content read) — safe with hundreds of files.
+        local _rot
+        _rot="$(ls -l "$WHOME"/logs/*.log "$WHOME"/logs/*/*.log 2>/dev/null | awk '
+            { p=$NF }
+            p ~ /\.[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]\.[0-9]+\.log$/ {
+                m=split(p,a,"/"); fn=a[m]
+                sub(/\.[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]\.[0-9]+\.log$/, "", fn)
+                match(p, /\.[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]\./); d=substr(p,RSTART+1,8)
+                c[fn]++; s[fn]+=$5
+                if (mn[fn]==""||d<mn[fn]) mn[fn]=d
+                if (d>mx[fn]) mx[fn]=d
+            }
+            END { for (b in c) printf "%s: %d files, %d bytes total, %s..%s\n", b, c[b], s[b], mn[b], mx[b] }
+        ' | sort)"
+        if [ -n "$_rot" ]; then printf '%s\n' "$_rot" | while IFS= read -r _l; do fact "$_l"; done
+        else fact "no rotated logs"; fi
+
+        subsection "recent ERROR/WARN/Exception counts (current logs only, last 2MB each)"
+        for _f in $(ls -1 "$WHOME"/logs/*.log "$WHOME"/logs/*/*.log 2>/dev/null); do
+            [ -f "$_f" ] || continue
+            case "$_f" in *.[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].*.log) continue ;; esac
+            local c; c="$(tail -c 2097152 "$_f" 2>/dev/null | grep -cE 'ERROR|WARN|Exception' 2>/dev/null)"
+            fact "${_f#"$WHOME"/}: ${c:-0}"
         done
-        subsection "tail of main log (last 50 lines)"
-        local main
-        main="$(find "$WHOME/logs" -maxdepth 1 -type f -name '*.log' 2>/dev/null | grep -vE '_self|_api|access|checker' | head -n1)"
-        if [ -n "$main" ]; then fact "$main:"; tail -n 50 "$main" 2>/dev/null | while IFS= read -r _l; do printf '        %s\n' "$_l"; done
-        else fact "main log: n/a (no non-self/api log file found)"; fi
+        subsection "per-service log tails (base logs, newest-first, 40 lines each)"
+        # A collection server co-locates many service logs (yard/proxy/gateway/
+        # keeper/account/notihub/eureka/front) — tail each base *.log, not just
+        # one. Sorted by mtime (ls -t) so the actively-written logs come first;
+        # excludes rotated .log.<date> and the _self/_api/access/checker/gc
+        # streams. Bounded: 40 lines each, at most 12 logs (rest are in inventory).
+        local TAIL_LINES=40 LOG_TAIL_FILES=12 _lc=0 _lf
+        for _lf in $(ls -1t "$WHOME"/logs/*.log 2>/dev/null); do
+            [ -f "$_lf" ] || continue
+            # skip secondary streams and rotated (logback ".<yyyyMMdd>.<i>.log") files
+            case "$_lf" in
+                *_self.log|*_api.log|*access*|*checker*|*/gc*.log) continue ;;
+                *.[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].*.log) continue ;;
+            esac
+            _lc=$((_lc + 1))
+            if [ "$_lc" -gt "$LOG_TAIL_FILES" ]; then
+                fact "(+ more base logs not tailed — see inventory above; use --bundle for full logs)"
+                break
+            fi
+            fact "${_lf#"$WHOME"/} (mtime $(date -u -r "$_lf" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo n/a)):"
+            tail -n "$TAIL_LINES" "$_lf" 2>/dev/null | while IFS= read -r _l || [ -n "$_l" ]; do printf '        %s\n' "$_l"; done
+        done
+        [ "$_lc" -eq 0 ] && fact "no base service logs found (only _self/_api/access streams, or none)"
         subsection "self-mon / checker"
         fact "yard_self.log: $( ls "$WHOME"/logs/*_self.log >/dev/null 2>&1 && echo present || echo 'n/a (path not found)' )"
         local chk; chk="$(find "$WHOME/logs" -maxdepth 2 -name '*checker*.log' 2>/dev/null | head -n1)"
@@ -631,8 +682,15 @@ collect_conf() {
 collect_logs() {
     local dest="$1"
     [ -n "$WHOME" ] && [ -d "$WHOME/logs" ] || { warn "logs: skipped (no WHATAP_HOME/logs)"; return; }
-    local cap=$((OPT_MAXLOG_MB * 1024 * 1024))
+    local cap=$((OPT_MAXLOG_MB * 1024 * 1024)) days="$OPT_LOG_DAYS"
     find "$WHOME/logs" -maxdepth 2 -type f \( -name '*.log' -o -name '*.log.*' \) 2>/dev/null | while IFS= read -r f; do
+        # rotated logs (date-stamped or .log.N/.gz): only copy those from the last
+        # $days days, so a year of history does not balloon the bundle. Current
+        # (non-rotated) logs are always copied.
+        case "$f" in
+            *.[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].*.log|*.log.[0-9]*|*.log.gz)
+                [ -n "$(find "$f" -mtime "-$days" 2>/dev/null)" ] || continue ;;
+        esac
         local rel sub sz
         rel="${f#"$WHOME"/logs/}"; sub="$(dirname "$rel")"
         mkdir -p "$dest/$sub" 2>/dev/null
@@ -640,7 +698,7 @@ collect_logs() {
         if [ "$sz" -le "$cap" ]; then cp -a "$f" "$dest/$rel" 2>/dev/null
         else tail -c "$cap" "$f" > "$dest/$rel" 2>/dev/null; printf 'truncated to last %sMB of %s bytes\n' "$OPT_MAXLOG_MB" "$sz" > "$dest/$rel.trunc"; fi
     done
-    progress "logs: copied (cap ${OPT_MAXLOG_MB}MB/file)"
+    progress "logs: copied (current + rotated within ${days}d, cap ${OPT_MAXLOG_MB}MB/file)"
 }
 
 collect_fs() {
@@ -779,8 +837,16 @@ do_bundle() {
 
     tarball="$OPT_OUT/$BASENAME.tar.gz"
     if have tar; then
-        ( cd "$work" && tar czf "$tarball" . 2>/dev/null ) && progress "bundle: $tarball"
-        rm -rf "$work" 2>/dev/null
+        # Use -C instead of `cd "$work"`: with a relative --out (the default "."),
+        # a `cd` into $work would make $tarball land INSIDE $work and then be
+        # deleted with it. -C changes only where tar reads inputs; $tarball stays
+        # relative to the caller's CWD. Only remove $work if tar actually wrote it.
+        if tar -C "$work" -czf "$tarball" . 2>/dev/null && [ -f "$tarball" ]; then
+            progress "bundle: $tarball"
+            rm -rf "$work" 2>/dev/null
+        else
+            warn "tar failed — artifacts left under $work"
+        fi
     else
         warn "tar: command not found — artifacts left under $work"
     fi
