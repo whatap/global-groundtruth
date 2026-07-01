@@ -6,7 +6,11 @@ copy a file and answer "what hidden facts does my agent keep asking the field
 engineer for?", you can author a collector.
 
 Read [CONTRACT.md](../CONTRACT.md) and [output-format.md](output-format.md)
-first. They are short and they are the whole spec.
+first. They are short and they are the whole spec. Then read
+[collector-engineering.md](collector-engineering.md) — the design guidelines
+(MECE sections, load-safe tiers, portability, reasoned absence) that keep a
+collector from misleading readers, overloading a sick host, or breaking on an
+unfamiliar OS.
 
 ---
 
@@ -81,3 +85,5 @@ team.
 - [ ] One command produces the whole paste.
 - [ ] `tools/validate.sh` passes.
 - [ ] `collectors/<domain>/README.md` describes facts, delivery, and status.
+- [ ] [collector-engineering.md](collector-engineering.md) checklist met (MECE,
+      load tiers, portability, reasoned `n/a`).

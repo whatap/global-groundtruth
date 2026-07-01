@@ -54,6 +54,10 @@ the whole interaction. They are not asked to interpret, edit, or select.
 The framework owner provides the contract, the shared format, the template, and
 the validator — and, at most, a **v0** of a collector to seed a domain.
 
+Until a domain team is ready to take a collector over, the framework owner is
+its **interim owner** — it manages the stub and any seeded v0. Handover then
+transfers **ongoing** ownership to the domain's developers.
+
 **Ongoing ownership of each collector belongs to that domain's developers** —
 the people who know which hidden facts their agent actually needs. A new
 collector is added by copying the template and following

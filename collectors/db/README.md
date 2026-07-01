@@ -2,7 +2,8 @@
 
 > **Status: NOT IMPLEMENTED.** This directory describes what a database
 > collector will gather and how it will be delivered. No collection code exists
-> here yet. It is owned by the DB domain team (CONTRACT rule 4).
+> here yet. It will be owned by the DB domain team (CONTRACT rule 4); until
+> handover it is managed by the Global team.
 
 ## (a) Hidden facts to collect
 

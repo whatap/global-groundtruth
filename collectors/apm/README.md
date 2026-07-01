@@ -2,7 +2,8 @@
 
 > **Status: NOT IMPLEMENTED.** This directory describes what an APM collector
 > will gather and how it will be delivered. No collection code exists here yet.
-> It is owned by the APM domain team (CONTRACT rule 4).
+> It will be owned by the APM domain team (CONTRACT rule 4); until handover it
+> is managed by the Global team.
 
 ## Note: this domain has language sub-families
 

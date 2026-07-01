@@ -1,0 +1,10 @@
+# Collector output artifacts (generated when a collector is run in place).
+# The report/bundle are deliverables, never source — never commit them.
+whatap-collserver-*.txt
+whatap-collserver-*.tar.gz
+*.hprof
+
+# Editor / OS noise
+.DS_Store
+*.swp
+*~
