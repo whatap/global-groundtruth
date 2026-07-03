@@ -48,8 +48,11 @@ One `.txt` report, organized into MECE domains:
   `Status:` line distinguishes `installed` from `half-configured`), whatap
   repo definitions (yum `*.repo` and apt `sources.list*`), repo signing key
   presence, `exclude=` directives in dnf/yum config (a legacy installer wrote
-  `exclude=whatap-nms*`) and apt holds, and the package versions the
-  configured repos actually offer (dnf/yum list available, `apt-cache policy`).
+  `exclude=whatap-nms*`) and apt holds, the package versions the configured
+  repos actually offer (dnf/yum list available, `apt-cache policy`), and the
+  **install/upgrade attempt history** (`dpkg.log` / apt `history.log` /
+  `dnf history`) — so a failed post-install step stays on record in the
+  report even after the package was removed or purged.
 - **E. Deployment layout** — install-root top-level listing, bundled venv
   python/pip versions, `whlhouse` wheel count, `requirements*` files, disk free.
   (The package post-install step builds the venv from the wheelhouse; the

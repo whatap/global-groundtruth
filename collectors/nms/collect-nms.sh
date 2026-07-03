@@ -39,7 +39,7 @@ export LC_ALL=C
 
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-nms"
-VERSION="0.2.0"
+VERSION="0.2.1"
 DOMAIN="nms"
 TARGET="host/$(hostname 2>/dev/null || echo unknown)"
 
@@ -422,6 +422,15 @@ run_report() {
     else
         fact "n/a (command not found: dnf, yum, apt-cache)"
     fi
+    # install/upgrade attempts and their outcomes stay on record even after a
+    # failed or purged install — the package-manager logs are the durable trace
+    # of a broken post-install step (bounded greps, current + one rotation)
+    subsection "package install/upgrade history ($NMS_PKG)"
+    if have dnf; then
+        probe "dnf history" dnf -q history list "$NMS_PKG"
+    fi
+    probe "dpkg.log entries (last 20)" sh -c 'grep -h "whatap-nms" /var/log/dpkg.log /var/log/dpkg.log.1 2>/dev/null | tail -n 20; :'
+    probe "apt history entries (last 30 lines)" sh -c 'grep -h -B2 -A4 "whatap-nms" /var/log/apt/history.log 2>/dev/null | tail -n 30; :'
 
     # [6] deployment layout — venv/wheelhouse state is where rpm %post pip
     # installs break (bcrypt case, 2025-05-30)
