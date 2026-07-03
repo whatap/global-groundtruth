@@ -68,6 +68,7 @@ global-groundtruth/
 │       └── k8s-huawei-cce.md     # seed entry: Huawei CCE
 ├── collectors/
 │   ├── k8s/                      # SEEDED v0 — cluster-level collector (operator/CR/agents)
+│   ├── nms/                      # SEEDED v0 — NMS Control Manager host collector
 │   ├── server/                   # STUB (README only)
 │   ├── apm/                      # STUB (README only) — one per language: nodejs/java/python/php/dotnet
 │   ├── db/                       # STUB (README only)
