@@ -131,9 +131,8 @@ Notes:
 ## 6. Security notes
 
 - The **collection-server** report and bundle include configuration files
-  **verbatim** — license keys, `secure.conf`, admin passwords. Transfer them
-  only over the channel your WhaTap contact names (never a public chat), and
-  delete your local copy when the case is closed.
+  **verbatim** — license keys, `secure.conf`, admin passwords. Delete your
+  local copy when the case is closed.
 - The **k8s** collector masks license/password/certificate values and never
   reads Kubernetes Secret contents — but its bundle still contains real logs.
   Handle it the same careful way.

@@ -142,8 +142,7 @@ Catatan:
 
 - Laporan dan bundle **collection-server** memuat file konfigurasi **apa
   adanya (verbatim)** — termasuk license key, `secure.conf`, dan password
-  admin. Kirimkan hanya melalui kanal yang ditentukan kontak WhaTap Anda
-  (jangan lewat chat publik), dan hapus salinan lokal setelah kasus ditutup.
+  admin. Hapus salinan lokal setelah kasus ditutup.
 - Collector **k8s** menyamarkan (masking) nilai license/password/sertifikat
   dan tidak pernah membaca isi Secret Kubernetes — tetapi bundle-nya tetap
   berisi log asli. Perlakukan dengan kehati-hatian yang sama.
