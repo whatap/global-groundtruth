@@ -53,12 +53,13 @@ copy the single collector script to the server (scp/SFTP/file transfer — one
 
 ## 3. Which collector, when
 
-Your WhaTap contact will name the collector to run. Two exist today:
+Your WhaTap contact will name the collector to run. Three exist today:
 
 | WhaTap asks about | Script | Run it where |
 |---|---|---|
 | The **backend / collection server** (yard, proxy, gateway, ...) | `collectors/collection-server/collect-collserver.sh` | directly on the backend host |
 | **Kubernetes** monitoring (operator, node agent, master agent, ...) | `collectors/k8s/collect-k8s.sh` | any machine where `kubectl` (or `oc`) reaches the cluster — a bastion or your workstation, **not** on a cluster node |
+| The **NMS Control Manager** (network monitoring) | `collectors/nms/collect-nms.sh` | directly on the NMS Control Manager host |
 
 ## 4. Run it
 
@@ -112,7 +113,17 @@ Notes:
   `--namespace <whatap-namespace>`.
 - On a bastion that reaches several clusters, add `--context <context-name>`.
 
-### 4.3 While it runs
+### 4.3 NMS Control Manager (manager host)
+
+```sh
+cd global-groundtruth/collectors/nms
+./collect-nms.sh --file
+# -> whatap-nms-<host>-<timestamp>.txt
+```
+
+Send back the `.txt` file it names. (This collector has no bundle mode yet.)
+
+### 4.4 While it runs
 
 - Progress lines starting with `>> ` appear on the terminal so you can see it
   working; they are not part of the report.
@@ -130,12 +141,14 @@ Notes:
 
 ## 6. Security notes
 
-- The **collection-server** report and bundle include configuration files
-  **verbatim** — license keys, `secure.conf`, admin passwords. Delete your
-  local copy when the case is closed.
-- The **k8s** collector masks license/password/certificate values and never
-  reads Kubernetes Secret contents — but its bundle still contains real logs.
-  Handle it the same careful way.
+- All reports and bundles contain configuration **verbatim** — no masking, by
+  framework policy: a value such as a license key or a community string must
+  be readable to be verified or refuted. `secure.conf`, admin passwords and
+  access keys therefore appear as-is. Move files over a trusted channel and
+  delete your local copy when the case is closed.
+- The **k8s** collector never fetches Kubernetes Secret values — secrets
+  appear only as name/type tables — but everything else, including its bundle
+  logs, is verbatim. Handle it the same careful way.
 
 ## 7. Languages
 

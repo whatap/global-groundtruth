@@ -52,12 +52,13 @@ cd global-groundtruth && git pull
 
 ## 3. ใช้ collector ตัวไหน เมื่อใด
 
-ผู้ติดต่อฝั่ง WhaTap จะระบุ collector ที่ต้องรันให้ ปัจจุบันมีสองตัว:
+ผู้ติดต่อฝั่ง WhaTap จะระบุ collector ที่ต้องรันให้ ปัจจุบันมีสามตัว:
 
 | สิ่งที่ WhaTap สอบถาม | สคริปต์ | รันที่ใด |
 |---|---|---|
 | **backend / collection server** (yard, proxy, gateway, ...) | `collectors/collection-server/collect-collserver.sh` | บนโฮสต์ backend โดยตรง |
 | การมอนิเตอร์ **Kubernetes** (operator, node agent, master agent, ...) | `collectors/k8s/collect-k8s.sh` | เครื่องใดก็ได้ที่เข้าถึงคลัสเตอร์ผ่าน `kubectl` (หรือ `oc`) — bastion หรือเครื่องทำงานของคุณ **ไม่ใช่** บนโหนดของคลัสเตอร์ |
+| **NMS Control Manager** (มอนิเตอร์เครือข่าย) | `collectors/nms/collect-nms.sh` | บนโฮสต์ NMS Control Manager โดยตรง |
 
 ## 4. การรัน
 
@@ -111,7 +112,17 @@ cd global-groundtruth/collectors/k8s
   `--namespace <namespace-ของ-whatap>`
 - บน bastion ที่เข้าถึงได้หลายคลัสเตอร์ ให้เพิ่ม `--context <ชื่อ-context>`
 
-### 4.3 ระหว่างที่สคริปต์ทำงาน
+### 4.3 NMS Control Manager (โฮสต์ของ manager)
+
+```sh
+cd global-groundtruth/collectors/nms
+./collect-nms.sh --file
+# -> whatap-nms-<host>-<timestamp>.txt
+```
+
+ส่งไฟล์ `.txt` ที่สคริปต์แจ้งชื่อกลับมา (collector ตัวนี้ยังไม่มีโหมด bundle)
+
+### 4.4 ระหว่างที่สคริปต์ทำงาน
 
 - บรรทัดแสดงความคืบหน้าที่ขึ้นต้นด้วย `>> ` จะปรากฏบนเทอร์มินัลให้เห็นว่า
   สคริปต์กำลังทำงาน บรรทัดเหล่านี้ไม่ใช่ส่วนหนึ่งของรายงาน
@@ -128,11 +139,13 @@ cd global-groundtruth/collectors/k8s
 
 ## 6. ข้อควรระวังด้านความปลอดภัย
 
-- รายงานและ bundle ของ **collection-server** มีไฟล์การตั้งค่าแบบ **ตรงตาม
-  ต้นฉบับ (verbatim)** — รวมถึง license key, `secure.conf` และรหัสผ่านผู้ดูแล
-  ระบบ ลบสำเนาในเครื่องเมื่อปิดเคสแล้ว
-- collector **k8s** จะปิดบัง (mask) ค่า license/รหัสผ่าน/ใบรับรอง และไม่อ่าน
-  เนื้อหา Secret ของ Kubernetes เลย — แต่ bundle ยังคงมี log จริงอยู่
+- รายงานและ bundle ทั้งหมดมีการตั้งค่าแบบ **ตรงตามต้นฉบับ (verbatim)** —
+  ไม่มีการปิดบัง ตามนโยบายของ framework: ค่าอย่าง license key หรือ community
+  string ต้องอ่านได้จึงจะตรวจสอบยืนยันหรือหักล้างได้ ดังนั้น `secure.conf`
+  รหัสผ่านผู้ดูแลระบบ และ access key จะปรากฏตามจริง ส่งไฟล์ผ่านช่องทางที่
+  เชื่อถือได้ และลบสำเนาในเครื่องเมื่อปิดเคสแล้ว
+- collector **k8s** ไม่อ่านค่า Secret ของ Kubernetes เลย (แสดงเป็นตาราง
+  ชื่อ/ชนิดเท่านั้น) — แต่ส่วนอื่นทั้งหมดรวมถึง log ใน bundle เป็น verbatim
   จึงต้องดูแลด้วยความระมัดระวังในระดับเดียวกัน
 
 ## 7. ภาษา

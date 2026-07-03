@@ -59,12 +59,13 @@ workstation Anda lalu salin satu file skrip collector ke server
 ## 3. Collector mana, untuk kasus apa
 
 Kontak WhaTap Anda akan menyebutkan collector yang harus dijalankan. Saat ini
-ada dua:
+ada tiga:
 
 | Yang ditanyakan WhaTap | Skrip | Dijalankan di mana |
 |---|---|---|
 | **Backend / collection server** (yard, proxy, gateway, ...) | `collectors/collection-server/collect-collserver.sh` | langsung di host backend |
 | Monitoring **Kubernetes** (operator, node agent, master agent, ...) | `collectors/k8s/collect-k8s.sh` | mesin mana pun yang dapat menjangkau cluster lewat `kubectl` (atau `oc`) — bastion atau workstation Anda, **bukan** di node cluster |
+| **NMS Control Manager** (monitoring jaringan) | `collectors/nms/collect-nms.sh` | langsung di host NMS Control Manager |
 
 ## 4. Menjalankannya
 
@@ -119,7 +120,17 @@ Catatan:
 - Pada bastion yang menjangkau beberapa cluster, tambahkan
   `--context <nama-context>`.
 
-### 4.3 Selama skrip berjalan
+### 4.3 NMS Control Manager (host manager)
+
+```sh
+cd global-groundtruth/collectors/nms
+./collect-nms.sh --file
+# -> whatap-nms-<host>-<timestamp>.txt
+```
+
+Kirim kembali file `.txt` yang disebutkannya. (Collector ini belum memiliki mode bundle.)
+
+### 4.4 Selama skrip berjalan
 
 - Baris progres yang diawali `>> ` muncul di terminal sehingga Anda dapat
   melihat skrip bekerja; baris itu bukan bagian dari laporan.
@@ -140,12 +151,14 @@ Catatan:
 
 ## 6. Catatan keamanan
 
-- Laporan dan bundle **collection-server** memuat file konfigurasi **apa
-  adanya (verbatim)** — termasuk license key, `secure.conf`, dan password
-  admin. Hapus salinan lokal setelah kasus ditutup.
-- Collector **k8s** menyamarkan (masking) nilai license/password/sertifikat
-  dan tidak pernah membaca isi Secret Kubernetes — tetapi bundle-nya tetap
-  berisi log asli. Perlakukan dengan kehati-hatian yang sama.
+- Semua laporan dan bundle memuat konfigurasi **apa adanya (verbatim)** —
+  tanpa masking, sesuai kebijakan framework: nilai seperti license key atau
+  community string harus terbaca agar bisa diverifikasi atau dibantah.
+  `secure.conf`, password admin, dan access key tampil apa adanya. Kirim
+  lewat jalur tepercaya dan hapus salinan lokal setelah kasus ditutup.
+- Collector **k8s** tidak pernah mengambil isi Secret Kubernetes (hanya
+  tabel nama/tipe) — tetapi selebihnya, termasuk log di dalam bundle,
+  verbatim. Perlakukan dengan kehati-hatian yang sama.
 
 ## 7. Bahasa
 

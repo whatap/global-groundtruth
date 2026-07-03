@@ -26,10 +26,11 @@
 #                         (command not found / permission denied / path not
 #                         found / timed out / not applicable / empty output).
 #
-# REDACTION: license/access-key/password values and certificate bundles are
-# masked (<REDACTED:len=N> / <omitted:len=N>) in the report AND in bundle
-# artifacts. Secret VALUES are never fetched (`get secret -o yaml|json` is not
-# used anywhere); secrets appear only as name/type/key tables.
+# OUTPUT IS VERBATIM: framework policy (docs/authoring-guide.md step 3) — no
+# masking; a value has to be readable to be verified or refuted against the
+# other side. Kubernetes Secret VALUES are still never fetched (`get secret
+# -o yaml|json` is not used anywhere); secrets appear only as name/type/key
+# tables — that is a data-scope choice, not masking.
 #
 # NOTE: no `set -e` / no `set -u`. A collector must run to completion and emit
 # its footer even when individual steps fail; each step guards itself.
@@ -39,7 +40,7 @@ export LC_ALL=C
 
 # ---- collector metadata -----------------------------------------------------
 COLLECTOR_NAME="whatap-k8s"
-VERSION="0.1.0"
+VERSION="0.2.0"
 DOMAIN="k8s"
 TARGET="k8s-cluster/unresolved"      # refined after CLI/context/namespace discovery
 
@@ -81,8 +82,8 @@ by accident.
   collect-k8s.sh --exec-per-node          run the in-pod probes on EVERY running
                                           node-agent pod (max 30) instead of 2 samples
 
-License / access-key values and certificate bundles are masked in all output;
-secret values are never fetched.
+Output is verbatim (framework policy: no masking). Kubernetes Secret values
+are never fetched; secrets appear only as name/type/key tables.
 EOF
 }
 
@@ -200,25 +201,6 @@ probe() {
     _emit_labeled "$label" "$out"
 }
 
-# probe_red: like probe but the output passes through redact first.
-probe_red() {
-    local label="$1"; shift
-    local bin="$1"
-    if ! command -v "$bin" >/dev/null 2>&1; then
-        fact "$label: n/a (command not found: $bin)"; return
-    fi
-    local out rc
-    if [ -n "$_timeout_bin" ]; then
-        out="$("$_timeout_bin" "$CMD_TIMEOUT" "$@" 2>"$_errfile")"; rc=$?
-    else
-        out="$("$@" 2>"$_errfile")"; rc=$?
-    fi
-    if [ "$rc" -eq 124 ] && [ -n "$_timeout_bin" ]; then fact "$label: n/a (timed out: ${CMD_TIMEOUT}s)"; return; fi
-    if [ "$rc" -ne 0 ]; then fact "$label: n/a ($(_classify_err))"; return; fi
-    if [ -z "$out" ]; then fact "$label: n/a (empty output)"; return; fi
-    _emit_labeled "$label" "$(printf '%s\n' "$out" | redact)"
-}
-
 warn() { printf '%s\n' "$*" >&2; }
 
 # progress: operational narration to the terminal (fd 3, saved from stderr in main
@@ -226,93 +208,6 @@ warn() { printf '%s\n' "$*" >&2; }
 # byte-for-byte the report even in --file mode. Silenced by --quiet. Keep the text a
 # fact about collection state (no judgment words) so validate.sh keeps passing.
 progress() { [ "$OPT_QUIET" = 1 ] && return; printf '>> %s\n' "$*" >&3 2>/dev/null; }
-
-# ---- redaction ---------------------------------------------------------------
-# One portable-awk pass over any text that may carry credentials: CR yaml, DS /
-# deployment / webhook yaml, describe output, helm values, log tails, exec
-# output, and every bundle artifact. Values are replaced by <REDACTED:len=N>
-# (length preserved: "a 38-char license is set" stays a fact). Certificate
-# bundles become <omitted:len=N>. secretKeyRef NAMES survive on purpose — the
-# reference structure is a fact the reader needs; only literal values die here.
-redact() {
-    awk '
-    function masked(s) { return "<REDACTED:len=" length(s) ">" }
-    BEGIN {
-        sens = "(licen[cs]e[_.-]?(key)?|access[_-]?key|api[_-]?(key|token)|passwd|password)"
-        sep  = "[\"\047]?[[:space:]]*[:=][[:space:]]*"
-        pending = 0
-    }
-    {
-        line = $0
-        low  = tolower(line)
-
-        # certificate / key-material bulk fields: mask the rest of the line
-        if (match(low, /(cabundle|certificate-authority-data|client-certificate-data|client-key-data)[\"\047]?[[:space:]]*:[[:space:]]*/)) {
-            p = RSTART + RLENGTH
-            v = substr(line, p)
-            gsub(/[[:space:]]+$/, "", v)
-            if (length(v) > 0) { print substr(line, 1, p - 1) "<omitted:len=" length(v) ">"; next }
-        }
-
-        # two-line yaml env form: a sensitive "name:" line arms masking of the
-        # "value:" line that follows; "valueFrom:" (secretKeyRef) disarms it so
-        # the secret NAME stays visible.
-        if (pending > 0) {
-            pending--
-            if (low ~ /valuefrom[\"\047]?[[:space:]]*:/) pending = 0
-            else if (low ~ /(^|[[:space:]])[\"\047]?value[\"\047]?[[:space:]]*:/) {
-                i = index(line, ":")
-                v = substr(line, i + 1)
-                gsub(/^[[:space:]]+/, "", v); gsub(/[\"\047]/, "", v)
-                print substr(line, 1, i) " " masked(v)
-                pending = 0
-                next
-            }
-        }
-        if (low ~ ("name[\"\047]?[[:space:]]*:[[:space:]]*[\"\047]?[a-z0-9_.-]*" sens)) {
-            pending = 3
-            # same-line JSON env form: {"name":"WHATAP_LICENSE","value":"..."}
-            if (match(low, /"value"[[:space:]]*:[[:space:]]*"/)) {
-                p = RSTART + RLENGTH
-                rest = substr(line, p)
-                q = index(rest, "\"")
-                if (q > 0) {
-                    line = substr(line, 1, p - 1) masked(substr(rest, 1, q - 1)) substr(rest, q)
-                    low = tolower(line)
-                    pending = 0
-                }
-            }
-        }
-
-        # inline key[:=]value forms (yaml scalars, java properties, shell env,
-        # helm values, json fields). Loop-guarded for multiple hits per line.
-        out = ""; guard = 0
-        while (match(tolower(line), sens sep) && guard < 8) {
-            guard++
-            p = RSTART + RLENGTH
-            head = substr(line, 1, p - 1)
-            rest = substr(line, p)
-            c = substr(rest, 1, 1)
-            if (c == "\"" || c == "\047") {
-                q = index(substr(rest, 2), c)
-                if (q > 0) { inner = substr(rest, 2, q - 1); tail = substr(rest, q + 2) }
-                else       { inner = substr(rest, 2);        tail = "" }
-                out = out head c masked(inner) c
-            } else {
-                t = match(rest, /[[:space:],}]/)
-                if (t == 0) { inner = rest; tail = "" }
-                else        { inner = substr(rest, 1, t - 1); tail = substr(rest, t) }
-                # kubectl describe renders secret references as "<set to the key
-                # ... in secret ...>" — structural text, not a value; keep it.
-                if (substr(inner, 1, 1) == "<") out = out head inner
-                else out = out head masked(inner)
-            }
-            line = tail
-        }
-        line = out line
-        print line
-    }'
-}
 
 # ---- kubectl/oc plumbing -----------------------------------------------------
 KCTL_BIN=""
@@ -358,13 +253,6 @@ kprobe() {
     else fact "$label: n/a ($(_k_reason))"; fi
 }
 
-# kprobe_red "label" ARGS... -> same, but output passes through redact
-kprobe_red() {
-    local label="$1"; shift
-    if run_k "$@" && [ -n "$K_OUT" ]; then _emit_labeled "$label" "$(printf '%s\n' "$K_OUT" | redact)"
-    else fact "$label: n/a ($(_k_reason))"; fi
-}
-
 # kfilter "label" "ERE" ARGS... -> CLI output filtered to lines matching ERE
 kfilter() {
     local label="$1" pat="$2"; shift 2
@@ -379,7 +267,7 @@ kfilter() {
 # kval ARGS... -> capture-only: prints stdout on success, nothing on failure.
 kval() { run_k "$@" || return 1; printf '%s\n' "$K_OUT"; }
 
-# emit_log_tail POD CONTAINER LINES [previous] -> redacted, bounded log tail
+# emit_log_tail POD CONTAINER LINES [previous] -> bounded log tail
 emit_log_tail() {
     local pod="$1" cont="$2" lines="$3" prev="${4:-}"
     local label="logs $pod/$cont"
@@ -388,18 +276,18 @@ emit_log_tail() {
     if [ -n "$prev" ]; then run_k logs -n "$NS" "$pod" -c "$cont" --tail="$lines" --previous; rc=$?
     else run_k logs -n "$NS" "$pod" -c "$cont" --tail="$lines"; rc=$?; fi
     if [ "$rc" -eq 0 ] && [ -n "$K_OUT" ]; then
-        _emit_labeled "$label" "$(printf '%s\n' "$K_OUT" | redact)"
+        _emit_labeled "$label" "$K_OUT"
     else
         fact "$label: n/a ($(_k_reason))"
     fi
 }
 
-# pod_exec_probe "label" POD CONTAINER CMDSTRING -> redacted output of a
+# pod_exec_probe "label" POD CONTAINER CMDSTRING -> output of a
 # read-only command run inside an agent pod, or a classified reason.
 pod_exec_probe() {
     local label="$1" pod="$2" cont="$3" cmd="$4"
     if run_k exec -n "$NS" "$pod" -c "$cont" -- sh -c "$cmd" && [ -n "$K_OUT" ]; then
-        _emit_labeled "$label" "$(printf '%s\n' "$K_OUT" | redact)"
+        _emit_labeled "$label" "$K_OUT"
     else
         fact "$label: n/a ($(_k_reason))"
     fi
@@ -594,7 +482,7 @@ run_report() {
             subsection "whatapagent instance: ${crns:+$crns/}$cr"
             if [ -n "$crns" ]; then crref="-n $crns"; else crref=""; fi
             # shellcheck disable=SC2086
-            kprobe_red "cr yaml (redacted)" get "$WA_CRD" "$cr" $crref -o yaml
+            kprobe "cr yaml" get "$WA_CRD" "$cr" $crref -o yaml
             # env placement facts: the operator applies container-level envs and
             # pod-level envs through different code paths — surface both verbatim.
             # shellcheck disable=SC2086
@@ -618,7 +506,7 @@ run_report() {
     section "D. Operator, RBAC & admission webhooks"
     if [ -n "$OP_DEPLOY" ]; then
         kprobe "operator pods" get pods -n "$NS" -l app.kubernetes.io/name=whatap-operator -o wide
-        kprobe_red "operator deployment yaml (redacted)" get deploy "$OP_DEPLOY" -n "$NS" -o yaml
+        kprobe "operator deployment yaml" get deploy "$OP_DEPLOY" -n "$NS" -o yaml
         kfilter "operator replicasets (revision/image history)" "whatap-operator|^NAME" get rs -n "$NS" -o custom-columns=NAME:.metadata.name,REVISION:.metadata.annotations.deployment\.kubernetes\.io/revision,IMAGE:.spec.template.spec.containers[0].image,CREATED:.metadata.creationTimestamp
     else
         fact "operator deployment: none found in ${NS:-<no namespace>}"
@@ -627,7 +515,7 @@ run_report() {
     if [ -n "$WEBHOOKS" ]; then
         local wh
         for wh in $WEBHOOKS; do
-            kprobe_red "webhook $wh (yaml, redacted)" get "$wh" -o yaml
+            kprobe "webhook $wh (yaml)" get "$wh" -o yaml
         done
     else
         fact "whatap mutating/validating webhooks: none found"
@@ -656,7 +544,7 @@ run_report() {
     if [ -n "$DS_NAME" ]; then
         kprobe "daemonset status" get ds "$DS_NAME" -n "$NS"
         fact "daemonset container names (discovered): ${DS_CONTAINERS:-n/a}"
-        kprobe_red "daemonset yaml (redacted)" get ds "$DS_NAME" -n "$NS" -o yaml
+        kprobe "daemonset yaml" get ds "$DS_NAME" -n "$NS" -o yaml
     else
         fact "node-agent daemonset: none found in ${NS:-<no namespace>}"
     fi
@@ -674,7 +562,7 @@ run_report() {
         # describe the two pods with the highest restart counts
         i=0
         while [ "$i" -lt 2 ] && [ "$i" -lt "$total" ]; do
-            kprobe_red "describe pod ${SP_POD[$i]} (redacted)" describe pod "${SP_POD[$i]}" -n "$NS"
+            kprobe "describe pod ${SP_POD[$i]}" describe pod "${SP_POD[$i]}" -n "$NS"
             i=$((i + 1))
         done
     else
@@ -705,7 +593,7 @@ run_report() {
     if [ -n "$NS" ]; then
         if [ -n "$OP_DEPLOY" ]; then
             if run_k logs -n "$NS" "deploy/$OP_DEPLOY" --tail="$OPT_TAIL" && [ -n "$K_OUT" ]; then
-                _emit_labeled "logs deploy/$OP_DEPLOY" "$(printf '%s\n' "$K_OUT" | redact)"
+                _emit_labeled "logs deploy/$OP_DEPLOY" "$K_OUT"
             else
                 fact "logs deploy/$OP_DEPLOY: n/a ($(_k_reason))"
             fi
@@ -714,7 +602,7 @@ run_report() {
         mdep="$(printf '%s\n' "$WHATAP_DEPLOYS" | awk '$1 ~ /master-agent/ {print $1; exit}')"
         if [ -n "$mdep" ]; then
             if run_k logs -n "$NS" "deploy/$mdep" --tail="$OPT_TAIL" && [ -n "$K_OUT" ]; then
-                _emit_labeled "logs deploy/$mdep" "$(printf '%s\n' "$K_OUT" | redact)"
+                _emit_labeled "logs deploy/$mdep" "$K_OUT"
             else
                 fact "logs deploy/$mdep: n/a ($(_k_reason))"
             fi
@@ -758,7 +646,7 @@ run_report() {
             printf '%s\n' "$hl" | awk 'NR>1 || $1!="NAME" {print $1, $2}' | grep -vi '^NAME' | head -n 3 | while read -r rel relns; do
                 [ -n "$rel" ] || continue
                 probe "helm history $rel" helm history "$rel" -n "$relns" "${HOPTS[@]}"
-                probe_red "helm values $rel (user-supplied, redacted)" helm get values "$rel" -n "$relns" "${HOPTS[@]}"
+                probe "helm values $rel (user-supplied)" helm get values "$rel" -n "$relns" "${HOPTS[@]}"
             done
         else
             fact "helm releases: n/a (empty output)"
@@ -890,7 +778,7 @@ run_report() {
                 kprobe "pod $tp initContainers" get pod "$tp" -n "$tns" -o 'jsonpath={range .spec.initContainers[*]}{.name}{" image="}{.image}{"\n"}{end}'
                 if run_k get pod "$tp" -n "$tns" -o yaml; then
                     local marks
-                    marks="$(printf '%s\n' "$K_OUT" | grep -Ein 'whatap|okind' | head -n 40 | redact)"
+                    marks="$(printf '%s\n' "$K_OUT" | grep -Ein 'whatap|okind' | head -n 40)"
                     if [ -n "$marks" ]; then _emit_labeled "pod $tp whatap-marker lines (grep whatap|okind, first 40)" "$marks"
                     else fact "pod $tp whatap-marker lines: none (no line matching whatap/okind in pod yaml)"; fi
                 else
@@ -910,10 +798,10 @@ run_report() {
 # Bundle (Tier 1)
 # =============================================================================
 _bundle_write() {
-    # _bundle_write FILE ARGS... -> run_k output (redacted) into FILE; skipped on failure
+    # _bundle_write FILE ARGS... -> run_k output into FILE; skipped on failure
     local file="$1"; shift
     if run_k "$@" && [ -n "$K_OUT" ]; then
-        printf '%s\n' "$K_OUT" | redact > "$file" 2>/dev/null
+        printf '%s\n' "$K_OUT" > "$file" 2>/dev/null
     fi
 }
 
@@ -970,10 +858,10 @@ collect_bundle_logs() {
         for cont in $conts; do
             [ -n "$cont" ] || continue
             if run_k logs -n "$NS" "$pod" -c "$cont" --tail=2000 --limit-bytes=5000000 && [ -n "$K_OUT" ]; then
-                printf '%s\n' "$K_OUT" | redact > "$dest/${pod}_${cont}.log" 2>/dev/null
+                printf '%s\n' "$K_OUT" > "$dest/${pod}_${cont}.log" 2>/dev/null
             fi
             if run_k logs -n "$NS" "$pod" -c "$cont" --tail=2000 --limit-bytes=5000000 --previous && [ -n "$K_OUT" ]; then
-                printf '%s\n' "$K_OUT" | redact > "$dest/${pod}_${cont}.previous.log" 2>/dev/null
+                printf '%s\n' "$K_OUT" > "$dest/${pod}_${cont}.previous.log" 2>/dev/null
             fi
         done
     done
@@ -1010,7 +898,7 @@ collect_bundle_helm() {
     awk 'NR>1 {print $1, $2}' "$dest/releases.txt" 2>/dev/null | head -n 3 | while read -r rel relns; do
         [ -n "$rel" ] || continue
         helm history "$rel" -n "$relns" "${HOPTS[@]}" > "$dest/history-$rel.txt" 2>/dev/null
-        helm get values "$rel" -n "$relns" "${HOPTS[@]}" 2>/dev/null | redact > "$dest/values-$rel.yaml" 2>/dev/null
+        helm get values "$rel" -n "$relns" "${HOPTS[@]}" 2>/dev/null > "$dest/values-$rel.yaml" 2>/dev/null
     done
     progress "helm: releases/history/values written"
 }

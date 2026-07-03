@@ -55,6 +55,14 @@ per-language collectors (apm) gives each its own token (`collect-apmjava.sh`,
   cannot obtain is a fact too — emit `n/a` via the `try` helper, never a
   fabricated default. This is what lets one collector work in an environment its
   author never saw (see [coverage-kb/](coverage-kb/)).
+- **Dump configuration verbatim — do not mask.** Framework policy: WhaTap
+  config files carry no plaintext secrets worth masking (genuinely sensitive
+  material is stored encrypted), and a masked value destroys the very fact a
+  reader needs — a mistyped community string or a wrong server address must be
+  readable to be verified or refuted against the other side. If your domain
+  ever does hold a plaintext secret, state it in your
+  `collectors/<domain>/README.md` security note rather than silently altering
+  the report.
 
 Use `section`, `fact`, and `try`; do not hand-format the header or footer.
 

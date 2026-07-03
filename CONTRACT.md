@@ -14,17 +14,27 @@ is enforced by review.
 
 No diagnosis. No "likely cause." No recommendation. No fix. No severity.
 
-A collector reports **what is**, never **what it means**. Interpretation is the
-reader's job — the reader is a remote WhaTap agent developer who has the context
-to interpret. **No output line may state a conclusion.**
+A collector reports **what is**, never **what it means**. **No report line may
+state a conclusion.**
+
+This rule binds **the script and its report — not people**. Field engineers,
+partners, and customers can and do form judgments about a case; that is their
+normal work. The collector's purpose is to gather the logs and facts that let
+any such judgment be **verified or refuted**. Interpretation happens outside
+the report — by the people reading it (typically a remote WhaTap agent
+developer, but also the engineer on site).
 
 > If a line could start with "so you should…", "this is probably…", or
 > "the problem is…", it violates this rule. Delete the judgment; keep the fact.
 
-`validate.sh` fails any collector whose **output** contains the words
+`validate.sh` fails any collector whose **source** contains the words
 `likely`, `diagnos`, `recommend`, `should`, `root cause`, or `fix`
-(case-insensitive). See [tools/validate.sh](tools/validate.sh) for how comments
-and the footer sentinel are excluded.
+(case-insensitive) on a non-comment line — that is, in any string the script
+could emit. See [tools/validate.sh](tools/validate.sh) for how comments and
+the footer sentinel are excluded. Environment content **quoted verbatim** into
+a report (a distro-shipped file, a vendor config comment) may happen to
+contain these words; that is a fact being reported, not a judgment being made,
+and the validator deliberately does not inspect runtime output.
 
 ## 2. Discover, never assume
 

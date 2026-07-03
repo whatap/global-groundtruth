@@ -1,6 +1,6 @@
 # collectors/nms
 
-> **Status: SEEDED v0 (`collect-nms.sh` 0.2.0).** A working collector exists and
+> **Status: SEEDED v0 (`collect-nms.sh` 0.3.0).** A working collector exists and
 > is owned, for now, by the Global team (framework owner). Handover transfers
 > ongoing ownership to the NMS development team (CONTRACT rule 4).
 > **Live-validated on Ubuntu 24.04 with a real `whatap-nms` 1.0.2 (deb)
@@ -70,14 +70,15 @@ One `.txt` report, organized into MECE domains:
   `repo.whatap.io` and `pypi.org`. (Closed networks break the post-install pip
   step with `ResolutionImpossible`; whether the host can reach out is itself a
   recurring question.)
-- **I. Configuration** — `wtinitset -v` (the official config viewer; key
-  material masked), then every discovered `*.conf`/`*.toml` (package manifest,
-  `<root>`, `<root>/etc`, `/etc/whatap-nms`) dumped with values of
-  sensitive-looking keys (community/password/secret/token/key/credential)
-  replaced by `<masked>` — this includes `etc/nmscore.conf` and the MIB module
-  registry `etc/mibmods.toml`. A flat "keys of record" grep
-  (`MANAGER_WEB_PORT`, `MANAGER_HTTPS_ENABLED`, `MANAGER_HTTPS_WEB_PORT`,
-  `MAX_REPETITIONS`, `IFX_32BIT_PPS_FALLBACK`) guards against dump caps.
+- **I. Configuration** — `wtinitset -v` (the official config viewer), then
+  every discovered `*.conf`/`*.toml` (package manifest, `<root>`,
+  `<root>/etc`, `/etc/whatap-nms`) dumped **verbatim** — this includes
+  `etc/nmscore.conf` and the MIB module registry `etc/mibmods.toml`. Verbatim
+  by framework policy (see the security note): a mistyped community string or
+  a wrong server address has to be readable to be verified or refuted against
+  the device side. A flat "keys of record" grep (`MANAGER_WEB_PORT`,
+  `MANAGER_HTTPS_ENABLED`, `MANAGER_HTTPS_WEB_PORT`, `MAX_REPETITIONS`,
+  `IFX_32BIT_PPS_FALLBACK`) guards against dump caps.
 - **J. Logs & recent events** — `/var/log/whatap-nms` inventory,
   `pkg-install-error.log` tail (the first artifact support asks for on an
   install failure), bounded tails of other logs, `/var/log/nmscore/nmscore.log`
@@ -125,13 +126,14 @@ Progress is narrated on **stderr** (`>> ...`); the report itself stays clean.
 
 ## (c) Security note
 
-Config dumps mask values of sensitive-looking keys (`community`, `passw*`,
-`secret`, `token`, `key`, `credential`) as `<masked>`. Masking is
-pattern-based and intentionally over-broad; it is still one file leaving a
-customer network — move it over a trusted channel and delete it when the case
-is closed. The `--snmp` probe requires the operator to type the community
-string on the command line; prefer running it from a root-only shell (shell
-history caveat applies).
+Config dumps are collected **verbatim, unmasked** — framework policy
+([authoring-guide](../../docs/authoring-guide.md) step 3): these files carry
+no plaintext secrets worth masking (genuinely sensitive WhaTap material is
+stored encrypted), and a masked value would destroy the diagnostic fact it is
+supposed to carry. It is still one file leaving a customer network — move it
+over a trusted channel and delete it when the case is closed. The `--snmp`
+probe requires the operator to type the community string on the command line;
+shell history caveat applies.
 
 ## (d) How it was built / how to maintain
 
@@ -157,8 +159,7 @@ and re-validate after edits:
   `cases/2026-07-03-nms-support-channel-analysis/resources/` in the analysis
   workspace. **Still to do: one run on a RHEL-family host and one on a
   fully-running manager** (unit states, listening 5000/514/162, established
-  :6600, `/var/log/nmscore` content, `wtinitset -v` output shape — mask
-  patterns may need adjusting to its real format).
+  :6600, `/var/log/nmscore` content, `wtinitset -v` output shape).
 - **Per-device polling settings are not collected** (SNMP v1-vs-v2c per device,
   polling interval, ifTable+ifXTable double registration — all named in past
   cases as facts the developer needed). Where the manager persists them

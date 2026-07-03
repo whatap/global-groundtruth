@@ -39,7 +39,7 @@ export LC_ALL=C
 
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-nms"
-VERSION="0.2.1"
+VERSION="0.3.0"
 DOMAIN="nms"
 TARGET="host/$(hostname 2>/dev/null || echo unknown)"
 
@@ -204,54 +204,18 @@ tail_file() {
     tail -n "$n" "$path" 2>/dev/null | while IFS= read -r _l || [ -n "$_l" ]; do printf '        %s\n' "$_l"; done
 }
 
-# probe_redacted "label" CMD [ARGS...] -> like probe_merged, but each output
-# line whose lowercased text names key material (license/access key/community/
-# password/secret/token) has its value replaced by <masked>. Lines with an
-# = or : separator keep the key part; lines without one are reduced to their
-# first word so raw key material can never pass through.
-probe_redacted() {
-    local label="$1"; shift
-    local bin="$1"
-    command -v "$bin" >/dev/null 2>&1 || { fact "$label: n/a (command not found: $bin)"; return; }
-    local out rc
-    if [ -n "$_timeout_bin" ]; then out="$("$_timeout_bin" "$CMD_TIMEOUT" "$@" 2>&1)"; rc=$?
-    else out="$("$@" 2>&1)"; rc=$?; fi
-    [ "$rc" -eq 124 ] && [ -n "$_timeout_bin" ] && { fact "$label: n/a (timed out: ${CMD_TIMEOUT}s)"; return; }
-    [ -z "$out" ] && { fact "$label: n/a (empty output)"; return; }
-    fact "$label:"
-    local _l _lc
-    printf '%s\n' "$out" | while IFS= read -r _l || [ -n "$_l" ]; do
-        _lc="$(printf '%s' "$_l" | tr 'A-Z' 'a-z')"
-        case "$_lc" in
-            *license*|*accesskey*|*access\ key*|*community*|*passw*|*secret*|*token*)
-                case "$_l" in
-                    *[=:]*) printf '        %s<masked>\n' "$(printf '%s' "$_l" | sed 's/\([=:]\).*$/\1 /')" ;;
-                    *)      printf '        %s <masked>\n' "$(printf '%s' "$_l" | awk '{print $1}')" ;;
-                esac ;;
-            *)
-                printf '        %s\n' "$_l" ;;
-        esac
-    done
-}
-
-# dump_file_redacted PATH [CAP] -> file content with values of sensitive-looking
-# keys (community/passw/secret/token/key/credential) replaced by <masked>.
-# Line-by-line in shell: portable (no GNU-sed flags), and config files here are
-# small; the CAP bounds the read either way.
-dump_file_redacted() {
-    local path="$1" cap="${2:-300}" lc
+# dump_file PATH [CAP] -> a file's content verbatim (line-capped), or a reason.
+# Framework policy (docs/authoring-guide.md step 3): configuration is dumped
+# verbatim, never masked — a value has to be readable to be verified or refuted
+# against the other side (e.g. a community string compared with the device),
+# and genuinely sensitive WhaTap material is stored encrypted anyway.
+dump_file() {
+    local path="$1" cap="${2:-400}"
     [ -e "$path" ] || { fact "n/a (path not found: $path)"; return; }
     [ -r "$path" ] || { fact "n/a (permission denied: $path)"; return; }
     [ -s "$path" ] || { fact "(empty file)"; return; }
     head -n "$cap" "$path" 2>/dev/null | while IFS= read -r _l || [ -n "$_l" ]; do
-        lc="$(printf '%s' "$_l" | tr 'A-Z' 'a-z')"
-        case "$lc" in
-            *community*=*|*passw*=*|*secret*=*|*token*=*|*key*=*|*credential*=*|\
-            *community*:*|*passw*:*|*secret*:*|*token*:*|*key*:*|*credential*:*)
-                printf '        %s<masked>\n' "$(printf '%s' "$_l" | sed 's/\([=:]\).*$/\1 /')" ;;
-            *)
-                printf '        %s\n' "$_l" ;;
-        esac
+        printf '        %s\n' "$_l"
     done
 }
 
@@ -554,9 +518,9 @@ run_report() {
     # wtinitset is the official configuration tool (docs.whatap.io/nms/
     # install-agent): -a sets the access key, -s the WhaTap server IP
     # (multi-IP "a/b" form exists), -v prints the current configuration.
-    section "I. Configuration (values of sensitive-looking keys masked)"
-    subsection "wtinitset -v (official config viewer; key material masked)"
-    probe_redacted "wtinitset -v" wtinitset -v
+    section "I. Configuration (verbatim)"
+    subsection "wtinitset -v (official config viewer)"
+    probe_merged "wtinitset -v" wtinitset -v
     subsection "discovered *.conf files"
     local _cfgs="" _cf
     if have rpm; then
@@ -576,7 +540,7 @@ run_report() {
         printf '%s\n' "$_cfgs" | while IFS= read -r _cf; do
             [ -e "$_cf" ] || { fact "$_cf: n/a (listed in package manifest, path not found on disk)"; continue; }
             fact "$_cf ($(file_meta "$_cf")):"
-            dump_file_redacted "$_cf" 400
+            dump_file "$_cf" 400
         done
         # keys of record, extracted flat in case a dump above hit its line cap:
         # MANAGER_WEB_PORT / MANAGER_HTTPS_* (UI port is configurable — FAQ),

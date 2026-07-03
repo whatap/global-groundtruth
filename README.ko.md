@@ -67,6 +67,7 @@ global-groundtruth/
 │       └── k8s-huawei-cce.md     # seed entry: Huawei CCE
 ├── collectors/
 │   ├── k8s/                      # SEEDED v0 — cluster-level collector (operator/CR/agents)
+│   ├── nms/                      # SEEDED v0 — NMS Control Manager host collector
 │   ├── server/                   # STUB (README only)
 │   ├── apm/                      # STUB (README only) — one per language: nodejs/java/python/php/dotnet
 │   ├── db/                       # STUB (README only)
@@ -82,6 +83,7 @@ global-groundtruth/
 | 도메인   | 상태          | 비고                                              |
 |----------|-----------------|----------------------------------------------------|
 | `k8s`               | SEEDED v0       | bastion에서 실행하는 클러스터 collector; `collectors/k8s/` 참조 |
+| `nms`               | SEEDED v0       | NMS Control Manager 호스트 스크립트; `collectors/nms/` 참조 |
 | `server`            | NOT IMPLEMENTED | 호스트 셸 스크립트; `collectors/server/` 참조          |
 | `apm`               | NOT IMPLEMENTED | 언어별 패밀리; `collectors/apm/` 참조            |
 | `db`                | NOT IMPLEMENTED | SQL + 에이전트 설정 덤프; `collectors/db/` 참조         |
@@ -89,7 +91,7 @@ global-groundtruth/
 
 이 저장소는 **프레임워크**(계약, 포맷, 템플릿, 검증기, 문서), 도메인별
 **스텁**, 그리고 핸드오버 전까지 Global 팀이 소유하는 **seeded v0** collector
-2개(`collection-server`, `k8s`)를 담고 있습니다. collector는 작성된 뒤 해당
+3개(`collection-server`, `k8s`, `nms`)를 담고 있습니다. collector는 작성된 뒤 해당
 도메인 팀이 소유합니다.
 
 ## collector 실행 (필드 엔지니어)

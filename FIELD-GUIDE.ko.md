@@ -52,12 +52,13 @@ cd global-groundtruth && git pull
 
 ## 3. 어떤 collector를 언제 쓰는가
 
-실행할 collector는 WhaTap 담당자가 지정해 줍니다. 현재 두 개가 있습니다:
+실행할 collector는 WhaTap 담당자가 지정해 줍니다. 현재 세 개가 있습니다:
 
 | WhaTap이 묻는 대상 | 스크립트 | 실행 위치 |
 |---|---|---|
 | **백엔드 / 수집 서버** (yard, proxy, gateway, ...) | `collectors/collection-server/collect-collserver.sh` | 백엔드 호스트에서 직접 |
 | **Kubernetes** 모니터링 (operator, node agent, master agent, ...) | `collectors/k8s/collect-k8s.sh` | `kubectl`(또는 `oc`)로 클러스터에 접근되는 아무 장비 — bastion 또는 워크스테이션. 클러스터 노드 위가 **아님** |
+| **NMS Control Manager** (네트워크 모니터링) | `collectors/nms/collect-nms.sh` | NMS Control Manager 호스트에서 직접 |
 
 ## 4. 실행하기
 
@@ -111,7 +112,17 @@ cd global-groundtruth/collectors/k8s
   `--namespace <whatap-네임스페이스>`를 붙이십시오.
 - 여러 클러스터에 접근되는 bastion에서는 `--context <컨텍스트명>`을 붙이십시오.
 
-### 4.3 실행 중에 보이는 것
+### 4.3 NMS Control Manager (매니저 호스트)
+
+```sh
+cd global-groundtruth/collectors/nms
+./collect-nms.sh --file
+# -> whatap-nms-<host>-<timestamp>.txt
+```
+
+생성된 `.txt` 파일을 보내주십시오. (이 collector에는 아직 번들 모드가 없습니다.)
+
+### 4.4 실행 중에 보이는 것
 
 - `>> `로 시작하는 진행 표시가 터미널에 출력되어 동작 중임을 확인할 수
   있습니다. 이 줄들은 리포트에 포함되지 않습니다.
@@ -128,12 +139,14 @@ cd global-groundtruth/collectors/k8s
 
 ## 6. 보안 주의사항
 
-- **collection-server** 리포트와 번들에는 설정 파일이 **원문 그대로**
-  들어갑니다 — 라이선스 키, `secure.conf`, 관리자 암호 포함. 케이스 종료 후
-  로컬 사본을 삭제하십시오.
-- **k8s** collector는 라이선스/암호/인증서 값을 마스킹하며 Kubernetes Secret
-  내용을 읽지 않습니다 — 다만 번들에는 실제 로그가 들어 있으므로 같은 수준으로
-  주의해서 다루십시오.
+- 모든 리포트와 번들에는 설정이 **원문 그대로(verbatim)** 들어갑니다 —
+  프레임워크 정책상 마스킹하지 않습니다. 라이선스 키나 community 문자열 같은
+  값은 읽을 수 있어야 검증·반박이 가능하기 때문입니다. `secure.conf`, 관리자
+  암호, 액세스 키도 그대로 나타납니다. 신뢰할 수 있는 경로로 전달하고 케이스
+  종료 후 로컬 사본을 삭제하십시오.
+- **k8s** collector는 Kubernetes Secret 값을 가져오지 않습니다(이름/타입
+  표로만 표시) — 그 외 리포트·로그·번들은 모두 원문 그대로이므로 같은
+  수준으로 주의해서 다루십시오.
 
 ## 7. 언어
 

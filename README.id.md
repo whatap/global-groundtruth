@@ -74,6 +74,7 @@ global-groundtruth/
 │       └── k8s-huawei-cce.md     # seed entry: Huawei CCE
 ├── collectors/
 │   ├── k8s/                      # SEEDED v0 — cluster-level collector (operator/CR/agents)
+│   ├── nms/                      # SEEDED v0 — NMS Control Manager host collector
 │   ├── server/                   # STUB (README only)
 │   ├── apm/                      # STUB (README only) — one per language: nodejs/java/python/php/dotnet
 │   ├── db/                       # STUB (README only)
@@ -89,14 +90,15 @@ global-groundtruth/
 | Domain   | Status          | Catatan                                              |
 |----------|-----------------|----------------------------------------------------|
 | `k8s`               | SEEDED v0       | collector cluster yang dijalankan dari bastion; lihat `collectors/k8s/` |
+| `nms`               | SEEDED v0       | skrip host NMS Control Manager; lihat `collectors/nms/` |
 | `server`            | NOT IMPLEMENTED | skrip shell host; lihat `collectors/server/`          |
 | `apm`               | NOT IMPLEMENTED | keluarga per-bahasa; lihat `collectors/apm/`            |
 | `db`                | NOT IMPLEMENTED | SQL + dump konfigurasi agent; lihat `collectors/db/`         |
 | `collection-server` | SEEDED v0       | skrip host backend; lihat `collectors/collection-server/` |
 
 Repositori ini memuat **framework**-nya (contract, format, template,
-validator, dokumentasi), **stub** per-domain, dan dua collector **seeded v0**
-(`collection-server`, `k8s`) yang dimiliki tim Global sampai serah terima.
+validator, dokumentasi), **stub** per-domain, dan tiga collector **seeded v0**
+(`collection-server`, `k8s`, `nms`) yang dimiliki tim Global sampai serah terima.
 Collector ditulis lalu dimiliki oleh tim domain masing-masing.
 
 ## Menjalankan collector (engineer lapangan)

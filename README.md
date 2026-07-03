@@ -84,14 +84,15 @@ global-groundtruth/
 | Domain   | Status          | Notes                                              |
 |----------|-----------------|----------------------------------------------------|
 | `k8s`               | SEEDED v0       | bastion-run cluster collector; see `collectors/k8s/` |
+| `nms`               | SEEDED v0       | NMS Control Manager host script; see `collectors/nms/` |
 | `server`            | NOT IMPLEMENTED | host shell script; see `collectors/server/`          |
 | `apm`               | NOT IMPLEMENTED | per-language family; see `collectors/apm/`            |
 | `db`                | NOT IMPLEMENTED | SQL + agent-config dump; see `collectors/db/`         |
 | `collection-server` | SEEDED v0       | backend host script; see `collectors/collection-server/` |
 
 This repository ships the **framework** (contract, format, template, validator,
-docs), per-domain **stubs**, and two **seeded v0** collectors
-(`collection-server`, `k8s`) that the Global team owns until handover.
+docs), per-domain **stubs**, and three **seeded v0** collectors
+(`collection-server`, `k8s`, `nms`) that the Global team owns until handover.
 Collectors are authored and then owned by their domain teams.
 
 ## Run a collector (field engineer)

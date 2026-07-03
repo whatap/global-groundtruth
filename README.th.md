@@ -69,6 +69,7 @@ global-groundtruth/
 │       └── k8s-huawei-cce.md     # seed entry: Huawei CCE
 ├── collectors/
 │   ├── k8s/                      # SEEDED v0 — cluster-level collector (operator/CR/agents)
+│   ├── nms/                      # SEEDED v0 — NMS Control Manager host collector
 │   ├── server/                   # STUB (README only)
 │   ├── apm/                      # STUB (README only) — one per language: nodejs/java/python/php/dotnet
 │   ├── db/                       # STUB (README only)
@@ -84,14 +85,15 @@ global-groundtruth/
 | โดเมน   | สถานะ          | หมายเหตุ                                              |
 |----------|-----------------|----------------------------------------------------|
 | `k8s`               | SEEDED v0       | collector ระดับคลัสเตอร์ รันจาก bastion; ดู `collectors/k8s/` |
+| `nms`               | SEEDED v0       | สคริปต์บนโฮสต์ NMS Control Manager; ดู `collectors/nms/` |
 | `server`            | NOT IMPLEMENTED | สคริปต์ shell บนโฮสต์; ดู `collectors/server/`          |
 | `apm`               | NOT IMPLEMENTED | แยกตามภาษา; ดู `collectors/apm/`            |
 | `db`                | NOT IMPLEMENTED | SQL + dump การตั้งค่า agent; ดู `collectors/db/`         |
 | `collection-server` | SEEDED v0       | สคริปต์บนโฮสต์ backend; ดู `collectors/collection-server/` |
 
 รีโพซิทอรีนี้ประกอบด้วยตัว **framework** (contract, format, template,
-validator, เอกสาร), **stub** รายโดเมน และ collector **seeded v0** สองตัว
-(`collection-server`, `k8s`) ซึ่งทีม Global เป็นเจ้าของจนกว่าจะส่งมอบ
+validator, เอกสาร), **stub** รายโดเมน และ collector **seeded v0** สามตัว
+(`collection-server`, `k8s`, `nms`) ซึ่งทีม Global เป็นเจ้าของจนกว่าจะส่งมอบ
 collector ถูกเขียนขึ้นแล้วส่งต่อให้ทีมโดเมนเป็นเจ้าของ
 
 ## การรัน collector (วิศวกรภาคสนาม)
