@@ -5,10 +5,14 @@
 # Gathers the environment facts that NMS support cases ask for over and over
 # (fact list derived from the #nms-support channel history 2025-04 ~ 2026-07;
 # see cases/2026-07-03-nms-support-channel-analysis/analysis.md in the analysis
-# workspace for the question -> section traceability).
+# workspace for the question -> section traceability), cross-checked against
+# the official docs:
+#   https://docs.whatap.io/nms/supported-spec   (OS/python matrix, ports)
+#   https://docs.whatap.io/nms/install-agent    (repo setup, wtinitset, units)
 #
-# Runs on the host where the WhaTap NMS Control Manager (whatap-nms rpm) is —
-# or was supposed to be — installed.
+# Runs on the host where the WhaTap NMS Control Manager (whatap-nms package,
+# rpm on RHEL-family / deb on Debian-family) is — or was supposed to be —
+# installed.
 #
 # THE CONTRACT (../../CONTRACT.md):
 #   1. Facts only. No diagnosis, no likely-cause, no recommendation, no fix.
@@ -35,7 +39,7 @@ export LC_ALL=C
 
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-nms"
-VERSION="0.1.0"
+VERSION="0.2.0"
 DOMAIN="nms"
 TARGET="host/$(hostname 2>/dev/null || echo unknown)"
 
@@ -200,6 +204,36 @@ tail_file() {
     tail -n "$n" "$path" 2>/dev/null | while IFS= read -r _l || [ -n "$_l" ]; do printf '        %s\n' "$_l"; done
 }
 
+# probe_redacted "label" CMD [ARGS...] -> like probe_merged, but each output
+# line whose lowercased text names key material (license/access key/community/
+# password/secret/token) has its value replaced by <masked>. Lines with an
+# = or : separator keep the key part; lines without one are reduced to their
+# first word so raw key material can never pass through.
+probe_redacted() {
+    local label="$1"; shift
+    local bin="$1"
+    command -v "$bin" >/dev/null 2>&1 || { fact "$label: n/a (command not found: $bin)"; return; }
+    local out rc
+    if [ -n "$_timeout_bin" ]; then out="$("$_timeout_bin" "$CMD_TIMEOUT" "$@" 2>&1)"; rc=$?
+    else out="$("$@" 2>&1)"; rc=$?; fi
+    [ "$rc" -eq 124 ] && [ -n "$_timeout_bin" ] && { fact "$label: n/a (timed out: ${CMD_TIMEOUT}s)"; return; }
+    [ -z "$out" ] && { fact "$label: n/a (empty output)"; return; }
+    fact "$label:"
+    local _l _lc
+    printf '%s\n' "$out" | while IFS= read -r _l || [ -n "$_l" ]; do
+        _lc="$(printf '%s' "$_l" | tr 'A-Z' 'a-z')"
+        case "$_lc" in
+            *license*|*accesskey*|*access\ key*|*community*|*passw*|*secret*|*token*)
+                case "$_l" in
+                    *[=:]*) printf '        %s<masked>\n' "$(printf '%s' "$_l" | sed 's/\([=:]\).*$/\1 /')" ;;
+                    *)      printf '        %s <masked>\n' "$(printf '%s' "$_l" | awk '{print $1}')" ;;
+                esac ;;
+            *)
+                printf '        %s\n' "$_l" ;;
+        esac
+    done
+}
+
 # dump_file_redacted PATH [CAP] -> file content with values of sensitive-looking
 # keys (community/passw/secret/token/key/credential) replaced by <masked>.
 # Line-by-line in shell: portable (no GNU-sed flags), and config files here are
@@ -250,20 +284,27 @@ elapsed_s() {  # elapsed_s START END -> "X.XXX" (awk does the float math)
 sd_show() { have systemctl && systemctl show -p "$1" "$2.service" 2>/dev/null | cut -d= -f2-; }
 
 # ---- discovery ----------------------------------------------------------------
-# Install root: resolved from the rpm manifest first (Contract rule 2); the
-# path seen in field sessions (/usr/share/whatap-nms) is only a fallback that
-# is used when it actually exists on disk.
+# Install root: resolved from the package manifest first (Contract rule 2) —
+# rpm on RHEL-family, dpkg on Debian-family (both are official install paths,
+# docs.whatap.io/nms/install-agent). The path seen in field sessions
+# (/usr/share/whatap-nms) is only a fallback that is used when it exists on disk.
 NMS_ROOT=""
 NMS_PKG="whatap-nms"
 discover_root() {
-    local p
+    # match a path whose component is the whatap-nms directory itself, and skip
+    # documentation paths (/usr/share/doc/whatap-nms sorts before the real root
+    # in the dpkg manifest — caught in live validation on Ubuntu 24.04)
+    local p="" _mgrep='/whatap-nms\(/\|$\)'
     if have rpm; then
-        p="$(rpm -ql "$NMS_PKG" 2>/dev/null | head -n 40 | grep -m1 '^/.*whatap-nms' )"
-        if [ -n "$p" ]; then
-            # trim to the .../whatap-nms directory component
-            NMS_ROOT="$(printf '%s\n' "$p" | sed 's#\(/whatap-nms\)/.*#\1#')"
-            [ -d "$NMS_ROOT" ] || NMS_ROOT=""
-        fi
+        p="$(rpm -ql "$NMS_PKG" 2>/dev/null | grep -v '/doc/' | grep -m1 "$_mgrep")"
+    fi
+    if [ -z "$p" ] && have dpkg; then
+        p="$(dpkg -L "$NMS_PKG" 2>/dev/null | grep -v '/doc/' | grep -m1 "$_mgrep")"
+    fi
+    if [ -n "$p" ]; then
+        # trim to the .../whatap-nms directory component
+        NMS_ROOT="$(printf '%s\n' "$p" | sed 's#\(/whatap-nms\)/.*#\1#')"
+        [ -d "$NMS_ROOT" ] || NMS_ROOT=""
     fi
     [ -z "$NMS_ROOT" ] && [ -d /usr/share/whatap-nms ] && NMS_ROOT=/usr/share/whatap-nms
 }
@@ -279,8 +320,9 @@ run_report() {
     fact "bash: ${BASH_VERSION:-unknown}"
     fact "uid: $(id -u 2>/dev/null || echo unknown) ($(id -un 2>/dev/null || echo unknown))"
     fact "tools:"
-    for t in systemctl journalctl ss netstat ip rpm dnf yum python3 pip3 \
-             snmpget snmpwalk timeout curl wget getenforce timedatectl chronyc ntpstat; do
+    for t in systemctl journalctl ss netstat ip rpm dnf yum dpkg apt-cache apt-mark \
+             wtinitset python3 pip3 snmpget snmpwalk timeout curl wget getenforce \
+             timedatectl chronyc ntpstat; do
         if have "$t"; then printf '        %-14s present\n' "$t"
         else printf '        %-14s absent\n' "$t"; fi
     done
@@ -325,10 +367,18 @@ run_report() {
     probe_merged "pip3 --version" pip3 --version
 
     # [5] package & repository — exclude= lines and a repo missing the package
-    # are both field-observed causes of "whatap-nms not found" (2026-06-04 / 07-02)
+    # are both field-observed causes of "whatap-nms not found" (2026-06-04 / 07-02).
+    # Both official install paths are covered: rpm/dnf (RHEL family) and
+    # dpkg/apt (Debian family) — docs.whatap.io/nms/install-agent.
     section "D. Package & repository"
-    probe "rpm -qi $NMS_PKG" rpm -qi "$NMS_PKG"
-    subsection "whatap repo definitions (/etc/yum.repos.d)"
+    if have rpm; then
+        probe "rpm -qi $NMS_PKG" rpm -qi "$NMS_PKG"
+    elif have dpkg; then
+        probe "dpkg -s $NMS_PKG" dpkg -s "$NMS_PKG"
+    else
+        fact "installed package: n/a (command not found: rpm, dpkg)"
+    fi
+    subsection "whatap repo definitions"
     local _found_repo=0 _rf
     for _rf in /etc/yum.repos.d/*.repo; do
         [ -e "$_rf" ] || continue
@@ -338,9 +388,28 @@ run_report() {
             tail_file "$_rf" 40
         fi
     done
-    [ "$_found_repo" = 0 ] && fact "no *.repo file under /etc/yum.repos.d mentions whatap"
-    subsection "package-manager exclude directives"
+    for _rf in /etc/apt/sources.list.d/*.list /etc/apt/sources.list; do
+        [ -e "$_rf" ] || continue
+        if grep -qi whatap "$_rf" 2>/dev/null; then
+            _found_repo=1
+            fact "$_rf ($(file_meta "$_rf")):"
+            tail_file "$_rf" 40
+        fi
+    done
+    [ "$_found_repo" = 0 ] && fact "no yum/apt repo definition mentions whatap (/etc/yum.repos.d, /etc/apt/sources.list*)"
+    subsection "repo signing key on disk"
+    if [ -e /etc/apt/trusted.gpg.d/whatap-release.gpg ]; then
+        fact "/etc/apt/trusted.gpg.d/whatap-release.gpg: present ($(file_meta /etc/apt/trusted.gpg.d/whatap-release.gpg))"
+    elif have rpm; then
+        probe "rpm gpg-pubkey packages" sh -c 'rpm -q gpg-pubkey --qf "%{NAME}-%{VERSION}-%{RELEASE} %{SUMMARY}\n" 2>/dev/null | grep -i whatap; :'
+    else
+        fact "n/a (no apt key file at /etc/apt/trusted.gpg.d/whatap-release.gpg and command not found: rpm)"
+    fi
+    subsection "package-manager exclude / hold directives"
     probe "exclude lines (/etc/dnf/dnf.conf, /etc/yum.conf)" sh -c 'grep -Hn "^[[:space:]]*exclude" /etc/dnf/dnf.conf /etc/yum.conf 2>/dev/null; :'
+    if have apt-mark; then
+        probe "apt-mark showhold" sh -c 'apt-mark showhold 2>/dev/null; :'
+    fi
     subsection "whatap packages visible to the package manager"
     if have dnf; then
         probe "dnf list available (whatap repos only)" dnf -q --disablerepo="*" --enablerepo="whatap*" list available --showduplicates
@@ -348,8 +417,10 @@ run_report() {
     elif have yum; then
         probe "yum list available (whatap repos only)" yum -q --disablerepo="*" --enablerepo="whatap*" list available
         probe "yum list installed whatap*" yum -q list installed "whatap*"
+    elif have apt-cache; then
+        probe "apt-cache policy $NMS_PKG" apt-cache policy "$NMS_PKG"
     else
-        fact "n/a (command not found: dnf, yum)"
+        fact "n/a (command not found: dnf, yum, apt-cache)"
     fi
 
     # [6] deployment layout — venv/wheelhouse state is where rpm %post pip
@@ -407,7 +478,9 @@ run_report() {
     fi
     subsection "nms-related processes"
     if have ps; then
-        probe "ps (wtnms / icmptcphealthd / whatap-nms)" sh -c "ps -eo pid,ppid,rss,etime,args | grep -E 'wtnms|icmptcphealthd|whatap-nms' | grep -v grep; :"
+        # grep -v collect-nms: this collector's own command line contains
+        # "whatap-nms" (script path / report name) — self-matches are excluded
+        probe "ps (wtnms / icmptcphealthd / whatap-nms)" sh -c "ps -eo pid,ppid,rss,etime,args | grep -E 'wtnms|icmptcphealthd|whatap-nms' | grep -vE 'grep|collect-nms'; :"
     else
         local _pid _cl _hit=0
         for _pid in /proc/[0-9]*; do
@@ -432,17 +505,18 @@ run_report() {
     if have ss; then probe "ss -lunp" sh -c "ss -lunp 2>/dev/null | head -n 40"
     elif have netstat; then probe "netstat -lunp" sh -c "netstat -lunp 2>/dev/null | head -n 40"
     else read_proc "/proc/net/udp (raw)" /proc/net/udp; fi
-    subsection "ports of record in past cases (161/162/514/1514/5000/5141)"
+    subsection "ports of record (channel cases + docs: 161/162/514/1514/5000/5141/6600/8443)"
     if have ss; then
-        probe "matching sockets" sh -c "ss -ltnup 2>/dev/null | awk '/:(161|162|514|1514|5000|5141)([[:space:]]|\$)/'; :"
+        probe "matching sockets" sh -c "ss -ltnup 2>/dev/null | awk '/:(161|162|514|1514|5000|5141|6600|8443)([[:space:]]|\$)/'; :"
     elif have netstat; then
-        probe "matching sockets" sh -c "netstat -ltnup 2>/dev/null | awk '/:(161|162|514|1514|5000|5141)([[:space:]]|\$)/'; :"
+        probe "matching sockets" sh -c "netstat -ltnup 2>/dev/null | awk '/:(161|162|514|1514|5000|5141|6600|8443)([[:space:]]|\$)/'; :"
     else
         fact "n/a (command not found: ss, netstat)"
     fi
     subsection "outbound connections of nms processes (manager -> WhaTap server)"
     if have ss; then
         probe "established (wtnms*)" sh -c "ss -tnp state established 2>/dev/null | grep -E 'wtnms|icmptcphealthd|uvicorn' | head -n 20; :"
+        probe "established to :6600 (collection-server data port per docs)" sh -c "ss -tn state established 2>/dev/null | awk '\$4 ~ /:6600\$/ || \$5 ~ /:6600\$/' | head -n 10; :"
     else
         fact "n/a (command not found: ss)"
     fi
@@ -467,30 +541,46 @@ run_report() {
     done
 
     # [10] configuration — nmscore.conf keys named in past cases:
-    # MAX_REPETITIONS, IFX_32BIT_PPS_FALLBACK, ssl settings, syslog port
+    # MAX_REPETITIONS, IFX_32BIT_PPS_FALLBACK, ssl settings, syslog port.
+    # wtinitset is the official configuration tool (docs.whatap.io/nms/
+    # install-agent): -a sets the access key, -s the WhaTap server IP
+    # (multi-IP "a/b" form exists), -v prints the current configuration.
     section "I. Configuration (values of sensitive-looking keys masked)"
+    subsection "wtinitset -v (official config viewer; key material masked)"
+    probe_redacted "wtinitset -v" wtinitset -v
+    subsection "discovered *.conf files"
     local _cfgs="" _cf
     if have rpm; then
         _cfgs="$(rpm -ql "$NMS_PKG" 2>/dev/null | grep '\.conf$' | head -n 20)"
     fi
     if [ -n "$NMS_ROOT" ]; then
-        _cfgs="$(printf '%s\n%s\n%s\n' "$_cfgs" \
+        # etc/nmscore.conf is the documented location (FAQ: vi /usr/share/whatap-nms/etc/nmscore.conf);
+        # etc/mibmods.toml is the MIB module registry (live-install observation)
+        _cfgs="$(printf '%s\n%s\n%s\n%s\n%s\n' "$_cfgs" \
             "$(ls -1 "$NMS_ROOT"/*.conf 2>/dev/null)" \
+            "$(ls -1 "$NMS_ROOT"/etc/*.conf 2>/dev/null)" \
+            "$(ls -1 "$NMS_ROOT"/etc/*.toml 2>/dev/null)" \
             "$(ls -1 "$NMS_ROOT"/conf/*.conf 2>/dev/null)")"
     fi
     _cfgs="$(printf '%s\n' "$_cfgs" "$(ls -1 /etc/whatap-nms/*.conf 2>/dev/null)" | grep -v '^$' | sort -u)"
     if [ -n "$_cfgs" ]; then
         printf '%s\n' "$_cfgs" | while IFS= read -r _cf; do
-            [ -e "$_cf" ] || { fact "$_cf: n/a (listed in rpm manifest, path not found on disk)"; continue; }
+            [ -e "$_cf" ] || { fact "$_cf: n/a (listed in package manifest, path not found on disk)"; continue; }
             fact "$_cf ($(file_meta "$_cf")):"
-            dump_file_redacted "$_cf" 300
+            dump_file_redacted "$_cf" 400
         done
+        # keys of record, extracted flat in case a dump above hit its line cap:
+        # MANAGER_WEB_PORT / MANAGER_HTTPS_* (UI port is configurable — FAQ),
+        # MAX_REPETITIONS, IFX_32BIT_PPS_FALLBACK (named in past cases)
+        subsection "keys of record across discovered conf files"
+        probe "grep" sh -c "printf '%s\n' \"$_cfgs\" | while IFS= read -r f; do [ -e \"\$f\" ] && grep -HnE '^[[:space:]]*(MANAGER_WEB_PORT|MANAGER_HTTPS_ENABLED|MANAGER_HTTPS_WEB_PORT|MAX_REPETITIONS|IFX_32BIT_PPS_FALLBACK)' \"\$f\"; done; :"
     else
-        fact "no *.conf discovered via rpm manifest, install root, or /etc/whatap-nms"
+        fact "no *.conf discovered via package manifest, install root, or /etc/whatap-nms"
     fi
 
     # [11] logs & events — pkg-install-error.log is the first artifact support
-    # asks for on an install failure (2026-06-09)
+    # asks for on an install failure (2026-06-09); /var/log/nmscore/nmscore.log
+    # is the artifact the FAQ names for MIB module-load and engine issues
     section "J. Logs & recent events"
     local _logdir=/var/log/whatap-nms
     if [ -d "$_logdir" ]; then
@@ -511,6 +601,15 @@ run_report() {
         [ "$_cnt" = 0 ] && fact "no additional *.log file in $_logdir"
     else
         fact "$_logdir: n/a (path not found)"
+    fi
+    local _coredir=/var/log/nmscore
+    if [ -d "$_coredir" ]; then
+        subsection "nms engine log inventory ($_coredir)"
+        probe "ls" ls -la "$_coredir"
+        subsection "nmscore.log (last 80 lines — MIB module load results land here per FAQ)"
+        tail_file "$_coredir/nmscore.log" 80
+    else
+        fact "$_coredir: n/a (path not found)"
     fi
     if have journalctl; then
         local _u2 _ls2

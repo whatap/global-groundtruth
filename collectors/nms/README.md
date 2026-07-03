@@ -1,24 +1,33 @@
 # collectors/nms
 
-> **Status: SEEDED v0 (`collect-nms.sh` 0.1.0).** A working collector exists and
+> **Status: SEEDED v0 (`collect-nms.sh` 0.2.0).** A working collector exists and
 > is owned, for now, by the Global team (framework owner). Handover transfers
 > ongoing ownership to the NMS development team (CONTRACT rule 4).
-> **Not yet run against a host with whatap-nms installed** — this v0 was
-> verified on a clean host (graceful reasoned-`n/a` degradation) and its fact
-> list comes from 15 months of real support threads; validate once on a live
-> NMS Control Manager before relying on it in the field.
+> **Live-validated on Ubuntu 24.04 with a real `whatap-nms` 1.0.2 (deb)
+> install** — including a failed-postinst scenario, where the report captured
+> the package state (`half-configured`), the `pkg-install-error.log` cause
+> line, python/venv facts, and outbound reachability in one paste. Also
+> verified to degrade gracefully (reasoned `n/a`) on a host without the
+> package. Not yet run on a RHEL-family host or a fully-running manager.
 
 The **WhaTap NMS Control Manager** is the on-prem network-monitoring manager
-(`whatap-nms` rpm): a Python application (bundled venv at `<root>/vpyenv`)
-running three systemd services — `uvicorn.service` (manager UI/API),
-`nmscore.service` (SNMP polling engine), `icmptcphealthd.service` (ICMP/TCP
-health-check daemon) — that polls network devices over SNMP (161/udp out),
-receives traps (162/udp) and syslog (514/udp), and feeds the WhaTap front.
+(`whatap-nms` package — rpm on RHEL-family, deb on Debian-family): a Python
+application (bundled venv at `<root>/vpyenv`, wheelhouse at `<root>/whlhouse`)
+running three systemd services — `uvicorn.service` (manager UI/API, TCP 5000
+HTTP / 8443 HTTPS), `nmscore.service` (SNMP polling engine),
+`icmptcphealthd.service` (ICMP/TCP health-check daemon) — that polls network
+devices over SNMP (161/udp out), receives traps (162/udp) and syslog
+(514/udp), and sends data to the WhaTap collection server (6600/tcp out).
+Main config: `<root>/etc/nmscore.conf`; MIB module registry:
+`<root>/etc/mibmods.toml`; logs: `/var/log/whatap-nms` (install) and
+`/var/log/nmscore` (engine / MIB module loads).
 
 The fact list was derived from every support thread in `#nms-support`
-(2025-04 ~ 2026-07): each section answers a question that a developer actually
-asked a field engineer during a case. The traceability table (question →
-evidence → section) lives in the analysis workspace at
+(2025-04 ~ 2026-07), cross-checked against the official docs
+([supported-spec](https://docs.whatap.io/nms/supported-spec),
+[install-agent](https://docs.whatap.io/nms/install-agent), NMS FAQ), and
+confirmed by a live install. The traceability table (question → evidence →
+section) lives in the analysis workspace at
 `cases/2026-07-03-nms-support-channel-analysis/analysis.md`.
 
 ## (a) Facts it collects
@@ -35,31 +44,42 @@ One `.txt` report, organized into MECE domains:
   delta ~3157s.)
 - **C. Python runtime** — system python3/pip3 versions and every `python3*`
   binary present. (Manager needs Python >= 3.9; RHEL 8 ships 3.6 by default.)
-- **D. Package & repository** — `rpm -qi whatap-nms`, whatap `*.repo`
-  definitions, `exclude=` directives in dnf/yum config (a legacy installer
-  wrote `exclude=whatap-nms*`), and the package versions the configured repos
-  actually offer (`dnf --disablerepo="*" --enablerepo="whatap*" list available`).
+- **D. Package & repository** — `rpm -qi` / `dpkg -s whatap-nms` (the dpkg
+  `Status:` line distinguishes `installed` from `half-configured`), whatap
+  repo definitions (yum `*.repo` and apt `sources.list*`), repo signing key
+  presence, `exclude=` directives in dnf/yum config (a legacy installer wrote
+  `exclude=whatap-nms*`) and apt holds, and the package versions the
+  configured repos actually offer (dnf/yum list available, `apt-cache policy`).
 - **E. Deployment layout** — install-root top-level listing, bundled venv
   python/pip versions, `whlhouse` wheel count, `requirements*` files, disk free.
-  (The rpm `%post` builds the venv from the wheelhouse; the bcrypt case died here.)
+  (The package post-install step builds the venv from the wheelhouse; the
+  bcrypt case died here, and so did the live-validation install on Ubuntu
+  24.04 — httptools vs `uvicorn[standard]==0.49.0` dependency conflict.)
 - **F. Runtime services & processes** — unit state / enabled / restart count /
   ExecStart for `uvicorn`, `nmscore`, `icmptcphealthd` (and the pre-rename
   `icmphealthd`), plus a `wtnms*` process scan.
 - **G. Network endpoints** — listening TCP/UDP sockets, a filtered view of the
-  ports named in past cases (161/162/514/1514/5000/5141 — a co-located WhaTap
-  collection server also binds 514/udp and the later starter loses the bind),
-  established outbound connections of nms processes, resolver/route/proxy.
+  ports of record (161/162/514/1514/5000/5141/6600/8443 — a co-located WhaTap
+  collection server also binds 514/udp and the later starter loses the bind;
+  6600/tcp is the documented outbound data port), established outbound
+  connections of nms processes and to :6600, resolver/route/proxy.
 - **H. Outbound reachability** — two bounded HEAD requests (5s cap each) to
-  `repo.whatap.io` and `pypi.org`. (Closed networks break the `%post` pip step
-  with `ResolutionImpossible`; whether the host can reach out is itself a
+  `repo.whatap.io` and `pypi.org`. (Closed networks break the post-install pip
+  step with `ResolutionImpossible`; whether the host can reach out is itself a
   recurring question.)
-- **I. Configuration** — every discovered `*.conf` (rpm manifest, install root,
-  `/etc/whatap-nms`) dumped with values of sensitive-looking keys
-  (community/password/secret/token/key/credential) replaced by `<masked>`.
-  Known keys of record: `MAX_REPETITIONS`, `IFX_32BIT_PPS_FALLBACK`, ssl, syslog port.
+- **I. Configuration** — `wtinitset -v` (the official config viewer; key
+  material masked), then every discovered `*.conf`/`*.toml` (package manifest,
+  `<root>`, `<root>/etc`, `/etc/whatap-nms`) dumped with values of
+  sensitive-looking keys (community/password/secret/token/key/credential)
+  replaced by `<masked>` — this includes `etc/nmscore.conf` and the MIB module
+  registry `etc/mibmods.toml`. A flat "keys of record" grep
+  (`MANAGER_WEB_PORT`, `MANAGER_HTTPS_ENABLED`, `MANAGER_HTTPS_WEB_PORT`,
+  `MAX_REPETITIONS`, `IFX_32BIT_PPS_FALLBACK`) guards against dump caps.
 - **J. Logs & recent events** — `/var/log/whatap-nms` inventory,
   `pkg-install-error.log` tail (the first artifact support asks for on an
-  install failure), bounded tails of other logs, per-unit journal tails.
+  install failure), bounded tails of other logs, `/var/log/nmscore/nmscore.log`
+  tail (the artifact the FAQ names for MIB module-load results), per-unit
+  journal tails.
 - **K. SNMP probe** *(Tier 2, opt-in — see below)*.
 
 Values are **discovered, not assumed**; an absent value is reported as
@@ -124,18 +144,24 @@ and re-validate after edits:
 
 ### Status notes / open items (for the NMS team at handover)
 
-- **Validate on a live NMS Control Manager host** — this v0 has only run on a
-  host without whatap-nms. Confirm: install-root resolution from `rpm -ql`,
-  the actual conf file locations/names (`nmscore.conf` path was never stated
-  in the channel), and log file names under `/var/log/whatap-nms` beyond
-  `pkg-install-error.log`.
+- **Live-validated (2026-07-03, Ubuntu 24.04, whatap-nms 1.0.2 deb)**: install
+  root resolves from the dpkg manifest (`/usr/share/whatap-nms`; a doc-path
+  false match was caught and excluded), `etc/nmscore.conf` and
+  `etc/mibmods.toml` are discovered and dumped, keys of record extract
+  correctly, and a real failed postinst (`httptools` vs
+  `uvicorn[standard]==0.49.0`, `ResolutionImpossible` with pypi reachable) was
+  fully captured in one report. Sample report:
+  `cases/2026-07-03-nms-support-channel-analysis/resources/` in the analysis
+  workspace. **Still to do: one run on a RHEL-family host and one on a
+  fully-running manager** (unit states, listening 5000/514/162, established
+  :6600, `/var/log/nmscore` content, `wtinitset -v` output shape — mask
+  patterns may need adjusting to its real format).
 - **Per-device polling settings are not collected** (SNMP v1-vs-v2c per device,
   polling interval, ifTable+ifXTable double registration — all named in past
   cases as facts the developer needed). Where the manager persists them
-  (file/SQLite/other) was never stated in the channel; add a section once the
-  NMS team names the store.
-- **Uploaded private MIB inventory is not collected** — storage path unknown
-  (same reason).
+  (file/SQLite/other) is still unnamed; `etc/mibmods.toml` covers the MIB
+  module registry but not per-device polling. Add a section once the NMS team
+  names the store.
 - Manager-side registration state as seen by the SaaS front (manager list,
   Inactive-for-24h disappearance) is server-side and out of scope for a host
   collector.
