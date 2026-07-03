@@ -10,6 +10,9 @@
 #   (2) it is missing the exact footer sentinel line
 #   (3) an EMITTED line contains a judgment word (case-insensitive):
 #         diagnos  recommend  likely  should  root cause  fix
+#   (4) its filename is not collect-<token>.sh — the required entrypoint name,
+#       so collectors never collide when copied side by side or into a shared
+#       bin/. The skeleton template and validate.sh itself are exempt.
 #
 # Rule (3) enforces CONTRACT rule 1 ("facts only — no emitted line states a
 # conclusion"). Two kinds of lines are therefore NOT judged, on purpose:
@@ -48,10 +51,20 @@ done
 
 rc=0
 for f in "${targets[@]}"; do
+    bn="$(basename "$f")"
     # The validator is not a collector; never lint it.
-    [ "$(basename "$f")" = "validate.sh" ] && continue
+    [ "$bn" = "validate.sh" ] && continue
 
     problems=()
+
+    # (0) entrypoint naming: collect-<token>.sh, never a bare collect.sh, so
+    #     collectors never collide when copied side by side or into a shared bin/.
+    #     The skeleton template is format-checked but exempt from the name rule
+    #     (it is copied and renamed, never run in the field).
+    case "$bn" in
+        collect-*.sh|collector-skeleton.sh) ;;
+        *) problems+=("entrypoint must be named collect-<token>.sh (got: $bn)") ;;
+    esac
 
     # (1) required header fields
     for label in "${HEADER_LABELS[@]}"; do

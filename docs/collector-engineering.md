@@ -9,7 +9,7 @@ They are **advisory** (unlike the four contract rules, which `validate.sh`
 enforces), but a collector that ignores them will eventually mislead a reader,
 add load to a sick server, break on an OS its author never saw, or hide *why* a
 value is missing. Follow them; the seed collector
-[`collectors/collection-server/collect.sh`](../collectors/collection-server/collect.sh)
+[`collectors/collection-server/collect-collserver.sh`](../collectors/collection-server/collect-collserver.sh)
 is the reference implementation of all four.
 
 ---
@@ -118,7 +118,7 @@ collector:
   `timeout` (if available) → classify the exit code and stderr into one of the
   reasons above. And a **`dump_file` / `read_proc`** helper that distinguishes
   path-not-found from permission-denied from empty. See the helper block in
-  [`collect.sh`](../collectors/collection-server/collect.sh).
+  [`collect-collserver.sh`](../collectors/collection-server/collect-collserver.sh).
 
 Keep reason strings free of judgment words (`fix`, `should`, `likely`,
 `recommend`, `diagnos`, `root cause`) so they pass `validate.sh` — describe the
@@ -127,10 +127,10 @@ mechanical cause, not what to do about it.
 ## 5. Operable — the operator sees it working, and discovers how to run it
 
 A collector is run by a field engineer, under stress, on a host they may not
-know well. Two conventions keep that interaction unsurprising. Both are built
-into the skeleton (`usage`, `progress`, the `section` helper, the `main`
-dispatch), so a collector that copies the skeleton gets them for free — and
-every collector must keep them.
+know well. A few conventions keep that interaction unsurprising. The first two
+are built into the skeleton (`usage`, `progress`, the `section` helper, the
+`main` dispatch), so a collector that copies the skeleton gets them for free —
+and every collector must keep them.
 
 - **No arguments prints usage.** Running the collector bare prints its
   usage/help and exits `0` — it does **not** start a collection. A run is
@@ -139,8 +139,16 @@ every collector must keep them.
   self-documenting, and stops an operator from kicking off a heavier-than-they-
   meant run — or waiting on a silent one — just by typing the script name. It
   does **not** weaken Contract rule 3 ("one command → paste"): the domain README
-  still names the one exact command (`./collect.sh --file`), so the engineer
+  still names the one exact command (`./collect-collserver.sh --file`), so the engineer
   runs one thing and copies the whole output.
+
+- **One obvious, collision-free name.** The entrypoint is `collect-<token>.sh`,
+  where `<token>` matches the collector's output-file prefix
+  (`whatap-<token>-…`) — the seed is `collect-collserver.sh` → `whatap-collserver-…`.
+  Never a bare `collect.sh`: collectors get copied into `$WHATAP_HOME/bin`, sit
+  next to each other, and are named in support chats, so identical filenames
+  collide or get run by mistake. See [authoring-guide.md](authoring-guide.md)
+  step 2; `tools/validate.sh` enforces the `collect-*.sh` shape.
 
 - **Progress on stderr, never in the report.** A collector often runs *because*
   a host is sick, and its journal/log/filesystem scans can take many seconds;

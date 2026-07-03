@@ -1,6 +1,6 @@
 # collectors/collection-server
 
-> **Status: SEEDED v0 (`collect.sh` 0.3.0).** A working collector exists and is
+> **Status: SEEDED v0 (`collect-collserver.sh` 0.3.0).** A working collector exists and is
 > owned, for now, by the Global team (framework owner). Handover transfers
 > ongoing ownership to the collection-server (backend) team (CONTRACT rule 4).
 > **Not yet run against a live production yard** — validate once on a staging
@@ -47,17 +47,17 @@ A **host shell script** the field engineer runs directly on the backend host —
 one command, hand over one file (CONTRACT rule 3):
 
 ```sh
-./collect.sh --file          # -> whatap-collserver-<host>-<UTC>.txt   (attach this)
-./collect.sh --bundle        # -> whatap-collserver-<host>-<UTC>.tar.gz (report + artifacts)
-./collect.sh --home /whatap  # force WHATAP_HOME if auto-resolution is n/a
-./collect.sh --file --quiet  # same, but no progress narration (for automation)
-./collect.sh                 # no arguments -> prints help (does not collect)
-./collect.sh --help          # all options
+./collect-collserver.sh --file          # -> whatap-collserver-<host>-<UTC>.txt   (attach this)
+./collect-collserver.sh --bundle        # -> whatap-collserver-<host>-<UTC>.tar.gz (report + artifacts)
+./collect-collserver.sh --home /whatap  # force WHATAP_HOME if auto-resolution is n/a
+./collect-collserver.sh --file --quiet  # same, but no progress narration (for automation)
+./collect-collserver.sh                 # no arguments -> prints help (does not collect)
+./collect-collserver.sh --help          # all options
 ```
 
 While it runs, each phase is narrated on **stderr** (`>> ...`) so you can see it
 working on a slow host; the report itself stays clean. A collection needs an
-explicit action flag — running `./collect.sh` with no arguments just prints help,
+explicit action flag — running `./collect-collserver.sh` with no arguments just prints help,
 so nothing starts by accident.
 
 ### Collection-load tiers (safe on a struggling server)
@@ -92,7 +92,7 @@ design guidelines in
 and re-validate after edits:
 
 ```sh
-../../tools/validate.sh collect.sh
+../../tools/validate.sh collect-collserver.sh
 ```
 
 ### Status notes / open items

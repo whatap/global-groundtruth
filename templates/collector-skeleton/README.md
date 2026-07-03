@@ -11,8 +11,13 @@ The starter for a new collector. It already emits the shared report shape
 
    ```sh
    cp templates/collector-skeleton/collector-skeleton.sh \
-      collectors/<domain>/<collector-name>.sh
+      collectors/<domain>/collect-<token>.sh
    ```
+
+   Name it `collect-<token>.sh` (never a bare `collect.sh`) — `<token>` matches
+   the output-file prefix `whatap-<token>-…`, so no two collectors collide when
+   copied side by side. `validate.sh` enforces this; see
+   [../../docs/authoring-guide.md](../../docs/authoring-guide.md) step 2.
 
 2. Set the four metadata variables at the top: `COLLECTOR_NAME`, `VERSION`,
    `DOMAIN`, `TARGET`.
@@ -35,7 +40,7 @@ The starter for a new collector. It already emits the shared report shape
 4. Validate before committing:
 
    ```sh
-   tools/validate.sh collectors/<domain>/<collector-name>.sh
+   tools/validate.sh collectors/<domain>/collect-<token>.sh
    ```
 
 Full walkthrough: [../../docs/authoring-guide.md](../../docs/authoring-guide.md).

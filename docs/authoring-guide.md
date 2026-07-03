@@ -28,10 +28,20 @@ runtime misconfigured" is a judgment and does not belong here.
 
 ```sh
 cp templates/collector-skeleton/collector-skeleton.sh \
-   collectors/<domain>/<collector-name>.sh
+   collectors/<domain>/collect-<token>.sh
 ```
 
 Set `COLLECTOR_NAME`, `VERSION`, `DOMAIN`, `TARGET` at the top.
+
+**Name the entrypoint `collect-<token>.sh`** — never a bare `collect.sh`. The
+`<token>` is this collector's unique short id, the **same token that prefixes its
+output filename** (`whatap-<token>-<host>-<UTC>.txt`); the seed collector is
+`collect-collserver.sh` → `whatap-collserver-…`. Two reasons: (1) the script name
+and its deliverable share one identifier, and (2) collectors are copied around —
+into `$WHATAP_HOME/bin`, next to each other, cited by name in support chats — and
+identical `collect.sh` files would collide or be run by mistake. A domain with
+per-language collectors (apm) gives each its own token (`collect-apmjava.sh`,
+`collect-apmpython.sh`). `tools/validate.sh` enforces the `collect-*.sh` shape.
 
 ### 3. Write the sections — obey the two hard rules
 
@@ -67,7 +77,7 @@ See [collector-engineering.md](collector-engineering.md) guideline 5.
 ### 5. Validate
 
 ```sh
-tools/validate.sh collectors/<domain>/<collector-name>.sh
+tools/validate.sh collectors/<domain>/collect-<token>.sh
 ```
 
 It fails on judgment words in emitted lines, a missing header field, or a

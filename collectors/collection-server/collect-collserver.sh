@@ -55,23 +55,23 @@ Run on the collection-server host. Produces one facts .txt or a tar.gz.
 Run with no arguments (or --help) to print this help — a collection needs an
 explicit action flag (--file / --stdout / --bundle) so nothing starts by accident.
 
-  collect.sh                          print this help (no collection)
-  collect.sh --file                   Tier 0 facts report -> one .txt file
-  collect.sh --stdout                 print the report to stdout instead of a file
-  collect.sh --bundle                 Tier 0 report + Tier 1 artifacts -> tar.gz
-  collect.sh --quiet ...              silence progress on stderr (for automation)
-  collect.sh --home DIR               force WHATAP_HOME (else auto-resolved)
-  collect.sh --out DIR                output directory (default: .)
-  collect.sh --bundle --hours N       journal window for the bundle (default: 24)
-  collect.sh --bundle --max-log-mb M  per-file log copy cap (default: 50)
-  collect.sh --bundle --log-days N    copy rotated logs from the last N days (default: 14)
+  collect-collserver.sh                          print this help (no collection)
+  collect-collserver.sh --file                   Tier 0 facts report -> one .txt file
+  collect-collserver.sh --stdout                 print the report to stdout instead of a file
+  collect-collserver.sh --bundle                 Tier 0 report + Tier 1 artifacts -> tar.gz
+  collect-collserver.sh --quiet ...              silence progress on stderr (for automation)
+  collect-collserver.sh --home DIR               force WHATAP_HOME (else auto-resolved)
+  collect-collserver.sh --out DIR                output directory (default: .)
+  collect-collserver.sh --bundle --hours N       journal window for the bundle (default: 24)
+  collect-collserver.sh --bundle --max-log-mb M  per-file log copy cap (default: 50)
+  collect-collserver.sh --bundle --log-days N    copy rotated logs from the last N days (default: 14)
 
   Tier 2 (opt-in, may add load — printed to stderr before running):
-  collect.sh --bundle --threads[=N]   jstack -l each JVM N times (default N=1)
-  collect.sh --bundle --histo         jmap -histo (NOT :live, no full GC)
-  collect.sh --bundle --heap          full heap dump (large, pauses the JVM)
-  collect.sh --bundle --du            recursive du of yardbase (data-disk I/O)
-  collect.sh --file --time-ref[=SRV]  also compare the clock to an external NTP/
+  collect-collserver.sh --bundle --threads[=N]   jstack -l each JVM N times (default N=1)
+  collect-collserver.sh --bundle --histo         jmap -histo (NOT :live, no full GC)
+  collect-collserver.sh --bundle --heap          full heap dump (large, pauses the JVM)
+  collect-collserver.sh --bundle --du            recursive du of yardbase (data-disk I/O)
+  collect-collserver.sh --file --time-ref[=SRV]  also compare the clock to an external NTP/
                                       HTTP source (network call; clock not set)
 EOF
 }
@@ -323,7 +323,7 @@ resolve_home() {
             if [ -n "$wd" ] && [ "$wd" != "/" ]; then WHOME="$wd"; WHOME_SRC="systemd $unit.service WorkingDirectory"; return; fi
         done
     fi
-    # from script location (if collect.sh was copied into $WHATAP_HOME/bin)
+    # from script location (if collect-collserver.sh was copied into $WHATAP_HOME/bin)
     local sd; sd="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
     if [ -n "$sd" ] && [ -d "$sd/../conf" ] && [ -d "$sd/../logs" ]; then
         WHOME="$(cd "$sd/.." && pwd)"; WHOME_SRC="script parent dir"; return
