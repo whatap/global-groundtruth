@@ -99,6 +99,9 @@ team.
 - [ ] Values are discovered (symlinks/mounts/args/config resolved), not hardcoded.
 - [ ] Absent values print `n/a` / `not found`, never a guessed default.
 - [ ] One command produces the whole paste.
+- [ ] Everything in the script is English — code, comments, usage/help text,
+      progress narration, report output. Tools parse the exact strings; see
+      the language policy in the root [README.md](../README.md).
 - [ ] No-args prints usage; a run needs an explicit action flag; progress is
       narrated on stderr (`--quiet` to suppress). (engineering guideline 5)
 - [ ] `tools/validate.sh` passes.
