@@ -54,9 +54,17 @@ anything expensive **opt-in**:
   whole-file `grep` across rotation history.
 - **Tier 1 — bundle of real artifacts** (`--bundle`). Copies logs (size-capped),
   configs, snapshots. Sequential disk reads with caps; still no JVM pause.
+  (The skeleton ships Tier 0 only — copy bundle plumbing from a seeded
+  collector; see [authoring-guide.md](authoring-guide.md) step 4.)
 - **Tier 2 — intrusive, opt-in** (`--threads`, `--heap`, `--du`, …). May pause a
   JVM or hit the data disk. **Off by default**, and print the target and the
   expected impact to **stderr before running** so the operator consents.
+- **Budget the whole run, not just each probe.** The skeleton's `CMD_TIMEOUT`
+  (20s) caps a single probe, so a Tier 0 report with dozens of probes on a
+  host where many of them hang can still take minutes in the worst case. Aim
+  for a Tier 0 run that finishes in about a minute on a healthy host; if your
+  collector leans on network-dependent probes, lower `CMD_TIMEOUT` or give
+  those probes their own shorter cap.
 
 > `jmap -histo:live` forces a full GC. Never use it. If you need a histogram,
 > `jmap -histo` (without `:live`) and only under an opt-in flag.

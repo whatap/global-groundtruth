@@ -64,6 +64,14 @@ each to appear in the collector's output:
   `n/a` or `not found`, never a guess.
 - No line states a cause, a severity, or an action. (Rule 1.)
 
+> **Letter labels.** Collectors commonly prefix the titles of their MECE
+> domains with stable letters — `[2] A. Host & platform`, `[3] B. Time &
+> clock` — so prose (domain READMEs, case notes) can say "section B" without
+> breaking when a new section is inserted and the automatic numbers shift.
+> The letter is **part of the title**, chosen by the author; the `[n]` is
+> emitted by the shared `section` helper and is purely positional. Both name
+> the same section — when cross-referencing, prefer the letter.
+
 ## Footer
 
 The last line is **exactly**:

@@ -130,6 +130,9 @@ have() { command -v "$1" >/dev/null 2>&1; }
 
 _errfile=""
 _timeout_bin=""
+# Per-probe cap. Budget the whole run too: dozens of hanging probes x 20s is
+# minutes on a sick host — lower this (or give network-dependent probes their
+# own shorter cap) if your collector has many of them. Guideline 2.
 CMD_TIMEOUT=20
 _init_probe() {
     _errfile="$(mktemp 2>/dev/null || echo "${TMPDIR:-/tmp}/.ggt.$$.err")"

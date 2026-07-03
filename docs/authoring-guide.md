@@ -82,6 +82,14 @@ running it **bare prints usage** (a collection needs an action flag — `--file`
 working on a slow host. Keep both — the exact one command goes in your README.
 See [collector-engineering.md](collector-engineering.md) guideline 5.
 
+The skeleton ships **Tier 0 only** — the facts report. If your domain needs a
+`--bundle` tier (size-capped log/config artifacts as a tar.gz), copy the
+bundle plumbing from a seeded collector
+([collect-collserver.sh](../collectors/collection-server/collect-collserver.sh)
+or [collect-k8s.sh](../collectors/k8s/collect-k8s.sh)) instead of inventing
+it, and keep its two habits: per-file size caps, and announcing anything
+expensive on stderr before running it.
+
 ### 5. Validate
 
 ```sh

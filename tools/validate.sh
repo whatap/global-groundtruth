@@ -6,8 +6,10 @@
 #
 # A collector FAILS validation if any of the following is true:
 #   (1) it is missing one of the required header fields
-#       (Collector: / Version: / Timestamp / Domain: / Target:)
-#   (2) it is missing the exact footer sentinel line
+#       (Collector: / Version: / Timestamp / Domain: / Target:) on a
+#       non-comment line — a label that lives only in a comment is never
+#       actually emitted
+#   (2) it is missing the exact footer sentinel line (same non-comment rule)
 #   (3) an EMITTED line contains a judgment word (case-insensitive):
 #         diagnos  recommend  likely  should  root cause  fix
 #   (4) its filename is not collect-<token>.sh — the required entrypoint name,
@@ -66,13 +68,16 @@ for f in "${targets[@]}"; do
         *) problems+=("entrypoint must be named collect-<token>.sh (got: $bn)") ;;
     esac
 
-    # (1) required header fields
+    # (1) required header fields — on non-comment lines only, so a label that
+    #     exists solely in a comment (never emitted) does not pass
     for label in "${HEADER_LABELS[@]}"; do
-        grep -qF "$label" "$f" || problems+=("missing header field: $label")
+        grep -v '^[[:space:]]*#' "$f" | grep -qF "$label" \
+            || problems+=("missing header field on a non-comment line: $label")
     done
 
-    # (2) exact footer sentinel
-    grep -qF "$FOOTER" "$f" || problems+=("missing exact footer line: $FOOTER")
+    # (2) exact footer sentinel — same non-comment rule
+    grep -v '^[[:space:]]*#' "$f" | grep -qF "$FOOTER" \
+        || problems+=("missing exact footer line on a non-comment line: $FOOTER")
 
     # (3) judgment words in emitted lines (exclude comments + footer sentinel,
     #     keeping the file's true line numbers)
