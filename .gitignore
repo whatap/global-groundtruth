@@ -2,6 +2,8 @@
 # The report/bundle are deliverables, never source — never commit them.
 whatap-collserver-*.txt
 whatap-collserver-*.tar.gz
+whatap-k8s-*.txt
+whatap-k8s-*.tar.gz
 *.hprof
 
 # Editor / OS noise
