@@ -1,9 +1,10 @@
-# collectors/apm — STUB
+# collectors/apm — language sub-family collectors
 
-> **Status: NOT IMPLEMENTED.** This directory describes what an APM collector
-> will gather and how it will be delivered. No collection code exists here yet.
-> It will be owned by the APM domain team (CONTRACT rule 4); until handover it
-> is managed by the Global team.
+> **Status: PARTIALLY SEEDED.** `python/` holds a working v0
+> ([python/collect-apmpython.sh](python/collect-apmpython.sh), see
+> [python/README.md](python/README.md)). The other language runtimes are not
+> implemented yet. Each collector will be owned by its agent's developers
+> (CONTRACT rule 4); until handover they are managed by the Global team.
 
 ## Note: this domain has language sub-families
 
