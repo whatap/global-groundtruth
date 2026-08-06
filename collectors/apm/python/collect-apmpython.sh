@@ -43,7 +43,7 @@ export LC_ALL=C
 
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-apmpython"
-VERSION="0.2.0"
+VERSION="0.3.0"
 DOMAIN="apm/python"
 TARGET="host/$(hostname 2>/dev/null || echo unknown)"
 
@@ -232,6 +232,7 @@ pyprobe() {
 D_PY_EXES=""
 D_GO_PIDS=""
 D_APP_PIDS=""
+D_ODOO_PIDS=""      # odoo processes (setproctitle may rename comm to odoo*)
 D_HOMES=""          # newline-joined "path|source" records
 D_PKG_DIRS=""       # newline-joined whatap package dirs seen in process environ
 D_LOCK_FILE="${WHATAP_LOCK_FILE:-/tmp/whatap-python.lock}"
@@ -245,7 +246,7 @@ D_LLM_LOCK_FILE="/tmp/whatap-python-llm.lock"
 resolve_fs() {
     local p="$1" pid
     [ -e "$p" ] && { printf '%s\n' "$p"; return; }
-    for pid in $D_GO_PIDS $D_APP_PIDS; do
+    for pid in $D_GO_PIDS $D_APP_PIDS $D_ODOO_PIDS; do
         [ -e "/proc/$pid/root$p" ] && { printf '%s\n' "/proc/$pid/root$p"; return; }
     done
     return 1
@@ -297,7 +298,11 @@ discover() {
         comm="$(cat "/proc/$pid/comm" 2>/dev/null)"
         case "$comm" in
             whatap_python*) D_GO_PIDS="$D_GO_PIDS $pid" ;;
+            odoo*) D_ODOO_PIDS="$D_ODOO_PIDS $pid" ;;
             python*)
+                case "$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)" in
+                    *odoo*) D_ODOO_PIDS="$D_ODOO_PIDS $pid" ;;
+                esac
                 D_APP_PIDS="$D_APP_PIDS $pid"
                 # argv0 keeps the venv invocation path; /proc/<pid>/exe is
                 # already symlink-resolved by the kernel and would lose it.
@@ -673,7 +678,116 @@ else:
         done
     fi
 
-    # [7] kubernetes / operator injection artifacts
+    # [8] odoo application facts — Odoo has its own web framework, prefork
+    # worker model, and config file; agent support depends on the Odoo version
+    # and the traffic dispatcher (http vs json vs websocket/longpolling vs
+    # cron), so a support case needs these facts. Cheap no-op on non-Odoo hosts.
+    section "Odoo application facts"
+    local opid _oc _ocands="" _rcands="" _c
+    if [ -z "$D_ODOO_PIDS" ]; then
+        fact "odoo processes: none found in /proc (by comm or cmdline)"
+    else
+        fact "odoo processes:"
+        for opid in $D_ODOO_PIDS; do
+            printf '        -- pid %s (ppid %s)\n' "$opid" "$(awk '/^PPid:/{print $2}' "/proc/$opid/status" 2>/dev/null)"
+            printf '           comm: %s\n' "$(cat "/proc/$opid/comm" 2>/dev/null)"
+            printf '           cmdline: %s\n' "$(tr '\0' ' ' < "/proc/$opid/cmdline" 2>/dev/null | cut -c1-300)"
+            printf '           cwd: %s\n' "$(readlink -f "/proc/$opid/cwd" 2>/dev/null || echo "n/a (permission denied or gone)")"
+            printf '           uid: %s\n' "$(awk '/^Uid:/{print $2}' "/proc/$opid/status" 2>/dev/null)"
+        done
+    fi
+
+    # odoo package version — read release.py as text; the odoo module is never
+    # imported and no odoo code runs
+    for py in $D_PY_EXES; do
+        _c="$("$py" -c '
+import importlib.util as u, os
+s = u.find_spec("odoo")
+loc = ""
+if s:
+    if s.origin: loc = os.path.dirname(s.origin)
+    elif s.submodule_search_locations:
+        for _p in s.submodule_search_locations: loc = _p; break
+print(os.path.join(loc, "release.py") if loc else "")' 2>/dev/null)"
+        [ -n "$_c" ] && _rcands="$_rcands $_c"
+    done
+    _rcands="$_rcands /usr/lib/python3/dist-packages/odoo/release.py"
+    for opid in $D_ODOO_PIDS; do
+        _c="$(readlink -f "/proc/$opid/cwd" 2>/dev/null)"
+        [ -n "$_c" ] && _rcands="$_rcands $_c/odoo/release.py"
+    done
+    for _d in $(printf '%s\n' "$D_PKG_DIRS"); do
+        _rcands="$_rcands $(dirname "$_d")/odoo/release.py"
+    done
+    _found_rel=0
+    _seen_rel=""
+    for _c in $_rcands; do
+        case "$_seen_rel" in *"|$_c|"*) continue ;; esac
+        _seen_rel="$_seen_rel|$_c|"
+        _fs="$(resolve_fs "$_c")" || continue
+        [ -f "$_fs" ] || continue
+        _found_rel=1
+        fact "odoo release file: $_fs"
+        grep -E '^(version|version_info|serie|product_name)' "$_fs" 2>/dev/null | head -n 6 | while IFS= read -r _l; do printf '        %s\n' "$_l"; done
+    done
+    [ "$_found_rel" = 0 ] && fact "odoo release file: n/a (no odoo/release.py found via interpreters, process cwd, dist-packages, or site-packages)"
+
+    # odoo configuration — path from cmdline -c/--config, env ODOO_RC, then
+    # the packaged default locations
+    for opid in $D_ODOO_PIDS; do
+        _oc="$(tr '\0' '\n' < "/proc/$opid/cmdline" 2>/dev/null | awk 'p==1{print;exit} $0=="-c"||$0=="--config"{p=1;next} sub(/^--config=/,""){print;exit} sub(/^-c/,"") && length($0)>0 {print;exit}')"
+        [ -z "$_oc" ] && _oc="$(tr '\0' '\n' < "/proc/$opid/environ" 2>/dev/null | grep '^ODOO_RC=' | head -n1 | cut -d= -f2-)"
+        if [ -n "$_oc" ]; then
+            fact "odoo config path (pid $opid): $_oc"
+            case "$_ocands" in *"|$_oc|"*) ;; *) _ocands="$_ocands|$_oc|" ;; esac
+        else
+            [ -n "$D_ODOO_PIDS" ] && fact "odoo config path (pid $opid): not specified on cmdline or ODOO_RC env"
+        fi
+    done
+    for _c in /etc/odoo/odoo.conf /etc/odoo.conf; do
+        if _fs="$(resolve_fs "$_c")" && [ -f "$_fs" ]; then
+            case "$_ocands" in *"|$_c|"*) ;; *) _ocands="$_ocands|$_c|"; fact "odoo config path (packaged default): $_c" ;; esac
+        fi
+    done
+    if [ -z "$_ocands" ]; then
+        fact "odoo config file: n/a (no path on cmdline/ODOO_RC and no packaged default present)"
+    else
+        printf '%s\n' "$_ocands" | tr '|' '\n' | grep -v '^$' | while IFS= read -r _oc; do
+            _fs="$(resolve_fs "$_oc")" || { fact "-- odoo config $_oc: n/a (path not visible from this mount namespace)"; continue; }
+            [ -r "$_fs" ] || { fact "-- odoo config $_oc: n/a (permission denied: $_fs)"; continue; }
+            _skip="$(grep -cE '^[[:space:]]*(db_password|admin_passwd)[[:space:]]*=' "$_fs" 2>/dev/null)"
+            fact "-- odoo config $_oc (data scope: db_password/admin_passwd lines not collected — ${_skip:-0} such line(s) omitted; first 200 lines):"
+            grep -vE '^[[:space:]]*(db_password|admin_passwd)[[:space:]]*=' "$_fs" 2>/dev/null | head -n 200 | while IFS= read -r _l; do printf '        %s\n' "$_l"; done
+            # where the http-worker traceback goes: the logfile key, or stdout
+            _lf="$(grep -E '^[[:space:]]*logfile[[:space:]]*=' "$_fs" 2>/dev/null | tail -n1 | cut -d= -f2- | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+            if [ -n "$_lf" ] && [ "$_lf" != "None" ] && [ "$_lf" != "False" ]; then
+                fact "   odoo logfile key: $_lf"
+                _lfs="$(resolve_fs "$_lf")" && tail_file "   odoo logfile (worker log)" "$_lfs" 120 || fact "   odoo logfile: n/a (path not visible: $_lf)"
+            else
+                fact "   odoo logfile key: not set (odoo log output goes to process stdout/stderr, e.g. the container log)"
+            fi
+        done
+    fi
+
+    # listening sockets of odoo processes (default http 8069, gevent/longpolling 8072)
+    probe "odoo listening tcp sockets (odoo or ports 8069/8072)" sh -c "ss -ltnp 2>/dev/null | awk 'NR==1 || /odoo/ || /:8069 / || /:8072 /' | head -n 30"
+
+    # systemd unit facts (VM installs; absent inside containers)
+    probe "systemd odoo units" sh -c "systemctl list-units --all 'odoo*' 2>/dev/null | head -n 20"
+    probe "systemd odoo unit file(s)" sh -c "systemctl cat 'odoo*' 2>/dev/null | head -n 80"
+
+    # agent hook evidence for odoo, per agent home (count only; the raw lines
+    # are in the log section's whatap-hook.log head)
+    if [ -n "$D_HOMES" ]; then
+        printf '%s\n' "$D_HOMES" | cut -d'|' -f1 | sort -u | while IFS= read -r home; do
+            [ -n "$home" ] || continue
+            _fh="$(resolve_fs "$home")" || continue
+            _hk="$_fh/logs/whatap-hook.log"
+            [ -r "$_hk" ] && fact "hook.log 'injected odoo' lines (first 400 lines, home $home): $(head -n 400 "$_hk" 2>/dev/null | grep -c 'injected odoo' 2>/dev/null)"
+        done
+    fi
+
+    # [9] kubernetes / operator injection artifacts
     section "Kubernetes / operator injection context"
     if [ -d /whatap-agent ]; then
         probe "/whatap-agent listing (operator injection volume)" sh -c "ls -la /whatap-agent 2>/dev/null | head -n 50"

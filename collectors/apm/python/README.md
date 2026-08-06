@@ -57,14 +57,21 @@ Container notes (all verified against real images):
 | 5 | Agent homes and configuration | every `WHATAP_HOME` candidate (env, port registry `/tmp/whatap-python.lock`, process cwd/environ, `/whatap-agent`), and per home: `whatap.conf` / `container.conf` verbatim, `whatap_python` symlink resolution, pid-file liveness, `logs/` inventory, `run/`, LLM module dir |
 | 6 | Network endpoints and port registry | UDP sockets (net_udp_port), TCP sessions toward :6600, port registry contents |
 | 7 | Agent logs | `whatap-hook.log` head (banner + `successfully injected <module>` lines = which libraries the agent hooked in this process) and tail (recent), the newest `whatap-boot-YYYYMMDD.log` (Go side) head + tail — all bounded reads |
-| 8 | Kubernetes / operator injection context | `/whatap-agent` volume, `WHATAP_PYTHON_AGENT_PATH` (symlink vs regular file), k8s env facts |
+| 8 | Odoo application facts | odoo master/worker processes, Odoo version (`odoo/release.py`, read as text — no odoo code runs), `odoo.conf` (path from `-c`/`ODOO_RC`/packaged defaults; see the data-scope note below) with the `logfile` key resolved and the worker log tailed (the HTTP-worker traceback lives there, not in the master/startup log), listening sockets (8069/8072), systemd unit facts (`Environment=`/`ExecStart` visibility for `whatap-start-agent` PATH issues), `injected odoo` hook-evidence counts. Cheap no-op on non-Odoo hosts. Interpretation aid: the agent's Odoo support matrix (14–19 from agent 2.1.3; JSON-RPC errors return HTTP 200 and are not captured; WebSocket/Longpolling/Cron not instrumented) is maintained in the internal "Odoo 지원" Notion document |
+| 9 | Kubernetes / operator injection context | `/whatap-agent` volume, `WHATAP_PYTHON_AGENT_PATH` (symlink vs regular file), k8s env facts |
 
 ## Security note
 
-Framework policy: configuration files (`whatap.conf`, `container.conf`) are
-dumped **verbatim, never masked** — a mistyped license or server address must
-be readable to be verified or refuted. `OTEL_*` variables of app processes
-are also reported verbatim. Handle the report accordingly.
+Framework policy: WhaTap configuration files (`whatap.conf`, `container.conf`)
+are dumped **verbatim, never masked** — a mistyped license or server address
+must be readable to be verified or refuted. `OTEL_*` variables of app
+processes are also reported verbatim. Handle the report accordingly.
+
+One data-scope exception (not masking): `odoo.conf` is a **customer-owned**
+file that carries plaintext secrets by design (`db_password`, `admin_passwd`).
+Those two keys are **not collected** — the report dumps the rest of the file
+verbatim and states how many lines were omitted. This follows the same
+precedent as the k8s collector not collecting Kubernetes Secret values.
 
 ## Load profile
 
