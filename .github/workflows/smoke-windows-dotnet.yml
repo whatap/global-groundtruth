@@ -1,0 +1,125 @@
+# Smoke test for collectors/apm/dotnet/collect-apmdotnet.ps1 on a real
+# Windows Server runner (windows-latest = Server 2022), under both Windows
+# PowerShell 5.1 (the field target) and pwsh 7.
+#
+# The runner has no WhaTap agent, so a fixture agent home plus the machine/
+# service-registry environment scopes are seeded first: the run then
+# exercises every Windows-only probe (registry, CIM/WMI, event logs, IIS
+# appcmd/WebAdministration, GAC dir, netstat) against the real OS, while
+# agent-specific probes hit either the fixture or their reasoned-n/a paths.
+#
+# Manual trigger only (workflow_dispatch) — this is a validation harness,
+# not a per-push gate.
+name: smoke-windows-dotnet
+
+on:
+  workflow_dispatch:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: validate.sh over all collectors
+        run: tools/validate.sh collectors/
+
+  smoke:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    defaults:
+      run:
+        shell: powershell   # Windows PowerShell 5.1 — the field target
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install IIS (Web-Server + management tools)
+        run: |
+          Install-WindowsFeature -Name Web-Server, Web-Mgmt-Tools | Format-Table -AutoSize
+          iisreset /start
+
+      - name: Seed fixture agent home and registry scopes
+        run: |
+          $h = "C:\Program Files\WhaTap .NET"
+          New-Item -ItemType Directory -Force -Path "$h\core","$h\net461","$h\logs" | Out-Null
+          Set-Content "$h\whatap.conf" @"
+          license=ci-fixture
+          whatap.server.host=127.0.0.1
+          whatap.server.port=6600
+          app_process_name=w3wp.exe
+          app_name=CI-FIXTURE
+          "@
+          Set-Content "$h\core\Whatap.ClrProfiler.dll" "MZ fixture"
+          Set-Content "$h\VERSION" "0.0.0-ci-fixture"
+          Set-Content "$h\logs\core-20260807.log" "2026-08-07 00:00:00 CLR Profiler 1.0.0 Initialize() - Starting profiler initialization (ci fixture)"
+          New-Item -ItemType Directory -Force -Path "C:\ProgramData\WhaTap\dotnet\logs" | Out-Null
+          Set-Content "C:\ProgramData\WhaTap\dotnet\logs\core-20260807.log" "2026-08-07 00:00:00 CLR Profiler 1.0.0 Initialize() - fixture (ProgramData)"
+          Set-Content "C:\ProgramData\WhaTap\dotnet\logs\20260807-9999.log" "[WA002] whatap.version=0.0.0-ci framework.version=ci runtime.version=ci whatap.home=$h"
+          [Environment]::SetEnvironmentVariable("WHATAP_DOTNET_HOME", $h, "Machine")
+          [Environment]::SetEnvironmentVariable("WHATAP_APP_TYPE", "7", "Machine")
+          $svcEnv = @(
+            "COR_ENABLE_PROFILING=1",
+            "COR_PROFILER={21CAE18A-4E44-4578-83FD-0576AAA47E68}",
+            "COR_PROFILER_PATH_64=$h\core\Whatap.ClrProfiler.dll",
+            "DOTNET_STARTUP_HOOKS=$h\core\Whatap.Startup.dll"
+          )
+          foreach ($svc in @("W3SVC","WAS")) {
+            New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\$svc" -Name Environment -PropertyType MultiString -Value $svcEnv -Force | Out-Null
+          }
+          # note: DOTNET_STARTUP_HOOKS target intentionally does NOT exist ->
+          # the report must state "not present" for it (the field outage case)
+
+      - name: Spawn a w3wp worker (hit Default Web Site once)
+        run: |
+          try { Invoke-WebRequest -UseBasicParsing http://localhost/ -TimeoutSec 20 | Out-Null } catch { Write-Host "request: $($_.Exception.Message)" }
+          Get-Process w3wp -ErrorAction SilentlyContinue | Format-Table Id, ProcessName -AutoSize
+
+      - name: Bare run prints usage and exits 0 (PS 5.1)
+        run: .\collectors\apm\dotnet\collect-apmdotnet.ps1
+
+      - name: Collect (PS 5.1, -Stdout) and assert report shape
+        run: |
+          $PSVersionTable.PSVersion
+          .\collectors\apm\dotnet\collect-apmdotnet.ps1 -Stdout -Quiet | Out-File -Encoding utf8 report-ps51.txt
+          $r = Get-Content report-ps51.txt
+          if ($r[-1] -ne "==== END OF COLLECTION (no diagnosis by design) ====") { throw "footer missing; last line: $($r[-1])" }
+          $sections = ($r | Select-String '^\[\d+\] ').Count
+          if ($sections -lt 11) { throw "expected 11 sections, got $sections" }
+          Write-Host "shape OK: $sections sections, $($r.Count) lines"
+
+      - name: Spot-check real-Windows facts reached the report (PS 5.1)
+        run: |
+          $r = Get-Content report-ps51.txt
+          foreach ($needle in @(
+            "administrator role: True",
+            ".NET Framework 4.x Release",
+            "IIS version",
+            "W3SVC Environment",
+            "configured DOTNET_STARTUP_HOOKS target: not present",
+            "whatap.conf (verbatim)",
+            "native profiler banner lines",
+            "app pools"
+          )) {
+            $hit = @($r | Select-String -SimpleMatch $needle).Count
+            if ($hit -eq 0) { throw "expected report content not found: $needle" }
+            Write-Host "found: $needle"
+          }
+
+      - name: Collect (pwsh 7, -Stdout) and assert report shape
+        shell: pwsh
+        run: |
+          $PSVersionTable.PSVersion
+          .\collectors\apm\dotnet\collect-apmdotnet.ps1 -Stdout -Quiet | Out-File -Encoding utf8 report-pwsh7.txt
+          $r = Get-Content report-pwsh7.txt
+          if ($r[-1] -ne "==== END OF COLLECTION (no diagnosis by design) ====") { throw "footer missing" }
+          $sections = @($r | Select-String '^\[\d+\] ').Count
+          if ($sections -lt 11) { throw "expected 11 sections, got $sections" }
+          Write-Host "shape OK: $sections sections, $($r.Count) lines"
+
+      - name: Print PS 5.1 report into the job log
+        run: Get-Content report-ps51.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: whatap-apmdotnet-smoke-reports
+          path: report-*.txt
