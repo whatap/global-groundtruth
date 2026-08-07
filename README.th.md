@@ -71,7 +71,7 @@ global-groundtruth/
 │   ├── k8s/                      # SEEDED v0 — cluster-level collector (operator/CR/agents)
 │   ├── nms/                      # SEEDED v0 — NMS Control Manager host collector
 │   ├── server/                   # STUB (README only)
-│   ├── apm/                      # STUB (README only) — one per language: nodejs/java/python/php/dotnet
+│   ├── apm/                      # PARTIALLY SEEDED — java/ python/ nodejs/ v0 + dotnet/ v0 (Windows); php pending
 │   ├── db/                       # STUB (README only)
 │   └── collection-server/        # SEEDED v0 — WhaTap backend (yard/proxy/...) collector
 ├── templates/
@@ -87,7 +87,7 @@ global-groundtruth/
 | `k8s`               | SEEDED v0       | collector ระดับคลัสเตอร์ รันจาก bastion; ดู `collectors/k8s/` |
 | `nms`               | SEEDED v0       | สคริปต์บนโฮสต์ NMS Control Manager; ดู `collectors/nms/` |
 | `server`            | NOT IMPLEMENTED | สคริปต์ shell บนโฮสต์; ดู `collectors/server/`          |
-| `apm`               | NOT IMPLEMENTED | แยกตามภาษา; ดู `collectors/apm/`            |
+| `apm`               | PARTIALLY SEEDED | แยกตามภาษา; seed v0 แล้ว: `java`, `python`, `nodejs`, `dotnet`; ดู `collectors/apm/` |
 | `db`                | NOT IMPLEMENTED | SQL + dump การตั้งค่า agent; ดู `collectors/db/`         |
 | `collection-server` | SEEDED v0       | สคริปต์บนโฮสต์ backend; ดู `collectors/collection-server/` |
 

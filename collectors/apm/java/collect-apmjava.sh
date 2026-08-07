@@ -1,0 +1,1516 @@
+#!/usr/bin/env bash
+#
+# WhaTap Global Groundtruth — APM Java agent collector
+# -----------------------------------------------------------------------------
+# Gathers the hidden facts a remote WhaTap Java-agent developer repeatedly asks
+# a field engineer for, from the host or container where the target JVM runs.
+# Derived from the agent source (io.whatap.java/whatap.agent.tracer, v2.2.76),
+# the whatap-operator Java injector (internal/webhook/v2alpha1/injector_java.go),
+# and WhaTap Global support cases 2026-06-16 (JBoss 5.1 eorder_uat), 2026-06-24
+# (KBANESCFServer socket gateway), 2026-06-30 (keypro GlassFish logging loop).
+#
+# Recurring field questions this report answers with facts:
+#   * Is a WhaTap -javaagent actually attached, and how many agents are on the
+#     JVM? The option may come from the command line OR from JAVA_TOOL_OPTIONS /
+#     _JAVA_OPTIONS / JDK_JAVA_OPTIONS (the operator injects it that way, so it
+#     never appears in /proc/<pid>/cmdline) — all four sources are read.
+#   * Which agent jar, which version? Version is read from whatap/v.properties
+#     INSIDE the jar (VERSION/BUILD), with the jar's size/mtime/sha256 and the
+#     agent log banner as independent cross-checks.
+#   * Where does the agent look for its config? The resolution the agent
+#     performs is: env WHATAP_CONFIG_FILE, else -Dwhatap.config.file, else
+#     -Dwhatap.home (DEFAULT ".", i.e. the process working directory) plus
+#     -Dwhatap.config (default "whatap.conf"). Resolved per process, and the
+#     file dumped verbatim.
+#   * Which settings are in force? whatap.conf is dumped verbatim, and every
+#     whatap-related environment variable and -D system property is listed per
+#     process: the agent overlays env and system properties onto the config
+#     (whatap/lang/conf/ConfigValueUtil.replaceSysProp), and env names may carry
+#     dots (license, whatap.server.host, whatap.server.port).
+#   * What kind of Java process is this? Server markers (catalina.base,
+#     jboss.home.dir, jeus.home, weblogic, websphere, Spring Boot loader) are
+#     read the same way the agent's own ProcessTypeDetector reads them.
+#   * The most frequent Java case — "the agent is installed, the process is
+#     healthy, but the hitmap stays empty because the application's framework
+#     is not instrumented" — needs four facts side by side, and the report
+#     carries all four: what the application carries (section F), what THIS
+#     agent build can instrument (section G: the weaving modules bundled in
+#     the installed jar plus its built-in ASM classes — read from the jar, so
+#     the list matches the deployed version), which modules the configuration
+#     selects (the weaving / hook_service_* / instrumentation_* keys), and
+#     which modules the running process actually loaded (the agent log's
+#     "Weaving" lines, including the compiled-class-version warnings that stop
+#     a module from applying).
+#   * Which libraries does the deployed application actually carry? Enumerated
+#     from the target's own -cp/-classpath, -jar (BOOT-INF/lib), CLASSPATH and
+#     the server deploy directories derived from its -D properties. The
+#     -javaagent jar itself is EXCLUDED from these lists and the exclusion is
+#     stated: the agent jar bundles weaving-module markers, so a scan that
+#     includes it reports the agent's own catalog instead of the application's
+#     libraries (case 2026-06-16).
+#   * Where does the JVM's stdout go? /proc/<pid>/fd/1 is resolved — the agent
+#     boot banner and a SIGQUIT thread dump land there, not in the agent log.
+#   * Which logging framework is in play, and where are its config files and
+#     output files? (case 2026-06-30: a console/JUL loop produced 19.8M events
+#     while the on-disk server log stayed small.)
+#   * Tier 2, opt-in: thread dumps (--threads) and jcmd VM data (--jcmd) of the
+#     target JVM — the artifact that decided both transaction-entry cases.
+#
+# THE CONTRACT (../../../CONTRACT.md):
+#   1. Facts only. No conclusion is stated on any emitted line.
+#   2. Discover, never assume. Resolve symlinks, process args, env, config.
+#   3. One field command -> paste the whole output.
+#   4. Domain-team owned. Seed v0 by the Global team; ownership transfers to
+#      the APM/Java agent developers.
+#
+# DESIGN GUIDELINES (../../../docs/collector-engineering.md): MECE sections,
+# Tier-0 load-safe defaults (bounded reads, directory listings only, no
+# recursive walks, no whole-log grep), bash 3.2+ and POSIX-sh compatible,
+# reasoned absence for every missing value. Tier 0 NEVER attaches to, signals,
+# or pauses the target JVM: `java -version` is only ever run on a discovered
+# java binary (a separate short-lived JVM), never against a running process.
+# jstack / jcmd / SIGQUIT are Tier 2 and print their impact before running.
+#
+# NOTE: no `set -e` — a collector must reach its footer even when every probe
+# fails. Failures are handled locally by the helpers.
+# -----------------------------------------------------------------------------
+
+export LC_ALL=C
+
+# ---- collector metadata ------------------------------------------------------
+COLLECTOR_NAME="whatap-apmjava"
+VERSION="0.1.0"
+DOMAIN="apm/java"
+TARGET="host/$(hostname 2>/dev/null || echo unknown)"
+
+# ---- CLI harness — DO NOT EDIT ----------------------------------------------
+OPT_FILE=0        # write the report to a .txt file
+OPT_STDOUT=0      # print the report to stdout
+OPT_QUIET=0       # suppress progress narration on stderr
+OPT_THREADS=0     # Tier 2: thread dumps of the target JVMs (0 = off)
+OPT_JCMD=0        # Tier 2: jcmd VM.command_line / VM.system_properties / VM.flags
+OPT_LIBS=""       # --library PATTERN (repeatable): library detail pack
+OPT_LIBALL=0      # --library-all: detail every enumerated jar (capped)
+OPT_CLASSES=""    # --class FQCN (repeatable): member signatures via javap
+
+usage() {
+    cat <<EOF
+$COLLECTOR_NAME $VERSION — a WhaTap Global Groundtruth collector (facts only).
+Collects Java APM agent facts from the host or container where the target JVM
+runs (run it inside the container for containerized apps, e.g. kubectl exec /
+docker exec, as the same OS user as the JVM where possible).
+
+Run with no arguments (or --help) to print this help; a collection needs an
+explicit action flag so nothing starts by accident.
+
+  $(basename "$0")             print this help (no collection)
+  $(basename "$0") --file      write the facts report -> ./$COLLECTOR_NAME-<host>-<UTC>.txt
+  $(basename "$0") --stdout    print the facts report to stdout
+  $(basename "$0") --quiet ..  silence progress on stderr (add to --file / --stdout)
+
+Library detail pack (off by default; read-only, no contact with the JVM) —
+for the case where a new weaving module has to be written for a library:
+  --library PAT  detail every enumerated jar whose name or path contains PAT
+                 (case-insensitive, repeatable): Maven coordinates, manifest
+                 versions, class-file version, package map, class list
+  --library-all  detail every enumerated jar (cap 40)
+  --class FQCN   member signatures of that class via javap, from each detailed
+                 jar that contains it (repeatable)
+
+Tier 2 (off by default; each announces its impact on stderr before running):
+  --threads[=N]  N thread dumps per WhaTap-attached JVM (default N=1) via
+                 jstack -l; pauses the target JVM at a safepoint for the dump
+  --jcmd         jcmd VM.command_line / VM.system_properties / VM.flags per
+                 WhaTap-attached JVM; uses the JVM attach mechanism
+EOF
+}
+
+ARGC=$#
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --file)      OPT_FILE=1 ;;
+        --stdout)    OPT_STDOUT=1 ;;
+        --quiet)     OPT_QUIET=1 ;;
+        --threads)   OPT_THREADS=1 ;;
+        --threads=*) OPT_THREADS="${1#*=}" ;;
+        --jcmd)      OPT_JCMD=1 ;;
+        --library)      shift; OPT_LIBS="$OPT_LIBS $1" ;;
+        --library=*)    OPT_LIBS="$OPT_LIBS ${1#*=}" ;;
+        --library-all)  OPT_LIBALL=1 ;;
+        --class)        shift; OPT_CLASSES="$OPT_CLASSES $1" ;;
+        --class=*)      OPT_CLASSES="$OPT_CLASSES ${1#*=}" ;;
+        -h|--help)   usage; exit 0 ;;
+        *) printf 'unknown argument: %s\n' "$1" >&2; usage >&2; exit 2 ;;
+    esac
+    shift
+done
+
+# ---- emit helpers — DO NOT EDIT ---------------------------------------------
+_section_n=0
+
+emit_header() {
+    printf '==== WhaTap Global Groundtruth Collection ====\n'
+    printf 'Collector:      %s\n' "$COLLECTOR_NAME"
+    printf 'Version:        %s\n' "$VERSION"
+    printf 'Timestamp(UTC): %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown)"
+    printf 'Domain:         %s\n' "$DOMAIN"
+    printf 'Target:         %s\n' "$TARGET"
+    printf '===============================================\n'
+}
+
+section() {
+    _section_n=$((_section_n + 1))
+    printf '\n[%d] %s\n' "$_section_n" "$1"
+    progress "[$_section_n] $1"
+}
+
+fact() {
+    printf '    %s\n' "$1"
+}
+
+emit_footer() {
+    printf '\n==== END OF COLLECTION (no diagnosis by design) ====\n'
+}
+
+progress() { [ "$OPT_QUIET" = 1 ] && return; printf '>> %s\n' "$*" >&3 2>/dev/null; }
+warn() { printf '%s\n' "$*" >&2; }
+
+# ---- reasoned-absence helpers -------------------------------------------------
+have() { command -v "$1" >/dev/null 2>&1; }
+
+_errfile=""
+_timeout_bin=""
+CMD_TIMEOUT=15
+_init_probe() {
+    _errfile="$(mktemp 2>/dev/null || echo "${TMPDIR:-/tmp}/.ggt.$$.err")"
+    have timeout && _timeout_bin="$(command -v timeout)"
+}
+_end_probe() { [ -n "$_errfile" ] && rm -rf "$_errfile" "$_errfile".* 2>/dev/null; }
+
+_classify_err() {
+    local txt=""
+    [ -f "$_errfile" ] && txt="$(cat "$_errfile" 2>/dev/null)"
+    case "$txt" in
+        *[Pp]"ermission denied"*|*"peration not permitted"*) echo "permission denied"; return ;;
+        *"o such file"*|*"annot access"*|*"oes not exist"*)   echo "path not found";    return ;;
+    esac
+    if [ -n "$txt" ]; then printf 'error: %s' "$(printf '%s' "$txt" | head -n1 | cut -c1-100)"
+    else echo "nonzero exit"; fi
+}
+
+_emit_labeled() {
+    local label="$1" body="$2" n
+    n="$(printf '%s\n' "$body" | wc -l | tr -d ' ')"
+    if [ "${n:-0}" -le 1 ]; then
+        fact "$label: $body"
+    else
+        fact "$label:"
+        printf '%s\n' "$body" | while IFS= read -r _l || [ -n "$_l" ]; do printf '        %s\n' "$_l"; done
+    fi
+}
+
+# probe "label" CMD [ARGS...] -> output as facts, or "label: n/a (<why>)".
+probe() {
+    local label="$1"; shift
+    command -v "$1" >/dev/null 2>&1 || { fact "$label: n/a (command not found: $1)"; return; }
+    local out rc
+    if [ -n "$_timeout_bin" ]; then out="$("$_timeout_bin" "$CMD_TIMEOUT" "$@" 2>"$_errfile")"; rc=$?
+    else out="$("$@" 2>"$_errfile")"; rc=$?; fi
+    [ "$rc" -eq 124 ] && [ -n "$_timeout_bin" ] && { fact "$label: n/a (timed out: ${CMD_TIMEOUT}s)"; return; }
+    [ "$rc" -ne 0 ] && { fact "$label: n/a ($(_classify_err))"; return; }
+    [ -z "$out" ] && { fact "$label: n/a (empty output)"; return; }
+    _emit_labeled "$label" "$out"
+}
+
+# read_proc "label" PATH -> content of a /proc or /sys file, or a reason.
+read_proc() {
+    local label="$1" path="$2" out
+    [ -e "$path" ] || { fact "$label: n/a (path not found: $path)"; return; }
+    [ -r "$path" ] || { fact "$label: n/a (permission denied: $path)"; return; }
+    out="$(cat "$path" 2>/dev/null)"
+    [ -z "$out" ] && { fact "$label: n/a (empty output)"; return; }
+    _emit_labeled "$label" "$out"
+}
+
+# dump_file "label" PATH [CAP] -> the file's content verbatim (line-capped),
+# or a classified reason. Framework policy: configuration is dumped verbatim,
+# never masked (see collectors/apm/java/README.md security note).
+dump_file() {
+    local label="$1" path="$2" cap="${3:-400}" total
+    [ -e "$path" ] || { fact "$label: n/a (path not found: $path)"; return; }
+    [ -r "$path" ] || { fact "$label: n/a (permission denied: $path)"; return; }
+    [ -s "$path" ] || { fact "$label: (empty file)"; return; }
+    total="$(wc -l < "$path" 2>/dev/null | tr -d ' ')"
+    fact "$label (first $cap of ${total:-?} lines):"
+    head -n "$cap" "$path" 2>/dev/null | while IFS= read -r _l || [ -n "$_l" ]; do printf '        %s\n' "$_l"; done
+}
+
+# tail_file "label" PATH [CAP] -> the file's LAST lines (bounded read).
+tail_file() {
+    local label="$1" path="$2" cap="${3:-200}" total
+    [ -e "$path" ] || { fact "$label: n/a (path not found: $path)"; return; }
+    [ -r "$path" ] || { fact "$label: n/a (permission denied: $path)"; return; }
+    [ -s "$path" ] || { fact "$label: (empty file)"; return; }
+    total="$(wc -l < "$path" 2>/dev/null | tr -d ' ')"
+    fact "$label (last $cap of ${total:-?} lines):"
+    tail -n "$cap" "$path" 2>/dev/null | while IFS= read -r _l || [ -n "$_l" ]; do printf '        %s\n' "$_l"; done
+}
+
+# head_file "label" PATH [CAP] -> the file's FIRST lines (bounded read).
+head_file() {
+    local label="$1" path="$2" cap="${3:-120}" total
+    [ -e "$path" ] || { fact "$label: n/a (path not found: $path)"; return; }
+    [ -r "$path" ] || { fact "$label: n/a (permission denied: $path)"; return; }
+    [ -s "$path" ] || { fact "$label: (empty file)"; return; }
+    total="$(wc -l < "$path" 2>/dev/null | tr -d ' ')"
+    fact "$label (first $cap of ${total:-?} lines):"
+    head -n "$cap" "$path" 2>/dev/null | while IFS= read -r _l || [ -n "$_l" ]; do printf '        %s\n' "$_l"; done
+}
+
+# conf_bytes "label" PATH -> byte-level facts a plain `cat` hides: total bytes
+# and CR (\r, 0x0D) byte count. Windows-edited conf files reach Linux hosts
+# through support cases; the reader compares these against the dumped text.
+conf_bytes() {
+    local label="$1" path="$2" sz cr
+    [ -e "$path" ] || return
+    [ -r "$path" ] || return
+    sz="$(wc -c < "$path" 2>/dev/null | tr -d ' ')"
+    cr="$(tr -dc '\r' < "$path" 2>/dev/null | wc -c | tr -d ' ')"
+    fact "$label: size ${sz:-?} bytes, CR (0x0D) bytes: ${cr:-?}"
+}
+
+# _sha256 PATH -> the artifact's sha256, or a classified reason.
+_sha256() {
+    if have sha256sum; then sha256sum "$1" 2>/dev/null | awk '{print $1}'
+    elif have shasum; then shasum -a 256 "$1" 2>/dev/null | awk '{print $1}'
+    else printf 'n/a (command not found: sha256sum, shasum)'; fi
+}
+
+# file_facts "indent" PATH -> identity of a binary artifact: size, mtime,
+# sha256. The Java agent jar carries no version in its filename in many
+# deployments, so these are the cross-check for the in-jar version.
+file_facts() {
+    local ind="$1" p="$2" sz mt sum
+    [ -e "$p" ] || { printf '%sn/a (path not found: %s)\n' "$ind" "$p"; return; }
+    sz="$(wc -c < "$p" 2>/dev/null | tr -d ' ')"
+    mt="$(stat -c '%y' "$p" 2>/dev/null || ls -l "$p" 2>/dev/null | cut -c1-60)"
+    printf '%ssize: %s bytes   mtime: %s\n' "$ind" "${sz:-?}" "${mt:-n/a (stat and ls both unavailable)}"
+    printf '%ssha256: %s\n' "$ind" "$(_sha256 "$p")"
+}
+
+# jar_version "indent" JAR -> VERSION/BUILD from whatap/v.properties inside the
+# jar (the file the agent's own whatap.Version class reads), read with unzip.
+jar_version() {
+    local ind="$1" jar="$2" out
+    if ! have unzip; then
+        printf '%sin-jar whatap/v.properties: n/a (command not found: unzip)\n' "$ind"
+        return
+    fi
+    if [ -n "$_timeout_bin" ]; then out="$("$_timeout_bin" "$CMD_TIMEOUT" unzip -p "$jar" whatap/v.properties 2>"$_errfile")"
+    else out="$(unzip -p "$jar" whatap/v.properties 2>"$_errfile")"; fi
+    if [ -z "$out" ]; then
+        printf '%sin-jar whatap/v.properties: n/a (%s)\n' "$ind" "$(_classify_err)"
+        return
+    fi
+    printf '%sin-jar whatap/v.properties:\n' "$ind"
+    printf '%s\n' "$out" | head -n 10 | while IFS= read -r _l || [ -n "$_l" ]; do printf '%s  %s\n' "$ind" "$_l"; done
+}
+
+# jar_entries "indent" JAR PATTERN CAP -> file entry names inside a jar
+# (central directory read only; the jar is never executed or loaded).
+# Directory entries are dropped so the list holds libraries, not folders.
+jar_entries() {
+    local ind="$1" jar="$2" pat="$3" cap="${4:-100}" out n
+    have unzip || { printf '%sn/a (command not found: unzip)\n' "$ind"; return; }
+    if [ -n "$_timeout_bin" ]; then out="$("$_timeout_bin" "$CMD_TIMEOUT" unzip -Z1 "$jar" "$pat" 2>/dev/null | grep -v '/$')"
+    else out="$(unzip -Z1 "$jar" "$pat" 2>/dev/null | grep -v '/$')"; fi
+    [ -z "$out" ] && { printf '%snone matching %s\n' "$ind" "$pat"; return; }
+    n="$(printf '%s\n' "$out" | grep -c .)"
+    printf '%s%s entries matching %s (first %s):\n' "$ind" "${n:-0}" "$pat" "$cap"
+    printf '%s\n' "$out" | head -n "$cap" | while IFS= read -r _l; do
+        [ -n "$_l" ] || continue
+        printf '%s  %s\n' "$ind" "$(basename "$_l")"
+        _lib_record "$(basename "$_l")"
+        case "$_l" in *.jar) _path_record "nested|$jar|$_l" ;; esac
+    done
+}
+
+# jvprobe "label" JAVA_EXE [ARGS...] -> run a DISCOVERED java binary (a new,
+# short-lived JVM). Never applied to a running process.
+jvprobe() {
+    local label="$1" jv="$2"; shift 2
+    [ -x "$jv" ] || { fact "$label: n/a (not executable: $jv)"; return; }
+    local out rc
+    if [ -n "$_timeout_bin" ]; then out="$("$_timeout_bin" "$CMD_TIMEOUT" "$jv" "$@" 2>&1)"; rc=$?
+    else out="$("$jv" "$@" 2>&1)"; rc=$?; fi
+    [ "$rc" -eq 124 ] && [ -n "$_timeout_bin" ] && { fact "$label: n/a (timed out: ${CMD_TIMEOUT}s)"; return; }
+    [ -z "$out" ] && { fact "$label: n/a (empty output)"; return; }
+    _emit_labeled "$label" "$out"
+}
+
+# _lib_record NAME -> append a library name to the per-process inventory that
+# section H filters. No-op when _LIBSINK is unset (outside section F).
+_LIBSINK=""
+_lib_record() {
+    [ -n "$_LIBSINK" ] || return
+    [ -n "$1" ] || return
+    printf '%s\n' "$1" >> "$_LIBSINK" 2>/dev/null
+}
+
+# _path_record RECORD -> append a locatable jar to the inventory section M
+# details. RECORD is "file|<path>" for a jar on the filesystem, or
+# "nested|<container jar>|<entry>" for one packed inside an executable jar.
+_PATHSINK=""
+_path_record() {
+    [ -n "$_PATHSINK" ] || return
+    [ -n "$1" ] || return
+    printf '%s\n' "$1" >> "$_PATHSINK" 2>/dev/null
+}
+
+# list_jars "indent" DIR CAP -> *.jar names in ONE directory level (no walk),
+# with the agent jar filtered out and the count reported.
+list_jars() {
+    local ind="$1" d="$2" cap="${3:-120}" n out
+    [ -d "$d" ] || { printf '%s%s: n/a (path not found)\n' "$ind" "$d"; return; }
+    [ -r "$d" ] || { printf '%s%s: n/a (permission denied)\n' "$ind" "$d"; return; }
+    out="$(ls "$d" 2>/dev/null | grep -i '\.jar$')"
+    if [ -z "$out" ]; then printf '%s%s: 0 jar files\n' "$ind" "$d"; return; fi
+    out="$(printf '%s\n' "$out" | grep -v -i 'whatap\.agent')"
+    n="$(printf '%s\n' "$out" | grep -c . )"
+    printf '%s%s: %s jar files (first %s)\n' "$ind" "$d" "${n:-0}" "$cap"
+    printf '%s\n' "$out" | head -n "$cap" | while IFS= read -r _l; do
+        [ -n "$_l" ] || continue
+        printf '%s  %s\n' "$ind" "$_l"
+        _lib_record "$_l"
+        _path_record "file|$d/$_l"
+    done
+}
+
+# list_deploy "indent" DIR -> deployment units in a server deploy directory,
+# one level plus the standard lib dirs inside exploded ear/war units.
+list_deploy() {
+    local ind="$1" d="$2" u seen=""
+    [ -d "$d" ] || { printf '%s%s: n/a (path not found)\n' "$ind" "$d"; return; }
+    printf '%sdeploy dir %s (units, first 60):\n' "$ind" "$d"
+    ls "$d" 2>/dev/null | head -n 60 | while IFS= read -r _l; do printf '%s  %s\n' "$ind" "$_l"; done
+    # the last two globs overlap on *.war units; list each directory once
+    for u in "$d"/*.ear/lib "$d"/*.war/WEB-INF/lib "$d"/*/WEB-INF/lib; do
+        [ -d "$u" ] || continue
+        case "$seen" in *"|$u|"*) continue ;; esac
+        seen="$seen|$u|"
+        list_jars "$ind  " "$u" 120
+    done
+}
+
+# _lib_match NAME -> success when NAME matches a --library pattern (or when
+# --library-all was given). Case-insensitive substring match.
+_lib_match() {
+    [ "$OPT_LIBALL" = 1 ] && return 0
+    [ -n "$OPT_LIBS" ] || return 1
+    local n p
+    n="$(printf '%s' "$1" | tr 'A-Z' 'a-z')"
+    for p in $OPT_LIBS; do
+        p="$(printf '%s' "$p" | tr 'A-Z' 'a-z')"
+        case "$n" in *"$p"*) return 0 ;; esac
+    done
+    return 1
+}
+
+# class_file_version "indent" JAR -> the class-file major version carried by
+# the jar, read from the first class entry (bytes 6-7 of the class file, big
+# endian). A weaving module has to be compiled for a version the target class
+# accepts, so this is the number its author needs. major - 44 is the Java
+# feature release (52 = Java 8).
+class_file_version() {
+    local ind="$1" jar="$2" ent hi lo maj
+    have unzip || { printf '%sclass-file version: n/a (command not found: unzip)\n' "$ind"; return; }
+    have od    || { printf '%sclass-file version: n/a (command not found: od)\n' "$ind"; return; }
+    ent="$(unzip -Z1 "$jar" '*.class' 2>/dev/null | grep -v '^META-INF/versions/' | head -n1)"
+    [ -n "$ent" ] || { printf '%sclass-file version: n/a (no class entry in this jar)\n' "$ind"; return; }
+    set -- $(unzip -p "$jar" "$ent" 2>/dev/null | od -An -tu1 -j6 -N2 2>/dev/null)
+    hi="$1"; lo="$2"
+    [ -n "$lo" ] || { printf '%sclass-file version: n/a (class entry not readable: %s)\n' "$ind" "$ent"; return; }
+    maj=$(( hi * 256 + lo ))
+    printf '%sclass-file major version: %s (Java %s), read from %s\n' "$ind" "$maj" "$((maj - 44))" "$ent"
+}
+
+# detail_jar "label" JAR -> the facts a weaving-module author needs about one
+# library: identity, Maven coordinates, manifest versions, class-file version,
+# package map (a relocated/shaded jar shows it here), class count, service
+# entries, multi-release markers.
+detail_jar() {
+    local label="$1" jar="$2" origin="$3" pp cnt
+    fact "-- $label"
+    if [ -n "$origin" ]; then
+        # a library packed inside an executable jar has no path of its own on
+        # this host; size and sha256 identify the entry's content, and the
+        # timestamps of the extraction it was read through carry no meaning
+        fact "       origin: $origin"
+        fact "       size: $(wc -c < "$jar" 2>/dev/null | tr -d ' ') bytes (content of that entry)"
+        fact "       sha256: $(_sha256 "$jar")"
+    else
+        fact "       path: $jar"
+        file_facts "           " "$jar"
+    fi
+    if ! have unzip; then
+        fact "       jar contents: n/a (command not found: unzip)"
+        return
+    fi
+    # definitive coordinates: the build stamps them into the jar
+    pp="$(unzip -Z1 "$jar" 'META-INF/maven/*/pom.properties' 2>/dev/null | head -n 3)"
+    if [ -n "$pp" ]; then
+        printf '%s\n' "$pp" | while IFS= read -r _e; do
+            printf '           maven entry: %s\n' "$_e"
+            unzip -p "$jar" "$_e" 2>/dev/null | grep -vE '^#' | while IFS= read -r _l; do
+                [ -n "$_l" ] && printf '             %s\n' "$_l"
+            done
+        done
+    else
+        fact "       maven coordinates: none (no META-INF/maven/*/pom.properties in this jar)"
+    fi
+    # manifest version attributes, for jars without maven metadata
+    _mf="$(unzip -p "$jar" META-INF/MANIFEST.MF 2>/dev/null | tr -d '\r' \
+           | grep -iE '^(Implementation-|Specification-|Bundle-SymbolicName|Bundle-Version|Bundle-Name|Automatic-Module-Name|Build-Jdk|Created-By|Multi-Release|Export-Package)' | head -n 20)"
+    if [ -n "$_mf" ]; then
+        fact "       manifest attributes:"
+        printf '%s\n' "$_mf" | while IFS= read -r _l; do printf '             %s\n' "$(printf '%s' "$_l" | cut -c1-200)"; done
+    else
+        fact "       manifest attributes: none of the version attributes are present"
+    fi
+    class_file_version "           " "$jar"
+    # package map: reveals the real namespace, including relocation/shading
+    cnt="$(unzip -Z1 "$jar" '*.class' 2>/dev/null | grep -c .)"
+    fact "       class entries: ${cnt:-0}"
+    fact "       packages by class count (top 25):"
+    unzip -Z1 "$jar" '*.class' 2>/dev/null | sed 's|/[^/]*$||' | sort | uniq -c | sort -rn | head -n 25 \
+        | while IFS= read -r _l; do printf '             %s\n' "$(printf '%s' "$_l" | sed 's|/|.|g')"; done
+    _mr="$(unzip -Z1 "$jar" 'META-INF/versions/*' 2>/dev/null | sed 's|^META-INF/versions/\([0-9]*\)/.*|\1|' | sort -u | tr '\n' ' ')"
+    [ -n "$_mr" ] && fact "       multi-release jar, versioned class trees for: $_mr"
+    unzip -Z1 "$jar" 'module-info.class' >/dev/null 2>&1 && fact "       module-info.class: present"
+    _svc="$(unzip -Z1 "$jar" 'META-INF/services/*' 2>/dev/null | head -n 10)"
+    if [ -n "$_svc" ]; then
+        fact "       service provider entries:"
+        printf '%s\n' "$_svc" | while IFS= read -r _l; do printf '             %s\n' "$_l"; done
+    fi
+    # member signatures of the classes named with --class
+    for _fq in $OPT_CLASSES; do
+        _ce="$(printf '%s' "$_fq" | tr '.' '/').class"
+        unzip -Z1 "$jar" "$_ce" >/dev/null 2>&1 || continue
+        if ! have javap; then
+            fact "       $_fq: present in this jar; member signatures n/a (command not found: javap)"
+            continue
+        fi
+        fact "       $_fq member signatures (javap -p, first 300 lines):"
+        if [ -n "$_timeout_bin" ]; then "$_timeout_bin" "$CMD_TIMEOUT" javap -p -classpath "$jar" "$_fq" 2>&1 | head -n 300 | while IFS= read -r _l; do printf '             %s\n' "$_l"; done
+        else javap -p -classpath "$jar" "$_fq" 2>&1 | head -n 300 | while IFS= read -r _l; do printf '             %s\n' "$_l"; done; fi
+    done
+}
+
+# bootjar_facts "indent" JAR -> the facts an executable (fat) jar carries that
+# a loose classpath does not: the launcher manifest (Start-Class names the real
+# application entry class, Spring-Boot-Version decides which weaving module
+# applies), the layer index, and the package map of the application's own
+# classes under BOOT-INF/classes.
+bootjar_facts() {
+    local ind="$1" jar="$2" mf cnt
+    have unzip || { printf '%sexecutable jar layout: n/a (command not found: unzip)\n' "$ind"; return; }
+    unzip -Z1 "$jar" 'BOOT-INF/*' 2>/dev/null | head -n1 | grep -q . || return
+    printf '%sexecutable jar layout: BOOT-INF present (libraries are packed inside this jar, not on the filesystem)\n' "$ind"
+    mf="$(unzip -p "$jar" META-INF/MANIFEST.MF 2>/dev/null | tr -d '\r' \
+          | grep -iE '^(Main-Class|Start-Class|Spring-Boot-Version|Spring-Boot-Classes|Spring-Boot-Lib|Implementation-Title|Implementation-Version|Build-Jdk|Created-By)' | head -n 12)"
+    if [ -n "$mf" ]; then
+        printf '%slauncher manifest:\n' "$ind"
+        printf '%s\n' "$mf" | while IFS= read -r _l; do printf '%s  %s\n' "$ind" "$(printf '%s' "$_l" | cut -c1-200)"; done
+    else
+        printf '%slauncher manifest: none of the launcher attributes are present\n' "$ind"
+    fi
+    unzip -Z1 "$jar" 'BOOT-INF/layers.idx' >/dev/null 2>&1 && printf '%sBOOT-INF/layers.idx: present (layered jar)\n' "$ind"
+    cnt="$(unzip -Z1 "$jar" 'BOOT-INF/classes/*.class' 2>/dev/null | grep -c .)"
+    printf '%sapplication classes in BOOT-INF/classes: %s\n' "$ind" "${cnt:-0}"
+    if [ "${cnt:-0}" -gt 0 ]; then
+        printf '%sapplication packages by class count (top 20):\n' "$ind"
+        unzip -Z1 "$jar" 'BOOT-INF/classes/*.class' 2>/dev/null \
+            | sed 's|^BOOT-INF/classes/||; s|/[^/]*$||' | sort | uniq -c | sort -rn | head -n 20 \
+            | while IFS= read -r _l; do printf '%s  %s\n' "$ind" "$(printf '%s' "$_l" | sed 's|/|.|g')"; done
+    fi
+}
+
+# nested_extract CONTAINER ENTRY -> extract one packed jar to a temp path and
+# print that path, so the same detail_jar reader works on a library that only
+# exists inside an executable jar. Bounded: entries above 80 MB are skipped.
+nested_extract() {
+    local jar="$1" ent="$2" out sz
+    have unzip || return 1
+    sz="$(unzip -Zt "$jar" "$ent" 2>/dev/null | awk '{print $3}')"
+    if [ -n "$sz" ] && [ "$sz" -gt 83886080 ] 2>/dev/null; then return 1; fi
+    out="${_errfile}.nested.jar"
+    unzip -p "$jar" "$ent" > "$out" 2>/dev/null || return 1
+    [ -s "$out" ] || return 1
+    printf '%s\n' "$out"
+}
+
+# weaving_lines "label" PATH -> the agent-log lines carrying the "Weaving" log
+# id, from a BOUNDED window (module load lines are written at startup, so the
+# head of the file is searched as well as the tail; never a whole-file grep).
+weaving_lines() {
+    local label="$1" path="$2" hw=3000 tw=1000 out n
+    [ -e "$path" ] || { fact "-- $label: n/a (path not found)"; return; }
+    [ -r "$path" ] || { fact "-- $label: n/a (permission denied)"; return; }
+    out="$( { head -n "$hw" "$path" 2>/dev/null; tail -n "$tw" "$path" 2>/dev/null; } \
+            | grep -a 'Weaving' | sort -u | head -n 80)"
+    if [ -z "$out" ]; then
+        fact "-- $label: no line carrying the Weaving log id in the first $hw or last $tw lines"
+        return
+    fi
+    n="$(printf '%s\n' "$out" | grep -c .)"
+    fact "-- $label: $n distinct Weaving lines in the first $hw and last $tw lines (first 80):"
+    printf '%s\n' "$out" | while IFS= read -r _l; do printf '             %s\n' "$(printf '%s' "$_l" | cut -c1-300)"; done
+}
+
+# ---- process / JVM helpers ---------------------------------------------------
+# _proc_env PID NAME -> value of NAME= in the process environ (empty if none).
+# Java agent env names may contain dots (license, whatap.server.host), which is
+# why the environ file is read directly instead of using the shell environment.
+_proc_env() {
+    tr '\0' '\n' < "/proc/$1/environ" 2>/dev/null | grep "^$2=" | head -n1 | cut -d= -f2-
+}
+
+# _all_jvm_args PID -> one JVM argument per line, in the order the JVM applies
+# them: JAVA_TOOL_OPTIONS, JDK_JAVA_OPTIONS, the command line, then
+# _JAVA_OPTIONS (which HotSpot processes last). The operator injects
+# -javaagent through JAVA_TOOL_OPTIONS, so the command line alone is not enough.
+_all_jvm_args() {
+    local pid="$1"
+    _proc_env "$pid" JAVA_TOOL_OPTIONS | tr ' ' '\n'
+    _proc_env "$pid" JDK_JAVA_OPTIONS | tr ' ' '\n'
+    tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null
+    _proc_env "$pid" _JAVA_OPTIONS | tr ' ' '\n'
+}
+
+# _jvm_sysprop PID KEY -> the last -DKEY=value seen across all argument
+# sources (see _all_jvm_args for the order). Empty when the property is unset.
+_jvm_sysprop() {
+    _all_jvm_args "$1" 2>/dev/null | grep "^-D$2=" | tail -n1 | sed "s/^-D$2=//"
+}
+
+# _is_jvm PID -> success if the process is a JVM (resolved binary, comm, or a
+# JVM-only argument). Launchers rename the process, so comm alone is not enough.
+# A launcher may rename the process (JBoss run.jar, jsvc, custom start
+# scripts), so comm alone is not enough; a JVM-only option is accepted as
+# evidence, but only as a WHOLE argument. A shell wrapper whose command line
+# merely contains a java invocation as text keeps the whole command in one
+# argument, and interpreters are excluded outright, so start.sh is not
+# reported as a JVM.
+_is_jvm() {
+    local pid="$1" comm exe
+    comm="$(cat "/proc/$pid/comm" 2>/dev/null)"
+    case "$comm" in java|java.*|jsvc*|jexec*) return 0 ;; esac
+    exe="$(readlink -f "/proc/$pid/exe" 2>/dev/null)"
+    case "${exe##*/}" in
+        java|jsvc|jsvc.exec) return 0 ;;
+        sh|bash|dash|ksh|zsh|busybox|python*|perl|ruby|node|nodejs|awk|sed|grep|tr) return 1 ;;
+    esac
+    tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null \
+        | grep -qE '^-(javaagent:|Xmx|Xms|XX:|Dcatalina\.|Djava\.|Dwhatap\.)' && return 0
+    return 1
+}
+
+# _whatap_attached PID -> success if a whatap -javaagent reaches this JVM from
+# any argument source, or a whatap system property / env variable is present.
+_whatap_attached() {
+    local pid="$1"
+    _all_jvm_args "$pid" 2>/dev/null | grep -qiE '^-javaagent:.*whatap|^-Dwhatap\.' && return 0
+    tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null \
+        | grep -qiE '^(WHATAP_|whatap\.|license=)' && return 0
+    return 1
+}
+
+# ---- discovery (internal; emits nothing) --------------------------------------
+# Populates:
+#   D_JVM_PIDS    pids of JVM processes, WhaTap-attached ones first
+#   D_MARKED      pids among them that carry a WhaTap attach marker
+#   D_JAVA_EXES   distinct java binaries (running processes + PATH + JAVA_HOME)
+#   D_AGENT_JARS  newline-joined "path|source" records for whatap agent jars
+#   D_HOMES       newline-joined "path|source" records for agent home candidates
+D_JVM_PIDS=""
+D_MARKED=""
+D_JAVA_EXES=""
+D_JAVA_KEYS=""
+D_AGENT_JARS=""
+D_HOMES=""
+
+# resolve_fs PATH -> a readable filesystem view of PATH: the path itself if it
+# exists here, otherwise the same path seen through the root of a discovered
+# JVM (/proc/<pid>/root<PATH>). Empty if neither is visible. This lets the
+# collector run from a different mount namespace (node shell, kubectl debug).
+resolve_fs() {
+    local p="$1" pid
+    [ -e "$p" ] && { printf '%s\n' "$p"; return; }
+    for pid in $D_JVM_PIDS; do
+        [ -e "/proc/$pid/root$p" ] && { printf '%s\n' "/proc/$pid/root$p"; return; }
+    done
+    return 1
+}
+
+_add_home() {  # _add_home PATH SOURCE
+    local p="$1" s="$2"
+    [ -n "$p" ] || return
+    case "$D_HOMES" in *"$p|"*) return ;; esac
+    if [ -n "$D_HOMES" ]; then D_HOMES="$D_HOMES
+$p|$s"; else D_HOMES="$p|$s"; fi
+}
+
+_add_jar() {  # _add_jar PATH SOURCE
+    local p="$1" s="$2"
+    [ -n "$p" ] || return
+    case "$D_AGENT_JARS" in *"$p|"*) return ;; esac
+    if [ -n "$D_AGENT_JARS" ]; then D_AGENT_JARS="$D_AGENT_JARS
+$p|$s"; else D_AGENT_JARS="$p|$s"; fi
+}
+
+# Dedup key for java binaries: the resolved target. Unlike Python virtualenvs,
+# a java launcher symlink and its target load the same runtime, so collapsing
+# to the resolved path loses nothing.
+_add_java() {
+    local p="$1" k
+    [ -n "$p" ] || return
+    [ -x "$p" ] || return
+    k="$(readlink -f "$p" 2>/dev/null || echo "$p")"
+    case "$D_JAVA_KEYS" in *"|$k|"*) return ;; esac
+    D_JAVA_KEYS="$D_JAVA_KEYS|$k|"
+    D_JAVA_EXES="$D_JAVA_EXES $p"
+}
+
+discover() {
+    progress "discovery: JVM processes, agent jars, agent homes, java binaries"
+    local pid exe v a rest marked
+
+    for pid in $(ls /proc 2>/dev/null | grep -E '^[0-9]+$'); do
+        [ "$pid" = "$$" ] && continue
+        [ -r "/proc/$pid/cmdline" ] || continue
+        _is_jvm "$pid" || continue
+        D_JVM_PIDS="$D_JVM_PIDS $pid"
+        exe="$(readlink -f "/proc/$pid/exe" 2>/dev/null)"
+        [ -n "$exe" ] && _add_java "$exe"
+    done
+
+    # WhaTap-attached JVMs take the per-process detail slots before unrelated
+    # JVMs (build daemons, IDE helpers) when the cap applies
+    marked=""; rest=""
+    for pid in $D_JVM_PIDS; do
+        if _whatap_attached "$pid"; then marked="$marked $pid"; else rest="$rest $pid"; fi
+    done
+    D_MARKED="$marked"
+    D_JVM_PIDS="$marked $rest"
+
+    # agent jars and homes from every attached JVM's own arguments
+    for pid in $D_JVM_PIDS; do
+        for a in $(_all_jvm_args "$pid" 2>/dev/null | grep -i '^-javaagent:.*whatap' | sed 's/^-javaagent://; s/=.*$//'); do
+            _add_jar "$a" "-javaagent of pid $pid"
+            _add_home "$(dirname "$a" 2>/dev/null)" "directory of the -javaagent jar of pid $pid"
+        done
+        v="$(_jvm_sysprop "$pid" whatap.home)"
+        [ -n "$v" ] && _add_home "$v" "-Dwhatap.home of pid $pid"
+        v="$(_jvm_sysprop "$pid" whatap.config.file)"
+        [ -n "$v" ] && _add_home "$(dirname "$v" 2>/dev/null)" "-Dwhatap.config.file of pid $pid"
+        v="$(_proc_env "$pid" WHATAP_CONFIG_FILE)"
+        [ -n "$v" ] && _add_home "$(dirname "$v" 2>/dev/null)" "env WHATAP_CONFIG_FILE of pid $pid"
+        v="$(_proc_env "$pid" WHATAP_HOME)"
+        [ -n "$v" ] && _add_home "$v" "env WHATAP_HOME of pid $pid"
+        v="$(_proc_env "$pid" WHATAP_JAVA_AGENT_PATH)"
+        if [ -n "$v" ]; then
+            _add_jar "$v" "env WHATAP_JAVA_AGENT_PATH of pid $pid"
+            _add_home "$(dirname "$v" 2>/dev/null)" "directory of WHATAP_JAVA_AGENT_PATH of pid $pid"
+        fi
+    done
+
+    # collector shell environment
+    [ -n "${WHATAP_HOME:-}" ] && _add_home "$WHATAP_HOME" "env WHATAP_HOME (collector shell)"
+    [ -n "${WHATAP_CONFIG_FILE:-}" ] && _add_home "$(dirname "$WHATAP_CONFIG_FILE" 2>/dev/null)" "env WHATAP_CONFIG_FILE (collector shell)"
+
+    # operator auto-injection volume (whatap-operator mounts the agent here)
+    [ -e /whatap-agent/whatap.agent.java.jar ] && _add_jar /whatap-agent/whatap.agent.java.jar "operator injection volume /whatap-agent"
+    [ -d /whatap-agent ] && _add_home /whatap-agent "operator injection volume /whatap-agent"
+
+    # java binaries on PATH, JAVA_HOME, and common install roots (shallow globs)
+    for v in java jsvc; do
+        exe="$(command -v "$v" 2>/dev/null)"
+        [ -n "$exe" ] && _add_java "$exe"
+    done
+    [ -n "${JAVA_HOME:-}" ] && _add_java "$JAVA_HOME/bin/java"
+    for exe in /usr/lib/jvm/*/bin/java /usr/java/*/bin/java /opt/java*/bin/java /opt/jdk*/bin/java; do
+        [ -x "$exe" ] && _add_java "$exe"
+    done
+}
+
+# ---- report body ---------------------------------------------------------------
+run_report() {
+    emit_header
+
+    # [1] capability preamble: every downstream "command not found" is
+    # pre-explained here.
+    section "Collection environment"
+    if [ -n "${BASH_VERSION:-}" ]; then fact "shell: bash $BASH_VERSION"
+    else fact "shell: POSIX sh (non-bash)"; fi
+    fact "uid: $(id -u 2>/dev/null || echo unknown) ($(id -un 2>/dev/null || echo unknown))"
+    fact "collector cwd: $(pwd 2>/dev/null || echo unknown)"
+    fact "tools:"
+    for t in java jstack jcmd jps unzip sha256sum ss netstat lsof readlink timeout stat awk tr; do
+        if command -v "$t" >/dev/null 2>&1; then printf '        %-12s present (%s)\n' "$t" "$(command -v "$t")"
+        else printf '        %-12s absent\n' "$t"; fi
+    done
+    fact "Tier 2 flags: --threads=$OPT_THREADS  --jcmd=$OPT_JCMD (0 = not requested)"
+    fact "library detail flags: --library=${OPT_LIBS:-none}  --library-all=$OPT_LIBALL  --class=${OPT_CLASSES:-none}"
+
+    _PATHSINK="${_errfile}.paths"
+    : > "$_PATHSINK" 2>/dev/null
+
+    discover
+
+    # [2] A. host / platform
+    section "A. Host / platform"
+    probe "kernel" uname -srm
+    read_proc "os-release" /etc/os-release
+    probe "cpu count (nproc)" nproc
+    fact "memory:"
+    grep -E '^(MemTotal|MemAvailable|SwapTotal)' /proc/meminfo 2>/dev/null | while IFS= read -r _l; do printf '        %s\n' "$_l"; done
+    read_proc "loadavg" /proc/loadavg
+    # the JVM sizes its heap and CPU-derived pools from these limits
+    if [ -f /sys/fs/cgroup/cgroup.controllers ]; then
+        fact "cgroup: v2 (unified)"
+        read_proc "cgroup memory.max" /sys/fs/cgroup/memory.max
+        read_proc "cgroup cpu.max" /sys/fs/cgroup/cpu.max
+    elif [ -d /sys/fs/cgroup/memory ]; then
+        fact "cgroup: v1"
+        read_proc "cgroup memory.limit_in_bytes" /sys/fs/cgroup/memory/memory.limit_in_bytes
+        read_proc "cgroup cpu cfs_quota_us" /sys/fs/cgroup/cpu/cpu.cfs_quota_us
+        read_proc "cgroup cpu cfs_period_us" /sys/fs/cgroup/cpu/cpu.cfs_period_us
+    else
+        fact "cgroup: n/a (path not found: /sys/fs/cgroup)"
+    fi
+    fact "container markers:"
+    for m in /.dockerenv /run/.containerenv; do
+        if [ -e "$m" ]; then printf '        %-22s present\n' "$m"; else printf '        %-22s absent\n' "$m"; fi
+    done
+    if [ -n "${KUBERNETES_SERVICE_HOST:-}" ]; then
+        printf '        %-22s %s\n' "KUBERNETES_SERVICE_HOST" "$KUBERNETES_SERVICE_HOST"
+    else
+        printf '        %-22s not set\n' "KUBERNETES_SERVICE_HOST"
+    fi
+    probe "self cgroup (first 5 lines)" sh -c "head -n 5 /proc/self/cgroup"
+    probe "pid 1 command" sh -c "tr '\0' ' ' < /proc/1/cmdline | cut -c1-160"
+    # clock: transaction timestamps and server-side correlation depend on it
+    probe "local time" date
+    probe "UTC time" date -u
+    probe "timedatectl" timedatectl
+
+    # [3] B. Java runtimes present on this host
+    section "B. Java runtimes discovered"
+    if [ -z "$D_JAVA_EXES" ]; then
+        fact "java binaries: none found among running processes, PATH, JAVA_HOME, /usr/lib/jvm"
+    fi
+    fact "env JAVA_HOME (collector shell): ${JAVA_HOME:-not set}"
+    _jc=0
+    for jv in $D_JAVA_EXES; do
+        _jc=$((_jc + 1))
+        if [ "$_jc" -gt 6 ]; then
+            fact "-- more java binaries found but not detailed (cap: 6)"
+            break
+        fi
+        fact "-- java binary: $jv"
+        fact "   resolves to: $(readlink -f "$jv" 2>/dev/null || echo "$jv")"
+        # the release file is free; -version starts a separate short-lived JVM
+        _rel="$(dirname "$(dirname "$(readlink -f "$jv" 2>/dev/null || echo "$jv")")")/release"
+        if [ -r "$_rel" ]; then
+            fact "   $_rel:"
+            grep -E '^(JAVA_VERSION|IMPLEMENTOR|JAVA_VERSION_DATE|OS_ARCH)=' "$_rel" 2>/dev/null | while IFS= read -r _l; do printf '        %s\n' "$_l"; done
+        else
+            fact "   release file: n/a (path not found: $_rel)"
+        fi
+        jvprobe "   version (separate short-lived JVM)" "$jv" -version
+    done
+
+    # [4] C. WhaTap Java agent artifacts on disk
+    section "C. WhaTap agent artifacts on disk"
+    if [ -z "$D_AGENT_JARS" ]; then
+        fact "whatap agent jars: none discovered (no -javaagent, no WHATAP_JAVA_AGENT_PATH, no /whatap-agent)"
+    else
+        fact "whatap agent jars discovered (read as files; never loaded or executed):"
+        printf '%s\n' "$D_AGENT_JARS" | while IFS='|' read -r p src; do
+            [ -n "$p" ] || continue
+            printf '        -- %s   <- %s\n' "$p" "$src"
+            fsp="$(resolve_fs "$p")"
+            if [ -z "$fsp" ]; then printf '           n/a (path not visible from this mount namespace)\n'; continue; fi
+            [ "$fsp" != "$p" ] && printf '           filesystem view: %s (read through a process root)\n' "$fsp"
+            printf '           resolves to: %s\n' "$(readlink -f "$fsp" 2>/dev/null || echo "$fsp")"
+            file_facts "           " "$fsp"
+            jar_version "           " "$fsp"
+        done
+    fi
+    # the helper CLI (whatap.javahelper) ships beside the agent and its output
+    # is quoted in weaving cases, so its presence and build are facts too
+    if [ -z "$D_AGENT_JARS" ]; then
+        fact "companion files next to an agent jar: n/a (no agent jar discovered)"
+    else
+        _comp="$(printf '%s\n' "$D_AGENT_JARS" | cut -d'|' -f1 | sort -u | while IFS= read -r p; do
+            [ -n "$p" ] || continue
+            d="$(dirname "$p" 2>/dev/null)"
+            fsd="$(resolve_fs "$d")"
+            [ -n "$fsd" ] || continue
+            ls "$fsd" 2>/dev/null | grep -i -E 'helper|whatap' | grep -v -F "$(basename "$p")" \
+                | head -n 20 | while IFS= read -r _l; do printf '%s/%s\n' "$fsd" "$_l"; done
+        done)"
+        if [ -n "$_comp" ]; then
+            fact "companion files next to an agent jar (javahelper and other whatap files):"
+            printf '%s\n' "$_comp" | while IFS= read -r _l; do printf '        %s\n' "$_l"; done
+        else
+            fact "companion files next to an agent jar (javahelper and other whatap files): none present"
+        fi
+    fi
+
+    # [5] D. JVM processes and how the agent is attached
+    section "D. JVM processes and agent attachment"
+    _n="$(echo $D_JVM_PIDS | wc -w | tr -d ' ')"
+    _nm="$(echo $D_MARKED | wc -w | tr -d ' ')"
+    if [ "${_n:-0}" -eq 0 ]; then
+        fact "JVM processes: none found in /proc (this pid namespace)"
+    else
+        fact "JVM processes found: $_n ($_nm carrying a WhaTap attach marker; those are listed first, detailing first 20)"
+        _shown=0
+        for pid in $D_JVM_PIDS; do
+            _shown=$((_shown + 1))
+            [ "$_shown" -gt 20 ] && { fact "-- remaining $((_n - 20)) JVM processes not detailed (cap: 20)"; break; }
+            printf '        -- pid %s (ppid %s)\n' "$pid" "$(awk '/^PPid:/{print $2}' "/proc/$pid/status" 2>/dev/null)"
+            printf '           comm: %s\n' "$(cat "/proc/$pid/comm" 2>/dev/null)"
+            printf '           exe: %s\n' "$(readlink -f "/proc/$pid/exe" 2>/dev/null || echo 'n/a (permission denied or gone)')"
+            printf '           uid/state/threads: %s\n' "$(awk '/^Uid:/{u=$2} /^State:/{s=$2} /^Threads:/{t=$2} END{print u" / "s" / "t}' "/proc/$pid/status" 2>/dev/null)"
+            printf '           VmRSS: %s\n' "$(awk '/^VmRSS:/{print $2" "$3}' "/proc/$pid/status" 2>/dev/null)"
+            printf '           start time (ps): %s\n' "$(ps -o lstart= -p "$pid" 2>/dev/null | head -n1)"
+            printf '           cwd: %s\n' "$(readlink -f "/proc/$pid/cwd" 2>/dev/null || echo 'n/a (permission denied or gone)')"
+            # where the boot banner and any SIGQUIT dump land
+            printf '           stdout (fd 1) -> %s\n' "$(readlink "/proc/$pid/fd/1" 2>/dev/null || echo 'n/a (permission denied or gone)')"
+            printf '           stderr (fd 2) -> %s\n' "$(readlink "/proc/$pid/fd/2" 2>/dev/null || echo 'n/a (permission denied or gone)')"
+            printf '           cmdline (verbatim):\n'
+            tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null | while IFS= read -r _l; do printf '             %s\n' "$_l"; done
+            # every -javaagent reaching this JVM, from all four argument sources
+            _ja="$(_all_jvm_args "$pid" 2>/dev/null | grep -c '^-javaagent:')"
+            printf '           -javaagent options reaching this JVM: %s\n' "${_ja:-0}"
+            _all_jvm_args "$pid" 2>/dev/null | grep '^-javaagent:' | while IFS= read -r _l; do
+                _jp="$(printf '%s' "$_l" | sed 's/^-javaagent://; s/=.*$//')"
+                if [ -e "$_jp" ]; then _ex="file present"; else _ex="file not found at this path"; fi
+                printf '             %s   (%s)\n' "$_l" "$_ex"
+            done
+            for _ev in JAVA_TOOL_OPTIONS JDK_JAVA_OPTIONS _JAVA_OPTIONS JAVA_OPTS CATALINA_OPTS JAVA_OPTIONS; do
+                _v="$(_proc_env "$pid" "$_ev")"
+                if [ -n "$_v" ]; then printf '           env %s=%s\n' "$_ev" "$(printf '%s' "$_v" | cut -c1-400)"; fi
+            done
+            # server type markers — the same properties the agent's own
+            # ProcessTypeDetector reads to name the process type
+            _smk=0
+            printf '           server markers:\n'
+            for _sp in catalina.base catalina.home catalina.useNaming jboss.home.dir jboss.server.name jboss.server.base.dir jeus.home weblogic.Name domain.home was.install.root server.root java.protocol.handler.pkgs spring.profiles.active; do
+                _v="$(_jvm_sysprop "$pid" "$_sp")"
+                if [ -n "$_v" ]; then _smk=$((_smk + 1)); printf '             -D%s=%s\n' "$_sp" "$(printf '%s' "$_v" | cut -c1-200)"; fi
+            done
+            if _all_jvm_args "$pid" 2>/dev/null | grep -qi 'org.springframework.boot.loader'; then
+                _smk=$((_smk + 1)); printf '             spring boot loader on the arguments: yes\n'
+            fi
+            [ "$_smk" = 0 ] && printf '             none of the known server properties are set on this JVM\n'
+            # program identity: the option values (-cp, -jar, --module-path …)
+            # are skipped so a classpath is never reported as a main class
+            _jarv="$(_all_jvm_args "$pid" 2>/dev/null | awk 'p=="-jar"{print; exit} {p=$0}')"
+            if [ -n "$_jarv" ]; then
+                printf '           program: executable jar %s\n' "$_jarv"
+            else
+                _mc="$(tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null | awk '
+                    NR==1 {p=$0; next}
+                    (p=="-cp"||p=="-classpath"||p=="--class-path"||p=="-p"||p=="--module-path"||p=="-jar"||p=="-m"||p=="--module"||p=="--add-opens"||p=="--add-exports") {p=$0; next}
+                    substr($0,1,1)=="-" {p=$0; next}
+                    {print; exit}')"
+                printf '           program: main class %s\n' "$(printf '%s' "${_mc:-n/a (no main class on the command line)}" | cut -c1-200)"
+            fi
+        done
+    fi
+
+    # [6] E. Agent home resolution and configuration
+    section "E. Agent home resolution and configuration"
+    fact "resolution the agent performs (whatap.agent.Configure.getPropertyFile):"
+    fact "  env WHATAP_CONFIG_FILE  >  -Dwhatap.config.file  >  -Dwhatap.home (default \".\" = process working directory) + -Dwhatap.config (default \"whatap.conf\")"
+    fact "  values in the file are then overlaid with environment variables and system properties (whatap.lang.conf.ConfigValueUtil.replaceSysProp); env names may contain dots"
+    if [ "${_nm:-0}" -eq 0 ]; then
+        fact "per-process resolution: n/a (no JVM carrying a WhaTap attach marker)"
+    fi
+    for pid in $D_MARKED; do
+        fact "-- pid $pid"
+        _cf="$(_proc_env "$pid" WHATAP_CONFIG_FILE)"; _src="env WHATAP_CONFIG_FILE"
+        if [ -z "$_cf" ]; then _cf="$(_jvm_sysprop "$pid" whatap.config.file)"; _src="-Dwhatap.config.file"; fi
+        if [ -z "$_cf" ]; then
+            _hm="$(_jvm_sysprop "$pid" whatap.home)"; _src="-Dwhatap.home"
+            if [ -z "$_hm" ]; then _hm="$(readlink -f "/proc/$pid/cwd" 2>/dev/null)"; _src="process working directory (whatap.home unset, default \".\")"; fi
+            _cn="$(_jvm_sysprop "$pid" whatap.config)"
+            [ -z "$_cn" ] && _cn="whatap.conf"
+            _cf="$_hm/$_cn"
+        else
+            _hm="$(dirname "$_cf" 2>/dev/null)"
+        fi
+        fact "   config path resolved by this collector: $_cf   <- $_src"
+        fact "   home used for the artifacts below: $_hm"
+        _fsh="$(resolve_fs "$_hm")"
+        _fsc="$(resolve_fs "$_cf")"
+        if [ -n "$_fsc" ]; then
+            [ "$_fsc" != "$_cf" ] && fact "   filesystem view: $_fsc (read through a process root)"
+            dump_file "   whatap.conf (verbatim)" "$_fsc" 400
+            conf_bytes "   whatap.conf byte facts" "$_fsc"
+        else
+            fact "   whatap.conf: n/a (path not found: $_cf)"
+        fi
+        # whatap-related environment of THIS process, verbatim
+        if [ -r "/proc/$pid/environ" ]; then
+            _wenv="$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null \
+                | grep -iE '^(WHATAP|whatap\.|license=|accesskey=|OKIND=|PODNAME=|POD_NAME=|NODE_NAME=|NODE_IP=)' \
+                | cut -c1-400)"
+            if [ -n "$_wenv" ]; then
+                fact "   whatap-related environment variables of this process:"
+                printf '%s\n' "$_wenv" | while IFS= read -r _l; do printf '             %s\n' "$_l"; done
+            else
+                fact "   whatap-related environment variables of this process: none set"
+            fi
+            # whatap.env is a properties blob applied on top of everything else
+            _we="$(_proc_env "$pid" whatap.env)"
+            if [ -n "$_we" ]; then fact "   env whatap.env (properties text applied over the config): $(printf '%s' "$_we" | cut -c1-400)"; fi
+        else
+            fact "   environ: n/a (permission denied: /proc/$pid/environ)"
+        fi
+        _wsp="$(_all_jvm_args "$pid" 2>/dev/null | grep -i '^-Dwhatap' | cut -c1-300)"
+        if [ -n "$_wsp" ]; then
+            fact "   whatap system properties on the arguments of this process:"
+            printf '%s\n' "$_wsp" | while IFS= read -r _l; do printf '             %s\n' "$_l"; done
+        else
+            fact "   whatap system properties on the arguments of this process: none set"
+        fi
+        # other files the agent reads or writes in its home
+        if [ -n "$_fsh" ]; then
+            probe "   home listing" sh -c "ls -la '$_fsh' 2>/dev/null | head -n 60"
+            for _sf in security.conf paramkey.txt; do
+                if [ -f "$_fsh/$_sf" ]; then
+                    fact "   $_sf: present, $(wc -c < "$_fsh/$_sf" 2>/dev/null | tr -d ' ') bytes (content not collected — SQL-parameter encryption key)"
+                else
+                    fact "   $_sf: absent"
+                fi
+            done
+            _ccp="$(_proc_env "$pid" WHATAP_CONTAINER_CONF_PATH)"
+            [ -n "$_ccp" ] && fact "   env WHATAP_CONTAINER_CONF_PATH: $_ccp"
+            dump_file "   container.conf (container id written by the k8s node agent)" "${_ccp:-$_fsh}/container.conf" 40
+        else
+            fact "   home listing: n/a (path not visible from this mount namespace: $_hm)"
+        fi
+    done
+    if [ -n "$D_HOMES" ]; then
+        fact "all agent home candidates discovered (union of every source):"
+        printf '%s\n' "$D_HOMES" | while IFS='|' read -r _p _s; do printf '        %s   <- %s\n' "$_p" "$_s"; done
+    fi
+
+    # [7] F. Application libraries visible to the target JVMs
+    section "F. Application libraries visible to the target JVMs"
+    fact "the -javaagent jar is excluded from every list below: it bundles the agent's weaving-module markers, which a scan that includes it reports instead of the application's own libraries"
+    if [ "${_nm:-0}" -eq 0 ]; then
+        fact "n/a (no JVM carrying a WhaTap attach marker)"
+    fi
+    _pc=0
+    for pid in $D_MARKED; do
+        _pc=$((_pc + 1))
+        [ "$_pc" -gt 4 ] && { fact "-- remaining attached JVMs not detailed in this section (cap: 4)"; break; }
+        fact "-- pid $pid"
+        _LIBSINK="${_errfile}.libs.$pid"
+        : > "$_LIBSINK" 2>/dev/null
+        # 1) explicit classpath given to this JVM
+        _cp="$(_all_jvm_args "$pid" 2>/dev/null | awk 'p=="-cp"||p=="-classpath"{print; exit} {p=$0}')"
+        [ -z "$_cp" ] && _cp="$(_jvm_sysprop "$pid" java.class.path)"
+        if [ -n "$_cp" ]; then
+            _cpn="$(printf '%s' "$_cp" | tr ':' '\n' | grep -c .)"
+            fact "   -cp / -classpath entries: $_cpn (first 120, agent jar excluded)"
+            printf '%s' "$_cp" | tr ':' '\n' | grep -v -i 'whatap.agent' | head -n 120 | while IFS= read -r _l; do
+                [ -n "$_l" ] || continue
+                printf '             %s\n' "$_l"
+                _lib_record "${_l##*/}"
+                case "$_l" in *.jar) _path_record "file|$_l" ;; esac
+            done
+        else
+            fact "   -cp / -classpath: not set on this JVM"
+        fi
+        _cpe="$(_proc_env "$pid" CLASSPATH)"
+        [ -n "$_cpe" ] && fact "   env CLASSPATH: $(printf '%s' "$_cpe" | cut -c1-400)"
+        # 2) executable jar (Spring Boot fat jar carries its libraries inside)
+        _jar="$(_all_jvm_args "$pid" 2>/dev/null | awk 'p=="-jar"{print; exit} {p=$0}')"
+        if [ -n "$_jar" ]; then
+            fact "   executable jar: $_jar"
+            _fsj="$(resolve_fs "$_jar")"
+            if [ -n "$_fsj" ]; then
+                bootjar_facts "             " "$_fsj"
+                fact "   libraries packed inside that jar:"
+                jar_entries "             " "$_fsj" 'BOOT-INF/lib/*' 200
+                jar_entries "             " "$_fsj" 'WEB-INF/lib/*' 200
+            else
+                fact "     n/a (path not visible from this mount namespace)"
+            fi
+        else
+            fact "   executable jar (-jar): not set on this JVM"
+        fi
+        # 3) server deploy and lib directories derived from this JVM's own -D
+        _cb="$(_jvm_sysprop "$pid" catalina.base)"; _ch="$(_jvm_sysprop "$pid" catalina.home)"
+        _jb="$(_jvm_sysprop "$pid" jboss.home.dir)"; _jsb="$(_jvm_sysprop "$pid" jboss.server.base.dir)"
+        _je="$(_jvm_sysprop "$pid" jeus.home)"; _dh="$(_jvm_sysprop "$pid" domain.home)"
+        # catalina.base and catalina.home are one directory in a single-instance
+        # install and two in a split install; list each distinct path once
+        _seen_d=""
+        for _d in "$_cb" "$_ch"; do
+            [ -n "$_d" ] || continue
+            case "$_seen_d" in *"|$_d|"*) continue ;; esac
+            _seen_d="$_seen_d|$_d|"
+            _fsd="$(resolve_fs "$_d")"
+            [ -n "$_fsd" ] || { fact "   server directory (catalina): $_d — n/a (path not visible from this mount namespace)"; continue; }
+            fact "   server directory (catalina): $_d"
+            list_jars "             " "$_fsd/lib" 120
+            for _w in "$_fsd"/webapps/*/WEB-INF/lib; do
+                [ -d "$_w" ] && list_jars "             " "$_w" 120
+            done
+        done
+        if [ -n "$_jb" ]; then
+            fact "   server directory (jboss.home.dir): $_jb"
+            _fsd="$(resolve_fs "$_jb")"
+            if [ -n "$_fsd" ]; then
+                list_jars "             " "$_fsd/lib" 60
+                for _dd in "$_fsd"/server/*/deploy "$_fsd"/server/*/lib "$_fsd"/standalone/deployments; do
+                    [ -d "$_dd" ] && list_deploy "             " "$_dd"
+                done
+            else
+                fact "     n/a (path not visible from this mount namespace)"
+            fi
+        fi
+        if [ -n "$_jsb" ]; then
+            _fsd="$(resolve_fs "$_jsb")"
+            [ -n "$_fsd" ] && { fact "   server base directory (jboss.server.base.dir): $_jsb"; list_deploy "             " "$_fsd/deployments"; }
+        fi
+        for _d in "$_je" "$_dh"; do
+            [ -n "$_d" ] || continue
+            _fsd="$(resolve_fs "$_d")"
+            [ -n "$_fsd" ] && { fact "   server directory: $_d"; probe "     listing" sh -c "ls '$_fsd' 2>/dev/null | head -n 40"; }
+        done
+        # 4) open jar files held by the process — covers layouts none of the
+        #    above describe (custom launchers, exploded frameworks)
+        if [ -r "/proc/$pid/fd" ]; then
+            _oj="$(ls -l "/proc/$pid/fd" 2>/dev/null | grep -i '\.jar$' | awk '{print $NF}' | grep -v -i 'whatap.agent')"
+            _ojn="$(printf '%s\n' "$_oj" | grep -c .)"
+            fact "   jar files currently open by this process: ${_ojn:-0} (first 120, agent jar excluded)"
+            printf '%s\n' "$_oj" | head -n 120 | while IFS= read -r _l; do
+                [ -n "$_l" ] || continue
+                printf '             %s\n' "$_l"
+                _lib_record "${_l##*/}"
+                _path_record "file|$_l"
+            done
+        else
+            fact "   open jar files: n/a (permission denied: /proc/$pid/fd)"
+        fi
+        _LIBSINK=""
+    done
+
+    # [8] G. Agent instrumentation surface and weaving activation
+    # The most frequent Java case is "the agent is installed but the hitmap
+    # stays empty". Reading it needs four facts side by side: what the
+    # application carries (section F), what THIS agent build can instrument
+    # (the bundled catalog below — read from the installed jar, so it matches
+    # the deployed version exactly), which modules the configuration selects,
+    # and which modules the process actually loaded (the agent log lines).
+    section "G. Agent instrumentation surface and weaving activation"
+    fact "the lists below come from the installed agent jar itself, so they describe the deployed version; read them against the application libraries in section F"
+    if [ -z "$D_AGENT_JARS" ]; then
+        fact "bundled instrumentation: n/a (no agent jar discovered)"
+    else
+        printf '%s\n' "$D_AGENT_JARS" | cut -d'|' -f1 | sort -u | while IFS= read -r p; do
+            [ -n "$p" ] || continue
+            fsp="$(resolve_fs "$p")"
+            [ -n "$fsp" ] || { fact "-- agent jar $p: n/a (path not visible from this mount namespace)"; continue; }
+            fact "-- agent jar: $p"
+            # weaving modules the jar carries; WeaveMain loads them from the
+            # jar resource /weaving/<name>.jar for each name in the weaving list
+            fact "   weaving modules bundled in this jar (loaded on demand from the weaving list):"
+            jar_entries "             " "$fsp" 'weaving/*' 200
+            # built-in bytecode instrumentation classes present in this build
+            fact "   built-in instrumentation classes in this jar (whatap/agent/asm):"
+            jar_entries "             " "$fsp" 'whatap/agent/asm/*ASM.class' 150
+        done
+    fi
+    # a jar dropped into <home>/weaving is loaded whole-directory, independent
+    # of the weaving list (WeaveMain.load -> listup)
+    if [ -z "$D_HOMES" ]; then
+        fact "on-disk weaving plugin directories: n/a (no agent home discovered)"
+    else
+        printf '%s\n' "$D_HOMES" | cut -d'|' -f1 | sort -u | while IFS= read -r home; do
+            [ -n "$home" ] || continue
+            fshome="$(resolve_fs "$home")"
+            [ -n "$fshome" ] || continue
+            if [ -d "$fshome/weaving" ]; then
+                fact "-- on-disk plugin directory $home/weaving (every jar here is loaded while weaving_plugin_enabled is true, independent of the weaving list):"
+                list_jars "             " "$fshome/weaving" 120
+            fi
+        done
+    fi
+    # which modules the configuration selects — the lines are selected from the
+    # config file dumped verbatim in section E, kept here next to the catalog
+    if [ "${_nm:-0}" -eq 0 ]; then
+        fact "instrumentation settings in force: n/a (no JVM carrying a WhaTap attach marker)"
+    fi
+    for pid in $D_MARKED; do
+        _cf2="$(_proc_env "$pid" WHATAP_CONFIG_FILE)"
+        [ -z "$_cf2" ] && _cf2="$(_jvm_sysprop "$pid" whatap.config.file)"
+        if [ -z "$_cf2" ]; then
+            _hm2="$(_jvm_sysprop "$pid" whatap.home)"
+            [ -z "$_hm2" ] && _hm2="$(readlink -f "/proc/$pid/cwd" 2>/dev/null)"
+            _cn2="$(_jvm_sysprop "$pid" whatap.config)"
+            [ -z "$_cn2" ] && _cn2="whatap.conf"
+            _cf2="$_hm2/$_cn2"
+        fi
+        _fsc2="$(resolve_fs "$_cf2")"
+        if [ -z "$_fsc2" ] || [ ! -r "$_fsc2" ]; then
+            fact "-- pid $pid instrumentation settings: n/a (config file not readable: $_cf2)"
+        else
+            _wk="$(grep -nE '^[[:space:]]*(weaving|weaving_reserved|weaving_[A-Za-z0-9_]*|hook_service_[A-Za-z_]*|hook_method_[A-Za-z_]*|hook_component|instrumentation_[A-Za-z0-9_]*|_enable_asm_[a-z]*|_enable_emb_[a-z]*|trace_component_enabled|bci_ignore_packages)[[:space:]]*=' "$_fsc2" 2>/dev/null | head -n 60)"
+            if [ -n "$_wk" ]; then
+                fact "-- pid $pid instrumentation settings (selected from the config file shown in section E, with line numbers):"
+                printf '%s\n' "$_wk" | while IFS= read -r _l; do printf '             %s\n' "$_l"; done
+            else
+                fact "-- pid $pid instrumentation settings: no weaving / hook / instrumentation key set in $_cf2"
+            fi
+        fi
+        _wenvp="$(_all_jvm_args "$pid" 2>/dev/null | grep -iE '^-D(weaving|hook_|instrumentation_)' | cut -c1-300)"
+        [ -n "$_wenvp" ] && printf '%s\n' "$_wenvp" | while IFS= read -r _l; do printf '             (argument) %s\n' "$_l"; done
+        # each name in the weaving list is loaded from the jar resource
+        # weaving/<name>.jar — state per name whether that entry exists in the
+        # jar attached to THIS process (the same check the report already makes
+        # for a -javaagent path)
+        _wlist=""
+        [ -n "$_fsc2" ] && [ -r "$_fsc2" ] && _wlist="$(grep -aE '^[[:space:]]*(weaving|weaving_reserved)[[:space:]]*=' "$_fsc2" 2>/dev/null | head -n 2 | sed 's/^[^=]*=//' | tr ',' '\n' | tr -d ' \r')"
+        if [ -n "$_wlist" ]; then
+            _pjar="$(_all_jvm_args "$pid" 2>/dev/null | grep -i '^-javaagent:.*whatap' | head -n1 | sed 's/^-javaagent://; s/=.*$//')"
+            _fspj="$(resolve_fs "$_pjar")"
+            if [ -z "$_fspj" ] || ! have unzip; then
+                fact "   weaving list entries vs the jar of this process: n/a (agent jar not readable here, or command not found: unzip)"
+            else
+                _cat="${_errfile}.weav.$pid"
+                if [ -n "$_timeout_bin" ]; then "$_timeout_bin" "$CMD_TIMEOUT" unzip -Z1 "$_fspj" 'weaving/*' > "$_cat" 2>/dev/null
+                else unzip -Z1 "$_fspj" 'weaving/*' > "$_cat" 2>/dev/null; fi
+                fact "   weaving list entries vs the modules bundled in $_pjar:"
+                printf '%s\n' "$_wlist" | while IFS= read -r _m; do
+                    [ -n "$_m" ] || continue
+                    if grep -qxF "weaving/$_m.jar" "$_cat" 2>/dev/null; then
+                        printf '             %-40s bundled in this jar\n' "$_m"
+                    else
+                        printf '             %-40s no weaving/%s.jar entry in this jar\n' "$_m" "$_m"
+                    fi
+                done
+                rm -f "$_cat" 2>/dev/null
+            fi
+        fi
+    done
+    # what actually loaded in the running process: the agent writes one
+    # "Weaving" line per module it loads, and a Warning/Error line when a
+    # module's compiled class version is above the target class version
+    if [ -z "$D_HOMES" ]; then
+        fact "weaving activity in the agent log: n/a (no agent home discovered)"
+    else
+        printf '%s\n' "$D_HOMES" | cut -d'|' -f1 | sort -u | while IFS= read -r home; do
+            [ -n "$home" ] || continue
+            fshome="$(resolve_fs "$home")"
+            [ -n "$fshome" ] || continue
+            weaving_lines "$home/logs/whatap.log" "$fshome/logs/whatap.log"
+            # after a rotation the module load lines sit in the previous file
+            _rot2="$(ls -t "$fshome"/logs/whatap-*.log 2>/dev/null | head -n 1)"
+            [ -n "$_rot2" ] && weaving_lines "$(basename "$_rot2") (most recent rotated log)" "$_rot2"
+        done
+    fi
+
+    # [9] H. Application logging stack
+    section "H. Application logging stack"
+    _lgp=0
+    fact "logging framework configuration properties on the attached JVMs:"
+    for pid in $D_MARKED; do
+        for _lp in logback.configurationFile logback.statusListenerClass log4j.configuration log4j.configurationFile log4j2.configurationFile java.util.logging.config.file java.util.logging.manager org.jboss.logging.provider; do
+            _v="$(_jvm_sysprop "$pid" "$_lp")"
+            if [ -n "$_v" ]; then _lgp=$((_lgp + 1)); printf '        pid %s  -D%s=%s\n' "$pid" "$_lp" "$_v"; fi
+        done
+    done
+    [ "$_lgp" = 0 ] && fact "    none of the known logging properties are set on the attached JVMs"
+    # filtered from the library inventory of section F (classpath entries, jar
+    # contents, server lib directories and open jar files), so a library that
+    # is present but not yet opened is still reported
+    fact "logging framework libraries in the section F inventory:"
+    for pid in $D_MARKED; do
+        _lf="${_errfile}.libs.$pid"
+        if [ ! -s "$_lf" ]; then printf '        pid %s: n/a (no libraries enumerated in section F)\n' "$pid"; continue; fi
+        _lgj="$(grep -i -E 'logback|log4j|slf4j|commons-logging|jboss-logging|logstash|tinylog|jcl-over|jul-to' "$_lf" 2>/dev/null | sort -u | head -n 40)"
+        if [ -n "$_lgj" ]; then
+            printf '%s\n' "$_lgj" | while IFS= read -r _l; do printf '        pid %s  %s\n' "$pid" "$_l"; done
+        else
+            printf '        pid %s: no logging framework library among %s enumerated entries\n' "$pid" "$(grep -c . "$_lf" 2>/dev/null)"
+        fi
+    done
+    _lgc=0
+    fact "logging configuration files in the working directory of each attached JVM (one level):"
+    for pid in $D_MARKED; do
+        _cwd="$(readlink -f "/proc/$pid/cwd" 2>/dev/null)"
+        [ -n "$_cwd" ] || continue
+        _lgf="$(ls "$_cwd" 2>/dev/null | grep -i -E '^(logback|log4j|log4j2|logging)[^/]*\.(xml|properties|yaml|yml|json)$' | head -n 10)"
+        if [ -n "$_lgf" ]; then
+            _lgc=$((_lgc + 1))
+            printf '%s\n' "$_lgf" | while IFS= read -r _l; do printf '        pid %s  %s/%s\n' "$pid" "$_cwd" "$_l"; done
+        fi
+    done
+    [ "$_lgc" = 0 ] && fact "    none present in any attached JVM working directory"
+    # console destination and on-disk server logs: the collected volume and the
+    # on-disk volume can differ, and both are facts a reader compares
+    fact "console destination and server log files of each attached JVM:"
+    for pid in $D_MARKED; do
+        printf '        pid %s stdout -> %s\n' "$pid" "$(readlink "/proc/$pid/fd/1" 2>/dev/null || echo 'n/a (permission denied or gone)')"
+        _cb="$(_jvm_sysprop "$pid" catalina.base)"
+        _jsb="$(_jvm_sysprop "$pid" jboss.server.base.dir)"
+        _cwd="$(readlink -f "/proc/$pid/cwd" 2>/dev/null)"
+        for _ld in "$_cb/logs" "$_jsb/log" "$_cwd/logs" "$_cwd/log"; do
+            case "$_ld" in /logs|/log) continue ;; esac
+            _fsl="$(resolve_fs "$_ld")"
+            [ -n "$_fsl" ] || continue
+            [ -d "$_fsl" ] || continue
+            printf '        pid %s log dir %s (newest 15 by name):\n' "$pid" "$_ld"
+            ls -la "$_fsl" 2>/dev/null | tail -n 15 | while IFS= read -r _l; do printf '             %s\n' "$_l"; done
+        done
+    done
+
+    # [10] I. WhaTap agent logs
+    section "I. WhaTap agent logs"
+    # default log_root is <whatap.home>/logs, log_name "whatap"; the live file
+    # is <log_name>.log and rotation renames it to <log_name>-YYYYMMDD.log
+    if [ -z "$D_HOMES" ]; then
+        fact "no agent home discovered; no log locations to read"
+    else
+        printf '%s\n' "$D_HOMES" | cut -d'|' -f1 | sort -u | while IFS= read -r home; do
+            [ -n "$home" ] || continue
+            fshome="$(resolve_fs "$home")"
+            [ -n "$fshome" ] || continue
+            [ -d "$fshome/logs" ] || continue
+            fact "-- log dir: $home/logs"
+            probe "   listing" sh -c "ls -la '$fshome/logs' 2>/dev/null | head -n 60"
+            # the live log opens with the agent banner: "WhaTap Java v<version>"
+            head_file "   whatap.log (first lines: banner and version)" "$fshome/logs/whatap.log" 40
+            tail_file "   whatap.log (recent lines)" "$fshome/logs/whatap.log" 200
+            _rot="$(ls -t "$fshome"/logs/whatap-*.log 2>/dev/null | head -n 1)"
+            if [ -n "$_rot" ]; then
+                tail_file "   $(basename "$_rot") (most recent rotated log, recent lines)" "$_rot" 120
+            else
+                fact "   rotated logs (whatap-YYYYMMDD.log): none present"
+            fi
+            if [ -r "$fshome/logs/whatap.log" ]; then
+                fact "   [WA*] codes in the last 500 lines of whatap.log:"
+                tail -n 500 "$fshome/logs/whatap.log" 2>/dev/null | grep -oE '\[WA[0-9A-Za-z-]*\]' | sort | uniq -c | sort -rn | head -n 20 | while IFS= read -r _l; do printf '        %s\n' "$_l"; done
+            fi
+        done
+    fi
+
+    # [11] J. Network endpoints
+    section "J. Network endpoints"
+    # the agent opens an outbound TCP session to whatap.server.host:port
+    # (default port 6600); the configured value is in section E
+    fact "whatap.server.host / whatap.server.port reaching each attached JVM through env or -D:"
+    for pid in $D_MARKED; do
+        for _k in whatap.server.host whatap.server.port WHATAP_SERVER_HOST WHATAP_SERVER_PORT; do
+            _v="$(_proc_env "$pid" "$_k")"
+            [ -n "$_v" ] && printf '        pid %s  env %s=%s\n' "$pid" "$_k" "$_v"
+            _v="$(_jvm_sysprop "$pid" "$_k")"
+            [ -n "$_v" ] && printf '        pid %s  -D%s=%s\n' "$pid" "$_k" "$_v"
+        done
+    done
+    if have ss; then
+        probe "tcp sessions of the attached JVMs and port 6600" sh -c "ss -tnp 2>/dev/null | awk 'NR==1 || /java/ || /:6600/' | head -n 60"
+    elif have netstat; then
+        probe "tcp sessions of the attached JVMs and port 6600" sh -c "netstat -tnp 2>/dev/null | awk 'NR<=2 || /java/ || /:6600/' | head -n 60"
+    else
+        fact "socket listing: n/a (command not found: ss, netstat); raw table follows"
+        probe "raw /proc/net/tcp (first 30 lines, ports in hex; 0x19C8=6600)" sh -c "head -n 30 /proc/net/tcp"
+    fi
+    read_proc "/etc/resolv.conf" /etc/resolv.conf
+    fact "proxy variables in the collector shell: ${http_proxy:+http_proxy=$http_proxy }${https_proxy:+https_proxy=$https_proxy }${no_proxy:+no_proxy=$no_proxy}"
+
+    # [12] K. Kubernetes / operator injection context
+    section "K. Kubernetes / operator injection context"
+    # the operator injects -javaagent:/whatap-agent/whatap.agent.java.jar through
+    # JAVA_TOOL_OPTIONS and sets WHATAP_JAVA_AGENT_PATH plus the connection env
+    if [ -d /whatap-agent ]; then
+        probe "/whatap-agent listing (operator injection volume)" sh -c "ls -la /whatap-agent 2>/dev/null | head -n 40"
+    else
+        fact "/whatap-agent: n/a (path not found — operator injection volume absent)"
+    fi
+    fact "env WHATAP_JAVA_AGENT_PATH (collector shell): ${WHATAP_JAVA_AGENT_PATH:-not set}"
+    fact "env JAVA_TOOL_OPTIONS (collector shell): ${JAVA_TOOL_OPTIONS:-not set}"
+    for v in POD_NAME PODNAME NODE_NAME NODE_IP OKIND WHATAP_MICRO_ENABLED; do
+        eval "_val=\${$v:-}"
+        if [ -n "$_val" ]; then fact "env $v: $_val"; else fact "env $v: not set"; fi
+    done
+    [ -d /var/run/secrets/kubernetes.io ] && fact "/var/run/secrets/kubernetes.io: present" || fact "/var/run/secrets/kubernetes.io: absent"
+    read_proc "container hostname (/etc/hostname)" /etc/hostname
+
+    # [13] L. Tier 2 — only when explicitly requested
+    section "L. Tier 2 artifacts (opt-in)"
+    if [ "$OPT_THREADS" = 0 ] && [ "$OPT_JCMD" = 0 ]; then
+        fact "not requested (--threads / --jcmd absent); no attach, signal, or pause was applied to any JVM"
+    fi
+    if [ "$OPT_THREADS" != 0 ] 2>/dev/null; then
+        _tn="$OPT_THREADS"
+        [ "$_tn" -ge 1 ] 2>/dev/null || _tn=1
+        _tp=0
+        for pid in $D_MARKED; do
+            _tp=$((_tp + 1))
+            [ "$_tp" -gt 3 ] && { fact "-- remaining attached JVMs not dumped (cap: 3)"; break; }
+            warn "[Tier2] thread dump: pid $pid x$_tn — pauses the target JVM at a safepoint for each dump"
+            _k=1
+            while [ "$_k" -le "$_tn" ]; do
+                if have jstack; then
+                    fact "-- thread dump pid $pid ($_k/$_tn) via jstack -l (first 5000 lines):"
+                    if [ -n "$_timeout_bin" ]; then "$_timeout_bin" 60 jstack -l "$pid" 2>&1 | head -n 5000 | while IFS= read -r _l; do printf '        %s\n' "$_l"; done
+                    else jstack -l "$pid" 2>&1 | head -n 5000 | while IFS= read -r _l; do printf '        %s\n' "$_l"; done; fi
+                elif have jcmd; then
+                    fact "-- thread dump pid $pid ($_k/$_tn) via jcmd Thread.print -l (first 5000 lines):"
+                    if [ -n "$_timeout_bin" ]; then "$_timeout_bin" 60 jcmd "$pid" Thread.print -l 2>&1 | head -n 5000 | while IFS= read -r _l; do printf '        %s\n' "$_l"; done
+                    else jcmd "$pid" Thread.print -l 2>&1 | head -n 5000 | while IFS= read -r _l; do printf '        %s\n' "$_l"; done; fi
+                else
+                    warn "[Tier2] jstack and jcmd absent: sending SIGQUIT to pid $pid — the dump goes to that process's stdout"
+                    kill -3 "$pid" 2>/dev/null
+                    fact "-- thread dump pid $pid ($_k/$_tn): jstack and jcmd absent; SIGQUIT sent, output goes to the process stdout shown in section D"
+                fi
+                [ "$_k" -lt "$_tn" ] && sleep 2
+                _k=$((_k + 1))
+            done
+        done
+        [ "$_tp" = 0 ] && fact "thread dumps: n/a (no JVM carrying a WhaTap attach marker)"
+    fi
+    if [ "$OPT_JCMD" != 0 ]; then
+        if ! have jcmd; then
+            fact "jcmd data: n/a (command not found: jcmd)"
+        else
+            _jp=0
+            for pid in $D_MARKED; do
+                _jp=$((_jp + 1))
+                [ "$_jp" -gt 3 ] && { fact "-- remaining attached JVMs not queried (cap: 3)"; break; }
+                warn "[Tier2] jcmd: pid $pid — uses the JVM attach mechanism on the target process"
+                probe "-- jcmd $pid VM.command_line" jcmd "$pid" VM.command_line
+                probe "-- jcmd $pid VM.system_properties" jcmd "$pid" VM.system_properties
+                probe "-- jcmd $pid VM.flags" jcmd "$pid" VM.flags
+                probe "-- jcmd $pid VM.version" jcmd "$pid" VM.version
+            done
+            [ "$_jp" = 0 ] && fact "jcmd data: n/a (no JVM carrying a WhaTap attach marker)"
+        fi
+    fi
+
+    # [14] M. Library detail pack — only when explicitly requested
+    # Writing a new weaving module needs more than a file name: the module is
+    # compiled against the customer's own artifact, redeclares the target
+    # class's fields and method signatures, and must not be compiled for a
+    # class-file version above the target's. This section carries exactly
+    # those inputs for the libraries named on the command line.
+    section "M. Library detail pack (opt-in)"
+    if [ "$OPT_LIBALL" = 0 ] && [ -z "$OPT_LIBS" ]; then
+        fact "not requested (--library / --library-all absent)"
+    elif [ ! -s "$_PATHSINK" ]; then
+        fact "no locatable jar was enumerated in section F; nothing to detail"
+    else
+        [ -n "$OPT_LIBS" ] && fact "patterns requested:$OPT_LIBS"
+        [ "$OPT_LIBALL" = 1 ] && fact "patterns requested: --library-all (every enumerated jar)"
+        [ -n "$OPT_CLASSES" ] && fact "member signatures requested for:$OPT_CLASSES"
+        _dn=0
+        sort -u "$_PATHSINK" 2>/dev/null > "${_errfile}.paths.u" 2>/dev/null
+        while IFS= read -r _rec; do
+            [ -n "$_rec" ] || continue
+            _kind="${_rec%%|*}"
+            case "$_kind" in
+                file)
+                    _p="${_rec#file|}"
+                    _lib_match "$_p" || continue
+                    _dn=$((_dn + 1))
+                    [ "$_dn" -gt 40 ] && { fact "-- cap reached: 40 jars detailed, later matches skipped"; break; }
+                    _fsp="$(resolve_fs "$_p")"
+                    if [ -z "$_fsp" ]; then fact "-- $_p: n/a (path not visible from this mount namespace)"; continue; fi
+                    detail_jar "$(basename "$_p")" "$_fsp"
+                    ;;
+                nested)
+                    _cj="${_rec#nested|}"; _ent="${_cj#*|}"; _cj="${_cj%%|*}"
+                    _lib_match "$_ent" || continue
+                    _dn=$((_dn + 1))
+                    [ "$_dn" -gt 40 ] && { fact "-- cap reached: 40 jars detailed, later matches skipped"; break; }
+                    _fsc="$(resolve_fs "$_cj")"
+                    if [ -z "$_fsc" ]; then fact "-- $_ent: n/a (container jar not visible from this mount namespace: $_cj)"; continue; fi
+                    _tmpj="$(nested_extract "$_fsc" "$_ent")"
+                    if [ -z "$_tmpj" ]; then
+                        fact "-- $_ent: n/a (packed inside $_cj; entry could not be read, or is above the 80 MB extraction bound)"
+                        continue
+                    fi
+                    detail_jar "$(basename "$_ent")" "$_tmpj" "entry $_ent inside $_cj"
+                    rm -f "$_tmpj" 2>/dev/null
+                    ;;
+            esac
+        done < "${_errfile}.paths.u"
+        [ "$_dn" = 0 ] && fact "no enumerated jar matched the requested patterns"
+        # a class named with --class may be an application class of an
+        # executable jar rather than a library class
+        for _fq in $OPT_CLASSES; do
+            _rel="$(printf '%s' "$_fq" | tr '.' '/').class"
+            for pid in $D_MARKED; do
+                _jarp="$(_all_jvm_args "$pid" 2>/dev/null | awk 'p=="-jar"{print; exit} {p=$0}')"
+                [ -n "$_jarp" ] || continue
+                _fsj2="$(resolve_fs "$_jarp")"
+                [ -n "$_fsj2" ] || continue
+                have unzip || continue
+                unzip -Z1 "$_fsj2" "BOOT-INF/classes/$_rel" >/dev/null 2>&1 || continue
+                fact "-- $_fq is an application class of $_jarp (BOOT-INF/classes)"
+                if ! have javap; then
+                    fact "   member signatures: n/a (command not found: javap)"
+                    continue
+                fi
+                _cd="${_errfile}.cls"
+                rm -rf "$_cd" 2>/dev/null; mkdir -p "$_cd" 2>/dev/null
+                if unzip -o -q -d "$_cd" "$_fsj2" "BOOT-INF/classes/$_rel" 2>/dev/null; then
+                    fact "   member signatures (javap -p, first 300 lines):"
+                    if [ -n "$_timeout_bin" ]; then "$_timeout_bin" "$CMD_TIMEOUT" javap -p -classpath "$_cd/BOOT-INF/classes" "$_fq" 2>&1 | head -n 300 | while IFS= read -r _l; do printf '             %s\n' "$_l"; done
+                    else javap -p -classpath "$_cd/BOOT-INF/classes" "$_fq" 2>&1 | head -n 300 | while IFS= read -r _l; do printf '             %s\n' "$_l"; done; fi
+                else
+                    fact "   member signatures: n/a (class entry could not be extracted)"
+                fi
+                rm -rf "$_cd" 2>/dev/null
+            done
+        done
+    fi
+
+    emit_footer
+}
+
+# ---- main — DO NOT EDIT --------------------------------------------------------
+exec 3>&2
+
+[ "$ARGC" -eq 0 ] && { usage; exit 0; }
+
+if [ "$OPT_FILE" = 0 ] && [ "$OPT_STDOUT" = 0 ]; then
+    printf 'no action flag given — need --file or --stdout\n' >&2
+    usage >&2
+    exit 2
+fi
+
+_init_probe
+if [ "$OPT_STDOUT" = 1 ]; then
+    progress "collecting facts (read-only) -> stdout"
+    run_report
+    progress "done."
+else
+    HOST="$(hostname 2>/dev/null || echo unknown)"
+    TS="$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null || echo unknown)"
+    OUTFILE="./$COLLECTOR_NAME-$HOST-$TS.txt"
+    progress "collecting facts (read-only) -> writing $OUTFILE"
+    run_report > "$OUTFILE" 2>/dev/null
+    progress "report written: $OUTFILE"
+fi
+_end_probe
