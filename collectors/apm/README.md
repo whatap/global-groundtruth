@@ -2,11 +2,14 @@
 
 > **Status: PARTIALLY SEEDED.** `python/` holds a working v0
 > ([python/collect-apmpython.sh](python/collect-apmpython.sh), see
-> [python/README.md](python/README.md)), and `nodejs/` holds a working v0
+> [python/README.md](python/README.md)), `nodejs/` holds a working v0
 > ([nodejs/collect-apmnodejs.sh](nodejs/collect-apmnodejs.sh), see
-> [nodejs/README.md](nodejs/README.md)). The other language runtimes are not
-> implemented yet. Each collector will be owned by its agent's developers
-> (CONTRACT rule 4); until handover they are managed by the Global team.
+> [nodejs/README.md](nodejs/README.md)), and `dotnet/` holds a working v0
+> for Windows hosts ([dotnet/collect-apmdotnet.ps1](dotnet/collect-apmdotnet.ps1),
+> PowerShell 5.1+, see [dotnet/README.md](dotnet/README.md); Linux .NET hosts
+> not covered yet). The other language runtimes are not implemented yet. Each
+> collector will be owned by its agent's developers (CONTRACT rule 4); until
+> handover they are managed by the Global team.
 
 ## Note: this domain has language sub-families
 
