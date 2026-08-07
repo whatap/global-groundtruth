@@ -2,7 +2,9 @@
 
 > **Status: PARTIALLY SEEDED.** `python/` holds a working v0
 > ([python/collect-apmpython.sh](python/collect-apmpython.sh), see
-> [python/README.md](python/README.md)). The other language runtimes are not
+> [python/README.md](python/README.md)), and `nodejs/` holds a working v0
+> ([nodejs/collect-apmnodejs.sh](nodejs/collect-apmnodejs.sh), see
+> [nodejs/README.md](nodejs/README.md)). The other language runtimes are not
 > implemented yet. Each collector will be owned by its agent's developers
 > (CONTRACT rule 4); until handover they are managed by the Global team.
 

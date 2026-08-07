@@ -70,8 +70,8 @@ global-groundtruth/
 │   ├── k8s/                      # SEEDED v0 — cluster-level collector (operator/CR/agents)
 │   ├── nms/                      # SEEDED v0 — NMS Control Manager host collector
 │   ├── server/                   # STUB (README only)
-│   ├── apm/                      # STUB (README only) — one per language: nodejs/java/python/php/dotnet
-│   ├── db/                       # STUB (README only)
+│   ├── apm/                      # PARTIALLY SEEDED — python/ + nodejs/ v0; java/php/dotnet pending
+│   ├── db/                       # SEEDED v0 — shell collector + SQL packs
 │   └── collection-server/        # SEEDED v0 — WhaTap backend (yard/proxy/...) collector
 ├── templates/
 │   └── collector-skeleton/       # copy this to start a collector
@@ -81,18 +81,19 @@ global-groundtruth/
 
 ## Collector status
 
-| Domain   | Status          | Notes                                              |
-|----------|-----------------|----------------------------------------------------|
-| `k8s`               | SEEDED v0       | bastion-run cluster collector; see `collectors/k8s/` |
-| `nms`               | SEEDED v0       | NMS Control Manager host script; see `collectors/nms/` |
-| `server`            | NOT IMPLEMENTED | host shell script; see `collectors/server/`          |
-| `apm`               | NOT IMPLEMENTED | per-language family; see `collectors/apm/`            |
-| `db`                | NOT IMPLEMENTED | SQL + agent-config dump; see `collectors/db/`         |
-| `collection-server` | SEEDED v0       | backend host script; see `collectors/collection-server/` |
+| Domain              | Status           | Notes                                                                     |
+|---------------------|------------------|---------------------------------------------------------------------------|
+| `k8s`               | SEEDED v0        | bastion-run cluster collector; see `collectors/k8s/`                      |
+| `nms`               | SEEDED v0        | NMS Control Manager host script; see `collectors/nms/`                    |
+| `server`            | NOT IMPLEMENTED  | host shell script; see `collectors/server/`                               |
+| `apm`               | PARTIALLY SEEDED | per-language family; `python` + `nodejs` v0 seeded; see `collectors/apm/` |
+| `db`                | SEEDED v0        | shell collector + SQL packs; see `collectors/db/`                         |
+| `collection-server` | SEEDED v0        | backend host script; see `collectors/collection-server/`                  |
 
 This repository ships the **framework** (contract, format, template, validator,
-docs), per-domain **stubs**, and three **seeded v0** collectors
-(`collection-server`, `k8s`, `nms`) that the Global team owns until handover.
+docs), per-domain **stubs**, and the **seeded v0** collectors listed above
+(`collection-server`, `k8s`, `nms`, `db`, `apm/python`, `apm/nodejs`) that the
+Global team owns until handover.
 Collectors are authored and then owned by their domain teams.
 
 ## Run a collector (field engineer)
