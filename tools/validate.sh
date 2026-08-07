@@ -2,7 +2,12 @@
 #
 # validate.sh — lint a WhaTap Global Groundtruth collector against the CONTRACT.
 # -----------------------------------------------------------------------------
-# Usage:  tools/validate.sh <collector.sh | directory> [more...]
+# Usage:  tools/validate.sh <collector.sh | collector.ps1 | directory> [more...]
+#
+# Both shell (.sh) and PowerShell (.ps1) collectors are linted: PowerShell
+# line comments use the same `#` prefix, so the comment-exclusion rules below
+# apply unchanged. (PowerShell block comments <# ... #> are NOT excluded —
+# keep collector commentary in line comments.)
 #
 # A collector FAILS validation if any of the following is true:
 #   (1) it is missing one of the required header fields
@@ -12,7 +17,13 @@
 #   (2) it is missing the exact footer sentinel line (same non-comment rule)
 #   (3) an EMITTED line contains a judgment word (case-insensitive):
 #         diagnos  recommend  likely  should  root cause  fix
-#   (4) its filename is not collect-<token>.sh — the required entrypoint name,
+#       .NET assembly/namespace identifiers (System.Diagnostics.*,
+#       Microsoft.Diagnostics.*, DiagnosticSource) are stripped from each
+#       line before this scan: they are proper names a .NET collector must
+#       emit as facts, not judgment prose. The prose words "diagnose /
+#       diagnosis / diagnostic(s)" outside such identifiers still fail.
+#   (4) its filename is not collect-<token>.sh (or .ps1) — the required
+#       entrypoint name,
 #       so collectors never collide when copied side by side or into a shared
 #       bin/. The skeleton template and validate.sh itself are exempt.
 #
@@ -41,7 +52,7 @@ targets=()
 for arg in "$@"; do
     if [ -d "$arg" ]; then
         while IFS= read -r f; do targets+=("$f"); done \
-            < <(find "$arg" -type f -name '*.sh' | sort)
+            < <(find "$arg" -type f \( -name '*.sh' -o -name '*.ps1' \) | sort)
     elif [ -f "$arg" ]; then
         targets+=("$arg")
     else
@@ -49,7 +60,7 @@ for arg in "$@"; do
         exit 2
     fi
 done
-[ ${#targets[@]} -gt 0 ] || { echo "no .sh collectors found" >&2; exit 2; }
+[ ${#targets[@]} -gt 0 ] || { echo "no .sh/.ps1 collectors found" >&2; exit 2; }
 
 rc=0
 for f in "${targets[@]}"; do
@@ -64,8 +75,8 @@ for f in "${targets[@]}"; do
     #     The skeleton template is format-checked but exempt from the name rule
     #     (it is copied and renamed, never run in the field).
     case "$bn" in
-        collect-*.sh|collector-skeleton.sh) ;;
-        *) problems+=("entrypoint must be named collect-<token>.sh (got: $bn)") ;;
+        collect-*.sh|collect-*.ps1|collector-skeleton.sh) ;;
+        *) problems+=("entrypoint must be named collect-<token>.sh or collect-<token>.ps1 (got: $bn)") ;;
     esac
 
     # (1) required header fields — on non-comment lines only, so a label that
@@ -80,8 +91,11 @@ for f in "${targets[@]}"; do
         || problems+=("missing exact footer line on a non-comment line: $FOOTER")
 
     # (3) judgment words in emitted lines (exclude comments + footer sentinel,
-    #     keeping the file's true line numbers)
-    offenders=$(grep -inE "$JUDGMENT" "$f" \
+    #     keeping the file's true line numbers). .NET identifiers containing
+    #     "Diagnostics" are stripped first (line structure is preserved, so
+    #     grep -n line numbers stay true).
+    offenders=$(sed -E 's/(System|Microsoft)\.Diagnostics[A-Za-z0-9.]*//g; s/DiagnosticSource//g' "$f" \
+                | grep -inE "$JUDGMENT" \
                 | grep -vE '^[0-9]+:[[:space:]]*#' \
                 | grep -vF "$FOOTER" || true)
     if [ -n "$offenders" ]; then
