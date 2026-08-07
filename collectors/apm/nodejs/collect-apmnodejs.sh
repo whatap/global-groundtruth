@@ -27,6 +27,11 @@
 #     appear in the recent lines.
 #   * Kubernetes/operator artifacts: /whatap-agent volume seeded by
 #     apm-init-nodejs, WHATAP_NODEJS_AGENT_PATH, container.conf.
+#   * When the install is healthy but no transactions appear: which modules
+#     the installed agent can hook (lib/observers, section 3), which
+#     libraries the app declares and has installed (package.json deps +
+#     node_modules names, section 8), and which observers actually engaged
+#     in this process (hook-log observer lines, section 7).
 #
 # THE CONTRACT (../../../CONTRACT.md):
 #   1. Facts only. No conclusion is stated on any emitted line.
@@ -49,7 +54,7 @@ export LC_ALL=C
 
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-apmnodejs"
-VERSION="0.1.0"
+VERSION="0.2.0"
 DOMAIN="apm/nodejs"
 TARGET="host/$(hostname 2>/dev/null || echo unknown)"
 
@@ -725,6 +730,10 @@ run_report() {
             if [ -n "$_hook" ]; then
                 head_file "   $(basename "$_hook") (hook log, first lines)" "$_hook" 80
                 tail_file "   $(basename "$_hook") (hook log, recent lines)" "$_hook" 120
+                # which observers engaged (or could not engage) in THIS
+                # process — startup writes one line per observer attempt
+                fact "   observer lines in the first 400 lines of $(basename "$_hook"):"
+                head -n 400 "$_hook" 2>/dev/null | grep -iE 'observer|unable to load|injected' | head -n 40 | while IFS= read -r _l; do printf '        %s\n' "$_l"; done
                 fact "   [WHATAP-*] codes in the last 400 lines of $(basename "$_hook"):"
                 tail -n 400 "$_hook" 2>/dev/null | grep -oE '\[WHATAP[-A-Za-z0-9]*\]' | sort | uniq -c | sort -rn | head -n 20 | while IFS= read -r _l; do printf '        %s\n' "$_l"; done
             else
@@ -784,8 +793,23 @@ run_report() {
             fact "   package.json whatap lines: $(grep -n 'whatap' "$cwd/package.json" 2>/dev/null | head -n 5 | tr '\n' ' ')"
             fact "   package.json scripts block:"
             awk '/"scripts"/{f=1} f{print; if(/}/ && f>1) exit; f++}' "$cwd/package.json" 2>/dev/null | head -n 15 | while IFS= read -r _l; do printf '        %s\n' "$_l"; done
+            # declared runtime libraries — read next to the agent's bundled
+            # observer list in the installs section (same report, two sides
+            # of one comparison a reader makes)
+            fact "   package.json dependencies block:"
+            awk '/"dependencies"/{f=1} f{print; if(/}/ && f>1) exit; f++}' "$cwd/package.json" 2>/dev/null | head -n 60 | while IFS= read -r _l; do printf '        %s\n' "$_l"; done
         else
             fact "   package.json: n/a (not readable or absent in $cwd)"
+        fi
+        # libraries actually installed (top-level names only; no tree walk)
+        if [ -d "$cwd/node_modules" ]; then
+            _nmn="$(ls "$cwd/node_modules" 2>/dev/null | grep -v '^\.' | wc -l | tr -d ' ')"
+            fact "   node_modules top-level packages (${_nmn:-?} total, first 150):"
+            ls "$cwd/node_modules" 2>/dev/null | grep -v '^\.' | head -n 150 | while IFS= read -r _l; do printf '        %s\n' "$_l"; done
+            _sc="$(ls -d "$cwd"/node_modules/@*/* 2>/dev/null | head -n 50 | awk -F/ '{print $(NF-1)"/"$NF}' | tr '\n' ' ')"
+            [ -n "$_sc" ] && fact "   scoped packages (first 50): $_sc"
+        else
+            fact "   node_modules: n/a (path not found: $cwd/node_modules)"
         fi
         for e in ecosystem.config.js ecosystem.config.cjs ecosystem.config.json ecosystem.json; do
             [ -f "$cwd/$e" ] && dump_file "   $e (pm2 launcher config; customer-owned file)" "$cwd/$e" 120

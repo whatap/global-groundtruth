@@ -25,6 +25,15 @@ The collector never loads the `whatap` module (a `require('whatap')` starts an
 agent); package facts are read as text and the node binary is only ever
 executed as `node --version`.
 
+**"Install is healthy but no transactions/hitmap" cases** are answered by
+reading three sections against each other: `[3]` what the installed agent
+*can* hook (its bundled `lib/observers` list — differs per version), `[8]`
+what the app *declares and has installed* (`package.json` dependencies,
+`node_modules` names), and `[7]` what *actually engaged in this process*
+(hook-log `XxxObserver starting!` / `unable to load <module>` lines). Whether
+a gap between the three explains the missing data is the reader's judgment;
+the report carries the facts for it.
+
 ## One field command
 
 Run **where the Node.js application runs**:
@@ -69,8 +78,8 @@ Container notes:
 | 4 | Runtime processes | `whatap_nodejs` master agents with cmdline (`-t 2 -d 1`, `--llm`), cwd, and env (`NODEJS_PARENT_APP_PID` links master → app; `APP_IDENTIFIER` is the `<id8>` in file names); node processes (whatap-marked ones detailed first) with `-r/--require` detection, `NODE_OPTIONS`/`WHATAP_*`/`POD_NAME`/PM2 env, and `cwd/node_modules/whatap` resolution |
 | 5 | Agent homes and configuration | every WHATAP_HOME candidate (env, port registry, process cwd/environ, `/whatap-agent`), and per home: `whatap.conf` verbatim **plus byte facts (size, CR 0x0D count — Windows-edited conf files are a recurring support case)**, alternate `WHATAP_CONF` names, `container.conf`, `whatap_nodejs` symlink resolution, pid-file liveness (`agent-<id8>.pid` vs legacy `whatap_nodejs.pid` — they differ by design after daemonization), lock files, `whatap_port_<pid>`, `run/`, `logs/` inventory |
 | 6 | Network endpoints and port registry | UDP sockets **including connected peers** (the 2.x app holds a connected UDP socket to `127.0.0.1:6600`, visible in `ss -uapn`), TCP sessions toward :6600, `/tmp/whatap-nodejs.lock` contents (format: `udp-port<TAB>home:app-identifier`) |
-| 7 | Agent logs | newest hook log (`*-hook-*.log`, 2.x) head+tail with a `[WHATAP-*]` code frequency count, legacy `whatap-YYYYMMDD.log` (0.5.x), rotation-off `whatap.log`, master-agent `whatap-boot-*.log` head+tail with a `[WA*]` code count, reqlog presence — all bounded reads. The startup banner goes to the **app's stdout**, not to these files |
-| 8 | Application and launcher facts | how the app is started decides how the agent attaches: pm2 daemon + `ecosystem.config.js`, app `package.json` (whatap dependency line, scripts block), Next.js `next.config.*` (`serverExternalPackages`) and `instrumentation.*` whatap lines, `.next`/standalone markers, pnpm store entries |
+| 7 | Agent logs | newest hook log (`*-hook-*.log`, 2.x) head+tail, **observer lines** (`XxxObserver starting!` / `unable to load <module>` — which hooks engaged, or could not engage, in this process), a `[WHATAP-*]` code frequency count, legacy `whatap-YYYYMMDD.log` (0.5.x), rotation-off `whatap.log`, master-agent `whatap-boot-*.log` head+tail with a `[WA*]` code count, reqlog presence — all bounded reads. The startup banner goes to the **app's stdout**, not to these files |
+| 8 | Application and launcher facts | how the app is started decides how the agent attaches: pm2 daemon + `ecosystem.config.js`, app `package.json` (whatap dependency line, scripts block, **dependencies block**), **`node_modules` top-level package names** (what the app actually has installed), Next.js `next.config.*` (`serverExternalPackages`) and `instrumentation.*` whatap lines, `.next`/standalone markers, pnpm store entries |
 | 9 | Kubernetes / operator injection context | `/whatap-agent` volume as seeded by `apm-init-nodejs` (incl. the arch-resolved stable path `node_modules/whatap/agent/whatap_nodejs`), `WHATAP_NODEJS_AGENT_PATH` (symlink vs regular file), `POD_NAME`/`NODE_NAME`/`NODE_IP`/`WHATAP_OKIND`/`WHATAP_MICRO_ENABLED`, k8s markers |
 
 ## Security note
