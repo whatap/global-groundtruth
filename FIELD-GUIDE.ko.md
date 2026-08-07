@@ -52,13 +52,19 @@ cd global-groundtruth && git pull
 
 ## 3. 어떤 collector를 언제 쓰는가
 
-실행할 collector는 WhaTap 담당자가 지정해 줍니다. 현재 세 개가 있습니다:
+실행할 collector는 WhaTap 담당자가 지정해 줍니다:
 
 | WhaTap이 묻는 대상 | 스크립트 | 실행 위치 |
 |---|---|---|
 | **백엔드 / 수집 서버** (yard, proxy, gateway, ...) | `collectors/collection-server/collect-collserver.sh` | 백엔드 호스트에서 직접 |
+| 백엔드 데이터 경로의 **ZFS** (별도로 요청됨) | `collectors/collection-server/collect-collzfs.sh` | 해당 백엔드 호스트에서 직접 |
 | **Kubernetes** 모니터링 (operator, node agent, master agent, ...) | `collectors/k8s/collect-k8s.sh` | `kubectl`(또는 `oc`)로 클러스터에 접근되는 아무 장비 — bastion 또는 워크스테이션. 클러스터 노드 위가 **아님** |
 | **NMS Control Manager** (네트워크 모니터링) | `collectors/nms/collect-nms.sh` | NMS Control Manager 호스트에서 직접 |
+| **데이터베이스 모니터링** (DBX/XOS/DMX 에이전트 및 대상 DB) | `collectors/db/collect-db.sh` (Windows/MSSQL: `collectors/db/windows/collect-db-mssql.ps1`) | DB 에이전트 호스트에서. 분리 구성이면 양쪽 호스트에서 각각 1회 |
+| **Java** 애플리케이션 모니터링 | `collectors/apm/java/collect-apmjava.sh` | Java 애플리케이션이 실행되는 호스트 또는 컨테이너에서 |
+| **Python** 애플리케이션 모니터링 | `collectors/apm/python/collect-apmpython.sh` | Python 애플리케이션이 실행되는 호스트 또는 컨테이너에서 |
+| **Node.js** 애플리케이션 모니터링 | `collectors/apm/nodejs/collect-apmnodejs.sh` | Node.js 애플리케이션이 실행되는 호스트 또는 컨테이너에서 |
+| **.NET** 애플리케이션 모니터링 (Windows) | `collectors/apm/dotnet/collect-apmdotnet.ps1` | .NET 애플리케이션이 실행되는 Windows 호스트에서, 관리자 권한 PowerShell로 |
 
 ## 4. 실행하기
 
@@ -89,6 +95,9 @@ cd global-groundtruth/collectors/collection-server
   줄이 늘어날 뿐입니다.
 - 리포트에 WhaTap 홈 디렉토리가 `n/a`로 나오면 `--home <경로>`를 붙여 다시
   실행하십시오. 예: `./collect-collserver.sh --file --home /whatap`
+- 백엔드 데이터 경로의 **ZFS**가 쟁점이면 같은 디렉토리의 companion collector
+  (`./collect-collzfs.sh --file`)도 함께 요청됩니다. 별도 리포트이므로 둘 다
+  보내주십시오.
 
 ### 4.2 Kubernetes (bastion / 워크스테이션)
 
@@ -122,7 +131,66 @@ cd global-groundtruth/collectors/nms
 
 생성된 `.txt` 파일을 보내주십시오. (이 collector에는 아직 번들 모드가 없습니다.)
 
-### 4.4 실행 중에 보이는 것
+### 4.4 데이터베이스 모니터링 (DB 에이전트 호스트)
+
+```sh
+cd global-groundtruth/collectors/db
+./collect-db.sh --file
+# -> whatap-db-<host>-<timestamp>.txt
+```
+
+참고:
+
+- **분리 구성**(에이전트와 데이터베이스가 서로 다른 호스트)이면 양쪽 호스트에서
+  각각 1회 실행하십시오 — 호스트당 파일 하나입니다.
+- 데이터베이스 내부에서만 확인되는 사실(권한, 파라미터, 모니터링 오브젝트 —
+  RDS 같은 관리형 클라우드 DB에서는 유일한 경로)까지 요청받으면, 해당 엔진의
+  `sql/` 팩을 지정해 줍니다. 평소 쓰는 DB 클라이언트로 실행한 뒤 결과를 함께
+  보내주십시오.
+- Windows + MSSQL 환경에서는 `windows/collect-db-mssql.ps1`을 사용하십시오.
+
+### 4.5 애플리케이션 모니터링 (애플리케이션 호스트 또는 컨테이너)
+
+애플리케이션 언어에 맞는 collector를 **애플리케이션 프로세스 옆에서** 실행
+하십시오. 컨테이너로 구동 중이면 컨테이너 안에서 실행합니다.
+
+```sh
+cd global-groundtruth/collectors/apm/java     # 또는 python / nodejs
+./collect-apmjava.sh --file
+# -> whatap-apmjava-<host>-<timestamp>.txt
+```
+
+Kubernetes나 Docker에서는 스크립트를 컨테이너로 복사하지 말고 stdin으로 흘려
+넣은 뒤, 리포트를 stdout으로 받으십시오:
+
+```sh
+kubectl exec -i <pod> -c <container> -- sh -s -- --stdout --quiet \
+    < collect-apmjava.sh > report.txt
+
+docker exec -i <container> sh -s -- --stdout --quiet \
+    < collect-apmjava.sh > report.txt
+```
+
+Windows에서는 .NET collector가 PowerShell 스크립트입니다. **64비트 관리자 권한**
+PowerShell에서 실행하십시오:
+
+```powershell
+cd global-groundtruth\collectors\apm\dotnet
+.\collect-apmdotnet.ps1 -File
+# -> whatap-apmdotnet-<HOST>-<UTC>.txt
+```
+
+참고:
+
+- 정책이 허용한다면 **애플리케이션 프로세스와 같은 OS 사용자**로 실행하십시오.
+  다른 사용자로 실행해도 리포트는 유효하며, `n/a (permission denied)` 줄이
+  늘어날 뿐입니다.
+- WhaTap이 추가 플래그를 붙인 2차 실행을 요청할 수 있습니다 — 예를 들어 특정
+  라이브러리 상세를 뽑는 `--library <이름>`, 스레드 덤프를 뜨는 `--threads`
+  입니다. 이런 플래그는 명시적으로 지정해 주며, 기본 `--file` 실행은
+  애플리케이션 프로세스에 전혀 접촉하지 않습니다.
+
+### 4.6 실행 중에 보이는 것
 
 - `>> `로 시작하는 진행 표시가 터미널에 출력되어 동작 중임을 확인할 수
   있습니다. 이 줄들은 리포트에 포함되지 않습니다.

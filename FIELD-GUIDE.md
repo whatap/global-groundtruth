@@ -53,13 +53,19 @@ copy the single collector script to the server (scp/SFTP/file transfer — one
 
 ## 3. Which collector, when
 
-Your WhaTap contact will name the collector to run. Three exist today:
+Your WhaTap contact will name the collector to run:
 
 | WhaTap asks about | Script | Run it where |
 |---|---|---|
 | The **backend / collection server** (yard, proxy, gateway, ...) | `collectors/collection-server/collect-collserver.sh` | directly on the backend host |
+| **ZFS** under a backend's data path (asked for separately) | `collectors/collection-server/collect-collzfs.sh` | directly on that backend host |
 | **Kubernetes** monitoring (operator, node agent, master agent, ...) | `collectors/k8s/collect-k8s.sh` | any machine where `kubectl` (or `oc`) reaches the cluster — a bastion or your workstation, **not** on a cluster node |
 | The **NMS Control Manager** (network monitoring) | `collectors/nms/collect-nms.sh` | directly on the NMS Control Manager host |
+| **Database monitoring** (DBX/XOS/DMX agents and the monitored DB) | `collectors/db/collect-db.sh` (Windows/MSSQL: `collectors/db/windows/collect-db-mssql.ps1`) | on the DB agent host; for a split install, once on each host |
+| **Java** application monitoring | `collectors/apm/java/collect-apmjava.sh` | on the host or container where the Java application runs |
+| **Python** application monitoring | `collectors/apm/python/collect-apmpython.sh` | on the host or container where the Python application runs |
+| **Node.js** application monitoring | `collectors/apm/nodejs/collect-apmnodejs.sh` | on the host or container where the Node.js application runs |
+| **.NET** application monitoring (Windows) | `collectors/apm/dotnet/collect-apmdotnet.ps1` | on the Windows host where the .NET application runs, in an elevated PowerShell |
 
 ## 4. Run it
 
@@ -90,6 +96,9 @@ Notes:
   more `n/a (permission denied)` lines.
 - If the report shows the WhaTap home directory as `n/a`, re-run with
   `--home <path>`, e.g. `./collect-collserver.sh --file --home /whatap`.
+- When the question is specifically about **ZFS** under the backend's data
+  path, WhaTap will ask for the companion collector in the same directory
+  (`./collect-collzfs.sh --file`) as well. It is a separate report; send both.
 
 ### 4.2 Kubernetes (bastion / workstation)
 
@@ -123,7 +132,66 @@ cd global-groundtruth/collectors/nms
 
 Send back the `.txt` file it names. (This collector has no bundle mode yet.)
 
-### 4.4 While it runs
+### 4.4 Database monitoring (DB agent host)
+
+```sh
+cd global-groundtruth/collectors/db
+./collect-db.sh --file
+# -> whatap-db-<host>-<timestamp>.txt
+```
+
+Notes:
+
+- For a **split install** (agent on one host, database on another) run it once
+  on each host — one file per host.
+- If WhaTap also asks for the facts that only the database itself can answer
+  (grants, parameters, monitoring objects — the only channel for a managed
+  cloud DB such as RDS), they will name the SQL pack for your engine under
+  `sql/`, which you run with your usual DB client and send back as well.
+- On Windows with MSSQL, use `windows/collect-db-mssql.ps1` instead.
+
+### 4.5 Application monitoring (application host or container)
+
+Run the collector for the application's language, **next to the application
+process** — inside the container for a containerized app.
+
+```sh
+cd global-groundtruth/collectors/apm/java     # or python / nodejs
+./collect-apmjava.sh --file
+# -> whatap-apmjava-<host>-<timestamp>.txt
+```
+
+In Kubernetes or Docker, pipe the script in over stdin instead of copying it
+into the container, and take the report on stdout:
+
+```sh
+kubectl exec -i <pod> -c <container> -- sh -s -- --stdout --quiet \
+    < collect-apmjava.sh > report.txt
+
+docker exec -i <container> sh -s -- --stdout --quiet \
+    < collect-apmjava.sh > report.txt
+```
+
+On Windows, the .NET collector is a PowerShell script — run it in a **64-bit
+elevated** PowerShell:
+
+```powershell
+cd global-groundtruth\collectors\apm\dotnet
+.\collect-apmdotnet.ps1 -File
+# -> whatap-apmdotnet-<HOST>-<UTC>.txt
+```
+
+Notes:
+
+- Run as the **same OS user as the application process** where your policy
+  allows. With a different user the report is still valid, just with more
+  `n/a (permission denied)` lines.
+- WhaTap may follow up with a second run carrying extra flags — for example
+  `--library <name>` to detail one library, or `--threads` for a thread dump.
+  Those are named explicitly; the plain `--file` run never touches the
+  application process.
+
+### 4.6 While it runs
 
 - Progress lines starting with `>> ` appear on the terminal so you can see it
   working; they are not part of the report.

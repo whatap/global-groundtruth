@@ -58,14 +58,19 @@ workstation Anda lalu salin satu file skrip collector ke server
 
 ## 3. Collector mana, untuk kasus apa
 
-Kontak WhaTap Anda akan menyebutkan collector yang harus dijalankan. Saat ini
-ada tiga:
+Kontak WhaTap Anda akan menyebutkan collector yang harus dijalankan:
 
 | Yang ditanyakan WhaTap | Skrip | Dijalankan di mana |
 |---|---|---|
 | **Backend / collection server** (yard, proxy, gateway, ...) | `collectors/collection-server/collect-collserver.sh` | langsung di host backend |
+| **ZFS** di bawah data path backend (diminta secara terpisah) | `collectors/collection-server/collect-collzfs.sh` | langsung di host backend tersebut |
 | Monitoring **Kubernetes** (operator, node agent, master agent, ...) | `collectors/k8s/collect-k8s.sh` | mesin mana pun yang dapat menjangkau cluster lewat `kubectl` (atau `oc`) — bastion atau workstation Anda, **bukan** di node cluster |
 | **NMS Control Manager** (monitoring jaringan) | `collectors/nms/collect-nms.sh` | langsung di host NMS Control Manager |
+| Monitoring **database** (agen DBX/XOS/DMX dan DB yang dimonitor) | `collectors/db/collect-db.sh` (Windows/MSSQL: `collectors/db/windows/collect-db-mssql.ps1`) | di host agen DB; untuk instalasi terpisah, satu kali di setiap host |
+| Monitoring aplikasi **Java** | `collectors/apm/java/collect-apmjava.sh` | di host atau container tempat aplikasi Java berjalan |
+| Monitoring aplikasi **Python** | `collectors/apm/python/collect-apmpython.sh` | di host atau container tempat aplikasi Python berjalan |
+| Monitoring aplikasi **Node.js** | `collectors/apm/nodejs/collect-apmnodejs.sh` | di host atau container tempat aplikasi Node.js berjalan |
+| Monitoring aplikasi **.NET** (Windows) | `collectors/apm/dotnet/collect-apmdotnet.ps1` | di host Windows tempat aplikasi .NET berjalan, dalam PowerShell dengan hak administrator |
 
 ## 4. Menjalankannya
 
@@ -96,6 +101,9 @@ Catatan:
   valid, hanya berisi lebih banyak baris `n/a (permission denied)`.
 - Jika laporan menampilkan direktori home WhaTap sebagai `n/a`, jalankan ulang
   dengan `--home <path>`, misalnya `./collect-collserver.sh --file --home /whatap`.
+- Bila pertanyaannya khusus tentang **ZFS** di bawah data path backend, WhaTap
+  akan meminta collector pendamping di direktori yang sama
+  (`./collect-collzfs.sh --file`). Itu laporan terpisah; kirim keduanya.
 
 ### 4.2 Kubernetes (bastion / workstation)
 
@@ -130,7 +138,67 @@ cd global-groundtruth/collectors/nms
 
 Kirim kembali file `.txt` yang disebutkannya. (Collector ini belum memiliki mode bundle.)
 
-### 4.4 Selama skrip berjalan
+### 4.4 Monitoring database (host agen DB)
+
+```sh
+cd global-groundtruth/collectors/db
+./collect-db.sh --file
+# -> whatap-db-<host>-<timestamp>.txt
+```
+
+Catatan:
+
+- Untuk **instalasi terpisah** (agen di satu host, database di host lain),
+  jalankan satu kali di setiap host — satu file per host.
+- Jika WhaTap juga meminta fakta yang hanya dapat dijawab oleh database itu
+  sendiri (grant, parameter, objek monitoring — satu-satunya jalur untuk DB
+  cloud terkelola seperti RDS), mereka akan menyebutkan paket SQL untuk engine
+  Anda di `sql/`. Jalankan dengan klien DB yang biasa Anda pakai dan kirim
+  hasilnya juga.
+- Di Windows dengan MSSQL, gunakan `windows/collect-db-mssql.ps1`.
+
+### 4.5 Monitoring aplikasi (host atau container aplikasi)
+
+Jalankan collector sesuai bahasa aplikasi, **di sebelah proses aplikasi** — di
+dalam container bila aplikasi dijalankan sebagai container.
+
+```sh
+cd global-groundtruth/collectors/apm/java     # atau python / nodejs
+./collect-apmjava.sh --file
+# -> whatap-apmjava-<host>-<timestamp>.txt
+```
+
+Di Kubernetes atau Docker, alirkan skrip lewat stdin alih-alih menyalinnya ke
+dalam container, lalu ambil laporannya dari stdout:
+
+```sh
+kubectl exec -i <pod> -c <container> -- sh -s -- --stdout --quiet \
+    < collect-apmjava.sh > report.txt
+
+docker exec -i <container> sh -s -- --stdout --quiet \
+    < collect-apmjava.sh > report.txt
+```
+
+Di Windows, collector .NET berupa skrip PowerShell — jalankan di PowerShell
+**64-bit dengan hak administrator**:
+
+```powershell
+cd global-groundtruth\collectors\apm\dotnet
+.\collect-apmdotnet.ps1 -File
+# -> whatap-apmdotnet-<HOST>-<UTC>.txt
+```
+
+Catatan:
+
+- Jalankan sebagai **user OS yang sama dengan proses aplikasi** bila kebijakan
+  Anda mengizinkan. Dengan user lain laporan tetap valid, hanya dengan lebih
+  banyak baris `n/a (permission denied)`.
+- WhaTap mungkin meminta satu kali jalan lagi dengan flag tambahan — misalnya
+  `--library <nama>` untuk merinci satu library, atau `--threads` untuk thread
+  dump. Flag tersebut akan disebutkan secara eksplisit; jalan `--file` biasa
+  tidak pernah menyentuh proses aplikasi.
+
+### 4.6 Selama skrip berjalan
 
 - Baris progres yang diawali `>> ` muncul di terminal sehingga Anda dapat
   melihat skrip bekerja; baris itu bukan bagian dari laporan.

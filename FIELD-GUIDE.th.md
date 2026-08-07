@@ -52,13 +52,19 @@ cd global-groundtruth && git pull
 
 ## 3. ใช้ collector ตัวไหน เมื่อใด
 
-ผู้ติดต่อฝั่ง WhaTap จะระบุ collector ที่ต้องรันให้ ปัจจุบันมีสามตัว:
+ผู้ติดต่อฝั่ง WhaTap จะระบุ collector ที่ต้องรันให้:
 
 | สิ่งที่ WhaTap สอบถาม | สคริปต์ | รันที่ใด |
 |---|---|---|
 | **backend / collection server** (yard, proxy, gateway, ...) | `collectors/collection-server/collect-collserver.sh` | บนโฮสต์ backend โดยตรง |
+| **ZFS** ใต้ data path ของ backend (ขอแยกต่างหาก) | `collectors/collection-server/collect-collzfs.sh` | บนโฮสต์ backend นั้นโดยตรง |
 | การมอนิเตอร์ **Kubernetes** (operator, node agent, master agent, ...) | `collectors/k8s/collect-k8s.sh` | เครื่องใดก็ได้ที่เข้าถึงคลัสเตอร์ผ่าน `kubectl` (หรือ `oc`) — bastion หรือเครื่องทำงานของคุณ **ไม่ใช่** บนโหนดของคลัสเตอร์ |
 | **NMS Control Manager** (มอนิเตอร์เครือข่าย) | `collectors/nms/collect-nms.sh` | บนโฮสต์ NMS Control Manager โดยตรง |
+| การมอนิเตอร์ **ฐานข้อมูล** (เอเจนต์ DBX/XOS/DMX และ DB ที่ถูกมอนิเตอร์) | `collectors/db/collect-db.sh` (Windows/MSSQL: `collectors/db/windows/collect-db-mssql.ps1`) | บนโฮสต์ของเอเจนต์ DB; หากติดตั้งแยกโฮสต์ ให้รันโฮสต์ละหนึ่งครั้ง |
+| การมอนิเตอร์แอปพลิเคชัน **Java** | `collectors/apm/java/collect-apmjava.sh` | บนโฮสต์หรือคอนเทนเนอร์ที่แอปพลิเคชัน Java ทำงาน |
+| การมอนิเตอร์แอปพลิเคชัน **Python** | `collectors/apm/python/collect-apmpython.sh` | บนโฮสต์หรือคอนเทนเนอร์ที่แอปพลิเคชัน Python ทำงาน |
+| การมอนิเตอร์แอปพลิเคชัน **Node.js** | `collectors/apm/nodejs/collect-apmnodejs.sh` | บนโฮสต์หรือคอนเทนเนอร์ที่แอปพลิเคชัน Node.js ทำงาน |
+| การมอนิเตอร์แอปพลิเคชัน **.NET** (Windows) | `collectors/apm/dotnet/collect-apmdotnet.ps1` | บนโฮสต์ Windows ที่แอปพลิเคชัน .NET ทำงาน โดยใช้ PowerShell แบบยกระดับสิทธิ์ |
 
 ## 4. การรัน
 
@@ -89,6 +95,9 @@ cd global-groundtruth/collectors/collection-server
   `n/a (permission denied)` มากขึ้น
 - หากรายงานแสดงไดเรกทอรีหลักของ WhaTap เป็น `n/a` ให้รันใหม่พร้อม
   `--home <path>` เช่น `./collect-collserver.sh --file --home /whatap`
+- หากคำถามเจาะจงเรื่อง **ZFS** ใต้ data path ของ backend ทาง WhaTap จะขอ
+  collector คู่กันในไดเรกทอรีเดียวกัน (`./collect-collzfs.sh --file`) ด้วย
+  เป็นรายงานคนละฉบับ กรุณาส่งทั้งสองไฟล์
 
 ### 4.2 Kubernetes (bastion / เครื่องทำงาน)
 
@@ -122,7 +131,66 @@ cd global-groundtruth/collectors/nms
 
 ส่งไฟล์ `.txt` ที่สคริปต์แจ้งชื่อกลับมา (collector ตัวนี้ยังไม่มีโหมด bundle)
 
-### 4.4 ระหว่างที่สคริปต์ทำงาน
+### 4.4 การมอนิเตอร์ฐานข้อมูล (โฮสต์ของเอเจนต์ DB)
+
+```sh
+cd global-groundtruth/collectors/db
+./collect-db.sh --file
+# -> whatap-db-<host>-<timestamp>.txt
+```
+
+หมายเหตุ:
+
+- กรณี**ติดตั้งแยกโฮสต์** (เอเจนต์อยู่โฮสต์หนึ่ง ฐานข้อมูลอยู่อีกโฮสต์หนึ่ง)
+  ให้รันโฮสต์ละหนึ่งครั้ง — ได้ไฟล์หนึ่งไฟล์ต่อหนึ่งโฮสต์
+- หาก WhaTap ขอข้อเท็จจริงที่มีเพียงตัวฐานข้อมูลเท่านั้นที่ตอบได้ (สิทธิ์ของ
+  บัญชี พารามิเตอร์ ออบเจ็กต์สำหรับมอนิเตอร์ — ซึ่งเป็นช่องทางเดียวสำหรับ DB
+  บนคลาวด์แบบ managed เช่น RDS) ทาง WhaTap จะระบุชุด SQL ของเอนจินคุณใน `sql/`
+  ให้รันด้วยไคลเอนต์ DB ที่คุณใช้ประจำ แล้วส่งผลลัพธ์กลับมาด้วย
+- บน Windows ที่ใช้ MSSQL ให้ใช้ `windows/collect-db-mssql.ps1` แทน
+
+### 4.5 การมอนิเตอร์แอปพลิเคชัน (โฮสต์หรือคอนเทนเนอร์ของแอปพลิเคชัน)
+
+ให้รัน collector ตามภาษาของแอปพลิเคชัน **ข้างๆ โปรเซสของแอปพลิเคชัน** — หาก
+แอปพลิเคชันทำงานเป็นคอนเทนเนอร์ ให้รันภายในคอนเทนเนอร์นั้น
+
+```sh
+cd global-groundtruth/collectors/apm/java     # หรือ python / nodejs
+./collect-apmjava.sh --file
+# -> whatap-apmjava-<host>-<timestamp>.txt
+```
+
+บน Kubernetes หรือ Docker ให้ส่งสคริปต์เข้าทาง stdin แทนการคัดลอกเข้าไปใน
+คอนเทนเนอร์ แล้วรับรายงานออกทาง stdout:
+
+```sh
+kubectl exec -i <pod> -c <container> -- sh -s -- --stdout --quiet \
+    < collect-apmjava.sh > report.txt
+
+docker exec -i <container> sh -s -- --stdout --quiet \
+    < collect-apmjava.sh > report.txt
+```
+
+บน Windows collector ของ .NET เป็นสคริปต์ PowerShell ให้รันใน PowerShell
+**แบบ 64 บิตและยกระดับสิทธิ์**:
+
+```powershell
+cd global-groundtruth\collectors\apm\dotnet
+.\collect-apmdotnet.ps1 -File
+# -> whatap-apmdotnet-<HOST>-<UTC>.txt
+```
+
+หมายเหตุ:
+
+- หากนโยบายอนุญาต ให้รันด้วย**ผู้ใช้ระบบปฏิบัติการเดียวกับโปรเซสของ
+  แอปพลิเคชัน** หากรันด้วยผู้ใช้อื่นรายงานก็ยังใช้ได้ เพียงแต่จะมีบรรทัด
+  `n/a (permission denied)` มากขึ้น
+- WhaTap อาจขอให้รันอีกครั้งพร้อม flag เพิ่มเติม เช่น `--library <ชื่อ>` เพื่อดู
+  รายละเอียดของไลบรารีหนึ่งตัว หรือ `--threads` เพื่อเก็บ thread dump โดยจะระบุ
+  flag เหล่านั้นให้อย่างชัดเจน ส่วนการรัน `--file` ตามปกติจะไม่แตะต้องโปรเซส
+  ของแอปพลิเคชันเลย
+
+### 4.6 ระหว่างที่สคริปต์ทำงาน
 
 - บรรทัดแสดงความคืบหน้าที่ขึ้นต้นด้วย `>> ` จะปรากฏบนเทอร์มินัลให้เห็นว่า
   สคริปต์กำลังทำงาน บรรทัดเหล่านี้ไม่ใช่ส่วนหนึ่งของรายงาน
