@@ -65,6 +65,7 @@ Your WhaTap contact will name the collector to run:
 | **Java** application monitoring | `collectors/apm/java/collect-apmjava.sh` | on the host or container where the Java application runs |
 | **Python** application monitoring | `collectors/apm/python/collect-apmpython.sh` | on the host or container where the Python application runs |
 | **Node.js** application monitoring | `collectors/apm/nodejs/collect-apmnodejs.sh` | on the host or container where the Node.js application runs |
+| **PHP** application monitoring | `collectors/apm/php/collect-apmphp.sh` | on the host or container where the PHP application runs (Apache / PHP-FPM) |
 | **.NET** application monitoring (Windows) | `collectors/apm/dotnet/collect-apmdotnet.ps1` | on the Windows host where the .NET application runs, in an elevated PowerShell |
 
 ## 4. Run it
@@ -156,7 +157,7 @@ Run the collector for the application's language, **next to the application
 process** — inside the container for a containerized app.
 
 ```sh
-cd global-groundtruth/collectors/apm/java     # or python / nodejs
+cd global-groundtruth/collectors/apm/java     # or python / nodejs / php
 ./collect-apmjava.sh --file
 # -> whatap-apmjava-<host>-<timestamp>.txt
 ```

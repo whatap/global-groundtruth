@@ -70,7 +70,7 @@ global-groundtruth/
 │   ├── k8s/                      # SEEDED v0 — cluster-level collector (operator/CR/agents)
 │   ├── nms/                      # SEEDED v0 — NMS Control Manager host collector
 │   ├── server/                   # STUB (README only)
-│   ├── apm/                      # PARTIALLY SEEDED — java/ python/ nodejs/ v0 + dotnet/ v0 (Windows); php pending
+│   ├── apm/                      # SEEDED — java/ python/ nodejs/ php/ v0 + dotnet/ v0 (Windows)
 │   ├── db/                       # SEEDED v0 — shell collector + SQL packs
 │   └── collection-server/        # SEEDED v0 — WhaTap backend (yard/proxy/...) collector
 ├── templates/
@@ -86,7 +86,7 @@ global-groundtruth/
 | `k8s`               | SEEDED v0        | bastion-run cluster collector; see `collectors/k8s/`                      |
 | `nms`               | SEEDED v0        | NMS Control Manager host script; see `collectors/nms/`                    |
 | `server`            | NOT IMPLEMENTED  | host shell script; see `collectors/server/`                               |
-| `apm`               | PARTIALLY SEEDED | per-language family; `java` + `python` + `nodejs` + `dotnet` v0 seeded; see `collectors/apm/` |
+| `apm`               | SEEDED v0        | per-language family; `java` + `python` + `nodejs` + `php` + `dotnet` v0 seeded; see `collectors/apm/` |
 | `db`                | SEEDED v0        | shell collector + SQL packs; see `collectors/db/`                         |
 | `collection-server` | SEEDED v0        | backend host script; see `collectors/collection-server/`                  |
 

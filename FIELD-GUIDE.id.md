@@ -70,6 +70,7 @@ Kontak WhaTap Anda akan menyebutkan collector yang harus dijalankan:
 | Monitoring aplikasi **Java** | `collectors/apm/java/collect-apmjava.sh` | di host atau container tempat aplikasi Java berjalan |
 | Monitoring aplikasi **Python** | `collectors/apm/python/collect-apmpython.sh` | di host atau container tempat aplikasi Python berjalan |
 | Monitoring aplikasi **Node.js** | `collectors/apm/nodejs/collect-apmnodejs.sh` | di host atau container tempat aplikasi Node.js berjalan |
+| Monitoring aplikasi **PHP** | `collectors/apm/php/collect-apmphp.sh` | di host atau container tempat aplikasi PHP (Apache / PHP-FPM) berjalan |
 | Monitoring aplikasi **.NET** (Windows) | `collectors/apm/dotnet/collect-apmdotnet.ps1` | di host Windows tempat aplikasi .NET berjalan, dalam PowerShell dengan hak administrator |
 
 ## 4. Menjalankannya
@@ -163,7 +164,7 @@ Jalankan collector sesuai bahasa aplikasi, **di sebelah proses aplikasi** — di
 dalam container bila aplikasi dijalankan sebagai container.
 
 ```sh
-cd global-groundtruth/collectors/apm/java     # atau python / nodejs
+cd global-groundtruth/collectors/apm/java     # atau python / nodejs / php
 ./collect-apmjava.sh --file
 # -> whatap-apmjava-<host>-<timestamp>.txt
 ```

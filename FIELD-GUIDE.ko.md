@@ -64,6 +64,7 @@ cd global-groundtruth && git pull
 | **Java** 애플리케이션 모니터링 | `collectors/apm/java/collect-apmjava.sh` | Java 애플리케이션이 실행되는 호스트 또는 컨테이너에서 |
 | **Python** 애플리케이션 모니터링 | `collectors/apm/python/collect-apmpython.sh` | Python 애플리케이션이 실행되는 호스트 또는 컨테이너에서 |
 | **Node.js** 애플리케이션 모니터링 | `collectors/apm/nodejs/collect-apmnodejs.sh` | Node.js 애플리케이션이 실행되는 호스트 또는 컨테이너에서 |
+| **PHP** 애플리케이션 모니터링 | `collectors/apm/php/collect-apmphp.sh` | PHP 애플리케이션(Apache / PHP-FPM)이 실행되는 호스트 또는 컨테이너에서 |
 | **.NET** 애플리케이션 모니터링 (Windows) | `collectors/apm/dotnet/collect-apmdotnet.ps1` | .NET 애플리케이션이 실행되는 Windows 호스트에서, 관리자 권한 PowerShell로 |
 
 ## 4. 실행하기
@@ -155,7 +156,7 @@ cd global-groundtruth/collectors/db
 하십시오. 컨테이너로 구동 중이면 컨테이너 안에서 실행합니다.
 
 ```sh
-cd global-groundtruth/collectors/apm/java     # 또는 python / nodejs
+cd global-groundtruth/collectors/apm/java     # 또는 python / nodejs / php
 ./collect-apmjava.sh --file
 # -> whatap-apmjava-<host>-<timestamp>.txt
 ```

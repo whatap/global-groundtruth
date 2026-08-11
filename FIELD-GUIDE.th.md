@@ -64,6 +64,7 @@ cd global-groundtruth && git pull
 | การมอนิเตอร์แอปพลิเคชัน **Java** | `collectors/apm/java/collect-apmjava.sh` | บนโฮสต์หรือคอนเทนเนอร์ที่แอปพลิเคชัน Java ทำงาน |
 | การมอนิเตอร์แอปพลิเคชัน **Python** | `collectors/apm/python/collect-apmpython.sh` | บนโฮสต์หรือคอนเทนเนอร์ที่แอปพลิเคชัน Python ทำงาน |
 | การมอนิเตอร์แอปพลิเคชัน **Node.js** | `collectors/apm/nodejs/collect-apmnodejs.sh` | บนโฮสต์หรือคอนเทนเนอร์ที่แอปพลิเคชัน Node.js ทำงาน |
+| การมอนิเตอร์แอปพลิเคชัน **PHP** | `collectors/apm/php/collect-apmphp.sh` | บนโฮสต์หรือคอนเทนเนอร์ที่แอปพลิเคชัน PHP (Apache / PHP-FPM) ทำงาน |
 | การมอนิเตอร์แอปพลิเคชัน **.NET** (Windows) | `collectors/apm/dotnet/collect-apmdotnet.ps1` | บนโฮสต์ Windows ที่แอปพลิเคชัน .NET ทำงาน โดยใช้ PowerShell แบบยกระดับสิทธิ์ |
 
 ## 4. การรัน
@@ -155,7 +156,7 @@ cd global-groundtruth/collectors/db
 แอปพลิเคชันทำงานเป็นคอนเทนเนอร์ ให้รันภายในคอนเทนเนอร์นั้น
 
 ```sh
-cd global-groundtruth/collectors/apm/java     # หรือ python / nodejs
+cd global-groundtruth/collectors/apm/java     # หรือ python / nodejs / php
 ./collect-apmjava.sh --file
 # -> whatap-apmjava-<host>-<timestamp>.txt
 ```

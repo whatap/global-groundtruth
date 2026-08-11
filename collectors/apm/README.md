@@ -1,17 +1,18 @@
 # collectors/apm — language sub-family collectors
 
-> **Status: PARTIALLY SEEDED.** `java/` holds a working v0
+> **Status: SEEDED.** `java/` holds a working v0
 > ([java/collect-apmjava.sh](java/collect-apmjava.sh), see
 > [java/README.md](java/README.md)), `python/` holds a working v0
 > ([python/collect-apmpython.sh](python/collect-apmpython.sh), see
 > [python/README.md](python/README.md)), `nodejs/` holds a working v0
 > ([nodejs/collect-apmnodejs.sh](nodejs/collect-apmnodejs.sh), see
-> [nodejs/README.md](nodejs/README.md)), and `dotnet/` holds a working v0
+> [nodejs/README.md](nodejs/README.md)), `php/` holds a working v0
+> ([php/collect-apmphp.sh](php/collect-apmphp.sh), see
+> [php/README.md](php/README.md)), and `dotnet/` holds a working v0
 > for Windows hosts ([dotnet/collect-apmdotnet.ps1](dotnet/collect-apmdotnet.ps1),
 > PowerShell 5.1+, see [dotnet/README.md](dotnet/README.md); Linux .NET hosts
-> not covered yet). `php/` is not implemented yet. Each collector will be owned
-> by its agent's developers (CONTRACT rule 4); until handover they are managed
-> by the Global team.
+> not covered yet). Each collector will be owned by its agent's developers
+> (CONTRACT rule 4); until handover they are managed by the Global team.
 
 ## Note: this domain has language sub-families
 
