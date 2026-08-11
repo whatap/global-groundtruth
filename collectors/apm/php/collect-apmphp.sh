@@ -21,6 +21,10 @@
 # Recurring field questions this report answers with facts:
 #   * Which PHP binaries/SAPIs exist, at which version, PHP API and thread
 #     safety (NTS/ZTS) — and which extension_dir and ini files does each use?
+#   * On a host carrying **several PHP versions** (Sury/ondrej, Remi, SCL,
+#     cPanel EasyApache, Plesk, CloudLinux alt-php, LiteSpeed lsphp, or a
+#     source build next to the distro one): which of them is the tracer bound
+#     to, which one serves the traffic, and where does `php` on PATH point?
 #   * Is whatap.so present in that extension_dir, and which
 #     whatap[_zts]_<API>.so does the symlink actually point to?
 #   * Is the extension actually mapped into the live Apache/PHP-FPM workers, or
@@ -64,7 +68,7 @@ export LC_ALL=C
 
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-apmphp"
-VERSION="0.1.0"
+VERSION="0.2.0"
 DOMAIN="apm/php"
 TARGET="host/$(hostname 2>/dev/null || echo unknown)"
 
@@ -312,6 +316,7 @@ php_info_block() {
 # ---- discovery (internal; emits nothing) --------------------------------------
 # Populates:
 #   D_PHP_BINS    distinct php / php-fpm / php-cgi binaries (PATH, globs, procs)
+#   D_PHP_FACTS   one record per detailed runtime, filled in by section 3
 #   D_AGENT_PIDS  pids of the Go agent (comm: whatap_php / whatap_php_stat*)
 #   D_WEB_PIDS    pids of httpd / apache2 / php-fpm / php-cgi / php processes
 #   D_ALT_PIDS    pids of persistent-worker PHP runtimes (swoole/octane/rr/...)
@@ -321,6 +326,7 @@ php_info_block() {
 #   D_INI_FILES   whatap ini files found on disk
 D_PHP_BINS=""
 D_PHP_KEYS=""
+D_PHP_FACTS=""      # newline-joined "bin|version|sapi|api|threadsafety|extdir|scandir|loaded|loadmsg"
 D_AGENT_PIDS=""
 D_WEB_PIDS=""
 D_ALT_PIDS=""
@@ -464,10 +470,20 @@ discover() {
         p="$(command -v "$c" 2>/dev/null)"
         [ -n "$p" ] && _add_php "$p"
     done
+    # Several PHP versions on one host is the normal case, not the exception,
+    # and each distribution/panel keeps them in its own tree. Enumerate the
+    # known shapes (shallow globs, no directory walk); anything else still
+    # arrives through the process scan and the PATH lookup above.
     for p in /usr/bin/php /usr/bin/php[0-9]* /usr/sbin/php-fpm* /usr/bin/php-fpm* \
-             /usr/local/bin/php /usr/local/bin/php[0-9]* /usr/local/sbin/php-fpm* \
-             /opt/*/bin/php /opt/*/sbin/php-fpm /opt/remi/php*/root/usr/bin/php \
-             /usr/local/php*/bin/php /usr/local/php*/sbin/php-fpm; do
+             /usr/bin/php-cgi* /usr/local/bin/php /usr/local/bin/php[0-9]* \
+             /usr/local/sbin/php-fpm* /usr/local/php*/bin/php /usr/local/php*/sbin/php-fpm \
+             /opt/*/bin/php /opt/*/sbin/php-fpm \
+             /opt/remi/php*/root/usr/bin/php /opt/remi/php*/root/usr/sbin/php-fpm \
+             /opt/rh/*php*/root/usr/bin/php /opt/rh/*php*/root/usr/sbin/php-fpm \
+             /opt/cpanel/ea-php*/root/usr/bin/php /opt/cpanel/ea-php*/root/usr/sbin/php-fpm \
+             /opt/plesk/php/*/bin/php /opt/plesk/php/*/sbin/php-fpm \
+             /opt/alt/php*/usr/bin/php /opt/alt/php*/usr/sbin/php-fpm \
+             /usr/local/lsws/lsphp*/bin/php /usr/local/lsws/lsphp*/bin/lsphp; do
         [ -x "$p" ] && [ -f "$p" ] && _add_php "$p"
     done
 
@@ -516,7 +532,13 @@ discover() {
              /etc/php/*/mods-available/whatap.ini /etc/php/*/*/conf.d/*whatap.ini \
              /etc/php/*/conf.d/*whatap.ini \
              /usr/local/etc/php/conf.d/whatap.ini /usr/local/etc/php/conf.d/*whatap.ini \
-             /usr/local/lib/php.d/whatap.ini /opt/remi/php*/root/etc/php.d/whatap.ini \
+             /usr/local/lib/php.d/whatap.ini \
+             /opt/remi/php*/root/etc/php.d/whatap.ini /etc/opt/remi/php*/php.d/whatap.ini \
+             /opt/rh/*php*/root/etc/php.d/whatap.ini /etc/opt/rh/*php*/php.d/whatap.ini \
+             /opt/cpanel/ea-php*/root/etc/php.d/whatap.ini \
+             /opt/plesk/php/*/etc/php.d/whatap.ini \
+             /opt/alt/php*/etc/php.d/whatap.ini \
+             /usr/local/lsws/lsphp*/etc/php.d/whatap.ini /usr/local/lsws/lsphp*/etc/php/*/mods-available/whatap.ini \
              "$D_DEFAULT_HOME"/whatap.ini; do
         _add_ini "$p"
     done
@@ -575,14 +597,15 @@ run_report() {
     # [3] PHP runtimes: one block per distinct binary. `php -i` is executed
     # once per binary and every field below is extracted from that capture.
     section "PHP runtimes and SAPIs"
+    fact "php binaries discovered: $(echo $D_PHP_BINS | wc -w | tr -d ' ')"
     if [ -z "$D_PHP_BINS" ]; then
-        fact "php binaries: n/a (none found on PATH, in the usual install paths, or among running processes)"
+        fact "   none on PATH, in the known per-version install paths (distro, Sury, Remi, SCL, cPanel EA, Plesk, alt-php, LiteSpeed, source builds), or among running processes"
     fi
     local _n=0 php
     for php in $D_PHP_BINS; do
         _n=$((_n + 1))
-        if [ "$_n" -gt 6 ]; then
-            fact "-- more php binaries found but not detailed (cap: 6): $(echo $D_PHP_BINS | tr ' ' '\n' | tail -n +7 | tr '\n' ' ')"
+        if [ "$_n" -gt 10 ]; then
+            fact "-- more php binaries found but not detailed (cap: 10): $(echo $D_PHP_BINS | tr ' ' '\n' | tail -n +11 | tr '\n' ' ')"
             break
         fi
         fact "-- php binary: $php"
@@ -597,9 +620,22 @@ run_report() {
             php_info_grep "   extension_dir" '^extension_dir =>' 2
             php_info_grep "   opcache" '^opcache\.(enable|enable_cli|jit|jit_buffer_size|preload) =>' 8
             php_info_grep "   whatap directives visible to this binary (local => master)" '^whatap\.' 80
-            # extension_dir feeds the module-binding section
-            _add_ext_dir "$(grep -E '^extension_dir =>' "$_infofile" 2>/dev/null | head -n1 | sed 's/.*=> *//; s/ *=>.*//')" "php -i of $php"
-            # the ini files this binary actually parses feed the config section
+            # everything the binding section needs, taken from this one capture
+            # (a host with several PHP versions gets one record per version)
+            _f_ver="$(grep '^PHP Version =>' "$_infofile" 2>/dev/null | head -n1 | sed 's/.*=> *//')"
+            _f_sapi="$(grep '^Server API =>' "$_infofile" 2>/dev/null | head -n1 | sed 's/.*=> *//')"
+            _f_api="$(grep '^PHP API =>' "$_infofile" 2>/dev/null | head -n1 | sed 's/.*=> *//')"
+            _f_ts="$(grep '^Thread Safety =>' "$_infofile" 2>/dev/null | head -n1 | sed 's/.*=> *//')"
+            _f_ed="$(grep '^extension_dir =>' "$_infofile" 2>/dev/null | head -n1 | sed 's/.*=> *//; s/ *=>.*//')"
+            _f_sd="$(grep '^Scan this dir for additional' "$_infofile" 2>/dev/null | head -n1 | sed 's/.*=> *//')"
+            if grep -q '^whatap\.' "$_infofile" 2>/dev/null; then _f_ld="yes"; else _f_ld="no"; fi
+            _f_wn="$( { grep -h 'Unable to load dynamic library' "$_infofile" "$_errfile" | head -n1 | cut -c1-200 ; } 2>/dev/null )"
+            [ -n "$_f_wn" ] || _f_wn="none in the php -i output"
+            D_PHP_FACTS="$D_PHP_FACTS
+$php|$_f_ver|$_f_sapi|$_f_api|$_f_ts|$_f_ed|$_f_sd|$_f_ld|$_f_wn"
+            _add_ext_dir "$_f_ed" "php -i of $php"
+            # ini files this binary parses, and the whatap ini its own scan dir
+            # would hold — discovered per runtime, not guessed from a path list
             grep -E '^(Loaded Configuration File|Additional \.ini files parsed) =>' "$_infofile" 2>/dev/null \
                 | sed 's/^[^=]*=> *//' | tr ',' '\n' | sed 's/^ *//; s/ *$//' \
                 | grep -i whatap > "$_errfile.ini" 2>/dev/null
@@ -607,8 +643,13 @@ run_report() {
                 while IFS= read -r _p; do _add_ini "$_p"; done < "$_errfile.ini"
             fi
             rm -f "$_errfile.ini" 2>/dev/null
+            case "$_f_sd" in
+                /*) for _p in "$_f_sd"/whatap.ini "$_f_sd"/*whatap*.ini; do _add_ini "$_p"; done ;;
+            esac
         else
             fact "   php -i: n/a ($(_classify_err))"
+            D_PHP_FACTS="$D_PHP_FACTS
+$php|||||||no|php -i did not run"
         fi
         php_run "   extensions loaded (php -m)" "$php" -m
     done
@@ -621,6 +662,21 @@ run_report() {
         [ -n "$_o" ] && printf '        %-40s %s\n' "$php" "$_o" && _other="y"
     done
     [ -z "$_other" ] && fact "   none found (searched: newrelic, datadog/ddtrace, elastic, opentelemetry, tideways, blackfire, xdebug, xhprof, pinpoint, scoutapm, instana)"
+    # on a multi-version host, `php` on PATH is usually a managed symlink —
+    # install.sh resolved whichever version it pointed to at install time
+    fact "what the php commands on PATH resolve to (usually a managed symlink):"
+    for c in php php-fpm php-cgi; do
+        p="$(command -v "$c" 2>/dev/null)"
+        if [ -n "$p" ]; then printf '        %-10s %s -> %s\n' "$c" "$p" "$(readlink -f "$p" 2>/dev/null || echo 'n/a (unresolvable)')"
+        else printf '        %-10s not on PATH\n' "$c"; fi
+    done
+    if have update-alternatives; then
+        probe "update-alternatives php entries" sh -c "update-alternatives --display php 2>&1 | head -n 20"
+    elif have alternatives; then
+        probe "alternatives php entries" sh -c "alternatives --display php 2>&1 | head -n 20"
+    else
+        fact "alternatives php entries: n/a (command not found: update-alternatives, alternatives)"
+    fi
 
     # [4] what actually serves the traffic
     section "Web server / application server layer"
@@ -654,6 +710,8 @@ run_report() {
     done
     if have nginx; then probe "nginx version" sh -c "nginx -v 2>&1 | head -n 2"
     else fact "nginx version: n/a (command not found: nginx)"; fi
+    # one FPM service per PHP version is the usual multi-version layout
+    probe "systemd php-fpm units" sh -c "systemctl list-units --all --type=service --no-pager --no-legend 'php*' 2>/dev/null | head -n 20"
     fact "web / php processes found: $(echo $D_WEB_PIDS | wc -w | tr -d ' ')"
     _shown=0
     for pid in $D_WEB_PIDS; do
@@ -732,29 +790,70 @@ run_report() {
     if have apk; then probe "   apk info whatap-php" sh -c "apk info -v whatap-php 2>&1 | head -n 3"
     else fact "   apk: n/a (command not found: apk)"; fi
 
-    # [6] how the tracer is bound to each PHP runtime
-    section "Tracer binding: whatap.so, ini placement, live load status"
+    # [6] the binding, reported per PHP runtime — on a host with several PHP
+    # versions the tracer is bound to some of them and not to others, and each
+    # version has its own extension_dir and its own ini scan dir.
+    section "Tracer binding per PHP runtime (module, ini, load state)"
+    if [ -z "$D_PHP_FACTS" ]; then
+        fact "no PHP runtime was detailed in section 3; only the extension_dir view below applies"
+    else
+        printf '%s\n' "$D_PHP_FACTS" | grep -v '^$' | while IFS='|' read -r _p _v _sapi _api _ts _ed _sd _ld _wn; do
+            [ -n "$_p" ] || continue
+            fact "-- runtime: $_p"
+            fact "   PHP ${_v:-n/a}, SAPI ${_sapi:-n/a}, PHP API ${_api:-n/a}, Thread Safety ${_ts:-n/a}"
+            if [ -n "$_ed" ]; then
+                fact "   extension_dir: $_ed"
+                fsd="$(resolve_fs "$_ed")"
+                if [ -z "$fsd" ]; then
+                    fact "   whatap.so there: n/a (extension_dir not visible from this mount namespace)"
+                elif [ -e "$fsd/whatap.so" ]; then
+                    fact "   whatap.so there: $(ls -l "$fsd/whatap.so" 2>/dev/null)"
+                    _t="$(readlink -f "$fsd/whatap.so" 2>/dev/null)"
+                    if [ -n "$_t" ]; then
+                        _b="$(basename "$_t")"
+                        fact "   it resolves to: $_b (name encodes: thread-safe build = $(case "$_b" in *_zts_*) echo yes ;; *) echo no ;; esac), PHP API = $(echo "$_b" | grep -oE '[0-9]{8}' | head -n1))"
+                    fi
+                else
+                    fact "   whatap.so there: n/a (path not found: $_ed/whatap.so)"
+                fi
+            else
+                fact "   extension_dir: n/a (php -i reported none)"
+            fi
+            if [ -n "$_sd" ]; then
+                fact "   ini scan dir: $_sd"
+                _i="$(ls "$_sd"/*whatap*.ini 2>/dev/null | tr '\n' ' ')"
+                if [ -n "$_i" ]; then fact "   whatap ini in that scan dir: $_i"
+                else fact "   whatap ini in that scan dir: n/a (no *whatap*.ini in $_sd)"; fi
+            else
+                fact "   ini scan dir: n/a (php -i reported none — the installer then writes into php.ini itself)"
+            fi
+            fact "   whatap.* directives registered in this runtime (module loaded at startup): $_ld"
+            fact "   dynamic-library load message: $_wn"
+        done
+    fi
     if [ -z "$D_EXT_DIRS" ]; then
         fact "extension_dir values: none discovered (php -i and service files both empty)"
     else
-        fact "extension_dir values discovered:"
-        printf '%s\n' "$D_EXT_DIRS" | while IFS='|' read -r _d _s; do printf '        %s   <- %s\n' "$_d" "$_s"; done
-        printf '%s\n' "$D_EXT_DIRS" | cut -d'|' -f1 | sort -u | while IFS= read -r d; do
-            [ -n "$d" ] || continue
-            fsd="$(resolve_fs "$d")"
-            if [ -z "$fsd" ]; then fact "-- extension_dir $d: n/a (path not visible from this mount namespace)"; continue; fi
-            fact "-- extension_dir: $d"
+        fact "every extension_dir seen, its source, and whether a discovered runtime reported it:"
+        printf '%s\n' "$D_EXT_DIRS" | grep -v '^$' | while IFS='|' read -r _d _s; do
+            [ -n "$_d" ] || continue
+            _u="no"
+            case "$D_PHP_FACTS" in *"|$_d|"*) _u="yes" ;; esac
+            printf '        %-50s <- %-42s runtime-reported: %s\n' "$_d" "$_s" "$_u"
+        done
+        # a dir that only the service files name belongs to a PHP install that
+        # no runtime found here reports — its module facts are collected too
+        printf '%s\n' "$D_EXT_DIRS" | grep -v '^$' | while IFS='|' read -r _d _s; do
+            [ -n "$_d" ] || continue
+            case "$D_PHP_FACTS" in *"|$_d|"*) continue ;; esac
+            fsd="$(resolve_fs "$_d")"
+            if [ -z "$fsd" ]; then fact "-- extension_dir $_d (no runtime reported it): n/a (path not visible from this mount namespace)"; continue; fi
+            fact "-- extension_dir $_d (no runtime reported it):"
             if [ -e "$fsd/whatap.so" ]; then
                 file_facts "   whatap.so" "$fsd/whatap.so"
-                _t="$(readlink -f "$fsd/whatap.so" 2>/dev/null)"
-                if [ -n "$_t" ]; then
-                    _b="$(basename "$_t")"
-                    fact "   module file it resolves to: $_b (name encodes: thread-safe build = $(case "$_b" in *_zts_*) echo yes ;; *) echo no ;; esac), PHP API = $(echo "$_b" | grep -oE '[0-9]{8}' | head -n1))"
-                fi
             else
-                fact "   whatap.so: n/a (path not found: $d/whatap.so)"
+                fact "   whatap.so: n/a (path not found: $_d/whatap.so)"
             fi
-            probe "   other whatap* files in this dir" sh -c "ls -la '$fsd' 2>/dev/null | grep -i whatap | head -n 10"
         done
     fi
     fact "whatap ini files found on disk:"
@@ -776,10 +875,14 @@ run_report() {
         grep -n -i whatap "$p" 2>/dev/null | head -n 30 | while IFS= read -r _l; do printf '           %s\n' "$_l"; done
     done
     [ "$_hit" = 0 ] && fact "   none found"
-    fact "ini directory trees present (per-SAPI trees are separate: a file in the cli tree is not read by fpm or apache):"
+    fact "ini directory trees present (per-version and per-SAPI trees are separate: a file in one tree is not read by another):"
     _hit=0
     for d in /etc/php.d /etc/php/*/cli/conf.d /etc/php/*/fpm/conf.d /etc/php/*/apache2/conf.d /etc/php/*/mods-available \
-             /etc/php[0-9]*/conf.d /usr/local/etc/php/conf.d /opt/remi/php*/root/etc/php.d; do
+             /etc/php[0-9]*/conf.d /usr/local/etc/php/conf.d \
+             /opt/remi/php*/root/etc/php.d /etc/opt/remi/php*/php.d \
+             /opt/rh/*php*/root/etc/php.d /etc/opt/rh/*php*/php.d \
+             /opt/cpanel/ea-php*/root/etc/php.d /opt/plesk/php/*/etc/php.d \
+             /opt/alt/php*/etc/php.d /usr/local/lsws/lsphp*/etc/php.d; do
         [ -d "$d" ] || continue
         _hit=1
         printf '        %-46s %s\n' "$d" "$(ls "$d" 2>/dev/null | grep -i whatap | tr '\n' ' ' | sed 's/^$/(no whatap entry)/')"
