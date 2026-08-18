@@ -41,7 +41,7 @@ export LC_ALL=C
 
 # ---- collector metadata -----------------------------------------------------
 COLLECTOR_NAME="whatap-k8s"
-VERSION="0.4.1"
+VERSION="0.4.2"
 DOMAIN="k8s"
 TARGET="k8s-cluster/unresolved"      # refined after CLI/context/namespace discovery
 
@@ -404,6 +404,10 @@ WEBHOOKS=""          # whatap mutating/validating webhook config names (full, on
 WEBHOOK_HOOKS=""     # per-hook names inside those configs (e.g. mpod.kb.io) — the label the
                      # API server uses in its own admission metrics
 WHATAP_CROLES=""     # whatap-related ClusterRole names
+ALL_HOOKS=""         # every admission hook in the cluster as "config<TAB>hookName" — the
+                     # API server keys its metrics by hook NAME alone, and kubebuilder
+                     # scaffolds generic names (mpod.kb.io), so a name used by a second
+                     # operator would silently share whatap's counters
 HELM_SECRETS=""      # sh.helm.release.v1.* secret names mentioning whatap
 
 discover_workloads() {
@@ -455,6 +459,8 @@ EOF
         WEBHOOK_HOOKS="$WEBHOOK_HOOKS $(kval get "$wh" -o 'jsonpath={range .webhooks[*]}{.name}{" "}{end}')"
     done
     WHATAP_CROLES="$(kval get clusterroles -o name | grep -Ei 'whatap' | sed 's#^clusterrole\.rbac\.authorization\.k8s\.io/##' | head -n 5)"
+    ALL_HOOKS="$(kval get mutatingwebhookconfigurations,validatingwebhookconfigurations \
+        -o 'jsonpath={range .items[*]}{.metadata.name}{"\t"}{range .webhooks[*]}{.name}{","}{end}{"\n"}{end}' | grep -v '^$' | head -n 60)"
 }
 
 # APM_SEL_VALS: every label VALUE named by an APM target's podSelector, one per
@@ -669,6 +675,13 @@ run_report() {
         fact "whatap mutating/validating webhooks: none found"
     fi
 
+    subsection "every admission webhook in the cluster (config -> hook names)"
+    # Not whatap-filtered on purpose: a third-party mutating webhook that runs on the same
+    # pods is part of the injection path (it can inject a conflicting env earlier in the
+    # list), and a hook NAME reused by another configuration shares whatap's metric series.
+    if [ -n "$ALL_HOOKS" ]; then _emit_labeled "webhook configurations (name -> hooks)" "$ALL_HOOKS"
+    else fact "webhook configurations: n/a ($(_k_reason))"; fi
+
     subsection "admission call counters (kube-apiserver /metrics)"
     # The API server counts every admission webhook call it makes, keyed by the
     # per-hook name. These counters come from the CALLER, so they are independent of
@@ -691,6 +704,19 @@ run_report() {
             mfo="$(printf '%s\n' "$K_OUT" | grep -E '^apiserver_admission_webhook_fail_open_count')"
             if [ -n "$mfo" ]; then _emit_labeled "fail_open_count for every webhook in the cluster" "$mfo"
             else fact "fail_open_count series: none present"; fi
+            # The counters above are keyed by hook NAME only — no configuration name — so a
+            # hook name used by two configurations shares one series. kubebuilder scaffolds
+            # generic names (mpod.kb.io / vpod.kb.io), so this is worth stating either way.
+            if [ -n "$ALL_HOOKS" ]; then
+                local hdup
+                hdup="$(printf '%s\n' "$ALL_HOOKS" | awk -F'\t' '{n=split($2,a,","); for(i=1;i<=n;i++) if(a[i]!="") print a[i] "\t" $1}' \
+                    | sort | awk -F'\t' '{c[$1]=c[$1] " " $2; n[$1]++} END {for (k in n) if (n[k]>1) printf "%s carried by:%s\n", k, c[k]}' | sort)"
+                if [ -n "$hdup" ]; then
+                    _emit_labeled "hook names carried by more than one webhook configuration (their counters are shared)" "$hdup"
+                else
+                    fact "hook names carried by more than one webhook configuration: none — each counter series above belongs to one configuration"
+                fi
+            fi
         else
             fact "kube-apiserver /metrics: n/a ($(_k_reason))"
         fi
