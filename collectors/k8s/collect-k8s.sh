@@ -41,7 +41,7 @@ export LC_ALL=C
 
 # ---- collector metadata -----------------------------------------------------
 COLLECTOR_NAME="whatap-k8s"
-VERSION="0.4.3"
+VERSION="0.4.4"
 DOMAIN="k8s"
 TARGET="k8s-cluster/unresolved"      # refined after CLI/context/namespace discovery
 
@@ -613,6 +613,11 @@ run_report() {
             # false, or no targets at all, the pod-mutating path returns before any target
             # is evaluated (whatapagent_webhook.go)
             # shellcheck disable=SC2086
+            # when each writer last touched the CR — settles "was the apm block present
+            # when that pod was created", which generation alone cannot answer
+            # shellcheck disable=SC2086
+            kprobe "cr write history (managedFields: manager / operation / time)" get "$WA_CRD" "$cr" $crref -o 'jsonpath={range .metadata.managedFields[*]}{.manager}{" op="}{.operation}{" subresource="}{.subresource}{" time="}{.time}{"\n"}{end}'
+            # shellcheck disable=SC2086
             kprobe "cr identity + master switches" get "$WA_CRD" "$cr" $crref -o 'jsonpath={"apiVersion="}{.apiVersion}{" name="}{.metadata.name}{" k8sAgent.namespace="}{.spec.features.k8sAgent.namespace}{" k8sAgent.enabled="}{.spec.features.k8sAgent.enabled}{" apm.instrumentation.enabled="}{.spec.features.apm.instrumentation.enabled}{" targets="}{.spec.features.apm.instrumentation.targets[*].name}'
             # shellcheck disable=SC2086
             kprobe "apm instrumentation targets" get "$WA_CRD" "$cr" $crref -o 'jsonpath={range .spec.features.apm.instrumentation.targets[*]}{"name="}{.name}{" lang="}{.language}{" enabled="}{.enabled}{" versions="}{.whatapApmVersions}{" mode="}{.config.mode}{" configMapRef="}{.config.configMapRef.name}{" nsSelector="}{.namespaceSelector}{" podSelector="}{.podSelector}{"\n"}{end}'
@@ -666,6 +671,14 @@ run_report() {
                     [ -n "$svcname" ] && [ -n "$svcns" ] || continue
                     kprobe "webhook backend service $svcns/$svcname" get svc "$svcname" -n "$svcns" -o wide
                     kprobe "webhook backend endpoints $svcns/$svcname" get endpoints "$svcname" -n "$svcns"
+                    # How many pods are serving this webhook right now. The operator mints
+                    # its own CA per process, and the registered caBundle can match only
+                    # one of them, so more than one ready address is itself the fact.
+                    local eaddr ecount
+                    eaddr="$(kval get endpoints "$svcname" -n "$svcns" -o 'jsonpath={range .subsets[*]}{range .addresses[*]}{.ip}{":"}{end}{"\n"}{end}' | tr ':' '\n' | grep -v '^$')"
+                    ecount="$(printf '%s\n' "$eaddr" | grep -c . )"
+                    if [ -n "$eaddr" ]; then _emit_labeled "ready backend addresses: $ecount" "$eaddr"
+                    else fact "ready backend addresses: 0 (no ready endpoint — every call to this webhook fails)"; fi
                 done
             else
                 fact "webhook $wh backend service: n/a (no clientConfig.service — url-based or empty)"
@@ -711,17 +724,18 @@ run_report() {
     # only its fingerprint is emitted — the key.pem / tls.key fields in this Secret are
     # never requested and never printed.
     if [ -n "$NS" ] && have openssl; then
-        local secfp
-        secfp="$(kval get secret whatap-webhook-certificate -n "$NS" -o 'jsonpath={.data.cert\.pem}' \
-            | base64 -d 2>/dev/null | base64 -d 2>/dev/null \
-            | openssl x509 -noout -sha256 -fingerprint -subject 2>/dev/null | tr '\n' ' ')"
-        if [ -z "$secfp" ]; then
-            secfp="$(kval get secret whatap-webhook-certificate -n "$NS" -o 'jsonpath={.data.cert\.pem}' \
+        # the Secret name is discovered, not assumed — it has differed across versions
+        local certsec secfp
+        certsec="$(kval get secrets -n "$NS" -o name | sed 's#^secret/##' | grep -Ei 'webhook.*cert|cert.*webhook' | head -n1)"
+        if [ -n "$certsec" ]; then
+            secfp="$(kval get secret "$certsec" -n "$NS" -o 'jsonpath={.data.cert\.pem}' \
                 | base64 -d 2>/dev/null \
                 | openssl x509 -noout -sha256 -fingerprint -subject 2>/dev/null | tr '\n' ' ')"
+            if [ -n "$secfp" ]; then fact "secret $certsec cert.pem (public CA field only): $secfp"
+            else fact "secret $certsec cert.pem: n/a (field absent or not parseable as a certificate)"; fi
+        else
+            fact "webhook certificate secret: none found in $NS matching webhook*cert (the operator may be keeping the CA only in its emptyDir)"
         fi
-        if [ -n "$secfp" ]; then fact "secret whatap-webhook-certificate cert.pem (public CA only): $secfp"
-        else fact "secret whatap-webhook-certificate cert.pem: n/a (secret absent, field absent, or not parseable as a certificate)"; fi
     fi
     # When each side was produced: an operator process that started AFTER the caBundle was
     # last written is serving a CA the configuration does not carry.
