@@ -12,9 +12,10 @@
 #
 # THE CONTRACT (../../CONTRACT.md) — facts only, no diagnosis / no judgment.
 # DESIGN GUIDELINES (../../docs/collector-engineering.md):
-#   * MECE sections     — every fact lives in exactly one domain (A..I below):
+#   * MECE sections     — every fact lives in exactly one domain (A..J below):
 #                         declared state in C/D/E, observed events in F, all
-#                         log streams in G, image index in H, in-pod facts in I.
+#                         log streams in G, image index in H, in-pod facts in I,
+#                         APM auto-instrumentation of application pods in J.
 #   * Load-safe by tier — Tier 0 (default report) is read-only API GETs with
 #                         bounded --tail and a per-call timeout; full logs and
 #                         yaml archives are --bundle; per-node exec fan-out is
@@ -40,7 +41,7 @@ export LC_ALL=C
 
 # ---- collector metadata -----------------------------------------------------
 COLLECTOR_NAME="whatap-k8s"
-VERSION="0.2.0"
+VERSION="0.3.0"
 DOMAIN="k8s"
 TARGET="k8s-cluster/unresolved"      # refined after CLI/context/namespace discovery
 
@@ -55,6 +56,7 @@ OPT_CONTEXT=""       # kubeconfig context passthrough
 OPT_KUBECONFIG=""    # kubeconfig path passthrough
 OPT_TAIL=200         # Tier 0 log tail lines per container
 OPT_EXEC_ALL=0       # Tier 2: run in-pod probes on every node-agent pod
+OPT_APM_EXEC=0       # Tier 2: exec into --apm-target application containers
 APM_TGTS=()          # opt-in: namespaces (ns or ns/workload) to inspect for injection facts
 
 usage() {
@@ -74,13 +76,21 @@ by accident.
   collect-k8s.sh --context CTX            kubeconfig context to use (multi-cluster bastion)
   collect-k8s.sh --kubeconfig PATH        kubeconfig file to use
   collect-k8s.sh --tail N                 Tier 0 log lines per container (default: 200)
-  collect-k8s.sh --apm-target NS[/NAME]   also inspect an application namespace for
-                                          whatap auto-instrumentation facts (repeatable,
-                                          max 5; reads that namespace's pod specs)
+  collect-k8s.sh --apm-target NS[/NAME]   inspect an application namespace for whatap APM
+                                          auto-instrumentation facts (repeatable, max 5):
+                                          workload template env (as declared) vs pod env
+                                          (as admitted), init-container state, mounts,
+                                          init/startup logs, namespace events
 
   Tier 2 (opt-in, wider fan-out — announced on stderr before running):
   collect-k8s.sh --exec-per-node          run the in-pod probes on EVERY running
                                           node-agent pod (max 30) instead of 2 samples
+  collect-k8s.sh --apm-exec               also run read-only probes INSIDE the
+                                          --apm-target application containers
+                                          (agent home listing, conf, agent logs)
+
+Section J runs even with no --apm-target: it always reports the cluster-wide
+inventory of pods carrying a whatap APM init container.
 
 Output is verbatim (framework policy: no masking). Kubernetes Secret values
 are never fetched; secrets appear only as name/type/key tables.
@@ -105,6 +115,7 @@ while [ $# -gt 0 ]; do
         --tail) OPT_TAIL="$2"; shift ;;
         --tail=*) OPT_TAIL="${1#*=}" ;;
         --exec-per-node) OPT_EXEC_ALL=1 ;;
+        --apm-exec) OPT_APM_EXEC=1 ;;
         --apm-target) APM_TGTS[${#APM_TGTS[@]}]="$2"; shift ;;
         --apm-target=*) APM_TGTS[${#APM_TGTS[@]}]="${1#*=}" ;;
         -h|--help) usage; exit 0 ;;
@@ -173,6 +184,42 @@ _emit_labeled() {
     else
         fact "$label:"
         printf '%s\n' "$body" | while IFS= read -r _l || [ -n "$_l" ]; do printf '        %s\n' "$_l"; done
+    fi
+}
+
+# ---- env-table helpers (APM auto-instrumentation facts) ----------------------
+# The operator's mutating webhook acts on PODS at CREATE, so a workload template
+# carries env as declared by the application owner and a running pod carries env
+# as admitted after mutation. Both are dumped through the same shape below so the
+# two can be compared line by line.
+#
+# _envpath ROOT -> a jsonpath emitting one "C<TAB>container" line, then one
+# "E<TAB>name<TAB>value<TAB>valueFrom" line per env entry. The container name is
+# unreachable from inside the inner range, hence the two line kinds.
+_envpath() {
+    printf 'jsonpath={range %s.containers[*]}{"C\\t"}{.name}{"\\n"}{range .env[*]}{"E\\t"}{.name}{"\\t"}{.value}{"\\t"}{.valueFrom}{"\\n"}{end}{end}{range %s.initContainers[*]}{"C\\tinit:"}{.name}{"\\n"}{range .env[*]}{"E\\t"}{.name}{"\\t"}{.value}{"\\t"}{.valueFrom}{"\\n"}{end}{end}' "$1" "$1"
+}
+
+# _emit_env_table "label" RAW -> render the C/E stream as a per-container env
+# table, then list any env name occurring more than once in the same container.
+# Kubernetes resolves a duplicated env name to its FIRST occurrence, so the
+# repetition itself is a fact worth stating (values are printed verbatim).
+_emit_env_table() {
+    local label="$1" raw="$2" rendered dups
+    if [ -z "$raw" ]; then fact "$label: n/a (empty output)"; return; fi
+    rendered="$(printf '%s\n' "$raw" | awk -F'\t' '
+        $1=="C" { c=$2; printf "container %s\n", c; next }
+        $1=="E" { printf "  %s = %s%s\n", $2, $3, ($4=="" ? "" : "   valueFrom=" $4) }')"
+    if [ -n "$rendered" ]; then _emit_labeled "$label" "$rendered"
+    else fact "$label: n/a (no containers or no env entries)"; fi
+    dups="$(printf '%s\n' "$raw" | awk -F'\t' '
+        $1=="C" { c=$2; next }
+        $1=="E" { k=c "|" $2; n[k]++; if (n[k]==2) order[++m]=k }
+        END { for (i=1;i<=m;i++) { split(order[i],a,"|"); printf "%s: %s occurs %d times\n", a[1], a[2], n[order[i]] } }')"
+    if [ -n "$dups" ]; then
+        _emit_labeled "$label / repeated env names (Kubernetes applies the first occurrence)" "$dups"
+    else
+        fact "$label / repeated env names: none"
     fi
 }
 
@@ -282,16 +329,32 @@ emit_log_tail() {
     fi
 }
 
-# pod_exec_probe "label" POD CONTAINER CMDSTRING -> output of a
-# read-only command run inside an agent pod, or a classified reason.
-pod_exec_probe() {
-    local label="$1" pod="$2" cont="$3" cmd="$4"
-    if run_k exec -n "$NS" "$pod" -c "$cont" -- sh -c "$cmd" && [ -n "$K_OUT" ]; then
+# emit_log_head_ns NS POD CONTAINER BYTES -> the FIRST bytes of a container log.
+# `logs --limit-bytes` without `--tail` returns the log from its beginning, which
+# is where an agent prints its boot banner (the Node.js agent banner goes to the
+# application stdout only) — a tail would miss it on a long-running pod.
+emit_log_head_ns() {
+    local ns="$1" pod="$2" cont="$3" bytes="$4"
+    if run_k logs -n "$ns" "$pod" -c "$cont" --limit-bytes="$bytes" && [ -n "$K_OUT" ]; then
+        _emit_labeled "log head $pod/$cont (first ${bytes}B)" "$K_OUT"
+    else
+        fact "log head $pod/$cont (first ${bytes}B): n/a ($(_k_reason))"
+    fi
+}
+
+# pod_exec_probe_ns NS "label" POD CONTAINER CMDSTRING -> output of a read-only
+# command run inside a pod in any namespace, or a classified reason.
+pod_exec_probe_ns() {
+    local ns="$1" label="$2" pod="$3" cont="$4" cmd="$5"
+    if run_k exec -n "$ns" "$pod" -c "$cont" -- sh -c "$cmd" && [ -n "$K_OUT" ]; then
         _emit_labeled "$label" "$K_OUT"
     else
         fact "$label: n/a ($(_k_reason))"
     fi
 }
+
+# pod_exec_probe "label" POD CONTAINER CMDSTRING -> same, in the whatap namespace.
+pod_exec_probe() { pod_exec_probe_ns "$NS" "$1" "$2" "$3" "$4"; }
 
 # ---- discovery (run once, before the report) ---------------------------------
 NS=""; NS_SRC=""; NS_ALL=""
@@ -491,8 +554,17 @@ run_report() {
             kprobe "nodeAgentContainer.envs names" get "$WA_CRD" "$cr" $crref -o 'jsonpath={.spec.features.k8sAgent.nodeAgent.nodeAgentContainer.envs[*].name}'
             # shellcheck disable=SC2086
             kprobe "nodeHelperContainer.envs names" get "$WA_CRD" "$cr" $crref -o 'jsonpath={.spec.features.k8sAgent.nodeAgent.nodeHelperContainer.envs[*].name}'
+            # master switches above the per-target level: with apm.instrumentation.enabled
+            # false, or no targets at all, the pod-mutating path returns before any target
+            # is evaluated (whatapagent_webhook.go)
+            # shellcheck disable=SC2086
+            kprobe "cr identity + master switches" get "$WA_CRD" "$cr" $crref -o 'jsonpath={"apiVersion="}{.apiVersion}{" name="}{.metadata.name}{" k8sAgent.namespace="}{.spec.features.k8sAgent.namespace}{" k8sAgent.enabled="}{.spec.features.k8sAgent.enabled}{" apm.instrumentation.enabled="}{.spec.features.apm.instrumentation.enabled}{" targets="}{.spec.features.apm.instrumentation.targets[*].name}'
             # shellcheck disable=SC2086
             kprobe "apm instrumentation targets" get "$WA_CRD" "$cr" $crref -o 'jsonpath={range .spec.features.apm.instrumentation.targets[*]}{"name="}{.name}{" lang="}{.language}{" enabled="}{.enabled}{" versions="}{.whatapApmVersions}{" mode="}{.config.mode}{" configMapRef="}{.config.configMapRef.name}{" nsSelector="}{.namespaceSelector}{" podSelector="}{.podSelector}{"\n"}{end}'
+            # the init image the operator will pull for each target: an explicit
+            # customImageFullName overrides the default public.ecr.aws/whatap/apm-init-<lang>:<version>
+            # shellcheck disable=SC2086
+            kprobe "apm target init image overrides + extra envs" get "$WA_CRD" "$cr" $crref -o 'jsonpath={range .spec.features.apm.instrumentation.targets[*]}{"name="}{.name}{" customImageFullName="}{.customImageFullName}{" customImageName="}{.customImageName}{" imagePullSecrets="}{.imagePullSecrets[*].name}{" envs="}{range .envs[*]}{.name}{"="}{.value}{";"}{end}{"\n"}{end}'
             i=$((i + 1))
         done
     else
@@ -507,15 +579,42 @@ run_report() {
     if [ -n "$OP_DEPLOY" ]; then
         kprobe "operator pods" get pods -n "$NS" -l app.kubernetes.io/name=whatap-operator -o wide
         kprobe "operator deployment yaml" get deploy "$OP_DEPLOY" -n "$NS" -o yaml
+        # the operator writes its per-pod admission decisions (target matched / pod
+        # labels do not match / namespace does not match / target disabled) at V(1)-V(2),
+        # so the log verbosity it was started with decides whether section G can show them
+        kprobe "operator container command/args + log-level env" get deploy "$OP_DEPLOY" -n "$NS" \
+            -o 'jsonpath={range .spec.template.spec.containers[*]}{.name}{" command="}{.command}{" args="}{.args}{" env="}{range .env[*]}{.name}{"="}{.value}{";"}{end}{"\n"}{end}'
         kfilter "operator replicasets (revision/image history)" "whatap-operator|^NAME" get rs -n "$NS" -o custom-columns=NAME:.metadata.name,REVISION:.metadata.annotations.deployment\.kubernetes\.io/revision,IMAGE:.spec.template.spec.containers[0].image,CREATED:.metadata.creationTimestamp
     else
         fact "operator deployment: none found in ${NS:-<no namespace>}"
     fi
     subsection "admission webhooks"
     if [ -n "$WEBHOOKS" ]; then
-        local wh
+        local wh whsvc svcns svcname
         for wh in $WEBHOOKS; do
+            # compact applicability line first (the full yaml below carries everything,
+            # but these four fields decide whether a given pod is even sent to the webhook)
+            kprobe "webhook $wh (per-hook: name / path / rules / policies / selectors)" get "$wh" \
+                -o 'jsonpath={range .webhooks[*]}{.name}{" path="}{.clientConfig.service.path}{" url="}{.clientConfig.url}{" ops="}{.rules[*].operations}{" resources="}{.rules[*].resources}{" failurePolicy="}{.failurePolicy}{" matchPolicy="}{.matchPolicy}{" reinvocationPolicy="}{.reinvocationPolicy}{" nsSelector="}{.namespaceSelector}{" objectSelector="}{.objectSelector}{"\n"}{end}'
+            # an empty caBundle means the API server has nothing to trust the backend
+            # with; the value itself is a long base64 blob, so its size is what is stated
+            local cab
+            cab="$(kval get "$wh" -o 'jsonpath={range .webhooks[*]}{.name}{"="}{.clientConfig.caBundle}{"\n"}{end}' | awk -F'=' '{printf "%s caBundle=%d bytes\n", $1, length($2)}')"
+            if [ -n "$cab" ]; then _emit_labeled "webhook $wh caBundle size per hook" "$cab"
+            else fact "webhook $wh caBundle size: n/a (empty output)"; fi
             kprobe "webhook $wh (yaml)" get "$wh" -o yaml
+            # the webhook backend: a Service with no ready endpoint cannot mutate anything
+            whsvc="$(kval get "$wh" -o 'jsonpath={range .webhooks[*]}{.clientConfig.service.namespace}{"/"}{.clientConfig.service.name}{"\n"}{end}' | sort -u | grep -v '^/*$')"
+            if [ -n "$whsvc" ]; then
+                for svcns in $whsvc; do
+                    svcname="${svcns#*/}"; svcns="${svcns%%/*}"
+                    [ -n "$svcname" ] && [ -n "$svcns" ] || continue
+                    kprobe "webhook backend service $svcns/$svcname" get svc "$svcname" -n "$svcns" -o wide
+                    kprobe "webhook backend endpoints $svcns/$svcname" get endpoints "$svcname" -n "$svcns"
+                done
+            else
+                fact "webhook $wh backend service: n/a (no clientConfig.service — url-based or empty)"
+            fi
         done
     else
         fact "whatap mutating/validating webhooks: none found"
@@ -596,6 +695,26 @@ run_report() {
                 _emit_labeled "logs deploy/$OP_DEPLOY" "$K_OUT"
             else
                 fact "logs deploy/$OP_DEPLOY: n/a ($(_k_reason))"
+            fi
+        fi
+        # The admission decision is written when a pod is CREATED, which is usually
+        # far behind a 200-line tail on a long-lived operator. Pull a deeper tail and
+        # keep only the lines the injector emits (agent injection, env assembly,
+        # webhook admission), so the trail survives without shipping the whole log.
+        if [ -n "$OP_DEPLOY" ]; then
+            if run_k logs -n "$NS" "deploy/$OP_DEPLOY" --tail=4000 --limit-bytes=4000000; then
+                local inj
+                # includes the webhook's own skip wording (target disabled / pod labels do
+                # not match / namespace does not match / no matching targets), which is the
+                # trail for a pod that was seen by the webhook and left untouched
+                inj="$(printf '%s\n' "$K_OUT" | grep -Ei 'inject|instrument|whatap-agent-init|NODE_OPTIONS|NODE_PATH|PYTHONPATH|JAVA_TOOL_OPTIONS|AGENT_PATH|mutat|admission|apm-init|target|selector|skipping' | tail -n 200)"
+                if [ -n "$inj" ]; then
+                    _emit_labeled "operator log lines matching injection markers (tail 4000 -> last 200 matches)" "$inj"
+                else
+                    fact "operator log lines matching injection markers: none in the last 4000 lines"
+                fi
+            else
+                fact "operator log injection markers: n/a ($(_k_reason))"
             fi
         fi
         local mdep
@@ -710,7 +829,7 @@ run_report() {
                 [ "${SP_PHASE[$i]}" = "Running" ] && { EXEC_PODS="$EXEC_PODS ${SP_POD[$i]}"; n=$((n + 1)); }
                 i=$((i + 1))
             done
-            warn "[Tier2] --exec-per-node: running read-only commands inside $n node-agent pods"
+            progress "[Tier2] --exec-per-node: running read-only commands inside $n node-agent pods"
             fact "exec fan-out: $n running pods (--exec-per-node, cap 30)"
         else
             local with="" without=""
@@ -755,10 +874,86 @@ run_report() {
         fact "in-pod probes: n/a (not applicable: no namespace/daemonset/pods discovered)"
     fi
 
-    # -- J. APM auto-instrumentation targets (opt-in) --------------------------------
-    if [ "${#APM_TGTS[@]}" -gt 0 ]; then
-        section "J. APM auto-instrumentation targets (--apm-target)"
-        local ti tgt tns twl tpods tp shown
+    # -- J. APM auto-instrumentation (application pods) ------------------------------
+    # The operator's mutating webhook acts on pods at CREATE, so three states exist
+    # and each is collected separately here:
+    #   declared  — the workload template the application owner applied
+    #   admitted  — the pod spec that survived admission (what the operator produced)
+    #   running   — what the process actually received (--apm-exec, /proc/1/environ)
+    # Section C carries the CR targets and their selectors; the namespace/pod labels
+    # below are the other half of that comparison.
+    section "J. APM auto-instrumentation"
+    fact "webhook scope: whatap admission acts on pods at CREATE (see the webhook rules in section D) — a pod created before the operator/CR existed carries no injection until it is recreated"
+    fact "states reported: declared (workload template) / admitted (pod spec) / running (--apm-exec only)"
+
+    # ---- name mapping: the identifiers that have to line up before anything is injected --
+    # Every one of these is a name or label the operator matches by string. They are
+    # collected together, verbatim, so each side of every match can be read off one page.
+    subsection "name mapping inputs (CR name, selectors, labels)"
+    fact "operator reference (whatap-operator internal/webhook/v2alpha1/whatapagent_webhook.go): the pod-mutating path resolves ONE cluster-scoped WhatapAgent by the fixed name 'whatap'; a CR under any other name is not read by that path. The CR names present in this cluster are listed below."
+    if [ -n "$WA_CRD" ]; then
+        kprobe "whatapagent CR names present (cluster)" get "$WA_CRD" -o 'jsonpath={range .items[*]}{.metadata.name}{" apiVersion="}{.apiVersion}{" created="}{.metadata.creationTimestamp}{"\n"}{end}'
+        if run_k get "$WA_CRD" -o 'jsonpath={.items[*].metadata.name}'; then
+            case " $K_OUT " in
+                *" whatap "*) fact "a whatapagent named 'whatap' is present: yes" ;;
+                *) fact "a whatapagent named 'whatap' is present: no (names found: ${K_OUT:-none})" ;;
+            esac
+        else
+            fact "a whatapagent named 'whatap' is present: n/a ($(_k_reason))"
+        fi
+        # how many targets exist at all, stated separately so "no targets declared" is
+        # never confused with "the selector probe returned nothing"
+        local tgtnames
+        tgtnames="$(kval get "$WA_CRD" -o 'jsonpath={range .items[*]}{.metadata.name}{"="}{range .spec.features.apm.instrumentation.targets[*]}{.name}{","}{end}{"\n"}{end}')"
+        if [ -n "$tgtnames" ]; then _emit_labeled "apm instrumentation targets declared per cr (cr=target,target,...; empty after '=' means none declared)" "$tgtnames"
+        else fact "apm instrumentation targets declared per cr: n/a ($(_k_reason))"; fi
+        # per-target selectors, one line per target, in the shape they are matched in:
+        # namespaceSelector by name OR by namespace label; podSelector by pod label
+        kprobe "target selectors (matched against namespace names/labels and pod labels)" get "$WA_CRD" -o 'jsonpath={range .items[*]}{"cr="}{.metadata.name}{"\n"}{range .spec.features.apm.instrumentation.targets[*]}{"  target="}{.name}{" enabled="}{.enabled}{" lang="}{.language}{"\n"}{"    namespaceSelector.matchNames="}{.namespaceSelector.matchNames}{"\n"}{"    namespaceSelector.matchLabels="}{.namespaceSelector.matchLabels}{"\n"}{"    namespaceSelector.matchExpressions="}{.namespaceSelector.matchExpressions}{"\n"}{"    podSelector.matchLabels="}{.podSelector.matchLabels}{"\n"}{"    podSelector.matchExpressions="}{.podSelector.matchExpressions}{"\n"}{end}{end}'
+    else
+        fact "whatapagent CR name mapping: n/a (not applicable: whatapagents crd not present)"
+    fi
+    # the namespace side of namespaceSelector, for every namespace in the cluster
+    kprobe "namespace names + labels (the namespaceSelector match input)" get ns --show-labels
+
+    subsection "cluster-wide inventory: pods the APM webhook has instrumented"
+    # Two independent markers, because either one alone can miss a pod:
+    #   * the injected init container   — present even if the annotations were stripped
+    #   * the whatap-apm-injected annotation the webhook stamps on the pod it mutated
+    #     (whatapagent_webhook.go) — present even when a target overrides the init image
+    #     with customImageFullName, whose name need not contain "whatap" at all
+    if run_k get pods -A -o 'jsonpath={range .items[*]}{.metadata.namespace}{"|"}{.metadata.name}{"|"}{.status.phase}{"|"}{range .spec.initContainers[*]}{.name}{"="}{.image}{","}{end}{"|injected="}{.metadata.annotations.whatap-apm-injected}{" lang="}{.metadata.annotations.whatap-apm-language}{" ver="}{.metadata.annotations.whatap-apm-version}{"\n"}{end}'; then
+        local inv invn invtot
+        invtot="$(printf '%s\n' "$K_OUT" | grep -c .)"
+        inv="$(printf '%s\n' "$K_OUT" | awk -F'|' 'NF>=5 && (tolower($4) ~ /whatap|apm-init/ || $5 ~ /injected=true/)')"
+        if [ -n "$inv" ]; then
+            invn="$(printf '%s\n' "$inv" | grep -c .)"
+            _emit_labeled "instrumented pods — namespace|pod|phase|initContainers|webhook annotations ($invn of $invtot pods cluster-wide; first 100 listed)" "$(printf '%s\n' "$inv" | head -n 100)"
+            _emit_labeled "count per namespace" "$(printf '%s\n' "$inv" | cut -d'|' -f1 | sort | uniq -c)"
+            _emit_labeled "count per annotated language" "$(printf '%s\n' "$inv" | cut -d'|' -f5 | sed -n 's/.* lang=\([^ ]*\).*/\1/p' | sed 's/^$/<none>/' | sort | uniq -c)"
+            # tally the whatap init images only; sibling init containers stay visible
+            # per pod above, where their ORDER relative to the agent init matters
+            _emit_labeled "whatap init-container images in use (count image)" "$(printf '%s\n' "$inv" | cut -d'|' -f4 | tr ',' '\n' | grep -Ei 'whatap|apm-init' | sed 's/^[^=]*=//' | grep -v '^$' | sort | uniq -c)"
+            # a pod carrying one marker but not the other is a fact on its own
+            local invmm
+            invmm="$(printf '%s\n' "$inv" | awk -F'|' '
+                { ic = (tolower($4) ~ /whatap|apm-init/); an = ($5 ~ /injected=true/) }
+                ic && !an { printf "%s/%s init container only (no whatap-apm-injected annotation)\n", $1, $2 }
+                !ic && an { printf "%s/%s annotation only (no whatap init container)\n", $1, $2 }' | head -n 40)"
+            if [ -n "$invmm" ]; then _emit_labeled "pods carrying only one of the two markers" "$invmm"
+            else fact "pods carrying only one of the two markers: none (every instrumented pod has both)"; fi
+        else
+            fact "instrumented pods: none among $invtot pods cluster-wide (no whatap init container and no whatap-apm-injected annotation)"
+        fi
+    else
+        fact "cluster-wide instrumented-pod inventory: n/a ($(_k_reason))"
+    fi
+
+    if [ "${#APM_TGTS[@]}" -eq 0 ]; then
+        fact "per-target inspection: n/a (not requested — pass --apm-target NS[/NAME] for workload/pod/env/log facts)"
+        [ "$OPT_APM_EXEC" = 1 ] && fact "in-container probes: n/a (--apm-exec given with no --apm-target: nothing to exec into)"
+    else
+        local ti tgt tns twl
         ti=0
         while [ "$ti" -lt "${#APM_TGTS[@]}" ] && [ "$ti" -lt 5 ]; do
             tgt="${APM_TGTS[$ti]}"
@@ -766,26 +961,132 @@ run_report() {
             twl=""; case "$tgt" in */*) twl="${tgt#*/}" ;; esac
             subsection "target: namespace=$tns${twl:+ workload=$twl}"
             kprobe "namespace labels" get ns "$tns" --show-labels
-            tpods="$(kval get pods -n "$tns" --no-headers | awk '{print $1}')"
-            [ -n "$twl" ] && tpods="$(printf '%s\n' "$tpods" | grep "^$twl" )"
-            tpods="$(printf '%s\n' "$tpods" | head -n 3)"
-            if [ -z "$tpods" ]; then
-                fact "pods: n/a (none found matching${twl:+ prefix $twl in} namespace $tns)"
+            kprobe "namespace annotations" get ns "$tns" -o 'jsonpath={.metadata.annotations}'
+
+            # ---- declared state: workload templates (never touched by the webhook) ----
+            local wls wl wlkind wlname
+            wls="$(kval get deploy,sts,ds -n "$tns" -o name)"
+            [ -n "$twl" ] && wls="$(printf '%s\n' "$wls" | awk -F'/' -v p="$twl" 'index($2, p) == 1')"
+            wls="$(printf '%s\n' "$wls" | grep -v '^$' | head -n 5)"
+            if [ -z "$wls" ]; then
+                fact "workloads (deploy/sts/ds): none found${twl:+ matching $twl} in $tns"
             fi
-            shown=0
-            for tp in $tpods; do
-                shown=$((shown + 1))
-                kprobe "pod $tp initContainers" get pod "$tp" -n "$tns" -o 'jsonpath={range .spec.initContainers[*]}{.name}{" image="}{.image}{"\n"}{end}'
-                if run_k get pod "$tp" -n "$tns" -o yaml; then
-                    local marks
-                    marks="$(printf '%s\n' "$K_OUT" | grep -Ein 'whatap|okind' | head -n 40)"
-                    if [ -n "$marks" ]; then _emit_labeled "pod $tp whatap-marker lines (grep whatap|okind, first 40)" "$marks"
-                    else fact "pod $tp whatap-marker lines: none (no line matching whatap/okind in pod yaml)"; fi
-                else
-                    fact "pod $tp yaml: n/a ($(_k_reason))"
-                fi
+            for wl in $wls; do
+                wlkind="${wl%%/*}"; wlname="${wl##*/}"
+                kprobe "workload $wl template labels" get "$wlkind" "$wlname" -n "$tns" -o 'jsonpath={.spec.template.metadata.labels}'
+                kprobe "workload $wl template annotations" get "$wlkind" "$wlname" -n "$tns" -o 'jsonpath={.spec.template.metadata.annotations}'
+                kprobe "workload $wl rollout (generation/observed/updated/ready)" get "$wlkind" "$wlname" -n "$tns" \
+                    -o 'jsonpath={"generation="}{.metadata.generation}{" observed="}{.status.observedGeneration}{" updated="}{.status.updatedReplicas}{" ready="}{.status.readyReplicas}{" replicas="}{.status.replicas}'
+                _emit_env_table "workload $wl env AS DECLARED" "$(kval get "$wlkind" "$wlname" -n "$tns" -o "$(_envpath .spec.template.spec)")"
             done
-            [ "$shown" -gt 0 ] && fact "pods inspected: $shown (cap 3 per target)"
+
+            # ---- admitted state: pods ------------------------------------------------
+            # order: pods with the most not-ready containers first (init containers
+            # counted too), so a stuck injection is inside the cap; then by name.
+            local praw psorted tpods tp ttotal
+            praw="$(kval get pods -n "$tns" -o 'jsonpath={range .items[*]}{.metadata.name}{"|"}{range .status.initContainerStatuses[*]}{.ready}{","}{end}{"|"}{range .status.containerStatuses[*]}{.ready}{","}{end}{"\n"}{end}')"
+            [ -n "$twl" ] && praw="$(printf '%s\n' "$praw" | grep -E "^$twl")"
+            psorted="$(printf '%s\n' "$praw" | grep -v '^$' | awk -F'|' '
+                { n=split($2 $3, a, ","); nr=0; for (i=1;i<=n;i++) if (a[i]=="false") nr++; print nr "|" $1 }' \
+                | sort -t'|' -k1,1nr -k2,2)"
+            ttotal="$(printf '%s\n' "$psorted" | grep -c .)"
+            tpods="$(printf '%s\n' "$psorted" | head -n 5 | cut -d'|' -f2)"
+            if [ -z "$tpods" ]; then
+                fact "pods: none found${twl:+ with name prefix $twl} in namespace $tns"
+            else
+                fact "pods inspected: $(printf '%s\n' "$tpods" | grep -c .) of $ttotal (cap 5, ordered by not-ready container count)"
+            fi
+            # every pod in the namespace with its labels (the podSelector match input) and
+            # its injection markers side by side — uncapped at 60, so the pods the webhook
+            # left untouched are visible next to the ones it changed
+            kprobe "all pods in $tns: labels + injection markers (podSelector match input)" get pods -n "$tns" \
+                -o 'jsonpath={range .items[*]}{.metadata.name}{" labels="}{.metadata.labels}{" injected="}{.metadata.annotations.whatap-apm-injected}{" lang="}{.metadata.annotations.whatap-apm-language}{" ver="}{.metadata.annotations.whatap-apm-version}{"\n"}{end}'
+            for tp in $tpods; do
+                fact "--- pod $tp ---"
+                kprobe "pod $tp identity" get pod "$tp" -n "$tns" \
+                    -o 'jsonpath={"phase="}{.status.phase}{" node="}{.spec.nodeName}{" created="}{.metadata.creationTimestamp}{" owner="}{range .metadata.ownerReferences[*]}{.kind}{"/"}{.name}{" "}{end}{" sa="}{.spec.serviceAccountName}'
+                kprobe "pod $tp labels" get pod "$tp" -n "$tns" -o 'jsonpath={.metadata.labels}'
+                kprobe "pod $tp annotations" get pod "$tp" -n "$tns" -o 'jsonpath={.metadata.annotations}'
+                kprobe "pod $tp initContainers (declared)" get pod "$tp" -n "$tns" -o 'jsonpath={range .spec.initContainers[*]}{.name}{" image="}{.image}{" imagePullPolicy="}{.imagePullPolicy}{"\n"}{end}'
+                kprobe "pod $tp initContainer status (state carries waiting reason/message)" get pod "$tp" -n "$tns" \
+                    -o 'jsonpath={range .status.initContainerStatuses[*]}{.name}{" ready="}{.ready}{" restarts="}{.restartCount}{" state="}{.state}{" lastState="}{.lastState}{"\n"}{end}'
+                kprobe "pod $tp container status" get pod "$tp" -n "$tns" \
+                    -o 'jsonpath={range .status.containerStatuses[*]}{.name}{" ready="}{.ready}{" restarts="}{.restartCount}{" image="}{.image}{" state="}{.state}{"\n"}{end}'
+                # the agent home is an emptyDir shared init->app; a mount present on the
+                # init container but absent on the app container is a fact worth having
+                kprobe "pod $tp volumes (name=source keys)" get pod "$tp" -n "$tns" -o 'jsonpath={range .spec.volumes[*]}{.name}{"\n"}{end}'
+                kprobe "pod $tp volumeMounts per container" get pod "$tp" -n "$tns" \
+                    -o 'jsonpath={range .spec.initContainers[*]}{"init:"}{.name}{" "}{range .volumeMounts[*]}{.name}{":"}{.mountPath}{" "}{end}{"\n"}{end}{range .spec.containers[*]}{.name}{" "}{range .volumeMounts[*]}{.name}{":"}{.mountPath}{" "}{end}{"\n"}{end}'
+                kprobe "pod $tp securityContext (pod + per container)" get pod "$tp" -n "$tns" \
+                    -o 'jsonpath={"pod="}{.spec.securityContext}{"\n"}{range .spec.containers[*]}{.name}{"="}{.securityContext}{"\n"}{end}'
+                _emit_env_table "pod $tp env AS ADMITTED" "$(kval get pod "$tp" -n "$tns" -o "$(_envpath .spec)")"
+
+                # ---- logs: init container output, then the head of each app container --
+                local icl icname acl acname acn
+                icl="$(kval get pod "$tp" -n "$tns" -o 'jsonpath={range .spec.initContainers[*]}{.name}{"\n"}{end}' | grep -Ei 'whatap|apm-init')"
+                if [ -n "$icl" ]; then
+                    for icname in $icl; do
+                        if run_k logs -n "$tns" "$tp" -c "$icname" --limit-bytes=8000; then
+                            if [ -n "$K_OUT" ]; then _emit_labeled "init log $tp/$icname (first 8000B)" "$K_OUT"
+                            else fact "init log $tp/$icname: n/a (empty output)"; fi
+                        else
+                            fact "init log $tp/$icname: n/a ($(_k_reason))"
+                        fi
+                    done
+                else
+                    fact "whatap init container in pod $tp: none (no initContainer named whatap/apm-init)"
+                fi
+                acl="$(kval get pod "$tp" -n "$tns" -o 'jsonpath={range .spec.containers[*]}{.name}{"\n"}{end}' | grep -v '^$')"
+                acn=0
+                for acname in $acl; do
+                    [ "$acn" -ge 2 ] && break
+                    acn=$((acn + 1))
+                    emit_log_head_ns "$tns" "$tp" "$acname" 4000
+                done
+            done
+
+            # ---- observed events in the application namespace ------------------------
+            if run_k get events -n "$tns" --sort-by=.lastTimestamp && [ -n "$K_OUT" ]; then
+                _emit_labeled "events in $tns (last 60 by lastTimestamp)" "$(printf '%s\n' "$K_OUT" | tail -n 60)"
+            else
+                fact "events in $tns: n/a ($(_k_reason))"
+            fi
+
+            # ---- Tier 2: running state inside the application container --------------
+            if [ "$OPT_APM_EXEC" = 1 ]; then
+                local xp xc xn=0
+                progress "[Tier2] --apm-exec: running read-only commands inside application containers in $tns"
+                for xp in $tpods; do
+                    [ "$xn" -ge 3 ] && break
+                    xc="$(kval get pod "$xp" -n "$tns" -o 'jsonpath={.spec.containers[0].name}')"
+                    [ -n "$xc" ] || continue
+                    xn=$((xn + 1))
+                    subsection "in-container probes: $tns/$xp/$xc"
+                    # /proc/1/environ is the env the process actually received — the pod
+                    # spec is what was requested, this is what took effect.
+                    pod_exec_probe_ns "$tns" "pid 1 cmdline" "$xp" "$xc" \
+                        'tr "\0" " " < /proc/1/cmdline 2>/dev/null; echo'
+                    pod_exec_probe_ns "$tns" "pid 1 environ (whatap / agent-loader keys)" "$xp" "$xc" \
+                        'tr "\0" "\n" < /proc/1/environ 2>/dev/null | grep -Ei "whatap|okind|NODE_OPTIONS|NODE_PATH|PYTHONPATH|JAVA_TOOL_OPTIONS|license|^APP_"'
+                    pod_exec_probe_ns "$tns" "agent home listing" "$xp" "$xc" \
+                        'H=${WHATAP_HOME:-/whatap-agent}; echo "home=$H"; ls -la "$H" 2>&1 | head -n 30'
+                    pod_exec_probe_ns "$tns" "agent home node_modules/whatap (nodejs seeding)" "$xp" "$xc" \
+                        'H=${WHATAP_HOME:-/whatap-agent}; ls -la "$H/node_modules/whatap" 2>&1 | head -n 20; ls -la "$H/agent" 2>&1 | head -n 10'
+                    pod_exec_probe_ns "$tns" "whatap.conf as present in the container" "$xp" "$xc" \
+                        'H=${WHATAP_HOME:-/whatap-agent}; for f in "$H/whatap.conf" ./whatap.conf /whatap.conf; do [ -f "$f" ] && { echo "== $f"; cat "$f"; }; done; :'
+                    pod_exec_probe_ns "$tns" "agent log directory + newest lines" "$xp" "$xc" \
+                        'H=${WHATAP_HOME:-/whatap-agent}; ls -la "$H/logs" 2>&1 | head -n 20; for f in "$H"/logs/*.log; do [ -f "$f" ] && { echo "== $f"; tail -n 40 "$f"; }; done; :'
+                    pod_exec_probe_ns "$tns" "agent port registry (/tmp/whatap-*.lock)" "$xp" "$xc" \
+                        'ls -la /tmp/whatap-*.lock 2>/dev/null && cat /tmp/whatap-*.lock 2>/dev/null; :'
+                    pod_exec_probe_ns "$tns" "language runtime version" "$xp" "$xc" \
+                        'node -v 2>&1; python3 -V 2>&1; java -version 2>&1 | head -n 3; :'
+                    pod_exec_probe_ns "$tns" "application module tree (whatap present in app node_modules?)" "$xp" "$xc" \
+                        'ls -d ./node_modules/whatap /app/node_modules/whatap /usr/src/app/node_modules/whatap 2>/dev/null; :'
+                done
+                [ "$xn" = 0 ] && fact "in-container probes: n/a (no pod/container resolved in $tns)"
+            else
+                fact "in-container probes: n/a (not requested — pass --apm-exec for running-state facts)"
+            fi
             ti=$((ti + 1))
         done
         [ "${#APM_TGTS[@]}" -gt 5 ] && fact "targets capped: first 5 of ${#APM_TGTS[@]} processed"
@@ -887,6 +1188,46 @@ collect_bundle_cluster() {
     progress "cluster: events/nodes/images written"
 }
 
+collect_bundle_apm() {
+    # Raw artifacts for the --apm-target namespaces: the workload yaml (env as
+    # declared), the pod yaml (env as admitted), init/app logs and events. The
+    # report carries the extracted facts; this carries the originals to re-read.
+    local dest="$1"
+    [ "${#APM_TGTS[@]}" -gt 0 ] || return
+    mkdir -p "$dest" 2>/dev/null
+    local ti tgt tns twl wls wl wlkind wlname pods tp conts cont
+    ti=0
+    while [ "$ti" -lt "${#APM_TGTS[@]}" ] && [ "$ti" -lt 5 ]; do
+        tgt="${APM_TGTS[$ti]}"; tns="${tgt%%/*}"
+        twl=""; case "$tgt" in */*) twl="${tgt#*/}" ;; esac
+        mkdir -p "$dest/$tns" 2>/dev/null
+        _bundle_write "$dest/$tns/pods-wide.txt" get pods -n "$tns" -o wide
+        _bundle_write "$dest/$tns/events.txt" get events -n "$tns" --sort-by=.lastTimestamp
+        _bundle_write "$dest/$tns/namespace.yaml" get ns "$tns" -o yaml
+        wls="$(kval get deploy,sts,ds -n "$tns" -o name)"
+        [ -n "$twl" ] && wls="$(printf '%s\n' "$wls" | awk -F'/' -v p="$twl" 'index($2, p) == 1')"
+        for wl in $(printf '%s\n' "$wls" | grep -v '^$' | head -n 5); do
+            wlkind="${wl%%/*}"; wlname="${wl##*/}"
+            _bundle_write "$dest/$tns/workload-$wlkind-$wlname.yaml" get "$wlkind" "$wlname" -n "$tns" -o yaml
+        done
+        pods="$(kval get pods -n "$tns" --no-headers | awk '{print $1}')"
+        [ -n "$twl" ] && pods="$(printf '%s\n' "$pods" | grep -E "^$twl")"
+        for tp in $(printf '%s\n' "$pods" | grep -v '^$' | head -n 5); do
+            _bundle_write "$dest/$tns/pod-$tp.yaml" get pod "$tp" -n "$tns" -o yaml
+            _bundle_write "$dest/$tns/describe-$tp.txt" describe pod "$tp" -n "$tns"
+            conts="$(kval get pod "$tp" -n "$tns" -o 'jsonpath={range .spec.initContainers[*]}{.name}{"\n"}{end}{range .spec.containers[*]}{.name}{"\n"}{end}')"
+            for cont in $conts; do
+                [ -n "$cont" ] || continue
+                if run_k logs -n "$tns" "$tp" -c "$cont" --limit-bytes=2000000 && [ -n "$K_OUT" ]; then
+                    printf '%s\n' "$K_OUT" > "$dest/$tns/${tp}_${cont}.log" 2>/dev/null
+                fi
+            done
+        done
+        ti=$((ti + 1))
+    done
+    progress "apm targets: workload/pod yaml, logs, events written"
+}
+
 collect_bundle_helm() {
     local dest="$1"
     have helm || { warn "helm: skipped (command not found: helm)"; return; }
@@ -914,6 +1255,7 @@ do_bundle() {
     collect_bundle_agents   "$work/agents"
     collect_bundle_logs     "$work/logs"
     collect_bundle_cluster  "$work/cluster"
+    collect_bundle_apm      "$work/apm-targets"
     collect_bundle_helm     "$work/helm"
 
     tarball="$OPT_OUT/$BASENAME.tar.gz"

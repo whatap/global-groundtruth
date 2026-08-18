@@ -1,6 +1,6 @@
 # collectors/k8s — SEEDED v0
 
-> **Status: SEEDED v0** (`collect-k8s.sh` 0.1.0). Owned by the k8s domain team
+> **Status: SEEDED v0** (`collect-k8s.sh` 0.3.0). Owned by the k8s domain team
 > (CONTRACT rule 4); until handover it is managed by the Global team.
 > Verified end-to-end against one live kubeadm cluster (v1.32, containerd,
 > whatap-operator 2.9.7 + node-agent DaemonSet + APM auto-instrumented app).
@@ -23,7 +23,7 @@ workstation, not on the node. One report, MECE sections:
 | [8] G. Logs | bounded tails: operator, master-agent, up to 3 sample node-agent pods × both containers, `--previous` when restarted |
 | [9] H. Helm & images | helm releases/history/values (verbatim); without the helm binary degrades to `sh.helm.release.v1.*` secret names; all deployed whatap image:tags |
 | [10] I. In-pod node facts | `kubectl exec` into up to 2 running node-agent pods: container-log symlink real target (standard `/var/log/pods` vs CCE `/mnt/paas/...`), log roots & runtime sockets (candidate paths derived from the DS's declared mounts, e.g. `/rootfs`), cgroup fs type, node-helper health endpoint, kubelet cmdline (only when hostPID) |
-| [11] J. APM targets (opt-in) | `--apm-target NS[/NAME]`: injection markers in app pods (init containers, `/whatap-agent` mount, `WHATAP_JAVA_AGENT_PATH`/`OKIND` env, injection annotations) |
+| [11] J. APM auto-instrumentation | **always**: name-mapping inputs (WhatapAgent CR names + whether one is named `whatap`, per-target namespaceSelector/podSelector, every namespace's labels) and a cluster-wide inventory of instrumented pods by **two** markers (whatap init container **or** the `whatap-apm-injected` annotation), with the mismatch list. With `--apm-target NS[/NAME]`: workload template env **as declared** vs pod env **as admitted** (per container, in API order, with repeated-name detection), init-container state (waiting reason/message), volumes/mounts, securityContext, every pod's labels + injection markers, init-container log and app-container log **head**, namespace events. With `--apm-exec` (Tier 2): `/proc/1/environ` and cmdline, agent home, `whatap.conf`, agent logs, `/tmp/whatap-*.lock`, runtime version |
 
 Everything is **discovered** (CRD group, namespace, DS/container names, mount
 prefixes), never hardcoded, so a new platform or install generation needs no
@@ -45,6 +45,11 @@ the case closes.
 ./collect-k8s.sh --file --namespace <ns>  # RBAC-scoped kubeconfig: name the whatap namespace
 ./collect-k8s.sh --file --context <ctx>   # multi-cluster bastion
 ./collect-k8s.sh                          # no arguments -> help only (does not collect)
+
+# APM auto-instrumentation case ("the agent is not being injected"):
+./collect-k8s.sh --file --apm-target <app-ns>            # + the app namespace
+./collect-k8s.sh --file --apm-target <app-ns>/<workload> # narrow it to one workload
+./collect-k8s.sh --bundle --apm-target <app-ns> --apm-exec
 ```
 
 Load tiers:
@@ -54,7 +59,8 @@ Load tiers:
 | 0 (default) | `--file` / `--stdout` | read-only API GETs, bounded log tails (`--tail`, default 200), exec into at most 2 agent pods; every call double-bounded (`--request-timeout=15s` + `timeout 20`) |
 | 1 | `--bundle` | Tier 0 report + full CR/DS/operator/webhook yaml, per-container logs for **all** whatap pods (tail 2000 / 5 MB caps), events, nodes, helm values — all verbatim |
 | 2 (opt-in) | `--exec-per-node` | in-pod probes on every running node-agent pod (cap 30); announces the fan-out on stderr first |
-| opt-in | `--apm-target NS[/NAME]` | reads an **application** namespace's pod specs (explicit opt-in because it leaves the whatap namespace); repeatable, cap 5 |
+| 2 (opt-in) | `--apm-exec` | read-only probes **inside** the `--apm-target` application containers (up to 3 pods per target): pid 1 cmdline + environ, agent home, `whatap.conf`, agent logs, port registry, runtime version |
+| opt-in | `--apm-target NS[/NAME]` | reads an **application** namespace: workloads, pods, env tables, logs, events (explicit opt-in because it leaves the whatap namespace); repeatable, cap 5. Section J's name-mapping and cluster-wide inventory run without it |
 
 The old idea of an in-cluster `Job` manifest delivery (host mounted read-only)
 remains future work; v0 is bastion-run by decision.
