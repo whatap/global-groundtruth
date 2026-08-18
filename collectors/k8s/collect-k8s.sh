@@ -41,7 +41,7 @@ export LC_ALL=C
 
 # ---- collector metadata -----------------------------------------------------
 COLLECTOR_NAME="whatap-k8s"
-VERSION="0.4.2"
+VERSION="0.4.3"
 DOMAIN="k8s"
 TARGET="k8s-cluster/unresolved"      # refined after CLI/context/namespace discovery
 
@@ -681,6 +681,84 @@ run_report() {
     # list), and a hook NAME reused by another configuration shares whatap's metric series.
     if [ -n "$ALL_HOOKS" ]; then _emit_labeled "webhook configurations (name -> hooks)" "$ALL_HOOKS"
     else fact "webhook configurations: n/a ($(_k_reason))"; fi
+
+    subsection "webhook serving certificate vs registered caBundle"
+    # The operator generates a fresh self-signed CA on every process start (cmd/main.go
+    # generateSelfSignedCert) and writes it to /etc/webhook/certs, which the Deployment
+    # mounts as an emptyDir — nothing persists across pod restarts. The caBundle in the
+    # webhook configuration is written from whichever operator process reconciled last.
+    # When the two disagree the API server rejects the call with
+    #   x509: certificate signed by unknown authority ... "whatap-webhook-ca"
+    # and, under failurePolicy: Ignore, the pod is admitted with no injection and no error.
+    # So: the fingerprints below, and the times they were produced, are the fact.
+    if [ -n "$WEBHOOKS" ] && have openssl; then
+        local wh2 cab1 fpr
+        for wh2 in $WEBHOOKS; do
+            cab1="$(kval get "$wh2" -o 'jsonpath={range .webhooks[*]}{.name}{"\t"}{.clientConfig.caBundle}{"\n"}{end}')"
+            [ -n "$cab1" ] || continue
+            fpr="$(printf '%s\n' "$cab1" | while IFS="$(printf '\t')" read -r hn hb; do
+                [ -n "$hb" ] || { printf '%s\tcaBundle empty\n' "$hn"; continue; }
+                printf '%s\t%s\n' "$hn" "$(printf '%s' "$hb" | base64 -d 2>/dev/null \
+                    | openssl x509 -noout -sha256 -fingerprint -subject -enddate 2>/dev/null \
+                    | tr '\n' ' ' | sed 's/  */ /g')"
+            done)"
+            [ -n "$fpr" ] && _emit_labeled "$wh2 caBundle certificate (hook / fingerprint+subject+expiry)" "$fpr"
+        done
+    elif [ -n "$WEBHOOKS" ]; then
+        fact "caBundle certificate fingerprints: n/a (command not found: openssl)"
+    fi
+    # The same CA as the operator stored it. Only the PUBLIC cert.pem field is read and
+    # only its fingerprint is emitted — the key.pem / tls.key fields in this Secret are
+    # never requested and never printed.
+    if [ -n "$NS" ] && have openssl; then
+        local secfp
+        secfp="$(kval get secret whatap-webhook-certificate -n "$NS" -o 'jsonpath={.data.cert\.pem}' \
+            | base64 -d 2>/dev/null | base64 -d 2>/dev/null \
+            | openssl x509 -noout -sha256 -fingerprint -subject 2>/dev/null | tr '\n' ' ')"
+        if [ -z "$secfp" ]; then
+            secfp="$(kval get secret whatap-webhook-certificate -n "$NS" -o 'jsonpath={.data.cert\.pem}' \
+                | base64 -d 2>/dev/null \
+                | openssl x509 -noout -sha256 -fingerprint -subject 2>/dev/null | tr '\n' ' ')"
+        fi
+        if [ -n "$secfp" ]; then fact "secret whatap-webhook-certificate cert.pem (public CA only): $secfp"
+        else fact "secret whatap-webhook-certificate cert.pem: n/a (secret absent, field absent, or not parseable as a certificate)"; fi
+    fi
+    # When each side was produced: an operator process that started AFTER the caBundle was
+    # last written is serving a CA the configuration does not carry.
+    if [ -n "$OP_DEPLOY" ]; then
+        kprobe "operator pod process start / restarts (a restart regenerates the CA)" get pods -n "$NS" \
+            -l app.kubernetes.io/name=whatap-operator \
+            -o 'jsonpath={range .items[*]}{.metadata.name}{" podStart="}{.status.startTime}{" containerStarted="}{range .status.containerStatuses[*]}{.state.running.startedAt}{" restarts="}{.restartCount}{end}{"\n"}{end}'
+    fi
+    local wh3
+    for wh3 in $WEBHOOKS; do
+        kprobe "$wh3 last written (managedFields times — when the caBundle was last set)" get "$wh3" \
+            -o 'jsonpath={range .metadata.managedFields[*]}{.manager}{" op="}{.operation}{" time="}{.time}{"\n"}{end}'
+    done
+    # Best effort: the CA the running process actually has on disk. The operator image may
+    # be distroless, in which case there is no shell and this reports why instead.
+    if [ -n "$NS" ]; then
+        local oppod
+        oppod="$(kval get pods -n "$NS" -l app.kubernetes.io/name=whatap-operator -o 'jsonpath={.items[0].metadata.name}')"
+        if [ -n "$oppod" ]; then
+            pod_exec_probe_ns "$NS" "operator pod /etc/webhook/certs listing (mtimes show when this process wrote them)" "$oppod" operator \
+                'ls -la /etc/webhook/certs 2>&1; :'
+            # ca.crt is a public certificate, so it is read out and fingerprinted HERE with
+            # the same openssl invocation used on the caBundle above — that is what makes the
+            # three values directly comparable. The PEM itself is not emitted, and the
+            # ca.key / tls.key files in that directory are never read.
+            if have openssl && run_k exec -n "$NS" "$oppod" -c operator -- cat /etc/webhook/certs/ca.crt; then
+                local podfp
+                podfp="$(printf '%s\n' "$K_OUT" | openssl x509 -noout -sha256 -fingerprint -subject 2>/dev/null | tr '\n' ' ')"
+                if [ -n "$podfp" ]; then fact "operator pod /etc/webhook/certs/ca.crt (fingerprinted locally, same command as the caBundle above): $podfp"
+                else fact "operator pod ca.crt fingerprint: n/a (content not parseable as a certificate)"; fi
+            elif ! have openssl; then
+                fact "operator pod ca.crt fingerprint: n/a (command not found: openssl)"
+            else
+                fact "operator pod ca.crt fingerprint: n/a ($(_k_reason))"
+            fi
+        fi
+    fi
 
     subsection "admission call counters (kube-apiserver /metrics)"
     # The API server counts every admission webhook call it makes, keyed by the
