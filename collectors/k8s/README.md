@@ -1,6 +1,6 @@
 # collectors/k8s — SEEDED v0
 
-> **Status: SEEDED v0** (`collect-k8s.sh` 0.3.0). Owned by the k8s domain team
+> **Status: SEEDED v0** (`collect-k8s.sh` 0.3.1). Owned by the k8s domain team
 > (CONTRACT rule 4); until handover it is managed by the Global team.
 > Verified end-to-end against one live kubeadm cluster (v1.32, containerd,
 > whatap-operator 2.9.7 + node-agent DaemonSet + APM auto-instrumented app).
@@ -23,7 +23,7 @@ workstation, not on the node. One report, MECE sections:
 | [8] G. Logs | bounded tails: operator, master-agent, up to 3 sample node-agent pods × both containers, `--previous` when restarted |
 | [9] H. Helm & images | helm releases/history/values (verbatim); without the helm binary degrades to `sh.helm.release.v1.*` secret names; all deployed whatap image:tags |
 | [10] I. In-pod node facts | `kubectl exec` into up to 2 running node-agent pods: container-log symlink real target (standard `/var/log/pods` vs CCE `/mnt/paas/...`), log roots & runtime sockets (candidate paths derived from the DS's declared mounts, e.g. `/rootfs`), cgroup fs type, node-helper health endpoint, kubelet cmdline (only when hostPID) |
-| [11] J. APM auto-instrumentation | **always**: name-mapping inputs (WhatapAgent CR names + whether one is named `whatap`, per-target namespaceSelector/podSelector, every namespace's labels) and a cluster-wide inventory of instrumented pods by **two** markers (whatap init container **or** the `whatap-apm-injected` annotation), with the mismatch list. With `--apm-target NS[/NAME]`: workload template env **as declared** vs pod env **as admitted** (per container, in API order, with repeated-name detection), init-container state (waiting reason/message), volumes/mounts, securityContext, every pod's labels + injection markers, init-container log and app-container log **head**, namespace events. With `--apm-exec` (Tier 2): `/proc/1/environ` and cmdline, agent home, `whatap.conf`, agent logs, `/tmp/whatap-*.lock`, runtime version |
+| [11] J. APM auto-instrumentation | **always**: name-mapping inputs (WhatapAgent CR names + whether one is named `whatap`, per-target namespaceSelector/podSelector, every namespace's labels) and a cluster-wide inventory of instrumented pods by **two** markers (whatap init container **or** the `whatap-apm-injected` annotation), with the mismatch list. With `--apm-target NS[/NAME]`: workload template env **as declared** vs pod env **as admitted** (per container, in API order, with repeated-name detection, **including `envFrom` ConfigMap/Secret sources** — a container with an empty `.env[]` is not a container without environment), init-container state (waiting reason/message), volumes/mounts, securityContext, every pod's labels + injection markers, init-container log and app-container log **head**, namespace events. Pods named by a CR target's `podSelector` are detailed first, so a per-target cap never skips the workloads the CR actually asks for. With `--apm-exec` (Tier 2): `/proc/1/environ` and cmdline, agent home, `whatap.conf`, agent logs, `/tmp/whatap-*.lock`, runtime version |
 
 Everything is **discovered** (CRD group, namespace, DS/container names, mount
 prefixes), never hardcoded, so a new platform or install generation needs no

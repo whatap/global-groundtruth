@@ -41,7 +41,7 @@ export LC_ALL=C
 
 # ---- collector metadata -----------------------------------------------------
 COLLECTOR_NAME="whatap-k8s"
-VERSION="0.3.0"
+VERSION="0.3.1"
 DOMAIN="k8s"
 TARGET="k8s-cluster/unresolved"      # refined after CLI/context/namespace discovery
 
@@ -194,13 +194,24 @@ _emit_labeled() {
 # two can be compared line by line.
 #
 # _envpath ROOT -> a jsonpath emitting one "C<TAB>container" line, then one
-# "E<TAB>name<TAB>value<TAB>valueFrom" line per env entry. The container name is
-# unreachable from inside the inner range, hence the two line kinds.
+# "E<TAB>name<TAB>value<TAB>valueFrom" line per env entry and one
+# "F<TAB>prefix<TAB>configMap<TAB>secret<TAB>optional" line per envFrom source.
+# The container name is unreachable from inside the inner ranges, hence the
+# separate C line.
+#
+# envFrom is collected because a container whose `.env[]` is empty is not a
+# container without environment: `envFrom` pulls whole ConfigMaps/Secrets in,
+# and `env` entries override what `envFrom` supplies. A loader variable
+# (NODE_OPTIONS, PYTHONPATH, JAVA_TOOL_OPTIONS) arriving that way is invisible
+# in `.env[]` yet present in the process.
 _envpath() {
-    printf 'jsonpath={range %s.containers[*]}{"C\\t"}{.name}{"\\n"}{range .env[*]}{"E\\t"}{.name}{"\\t"}{.value}{"\\t"}{.valueFrom}{"\\n"}{end}{end}{range %s.initContainers[*]}{"C\\tinit:"}{.name}{"\\n"}{range .env[*]}{"E\\t"}{.name}{"\\t"}{.value}{"\\t"}{.valueFrom}{"\\n"}{end}{end}' "$1" "$1"
+    # single backslashes here on purpose: $e is substituted through %s, which
+    # printf copies verbatim (only the FORMAT string's escapes are processed)
+    local e='{range .env[*]}{"E\t"}{.name}{"\t"}{.value}{"\t"}{.valueFrom}{"\n"}{end}{range .envFrom[*]}{"F\t"}{.prefix}{"\t"}{.configMapRef.name}{"\t"}{.secretRef.name}{"\t"}{.configMapRef.optional}{.secretRef.optional}{"\n"}{end}'
+    printf 'jsonpath={range %s.containers[*]}{"C\\t"}{.name}{"\\n"}%s{end}{range %s.initContainers[*]}{"C\\tinit:"}{.name}{"\\n"}%s{end}' "$1" "$e" "$1" "$e"
 }
 
-# _emit_env_table "label" RAW -> render the C/E stream as a per-container env
+# _emit_env_table "label" RAW -> render the C/E/F stream as a per-container env
 # table, then list any env name occurring more than once in the same container.
 # Kubernetes resolves a duplicated env name to its FIRST occurrence, so the
 # repetition itself is a fact worth stating (values are printed verbatim).
@@ -209,7 +220,8 @@ _emit_env_table() {
     if [ -z "$raw" ]; then fact "$label: n/a (empty output)"; return; fi
     rendered="$(printf '%s\n' "$raw" | awk -F'\t' '
         $1=="C" { c=$2; printf "container %s\n", c; next }
-        $1=="E" { printf "  %s = %s%s\n", $2, $3, ($4=="" ? "" : "   valueFrom=" $4) }')"
+        $1=="E" { printf "  %s = %s%s\n", $2, $3, ($4=="" ? "" : "   valueFrom=" $4); next }
+        $1=="F" { printf "  envFrom%s%s%s%s\n", ($3=="" ? "" : " configMap=" $3), ($4=="" ? "" : " secret=" $4), ($2=="" ? "" : " prefix=" $2), ($5=="" ? "" : " optional=" $5) }')"
     if [ -n "$rendered" ]; then _emit_labeled "$label" "$rendered"
     else fact "$label: n/a (no containers or no env entries)"; fi
     dups="$(printf '%s\n' "$raw" | awk -F'\t' '
@@ -433,6 +445,24 @@ EOF
         HELM_SECRETS="$(kval get secrets -n "$NS" -o name | grep -E 'sh\.helm\.release\.v1\..*whatap' | sed 's#^secret/##')"
     fi
     WEBHOOKS="$(kval get mutatingwebhookconfigurations,validatingwebhookconfigurations -o name | grep -Ei 'whatap')"
+}
+
+# APM_SEL_VALS: every label VALUE named by an APM target's podSelector, one per
+# line. Section J uses it to inspect the pods a target actually names before the
+# rest of the namespace — without it a per-target cap can fill up with unrelated
+# pods and leave the named workloads out of the report entirely.
+# Only VALUES are collected, never keys: a key like "app" is carried by nearly
+# every pod and would select everything.
+APM_SEL_VALS=""
+discover_apm_selector_values() {
+    [ -n "$KCTL_BIN" ] && [ -n "$WA_CRD" ] || return
+    local exprs labels
+    exprs="$(kval get "$WA_CRD" -o 'jsonpath={range .items[*]}{range .spec.features.apm.instrumentation.targets[*]}{range .podSelector.matchExpressions[*]}{range .values[*]}{.}{"\n"}{end}{end}{end}{end}')"
+    # matchLabels is a map; jsonpath cannot range over it, so the JSON object is
+    # emitted and its values are taken from the "key":"value" pairs
+    labels="$(kval get "$WA_CRD" -o 'jsonpath={range .items[*]}{range .spec.features.apm.instrumentation.targets[*]}{.podSelector.matchLabels}{"\n"}{end}{end}' \
+        | tr ',' '\n' | sed -n 's/.*":"\([^"]*\)".*/\1/p')"
+    APM_SEL_VALS="$(printf '%s\n%s\n' "$exprs" "$labels" | grep -v '^$' | sort -u)"
 }
 
 # sample node-agent pods: SP_POD/SP_PHASE/SP_RST parallel arrays sorted by
@@ -981,20 +1011,32 @@ run_report() {
             done
 
             # ---- admitted state: pods ------------------------------------------------
-            # order: pods with the most not-ready containers first (init containers
-            # counted too), so a stuck injection is inside the cap; then by name.
+            # order: (1) pods whose labels carry a value named by an APM target's
+            # podSelector — the pods the CR actually asks for, which a plain
+            # alphabetical cap can miss entirely; then (2) most not-ready containers
+            # first (init containers counted too); then (3) by name.
             local praw psorted tpods tp ttotal
-            praw="$(kval get pods -n "$tns" -o 'jsonpath={range .items[*]}{.metadata.name}{"|"}{range .status.initContainerStatuses[*]}{.ready}{","}{end}{"|"}{range .status.containerStatuses[*]}{.ready}{","}{end}{"\n"}{end}')"
+            praw="$(kval get pods -n "$tns" -o 'jsonpath={range .items[*]}{.metadata.name}{"|"}{range .status.initContainerStatuses[*]}{.ready}{","}{end}{"|"}{range .status.containerStatuses[*]}{.ready}{","}{end}{"|"}{.metadata.labels}{"\n"}{end}')"
             [ -n "$twl" ] && praw="$(printf '%s\n' "$praw" | grep -E "^$twl")"
-            psorted="$(printf '%s\n' "$praw" | grep -v '^$' | awk -F'|' '
-                { n=split($2 $3, a, ","); nr=0; for (i=1;i<=n;i++) if (a[i]=="false") nr++; print nr "|" $1 }' \
-                | sort -t'|' -k1,1nr -k2,2)"
+            psorted="$(printf '%s\n' "$praw" | grep -v '^$' | awk -F'|' -v sel="$APM_SEL_VALS" '
+                BEGIN { nsel = split(sel, sv, "\n") }
+                { n = split($2 $3, a, ","); nr = 0; for (i = 1; i <= n; i++) if (a[i] == "false") nr++
+                  hit = 0
+                  for (i = 1; i <= nsel; i++) if (sv[i] != "" && index($4, "\"" sv[i] "\"") > 0) { hit = 1; break }
+                  print hit "|" nr "|" $1 }' \
+                | sort -t'|' -k1,1nr -k2,2nr -k3,3)"
             ttotal="$(printf '%s\n' "$psorted" | grep -c .)"
-            tpods="$(printf '%s\n' "$psorted" | head -n 5 | cut -d'|' -f2)"
+            tpods="$(printf '%s\n' "$psorted" | head -n 5 | cut -d'|' -f3)"
+            if [ -n "$APM_SEL_VALS" ]; then
+                _emit_labeled "label values named by an apm target podSelector (pods carrying one are inspected first)" "$APM_SEL_VALS"
+                fact "pods carrying one of those values: $(printf '%s\n' "$psorted" | awk -F'|' '$1==1' | grep -c .) of $ttotal"
+            else
+                fact "apm target podSelector values: none declared (pod order falls back to not-ready count, then name)"
+            fi
             if [ -z "$tpods" ]; then
                 fact "pods: none found${twl:+ with name prefix $twl} in namespace $tns"
             else
-                fact "pods inspected: $(printf '%s\n' "$tpods" | grep -c .) of $ttotal (cap 5, ordered by not-ready container count)"
+                fact "pods inspected: $(printf '%s\n' "$tpods" | grep -c .) of $ttotal (cap 5, ordered by podSelector match, then not-ready count, then name)"
             fi
             # every pod in the namespace with its labels (the podSelector match input) and
             # its injection markers side by side — uncapped at 60, so the pods the webhook
@@ -1299,6 +1341,7 @@ progress "resolving CLI / namespace / whatap workloads ..."
 k8s_cli_discover
 k8s_ns_discover
 discover_workloads
+discover_apm_selector_values
 pick_sample_pods
 
 CTX_NAME="$OPT_CONTEXT"
