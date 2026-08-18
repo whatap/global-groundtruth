@@ -41,7 +41,7 @@ export LC_ALL=C
 
 # ---- collector metadata -----------------------------------------------------
 COLLECTOR_NAME="whatap-k8s"
-VERSION="0.3.1"
+VERSION="0.4.0"
 DOMAIN="k8s"
 TARGET="k8s-cluster/unresolved"      # refined after CLI/context/namespace discovery
 
@@ -401,6 +401,9 @@ DS_CONTAINERS=""     # container names in the DS pod template (space-separated)
 OP_DEPLOY=""         # operator Deployment name (short)
 WHATAP_DEPLOYS=""    # all whatap-ish Deployments in NS (table lines)
 WEBHOOKS=""          # whatap mutating/validating webhook config names (full, one per line)
+WEBHOOK_HOOKS=""     # per-hook names inside those configs (e.g. mpod.kb.io) — the label the
+                     # API server uses in its own admission metrics
+WHATAP_CROLES=""     # whatap-related ClusterRole names
 HELM_SECRETS=""      # sh.helm.release.v1.* secret names mentioning whatap
 
 discover_workloads() {
@@ -445,6 +448,13 @@ EOF
         HELM_SECRETS="$(kval get secrets -n "$NS" -o name | grep -E 'sh\.helm\.release\.v1\..*whatap' | sed 's#^secret/##')"
     fi
     WEBHOOKS="$(kval get mutatingwebhookconfigurations,validatingwebhookconfigurations -o name | grep -Ei 'whatap')"
+    # per-hook names: the API server keys its admission metrics by these, not by the
+    # configuration object name, so they have to be resolved to read the counters
+    local wh
+    for wh in $WEBHOOKS; do
+        WEBHOOK_HOOKS="$WEBHOOK_HOOKS $(kval get "$wh" -o 'jsonpath={range .webhooks[*]}{.name}{" "}{end}')"
+    done
+    WHATAP_CROLES="$(kval get clusterroles -o name | grep -Ei 'whatap' | sed 's#^clusterrole\.rbac\.authorization\.k8s\.io/##' | head -n 5)"
 }
 
 # APM_SEL_VALS: every label VALUE named by an APM target's podSelector, one per
@@ -649,6 +659,36 @@ run_report() {
     else
         fact "whatap mutating/validating webhooks: none found"
     fi
+
+    subsection "admission call counters (kube-apiserver /metrics)"
+    # The API server counts every admission webhook call it makes, keyed by the
+    # per-hook name. These counters come from the CALLER, so they are independent of
+    # anything the operator logs: they state whether the API server reached the
+    # webhook at all, what HTTP code came back, and how many calls were let through
+    # without the webhook (fail-open, which is what failurePolicy: Ignore does).
+    # Available on managed control planes too, where the API server log is not.
+    fact "counter meanings: request_total = calls made (per HTTP code) / fail_open_count = calls admitted WITHOUT the webhook after a failed call / admission_duration_seconds_count = calls attempted"
+    if [ -n "$WEBHOOK_HOOKS" ]; then
+        fact "whatap hook names (metric label 'name'): $(printf '%s' "$WEBHOOK_HOOKS" | tr -s ' ' | sed 's/^ //; s/ $//')"
+        if run_k get --raw /metrics; then
+            local mpat mrows mfo
+            fact "/metrics payload: ${#K_OUT} bytes (single read, bounded by the per-call timeout)"
+            mpat="$(printf '%s\n' $WEBHOOK_HOOKS | grep -v '^$' | sed 's/\./\\./g' | awk '{printf "%s%s", (NR>1 ? "|" : ""), $0}')"
+            mrows="$(printf '%s\n' "$K_OUT" | grep -E '^apiserver_admission_webhook_(request_total|fail_open_count|admission_duration_seconds_count)' | grep -E "name=\"($mpat)\"")"
+            if [ -n "$mrows" ]; then _emit_labeled "whatap hook counters" "$mrows"
+            else fact "whatap hook counters: no metric series carries these hook names (the API server has not recorded a call for them)"; fi
+            # every fail-open in the cluster, for context: another webhook failing the
+            # same way points at the path rather than at whatap
+            mfo="$(printf '%s\n' "$K_OUT" | grep -E '^apiserver_admission_webhook_fail_open_count')"
+            if [ -n "$mfo" ]; then _emit_labeled "fail_open_count for every webhook in the cluster" "$mfo"
+            else fact "fail_open_count series: none present"; fi
+        else
+            fact "kube-apiserver /metrics: n/a ($(_k_reason))"
+        fi
+    else
+        fact "admission call counters: n/a (not applicable: no whatap webhook hook names resolved)"
+    fi
+
     subsection "rbac & identity"
     if [ -n "$NS" ]; then
         kprobe "serviceaccounts (ns)" get sa -n "$NS"
@@ -666,6 +706,15 @@ run_report() {
         fact "rbac probes: n/a (not applicable: no whatap namespace discovered)"
     fi
     kfilter "clusterroles (whatap-filtered)" 'whatap|^NAME' get clusterroles
+    # rules, not just names: the pod-mutating path reads the Pod's Namespace object
+    # while matching a target's namespaceSelector, so what the operator's role grants
+    # on core resources is part of the injection path
+    local crole
+    for crole in $WHATAP_CROLES; do
+        kprobe "clusterrole $crole rules (apiGroups | resources | verbs)" get clusterrole "$crole" \
+            -o 'jsonpath={range .rules[*]}{.apiGroups}{" | "}{.resources}{" | "}{.verbs}{"\n"}{end}'
+    done
+    [ -z "$WHATAP_CROLES" ] && fact "clusterrole rules: n/a (no whatap-named clusterrole found)"
     kfilter "clusterrolebindings (whatap-filtered)" 'whatap|^NAME' get clusterrolebindings
 
     # -- E. Agent workloads (declared + pod state) -------------------------------
@@ -779,6 +828,37 @@ run_report() {
         [ "${#SP_POD[@]}" -eq 0 ] && fact "node-agent pod logs: n/a (no node-agent pods found)"
     else
         fact "log probes: n/a (not applicable: no whatap namespace discovered)"
+    fi
+
+    subsection "kube-apiserver logs (webhook call outcome)"
+    # The API server writes a warning for every admission webhook call that fails,
+    # INCLUDING when failurePolicy: Ignore then lets the request through — which is
+    # otherwise a completely silent event. That line carries the reason (timeout /
+    # x509 / connection refused), which the counters in section D do not.
+    # A self-hosted control plane exposes it as a mirror pod in kube-system; a managed
+    # control plane does not, and then the host's own log is the only source.
+    local apods ap an=0
+    apods="$(kval get pods -n kube-system -l component=kube-apiserver -o name | sed 's#^pod/##')"
+    if [ -z "$apods" ]; then
+        apods="$(kval get pods -n kube-system --no-headers | awk '$1 ~ /^kube-apiserver-/ {print $1}')"
+    fi
+    if [ -n "$apods" ]; then
+        fact "kube-apiserver pods found: $(printf '%s' "$apods" | tr '\n' ' ')"
+        fact "bounds: --tail=2000 per pod, up to 3 pods, then filtered to webhook/whatap lines (cap 80). A failure older than that tail is still counted in the section D counters."
+        for ap in $apods; do
+            [ "$an" -ge 3 ] && break
+            an=$((an + 1))
+            if run_k logs -n kube-system "$ap" --tail=2000; then
+                local alines
+                alines="$(printf '%s\n' "$K_OUT" | grep -Ei 'failed calling webhook|admission webhook|webhook.*(timeout|x509|refused|no route|deadline)|whatap' | tail -n 80)"
+                if [ -n "$alines" ]; then _emit_labeled "$ap webhook/whatap log lines" "$alines"
+                else fact "$ap webhook/whatap log lines: none in the last 2000 lines"; fi
+            else
+                fact "logs $ap: n/a ($(_k_reason))"
+            fi
+        done
+    else
+        fact "kube-apiserver pods: none found in kube-system (managed control plane, or the API server does not run as a pod) — the control-plane host's own log is then the only source for webhook call failures; the section D counters still apply"
     fi
 
     # -- H. Helm & deployed image inventory ----------------------------------------
