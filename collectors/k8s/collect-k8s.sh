@@ -41,7 +41,7 @@ export LC_ALL=C
 
 # ---- collector metadata -----------------------------------------------------
 COLLECTOR_NAME="whatap-k8s"
-VERSION="0.4.0"
+VERSION="0.4.1"
 DOMAIN="k8s"
 TARGET="k8s-cluster/unresolved"      # refined after CLI/context/namespace discovery
 
@@ -566,6 +566,15 @@ run_report() {
     else
         fact "node status summary: n/a ($(_k_reason))"
     fi
+    # Which nodes carry the control plane, and their addresses. An admission webhook is
+    # called BY the API server, so when a webhook is not being applied, these are the
+    # hosts whose path to the webhook backend is the one that matters. Both the current
+    # and the pre-1.24 role label are printed, and roles are read from labels rather
+    # than assumed from the node name.
+    kprobe "control-plane nodes (role labels + addresses)" get nodes \
+        -l node-role.kubernetes.io/control-plane \
+        -o 'custom-columns=NAME:.metadata.name,INTERNAL-IP:.status.addresses[?(@.type=="InternalIP")].address,CP:.metadata.labels.node-role\.kubernetes\.io/control-plane,MASTER:.metadata.labels.node-role\.kubernetes\.io/master'
+    kfilter "nodes carrying any node-role label (fallback view, covers pre-1.24 'master')" 'node-role|^NAME' get nodes --show-labels
 
     # -- C. WhaTap CRDs & WhatapAgent CR ----------------------------------------
     section "C. WhaTap CRDs & WhatapAgent CR"

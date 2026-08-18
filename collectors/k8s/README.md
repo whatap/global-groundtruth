@@ -1,6 +1,6 @@
 # collectors/k8s — SEEDED v0
 
-> **Status: SEEDED v0** (`collect-k8s.sh` 0.4.0). Owned by the k8s domain team
+> **Status: SEEDED v0** (`collect-k8s.sh` 0.4.1). Owned by the k8s domain team
 > (CONTRACT rule 4); until handover it is managed by the Global team.
 > Verified end-to-end against one live kubeadm cluster (v1.32, containerd,
 > whatap-operator 2.9.7 + node-agent DaemonSet + APM auto-instrumented app).
@@ -15,7 +15,7 @@ workstation, not on the node. One report, MECE sections:
 |---|---|
 | [1] Collection environment | tool presence, CLI in use (kubectl→oc fallback), context name, discovered namespace + how |
 | [2] A. Cluster & API server | client+server version, /readyz, node/ns counts, platform markers (providerID, platform labels, OpenShift api groups → clusterversion/SCC) |
-| [3] B. Nodes | kubelet/OS/kernel/runtime/arch table (cap 50 + total), distinct runtimes, Ready summary |
+| [3] B. Nodes | kubelet/OS/kernel/runtime/arch table (cap 50 + total), distinct runtimes, Ready summary, **control-plane nodes with their InternalIP** (roles read from labels, current and pre-1.24 `master` both covered) — an admission webhook is called *by* the API server, so these are the hosts whose path to the webhook backend matters |
 | [4] C. WhaTap CRDs & CR | whatap CRDs (group name = install generation hint), install-generation markers, full WhatapAgent CR yaml (verbatim), pod-level vs container-level env placement, APM instrumentation targets (selectors/mode/configMapRef), ConfigMap inventory |
 | [5] D. Operator, RBAC & webhooks | operator deploy yaml + ReplicaSet image history, mutating/validating webhooks (yaml, verbatim), ServiceAccounts + the SA referenced by DS/operator, whatap clusterroles/bindings **plus their rules** (apiGroups/resources/verbs — the pod-mutating path reads the Pod's Namespace object while matching a namespaceSelector), **admission call counters from the API server's own `/metrics`** (`request_total` per HTTP code, `fail_open_count`, `admission_duration_seconds_count`, keyed by per-hook name — these come from the CALLER, so they state whether the API server reached the webhook at all, independently of anything the operator logs; available on managed control planes too), secret names/types only |
 | [6] E. Agent workloads | DaemonSet status + yaml, container names (discovered, covers operator vs legacy v2 naming), pod table by restart count, describe of top-2 restart pods, other whatap deployments |
