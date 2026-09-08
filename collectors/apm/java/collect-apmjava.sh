@@ -79,7 +79,7 @@ export LC_ALL=C
 
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-apmjava"
-VERSION="0.1.0"
+VERSION="0.2.0"
 DOMAIN="apm/java"
 TARGET="host/$(hostname 2>/dev/null || echo unknown)"
 
@@ -92,6 +92,7 @@ OPT_JCMD=0        # Tier 2: jcmd VM.command_line / VM.system_properties / VM.fla
 OPT_LIBS=""       # --library PATTERN (repeatable): library detail pack
 OPT_LIBALL=0      # --library-all: detail every enumerated jar (capped)
 OPT_CLASSES=""    # --class FQCN (repeatable): member signatures via javap
+OPT_APPCLASSES=0  # --appclasses: application class index (section N)
 
 usage() {
     cat <<EOF
@@ -114,8 +115,16 @@ for the case where a new weaving module has to be written for a library:
                  (case-insensitive, repeatable): Maven coordinates, manifest
                  versions, class-file version, package map, class list
   --library-all  detail every enumerated jar (cap 40)
-  --class FQCN   member signatures of that class via javap, from each detailed
-                 jar that contains it (repeatable)
+  --class FQCN   member signatures of that class via javap -p -s (the JVM
+                 descriptor of every member included), from each detailed jar
+                 that contains it (repeatable)
+
+Application class index (off by default; read-only, no contact with the JVM) —
+for the case where the transaction entry point of an application no weaving
+module covers has to be located without access to the customer's source:
+  --appclasses   enumerate the application's OWN classes from WEB-INF/classes,
+                 BOOT-INF/classes and directory classpath entries: package
+                 histogram, a name-pattern index, and the class list
 
 Tier 2 (off by default; each announces its impact on stderr before running):
   --threads[=N]  N thread dumps per WhaTap-attached JVM (default N=1) via
@@ -139,6 +148,7 @@ while [ $# -gt 0 ]; do
         --library-all)  OPT_LIBALL=1 ;;
         --class)        shift; OPT_CLASSES="$OPT_CLASSES $1" ;;
         --class=*)      OPT_CLASSES="$OPT_CLASSES ${1#*=}" ;;
+        --appclasses)   OPT_APPCLASSES=1 ;;
         -h|--help)   usage; exit 0 ;;
         *) printf 'unknown argument: %s\n' "$1" >&2; usage >&2; exit 2 ;;
     esac
@@ -367,6 +377,19 @@ _path_record() {
     printf '%s\n' "$1" >> "$_PATHSINK" 2>/dev/null
 }
 
+# _appclass_record RECORD -> append an application class ROOT to the inventory
+# section N enumerates. RECORD is "dir|<path>" for an exploded class directory
+# or a directory classpath entry, or "archive|<path>" for a war/ear/executable
+# jar whose WEB-INF/classes or BOOT-INF/classes is read in place. Jars are
+# libraries and go to _path_record; the classes the application itself ships
+# live in these roots and are enumerated nowhere else in this report.
+_APPSINK=""
+_appclass_record() {
+    [ -n "$_APPSINK" ] || return
+    [ -n "$1" ] || return
+    printf '%s\n' "$1" >> "$_APPSINK" 2>/dev/null
+}
+
 # list_jars "indent" DIR CAP -> *.jar names in ONE directory level (no walk),
 # with the agent jar filtered out and the count reported.
 list_jars() {
@@ -399,6 +422,18 @@ list_deploy() {
         case "$seen" in *"|$u|"*) continue ;; esac
         seen="$seen|$u|"
         list_jars "$ind  " "$u" 120
+    done
+    # the application's own classes, for section N — exploded units first,
+    # then unexploded archives read in place
+    for u in "$d"/*.ear/*.war/WEB-INF/classes "$d"/*.war/WEB-INF/classes "$d"/*/WEB-INF/classes; do
+        [ -d "$u" ] || continue
+        case "$seen" in *"|$u|"*) continue ;; esac
+        seen="$seen|$u|"
+        _appclass_record "dir|$u"
+    done
+    for u in "$d"/*.war "$d"/*.ear; do
+        [ -f "$u" ] || continue
+        _appclass_record "archive|$u"
     done
 }
 
@@ -500,9 +535,9 @@ detail_jar() {
             fact "       $_fq: present in this jar; member signatures n/a (command not found: javap)"
             continue
         fi
-        fact "       $_fq member signatures (javap -p, first 300 lines):"
-        if [ -n "$_timeout_bin" ]; then "$_timeout_bin" "$CMD_TIMEOUT" javap -p -classpath "$jar" "$_fq" 2>&1 | head -n 300 | while IFS= read -r _l; do printf '             %s\n' "$_l"; done
-        else javap -p -classpath "$jar" "$_fq" 2>&1 | head -n 300 | while IFS= read -r _l; do printf '             %s\n' "$_l"; done; fi
+        fact "       $_fq member signatures (javap -p -s, first 400 lines):"
+        if [ -n "$_timeout_bin" ]; then "$_timeout_bin" "$CMD_TIMEOUT" javap -p -s -classpath "$jar" "$_fq" 2>&1 | head -n 400 | while IFS= read -r _l; do printf '             %s\n' "$_l"; done
+        else javap -p -s -classpath "$jar" "$_fq" 2>&1 | head -n 400 | while IFS= read -r _l; do printf '             %s\n' "$_l"; done; fi
     done
 }
 
@@ -764,6 +799,8 @@ run_report() {
 
     _PATHSINK="${_errfile}.paths"
     : > "$_PATHSINK" 2>/dev/null
+    _APPSINK="${_errfile}.approots"
+    : > "$_APPSINK" 2>/dev/null
 
     discover
 
@@ -1033,7 +1070,10 @@ run_report() {
                 [ -n "$_l" ] || continue
                 printf '             %s\n' "$_l"
                 _lib_record "${_l##*/}"
-                case "$_l" in *.jar) _path_record "file|$_l" ;; esac
+                case "$_l" in
+                    *.jar) _path_record "file|$_l" ;;
+                    *)     [ -d "$_l" ] && _appclass_record "dir|$_l" ;;
+                esac
             done
         else
             fact "   -cp / -classpath: not set on this JVM"
@@ -1047,6 +1087,7 @@ run_report() {
             _fsj="$(resolve_fs "$_jar")"
             if [ -n "$_fsj" ]; then
                 bootjar_facts "             " "$_fsj"
+                _appclass_record "archive|$_fsj"
                 fact "   libraries packed inside that jar:"
                 jar_entries "             " "$_fsj" 'BOOT-INF/lib/*' 200
                 jar_entries "             " "$_fsj" 'WEB-INF/lib/*' 200
@@ -1073,6 +1114,12 @@ run_report() {
             list_jars "             " "$_fsd/lib" 120
             for _w in "$_fsd"/webapps/*/WEB-INF/lib; do
                 [ -d "$_w" ] && list_jars "             " "$_w" 120
+            done
+            for _w in "$_fsd"/webapps/*/WEB-INF/classes; do
+                [ -d "$_w" ] && _appclass_record "dir|$_w"
+            done
+            for _w in "$_fsd"/webapps/*.war; do
+                [ -f "$_w" ] && _appclass_record "archive|$_w"
             done
         done
         if [ -n "$_jb" ]; then
@@ -1362,6 +1409,8 @@ run_report() {
         fact "not requested (--threads / --jcmd absent); no attach, signal, or pause was applied to any JVM"
     fi
     if [ "$OPT_THREADS" != 0 ] 2>/dev/null; then
+        _TDUMPS=0
+        : > "${_errfile}.tframes" 2>/dev/null
         _tn="$OPT_THREADS"
         [ "$_tn" -ge 1 ] 2>/dev/null || _tn=1
         _tp=0
@@ -1371,14 +1420,21 @@ run_report() {
             warn "[Tier2] thread dump: pid $pid x$_tn — pauses the target JVM at a safepoint for each dump"
             _k=1
             while [ "$_k" -le "$_tn" ]; do
+                _td="${_errfile}.tdump"
                 if have jstack; then
+                    if [ -n "$_timeout_bin" ]; then "$_timeout_bin" 60 jstack -l "$pid" > "$_td" 2>&1
+                    else jstack -l "$pid" > "$_td" 2>&1; fi
                     fact "-- thread dump pid $pid ($_k/$_tn) via jstack -l (first 5000 lines):"
-                    if [ -n "$_timeout_bin" ]; then "$_timeout_bin" 60 jstack -l "$pid" 2>&1 | head -n 5000 | while IFS= read -r _l; do printf '        %s\n' "$_l"; done
-                    else jstack -l "$pid" 2>&1 | head -n 5000 | while IFS= read -r _l; do printf '        %s\n' "$_l"; done; fi
+                    head -n 5000 "$_td" 2>/dev/null | while IFS= read -r _l; do printf '        %s\n' "$_l"; done
+                    cat "$_td" >> "${_errfile}.tframes" 2>/dev/null
+                    _TDUMPS=$((_TDUMPS + 1))
                 elif have jcmd; then
+                    if [ -n "$_timeout_bin" ]; then "$_timeout_bin" 60 jcmd "$pid" Thread.print -l > "$_td" 2>&1
+                    else jcmd "$pid" Thread.print -l > "$_td" 2>&1; fi
                     fact "-- thread dump pid $pid ($_k/$_tn) via jcmd Thread.print -l (first 5000 lines):"
-                    if [ -n "$_timeout_bin" ]; then "$_timeout_bin" 60 jcmd "$pid" Thread.print -l 2>&1 | head -n 5000 | while IFS= read -r _l; do printf '        %s\n' "$_l"; done
-                    else jcmd "$pid" Thread.print -l 2>&1 | head -n 5000 | while IFS= read -r _l; do printf '        %s\n' "$_l"; done; fi
+                    head -n 5000 "$_td" 2>/dev/null | while IFS= read -r _l; do printf '        %s\n' "$_l"; done
+                    cat "$_td" >> "${_errfile}.tframes" 2>/dev/null
+                    _TDUMPS=$((_TDUMPS + 1))
                 else
                     warn "[Tier2] jstack and jcmd absent: sending SIGQUIT to pid $pid — the dump goes to that process's stdout"
                     kill -3 "$pid" 2>/dev/null
@@ -1389,6 +1445,28 @@ run_report() {
             done
         done
         [ "$_tp" = 0 ] && fact "thread dumps: n/a (no JVM carrying a WhaTap attach marker)"
+        # Frame frequency over the dumps just taken. A transaction entry point
+        # that no weaving module covers is read off the frames that recur in
+        # every dump, and counting them by hand across N dumps is the step the
+        # field repeats on every such case. The three buckets are defined by
+        # the package prefixes printed with them; no frame is filtered away.
+        if [ "${_TDUMPS:-0}" -gt 0 ] && [ -s "${_errfile}.tframes" ]; then
+            grep -E '^[[:space:]]*at ' "${_errfile}.tframes" 2>/dev/null \
+                | sed 's/^[[:space:]]*at //; s/(.*$//' \
+                | sort | uniq -c | sort -rn > "${_errfile}.tfreq" 2>/dev/null
+            _fq_n="$(grep -c . "${_errfile}.tfreq" 2>/dev/null)"
+            fact "-- stack frame frequency over the $_TDUMPS dump(s) above: ${_fq_n:-0} distinct frames"
+            fact "   counted from the 'at <class>.<method>' lines of every thread, at any stack depth"
+            fact "   bucket 1 of 3 — JDK and JVM-vendor frames (package starts with java. javax. jakarta. sun. jdk. com.sun. oracle. org.graalvm.), top 20:"
+            grep -E '[0-9]+ (java|javax|jakarta|sun|jdk|com\.sun|oracle|org\.graalvm)\.' "${_errfile}.tfreq" 2>/dev/null | head -n 20 > "${_errfile}.tb" 2>/dev/null
+            if [ -s "${_errfile}.tb" ]; then while IFS= read -r _l; do printf '        %s\n' "$_l"; done < "${_errfile}.tb"; else printf '        (no frame in this bucket)\n'; fi
+            fact "   bucket 2 of 3 — WhaTap agent frames (package starts with whatap.), top 20:"
+            grep -E '[0-9]+ whatap\.' "${_errfile}.tfreq" 2>/dev/null | head -n 20 > "${_errfile}.tb" 2>/dev/null
+            if [ -s "${_errfile}.tb" ]; then while IFS= read -r _l; do printf '        %s\n' "$_l"; done < "${_errfile}.tb"; else printf '        (no frame in this bucket)\n'; fi
+            fact "   bucket 3 of 3 — every remaining frame, top 80:"
+            grep -vE '[0-9]+ (java|javax|jakarta|sun|jdk|com\.sun|oracle|org\.graalvm|whatap)\.' "${_errfile}.tfreq" 2>/dev/null | head -n 80 > "${_errfile}.tb" 2>/dev/null
+            if [ -s "${_errfile}.tb" ]; then while IFS= read -r _l; do printf '        %s\n' "$_l"; done < "${_errfile}.tb"; else printf '        (no frame in this bucket)\n'; fi
+        fi
     fi
     if [ "$OPT_JCMD" != 0 ]; then
         if ! have jcmd; then
@@ -1475,15 +1553,87 @@ run_report() {
                 _cd="${_errfile}.cls"
                 rm -rf "$_cd" 2>/dev/null; mkdir -p "$_cd" 2>/dev/null
                 if unzip -o -q -d "$_cd" "$_fsj2" "BOOT-INF/classes/$_rel" 2>/dev/null; then
-                    fact "   member signatures (javap -p, first 300 lines):"
-                    if [ -n "$_timeout_bin" ]; then "$_timeout_bin" "$CMD_TIMEOUT" javap -p -classpath "$_cd/BOOT-INF/classes" "$_fq" 2>&1 | head -n 300 | while IFS= read -r _l; do printf '             %s\n' "$_l"; done
-                    else javap -p -classpath "$_cd/BOOT-INF/classes" "$_fq" 2>&1 | head -n 300 | while IFS= read -r _l; do printf '             %s\n' "$_l"; done; fi
+                    fact "   member signatures (javap -p -s, first 400 lines):"
+                    if [ -n "$_timeout_bin" ]; then "$_timeout_bin" "$CMD_TIMEOUT" javap -p -s -classpath "$_cd/BOOT-INF/classes" "$_fq" 2>&1 | head -n 400 | while IFS= read -r _l; do printf '             %s\n' "$_l"; done
+                    else javap -p -s -classpath "$_cd/BOOT-INF/classes" "$_fq" 2>&1 | head -n 400 | while IFS= read -r _l; do printf '             %s\n' "$_l"; done; fi
                 else
                     fact "   member signatures: n/a (class entry could not be extracted)"
                 fi
                 rm -rf "$_cd" 2>/dev/null
             done
         done
+    fi
+
+    # [15] N. Application class index — only when explicitly requested
+    # Attaching a transaction to an application that no weaving module covers
+    # starts from one question: which classes are the application's own? The
+    # customer's source is frequently out of reach for procurement or security
+    # reasons, and the deployed artifact answers the same question. Section F
+    # inventories the LIBRARIES; this section inventories the classes the
+    # application itself ships, from the same roots the JVM loads them from.
+    section "N. Application class index (opt-in)"
+    _APPPAT="Controller Action Servlet Handler Endpoint Resource Service Facade Manager Delegate Listener Consumer Processor Job Task Batch Adapter Gateway"
+    if [ "$OPT_APPCLASSES" = 0 ]; then
+        fact "not requested (--appclasses absent)"
+    elif [ ! -s "$_APPSINK" ]; then
+        fact "requested, but section F enumerated no application class root (no directory classpath entry, no WEB-INF/classes, no BOOT-INF/classes)"
+    else
+        sort -u "$_APPSINK" 2>/dev/null > "${_errfile}.approots.u" 2>/dev/null
+        _NAMES="${_errfile}.appnames"
+        : > "$_NAMES" 2>/dev/null
+        _rn=0
+        while IFS= read -r _rec; do
+            [ -n "$_rec" ] || continue
+            _rn=$((_rn + 1))
+            [ "$_rn" -gt 12 ] && { fact "-- cap reached: 12 class roots read, later roots skipped"; break; }
+            case "$_rec" in
+                dir\|*)
+                    _rt="${_rec#dir|}"
+                    if [ ! -d "$_rt" ]; then fact "-- directory root $_rt: n/a (path not found)"; continue; fi
+                    if [ ! -r "$_rt" ]; then fact "-- directory root $_rt: n/a (permission denied)"; continue; fi
+                    _cnt="$(find "$_rt" -name '*.class' -type f 2>/dev/null | head -n 20000 | grep -c .)"
+                    fact "-- directory root $_rt: ${_cnt:-0} class files (read bound: 20000)"
+                    find "$_rt" -name '*.class' -type f 2>/dev/null | head -n 20000 | while IFS= read -r _cf; do
+                        _fq="${_cf#"$_rt"/}"; _fq="${_fq%.class}"
+                        printf '%s\n' "$_fq" | tr '/' '.' >> "$_NAMES" 2>/dev/null
+                    done
+                    ;;
+                archive\|*)
+                    _rt="${_rec#archive|}"
+                    if [ ! -f "$_rt" ]; then fact "-- archive root $_rt: n/a (path not found)"; continue; fi
+                    if ! have unzip; then fact "-- archive root $_rt: n/a (command not found: unzip)"; continue; fi
+                    if [ -n "$_timeout_bin" ]; then _lst="$("$_timeout_bin" "$CMD_TIMEOUT" unzip -Z1 "$_rt" 'WEB-INF/classes/*.class' 'BOOT-INF/classes/*.class' 2>/dev/null)"
+                    else _lst="$(unzip -Z1 "$_rt" 'WEB-INF/classes/*.class' 'BOOT-INF/classes/*.class' 2>/dev/null)"; fi
+                    _cnt="$(printf '%s\n' "$_lst" | grep -c .)"
+                    fact "-- archive root $_rt: ${_cnt:-0} class entries under WEB-INF/classes or BOOT-INF/classes (read bound: 20000)"
+                    printf '%s\n' "$_lst" | head -n 20000 | while IFS= read -r _ce; do
+                        [ -n "$_ce" ] || continue
+                        _fq="${_ce#WEB-INF/classes/}"; _fq="${_fq#BOOT-INF/classes/}"; _fq="${_fq%.class}"
+                        printf '%s\n' "$_fq" | tr '/' '.' >> "$_NAMES" 2>/dev/null
+                    done
+                    ;;
+            esac
+        done < "${_errfile}.approots.u"
+        if [ ! -s "$_NAMES" ]; then
+            fact "no class file was read from the enumerated roots"
+        else
+            sort -u "$_NAMES" 2>/dev/null > "${_NAMES}.u" 2>/dev/null
+            _tot="$(grep -c . "${_NAMES}.u" 2>/dev/null)"
+            fact "-- distinct application classes: ${_tot:-0}"
+            fact "-- package histogram, class count per package (top 40):"
+            sed 's/\.[^.]*$//' "${_NAMES}.u" 2>/dev/null | sort | uniq -c | sort -rn | head -n 40 | while IFS= read -r _l; do printf '        %s\n' "$_l"; done
+            fact "-- name-pattern index. The patterns are a fixed list carried by this collector, printed here verbatim so the reader knows exactly what was matched and what was not:"
+            fact "   $_APPPAT"
+            for _p in $_APPPAT; do
+                _mn="$(grep -E "(^|\.)[^.]*${_p}[^.]*$" "${_NAMES}.u" 2>/dev/null | grep -c .)"
+                [ "${_mn:-0}" -eq 0 ] && continue
+                fact "   *${_p}*: ${_mn} (first 60)"
+                grep -E "(^|\.)[^.]*${_p}[^.]*$" "${_NAMES}.u" 2>/dev/null | head -n 60 | while IFS= read -r _l; do printf '        %s\n' "$_l"; done
+            done
+            fact "-- classes matching none of those patterns: $(grep -vE "(^|\.)[^.]*($(printf '%s' "$_APPPAT" | tr ' ' '|'))[^.]*$" "${_NAMES}.u" 2>/dev/null | grep -c .)"
+            fact "-- full class list (first 2000, alphabetical):"
+            head -n 2000 "${_NAMES}.u" 2>/dev/null | while IFS= read -r _l; do printf '        %s\n' "$_l"; done
+        fi
     fi
 
     emit_footer
