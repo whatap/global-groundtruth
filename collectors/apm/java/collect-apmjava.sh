@@ -79,7 +79,7 @@ export LC_ALL=C
 
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-apmjava"
-VERSION="0.2.0"
+VERSION="0.3.0"
 DOMAIN="apm/java"
 TARGET="host/$(hostname 2>/dev/null || echo unknown)"
 
@@ -122,8 +122,10 @@ for the case where a new weaving module has to be written for a library:
 Application class index (off by default; read-only, no contact with the JVM) —
 for the case where the transaction entry point of an application no weaving
 module covers has to be located without access to the customer's source:
-  --appclasses   enumerate the application's OWN classes from WEB-INF/classes,
-                 BOOT-INF/classes and directory classpath entries: package
+  --appclasses   enumerate the application's OWN classes from every class root
+                 section F finds — WEB-INF/classes, BOOT-INF/classes, directory
+                 classpath entries, the JVM's own working directory, and the
+                 webapp directories each server product configures: package
                  histogram, a name-pattern index, and the class list
 
 Tier 2 (off by default; each announces its impact on stderr before running):
@@ -687,6 +689,92 @@ resolve_fs() {
     return 1
 }
 
+# resolve_rel PID PATH -> a readable filesystem view of PATH as the JVM at PID
+# resolves it. An absolute path goes through resolve_fs. A RELATIVE path is
+# resolved by a process against its OWN working directory, never the
+# collector's, so it is joined to /proc/<pid>/cwd — the same directory
+# section D reports. The collector is often started somewhere else than the
+# JVM (a script copied to /tmp, a debug shell), and an entrypoint of
+# "java -jar app.jar" under a WORKDIR is a documented container layout, so a
+# relative argument is an ordinary case and not an exotic one.
+resolve_rel() {
+    local pid="$1" p="$2" c
+    case "$p" in /*) resolve_fs "$p"; return ;; esac
+    c="$(readlink "/proc/$pid/cwd" 2>/dev/null)"
+    [ -n "$c" ] && [ -e "$c/$p" ] && { printf '%s\n' "$c/$p"; return; }
+    [ -e "/proc/$pid/cwd/$p" ] && { printf '%s\n' "/proc/$pid/cwd/$p"; return; }
+    return 1
+}
+
+# cwd_view PID -> a readable path to the working directory of PID: the link
+# target when it exists in this mount namespace, otherwise the link itself,
+# which the kernel resolves inside the target's namespace.
+cwd_view() {
+    local pid="$1" t
+    t="$(readlink "/proc/$pid/cwd" 2>/dev/null)"
+    [ -n "$t" ] && [ -d "$t" ] && { printf '%s\n' "$t"; return; }
+    [ -d "/proc/$pid/cwd" ] && { printf '%s\n' "/proc/$pid/cwd"; return; }
+    return 1
+}
+
+# tomcat_app_bases FSDIR -> every appBase this instance configures, one per
+# line. Read from server.xml instead of assuming <instance>/webapps, because
+# an instance is free to place its appBase anywhere; a relative value is
+# joined to the instance directory, which is how Tomcat resolves it.
+tomcat_app_bases() {
+    local fsd="$1" b
+    [ -r "$fsd/conf/server.xml" ] || return 0
+    grep -o 'appBase="[^"]*"' "$fsd/conf/server.xml" 2>/dev/null \
+        | sed 's/^appBase="//; s/"$//' | while IFS= read -r b; do
+        [ -n "$b" ] || continue
+        case "$b" in /*) printf '%s\n' "$b" ;; *) printf '%s\n' "$fsd/$b" ;; esac
+    done
+}
+
+# tomcat_doc_bases FSDIR APPBASEFILE -> every docBase this instance configures,
+# from server.xml and from the per-host context files under conf/<engine>/
+# <host>/. An absolute value is printed as is. A relative value is resolved
+# against each appBase listed in APPBASEFILE and against the instance
+# directory; only the candidates that exist are printed, so no single layout
+# is assumed.
+tomcat_doc_bases() {
+    local fsd="$1" basefile="$2" f b a
+    for f in "$fsd"/conf/server.xml "$fsd"/conf/*/*/*.xml; do
+        [ -r "$f" ] || continue
+        grep -o 'docBase="[^"]*"' "$f" 2>/dev/null \
+            | sed 's/^docBase="//; s/"$//' | while IFS= read -r b; do
+            [ -n "$b" ] || continue
+            case "$b" in
+                /*) printf '%s\n' "$b" ;;
+                *)  [ -e "$fsd/$b" ] && printf '%s\n' "$fsd/$b"
+                    [ -r "$basefile" ] || continue
+                    while IFS= read -r a; do
+                        [ -n "$a" ] || continue
+                        [ -e "$a/$b" ] && printf '%s\n' "$a/$b"
+                    done < "$basefile" ;;
+            esac
+        done
+    done
+}
+
+# webapp_roots "indent" FSDIR CAP -> record the application class roots under
+# one webapp container directory (an appBase, a Jetty base) and list the
+# libraries next to them.
+webapp_roots() {
+    local ind="$1" ab="$2" cap="${3:-120}" lbl="${4:-appBase}" w
+    [ -d "$ab" ] || { printf '%s%s %s: n/a (path not found)\n' "$ind" "$lbl" "$ab"; return; }
+    printf '%s%s %s\n' "$ind" "$lbl" "$ab"
+    for w in "$ab"/*/WEB-INF/lib; do
+        [ -d "$w" ] && list_jars "$ind  " "$w" "$cap"
+    done
+    for w in "$ab"/*/WEB-INF/classes; do
+        [ -d "$w" ] && _appclass_record "dir|$w"
+    done
+    for w in "$ab"/*.war; do
+        [ -f "$w" ] && _appclass_record "archive|$w"
+    done
+}
+
 _add_home() {  # _add_home PATH SOURCE
     local p="$1" s="$2"
     [ -n "$p" ] || return
@@ -945,7 +1033,7 @@ run_report() {
             # ProcessTypeDetector reads to name the process type
             _smk=0
             printf '           server markers:\n'
-            for _sp in catalina.base catalina.home catalina.useNaming jboss.home.dir jboss.server.name jboss.server.base.dir jeus.home weblogic.Name domain.home was.install.root server.root java.protocol.handler.pkgs spring.profiles.active; do
+            for _sp in catalina.base catalina.home catalina.useNaming jboss.home.dir jboss.server.name jboss.server.base.dir jetty.base jetty.home jeus.home weblogic.Name domain.home was.install.root server.root java.protocol.handler.pkgs spring.profiles.active; do
                 _v="$(_jvm_sysprop "$pid" "$_sp")"
                 if [ -n "$_v" ]; then _smk=$((_smk + 1)); printf '             -D%s=%s\n' "$_sp" "$(printf '%s' "$_v" | cut -c1-200)"; fi
             done
@@ -1070,9 +1158,14 @@ run_report() {
                 [ -n "$_l" ] || continue
                 printf '             %s\n' "$_l"
                 _lib_record "${_l##*/}"
+                _fsl="$(resolve_rel "$pid" "$_l")"
+                case "$_l" in /*) ;; *)
+                    if [ -n "$_fsl" ]; then printf '               relative entry, resolved through the working directory of pid %s: %s\n' "$pid" "$_fsl"
+                    else printf '               relative entry, not readable through the working directory of pid %s\n' "$pid"; fi ;;
+                esac
                 case "$_l" in
-                    *.jar) _path_record "file|$_l" ;;
-                    *)     [ -d "$_l" ] && _appclass_record "dir|$_l" ;;
+                    *.jar) _path_record "file|${_fsl:-$_l}" ;;
+                    *)     [ -n "$_fsl" ] && [ -d "$_fsl" ] && _appclass_record "dir|$_fsl" ;;
                 esac
             done
         else
@@ -1084,20 +1177,46 @@ run_report() {
         _jar="$(_all_jvm_args "$pid" 2>/dev/null | awk 'p=="-jar"{print; exit} {p=$0}')"
         if [ -n "$_jar" ]; then
             fact "   executable jar: $_jar"
-            _fsj="$(resolve_fs "$_jar")"
+            _fsj="$(resolve_rel "$pid" "$_jar")"
             if [ -n "$_fsj" ]; then
+                case "$_jar" in /*) ;; *) fact "     relative path, resolved through the working directory of pid $pid: $_fsj" ;; esac
                 bootjar_facts "             " "$_fsj"
                 _appclass_record "archive|$_fsj"
                 fact "   libraries packed inside that jar:"
                 jar_entries "             " "$_fsj" 'BOOT-INF/lib/*' 200
                 jar_entries "             " "$_fsj" 'WEB-INF/lib/*' 200
             else
-                fact "     n/a (path not visible from this mount namespace)"
+                fact "     n/a (path not readable here: an absolute path is tried in this mount namespace and through /proc/$pid/root, a relative one through /proc/$pid/cwd)"
             fi
         else
             fact "   executable jar (-jar): not set on this JVM"
         fi
-        # 3) server deploy and lib directories derived from this JVM's own -D
+        # 3) the working directory of this JVM. A process started with neither
+        #    -cp nor -jar loads from its own working directory (the default
+        #    class path is "."), which is how an extracted application layout
+        #    runs, so the working directory is a class root candidate on its
+        #    own. Section D reports the same directory.
+        _cwd="$(cwd_view "$pid")"
+        if [ -n "$_cwd" ]; then
+            fact "   working directory of this JVM: $_cwd"
+            _cwdn=0
+            for _sub in BOOT-INF/classes WEB-INF/classes classes; do
+                if [ -d "$_cwd/$_sub" ]; then
+                    fact "     $_sub is present under it"
+                    _appclass_record "dir|$_cwd/$_sub"
+                    _cwdn=$((_cwdn + 1))
+                fi
+            done
+            if [ -n "$(find "$_cwd" -maxdepth 1 -name '*.class' -type f 2>/dev/null | head -n 1)" ]; then
+                fact "     class files are present directly under it"
+                _appclass_record "dir|$_cwd"
+                _cwdn=$((_cwdn + 1))
+            fi
+            [ "$_cwdn" = 0 ] && fact "     no BOOT-INF/classes, WEB-INF/classes, classes directory or top-level class file under it"
+        else
+            fact "   working directory of this JVM: n/a (permission denied or gone)"
+        fi
+        # 4) server deploy and lib directories derived from this JVM's own -D
         _cb="$(_jvm_sysprop "$pid" catalina.base)"; _ch="$(_jvm_sysprop "$pid" catalina.home)"
         _jb="$(_jvm_sysprop "$pid" jboss.home.dir)"; _jsb="$(_jvm_sysprop "$pid" jboss.server.base.dir)"
         _je="$(_jvm_sysprop "$pid" jeus.home)"; _dh="$(_jvm_sysprop "$pid" domain.home)"
@@ -1112,15 +1231,44 @@ run_report() {
             [ -n "$_fsd" ] || { fact "   server directory (catalina): $_d — n/a (path not visible from this mount namespace)"; continue; }
             fact "   server directory (catalina): $_d"
             list_jars "             " "$_fsd/lib" 120
-            for _w in "$_fsd"/webapps/*/WEB-INF/lib; do
-                [ -d "$_w" ] && list_jars "             " "$_w" 120
+            # the appBase of an instance is whatever server.xml says it is;
+            # <instance>/webapps is only the shipped default, so both are read
+            _abs="$(printf '%s\n' "$_fsd/webapps"; tomcat_app_bases "$_fsd")"
+            _abs="$(printf '%s\n' "$_abs" | grep . | sort -u)"
+            printf '%s\n' "$_abs" | while IFS= read -r _ab; do
+                [ -n "$_ab" ] && webapp_roots "             " "$_ab" 120
             done
-            for _w in "$_fsd"/webapps/*/WEB-INF/classes; do
-                [ -d "$_w" ] && _appclass_record "dir|$_w"
-            done
-            for _w in "$_fsd"/webapps/*.war; do
-                [ -f "$_w" ] && _appclass_record "archive|$_w"
-            done
+            # a context can point its docBase outside every appBase
+            printf '%s\n' "$_abs" > "${_errfile}.abs" 2>/dev/null
+            _dbs="$(tomcat_doc_bases "$_fsd" "${_errfile}.abs" | sort -u)"
+            if [ -n "$_dbs" ]; then
+                printf '%s\n' "$_dbs" | while IFS= read -r _db; do
+                    [ -n "$_db" ] || continue
+                    if [ -d "$_db/WEB-INF/classes" ]; then
+                        fact "         docBase $_db (WEB-INF/classes present)"
+                        _appclass_record "dir|$_db/WEB-INF/classes"
+                    elif [ -f "$_db" ]; then
+                        fact "         docBase $_db (archive, read in place)"
+                        _appclass_record "archive|$_db"
+                    else
+                        fact "         docBase $_db: no WEB-INF/classes under it"
+                    fi
+                    [ -d "$_db/WEB-INF/lib" ] && list_jars "               " "$_db/WEB-INF/lib" 120
+                done
+            else
+                fact "         docBase entries in server.xml or conf/<engine>/<host>/*.xml: none"
+            fi
+        done
+        _seen_t=""
+        for _d in "$(_jvm_sysprop "$pid" jetty.base)" "$(_jvm_sysprop "$pid" jetty.home)"; do
+            [ -n "$_d" ] || continue
+            case "$_seen_t" in *"|$_d|"*) continue ;; esac
+            _seen_t="$_seen_t|$_d|"
+            _fsd="$(resolve_fs "$_d")"
+            [ -n "$_fsd" ] || { fact "   server directory (jetty): $_d — n/a (path not readable here)"; continue; }
+            fact "   server directory (jetty): $_d"
+            list_jars "             " "$_fsd/lib" 120
+            webapp_roots "             " "$_fsd/webapps" 120 "webapps directory"
         done
         if [ -n "$_jb" ]; then
             fact "   server directory (jboss.home.dir): $_jb"
@@ -1141,7 +1289,27 @@ run_report() {
         for _d in "$_je" "$_dh"; do
             [ -n "$_d" ] || continue
             _fsd="$(resolve_fs "$_d")"
-            [ -n "$_fsd" ] && { fact "   server directory: $_d"; probe "     listing" sh -c "ls '$_fsd' 2>/dev/null | head -n 40"; }
+            [ -n "$_fsd" ] || continue
+            fact "   server directory: $_d"
+            probe "     listing" sh -c "ls '$_fsd' 2>/dev/null | head -n 40"
+            # these products compose the staging path of a deployment at
+            # runtime, so the class roots are found by searching for them
+            # rather than by naming a layout
+            if [ -n "$_timeout_bin" ]; then
+                "$_timeout_bin" "$CMD_TIMEOUT" find "$_fsd" -maxdepth 10 -type d -path '*/WEB-INF/classes' 2>/dev/null | head -n 12 > "${_errfile}.wi" 2>/dev/null
+            else
+                find "$_fsd" -maxdepth 10 -type d -path '*/WEB-INF/classes' 2>/dev/null | head -n 12 > "${_errfile}.wi" 2>/dev/null
+            fi
+            if [ -s "${_errfile}.wi" ]; then
+                fact "     WEB-INF/classes directories under it (depth 10, first 12):"
+                while IFS= read -r _w; do
+                    [ -n "$_w" ] || continue
+                    printf '             %s\n' "$_w"
+                    _appclass_record "dir|$_w"
+                done < "${_errfile}.wi"
+            else
+                fact "     WEB-INF/classes directories under it (depth 10): none found"
+            fi
         done
         # 4) open jar files held by the process — covers layouts none of the
         #    above describe (custom launchers, exploded frameworks)
@@ -1576,8 +1744,9 @@ run_report() {
     if [ "$OPT_APPCLASSES" = 0 ]; then
         fact "not requested (--appclasses absent)"
     elif [ ! -s "$_APPSINK" ]; then
-        fact "requested, but section F enumerated no application class root (no directory classpath entry, no WEB-INF/classes, no BOOT-INF/classes)"
+        fact "requested, but section F enumerated no application class root (no directory classpath entry, no WEB-INF/classes, no BOOT-INF/classes). Section F states, per JVM, what its -cp, its -jar, its working directory and its server directories yielded"
     else
+        fact "-- names are reported as the JVM loads them: a BOOT-INF/classes or WEB-INF/classes segment at the head of a path inside a root is a layout artifact, not part of the class name, and is not printed"
         sort -u "$_APPSINK" 2>/dev/null > "${_errfile}.approots.u" 2>/dev/null
         _NAMES="${_errfile}.appnames"
         : > "$_NAMES" 2>/dev/null
@@ -1595,6 +1764,7 @@ run_report() {
                     fact "-- directory root $_rt: ${_cnt:-0} class files (read bound: 20000)"
                     find "$_rt" -name '*.class' -type f 2>/dev/null | head -n 20000 | while IFS= read -r _cf; do
                         _fq="${_cf#"$_rt"/}"; _fq="${_fq%.class}"
+                        _fq="${_fq#BOOT-INF/classes/}"; _fq="${_fq#WEB-INF/classes/}"
                         printf '%s\n' "$_fq" | tr '/' '.' >> "$_NAMES" 2>/dev/null
                     done
                     ;;

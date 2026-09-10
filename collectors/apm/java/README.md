@@ -28,10 +28,10 @@ agent jar.** The agent jar bundles the weaving-module markers, so a scan whose
 input includes it reports the agent's own catalog (case 2026-06-16 saw
 `spring-boot-2.1`…`4.0` matched at once in a single app). Section F therefore
 builds its inventory from the target JVM's own `-cp`/`-classpath`, its `-jar`
-(`BOOT-INF/lib`, `WEB-INF/lib`), `CLASSPATH`, the server directories derived
-from its own `-D` properties (`catalina.base`/`home`, `jboss.home.dir`,
-`jboss.server.base.dir`, `jeus.home`, `domain.home`) and its open jar file
-descriptors — with the `-javaagent` jar excluded and the exclusion stated in
+(`BOOT-INF/lib`, `WEB-INF/lib`), `CLASSPATH`, its own working directory, the
+server directories derived from its own `-D` properties (`catalina.base`/`home`,
+`jboss.home.dir`, `jboss.server.base.dir`, `jetty.base`/`home`, `jeus.home`,
+`domain.home`) and its open jar file descriptors — with the `-javaagent` jar excluded and the exclusion stated in
 the report.
 
 ## The common case: installed, healthy, but the hitmap stays empty
@@ -190,7 +190,7 @@ Container notes:
 | 12 | K. Kubernetes / operator injection context | `/whatap-agent` listing, `WHATAP_JAVA_AGENT_PATH`, `JAVA_TOOL_OPTIONS`, `POD_NAME`/`NODE_NAME`/`NODE_IP`/`OKIND`/`WHATAP_MICRO_ENABLED`, k8s markers |
 | 13 | L. Tier 2 artifacts (opt-in) | `--threads[=N]`: N `jstack -l` dumps per attached JVM (cap 3 JVMs, 5000 lines per dump), falling back to `jcmd Thread.print -l` and then to SIGQUIT (whose output goes to the fd 1 target shown in section D), **followed by a frame-frequency count over the dumps just taken** — every `at <class>.<method>` line, counted and sorted, in three buckets defined by the package prefixes printed with them (JDK/vendor, `whatap.`, everything else). `--jcmd`: `VM.command_line`, `VM.system_properties`, `VM.flags`, `VM.version`. When neither flag is given the section states that no attach, signal or pause was applied |
 | 14 | M. Library detail pack (opt-in) | `--library PAT` / `--library-all`: for every enumerated jar that matches — Maven coordinates from `META-INF/maven/*/pom.properties`, manifest version attributes, **class-file major version** (the number a weaving module has to be compiled against), package map (shading shows here), class count, multi-release/module/service entries; `--class FQCN` adds `javap -p -s` member signatures, JVM descriptor included. Libraries packed inside an executable jar are extracted (bounded at 80 MB) and reported with an `origin:` entry line instead of a path; `--class` also resolves application classes out of `BOOT-INF/classes` |
-| 15 | N. Application class index (opt-in) | `--appclasses`: the classes the application itself ships, from every class root section F enumerated — directory classpath entries, `<webapps>/*/WEB-INF/classes`, `WEB-INF/classes` of deployment units, and `WEB-INF/classes`/`BOOT-INF/classes` read in place inside a war/ear/executable jar (cap 12 roots, 20000 class files per root). Reported as a class count, a package histogram, a name-pattern index over a fixed pattern list printed with it, a count of the classes matching none of those patterns, and the class list (first 2000). Libraries are section F; this section is the application's own code |
+| 15 | N. Application class index (opt-in) | `--appclasses`: the classes the application itself ships, from every class root section F enumerated — directory classpath entries (a relative one resolved through the JVM's own working directory), the JVM's working directory itself when it carries `BOOT-INF/classes`, `WEB-INF/classes`, `classes` or a top-level class file, every configured Tomcat `appBase` and `docBase` rather than `<instance>/webapps` alone, a Jetty base's `webapps`, `WEB-INF/classes` of deployment units, `WEB-INF/classes` directories found under `jeus.home`/`domain.home` (depth 10, first 12), and `WEB-INF/classes`/`BOOT-INF/classes` read in place inside a war/ear/executable jar (cap 12 roots, 20000 class files per root). A `BOOT-INF/classes` or `WEB-INF/classes` segment at the head of a path inside a root is a layout artifact and is not printed as part of the class name. Reported as a class count, a package histogram, a name-pattern index over a fixed pattern list printed with it, a count of the classes matching none of those patterns, and the class list (first 2000). Libraries are section F; this section is the application's own code |
 
 ## Security note
 
