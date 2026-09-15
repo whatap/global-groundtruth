@@ -53,6 +53,14 @@
 #   * Which logging framework is in play, and where are its config files and
 #     output files? (case 2026-06-30: a console/JUL loop produced 19.8M events
 #     while the on-disk server log stayed small.)
+#   * Is the process a JVM at all when nothing about it says java? A native
+#     launcher that creates the VM in-process through JNI_CreateJavaVM (Axway
+#     API Gateway's `vshell` is one) has its own comm and exe and passes the
+#     JVM options in memory, so no /proc file names them. Such a process is
+#     identified by the VM shared library mapped into it (libjvm.so /
+#     libj9vm*.so), and --jcmd then reads its options back from the VM itself
+#     (case 2026-09-11 BAF: section D reported no JVM while section J showed
+#     two `vshell` processes connected to the collection server).
 #   * Tier 2, opt-in: thread dumps (--threads) and jcmd VM data (--jcmd) of the
 #     target JVM — the artifact that decided both transaction-entry cases.
 #
@@ -79,7 +87,7 @@ export LC_ALL=C
 
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-apmjava"
-VERSION="0.3.0"
+VERSION="0.4.0"
 DOMAIN="apm/java"
 TARGET="host/$(hostname 2>/dev/null || echo unknown)"
 
@@ -132,7 +140,10 @@ Tier 2 (off by default; each announces its impact on stderr before running):
   --threads[=N]  N thread dumps per WhaTap-attached JVM (default N=1) via
                  jstack -l; pauses the target JVM at a safepoint for the dump
   --jcmd         jcmd VM.command_line / VM.system_properties / VM.flags per
-                 WhaTap-attached JVM; uses the JVM attach mechanism
+                 WhaTap-attached JVM; uses the JVM attach mechanism. Also
+                 recovers the options of a JVM a native launcher created
+                 through JNI, whose options are in no /proc file, so sections
+                 E/F/G read them
 EOF
 }
 
@@ -616,12 +627,71 @@ _proc_env() {
 # them: JAVA_TOOL_OPTIONS, JDK_JAVA_OPTIONS, the command line, then
 # _JAVA_OPTIONS (which HotSpot processes last). The operator injects
 # -javaagent through JAVA_TOOL_OPTIONS, so the command line alone is not enough.
+# A fifth source is appended when it exists: arguments recovered from the
+# running VM itself with `jcmd` (see _jcmd_recover). It is written only for a
+# process whose options are absent from /proc and only when --jcmd was passed,
+# is empty otherwise, and is last because it reports the EFFECTIVE set the VM
+# holds — which is what "last wins" means for _jvm_sysprop.
 _all_jvm_args() {
     local pid="$1"
     _proc_env "$pid" JAVA_TOOL_OPTIONS | tr ' ' '\n'
     _proc_env "$pid" JDK_JAVA_OPTIONS | tr ' ' '\n'
     tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null
     _proc_env "$pid" _JAVA_OPTIONS | tr ' ' '\n'
+    [ -n "$_errfile" ] && [ -f "${_errfile}.jcmdargs.$pid" ] \
+        && cat "${_errfile}.jcmdargs.$pid" 2>/dev/null
+    return 0
+}
+
+# ---- Tier 2 argument recovery (opt-in: --jcmd) --------------------------------
+# A JVM the collector found only by its libjvm.so mapping carries its options
+# nowhere in /proc: the native launcher passed them to JNI_CreateJavaVM as an
+# array it built, so /proc/<pid>/cmdline holds the launcher's own arguments and
+# nothing else. Sections E, F and G read those options, so for such a process
+# they have nothing to read and report absence.
+#
+# The running VM still holds them, and `jcmd <pid> VM.command_line` and
+# `VM.system_properties` report them. Reaching the VM that way is the JVM
+# attach mechanism on a live process — Tier 2 — so this runs ONLY when the
+# field engineer passed --jcmd, and only for the processes whose options are
+# not in /proc. Its output is written to a per-pid file that _all_jvm_args
+# appends, so every section downstream reads it through the path it already
+# uses; nothing else changes.
+#
+# Splitting jvm_args on spaces is the same treatment _all_jvm_args already
+# gives JAVA_TOOL_OPTIONS: an argument containing a space is split, and both
+# halves are reported. VM.system_properties is Properties.store format, in
+# which "=", ":", "#" and "!" arrive backslash-escaped in keys and values
+# alike (java.class.path reaches here as /a\:/b), so those escapes are undone
+# before each property is written as the -Dkey=value the other sections read.
+_JCMD_RECOVERED=""
+_jcmd_recover() {
+    local pid="$1" out cl dst
+    have jcmd || return 1
+    dst="${_errfile}.jcmdargs.$pid"
+    : > "$dst" 2>/dev/null
+    warn "[Tier2] jcmd argument recovery: pid $pid — uses the JVM attach mechanism on the target process"
+    if [ -n "$_timeout_bin" ]; then cl="$("$_timeout_bin" "$CMD_TIMEOUT" jcmd "$pid" VM.command_line 2>/dev/null)"
+    else cl="$(jcmd "$pid" VM.command_line 2>/dev/null)"; fi
+    printf '%s\n' "$cl" | sed -n 's/^jvm_args: //p' | tr ' ' '\n' | grep . >> "$dst" 2>/dev/null
+    # the program the VM recorded, when it recorded one; a VM created straight
+    # through JNI_CreateJavaVM often carries "<unknown>" here, and that is the
+    # fact section D prints in place of a main class read off the launcher's
+    # own argv, which is not a java command line at all
+    printf '%s\n' "$cl" | sed -n 's/^java_command: //p' | head -n1 > "${_errfile}.jcmdmain.$pid" 2>/dev/null
+    if [ -n "$_timeout_bin" ]; then out="$("$_timeout_bin" "$CMD_TIMEOUT" jcmd "$pid" VM.system_properties 2>/dev/null)"
+    else out="$(jcmd "$pid" VM.system_properties 2>/dev/null)"; fi
+    # a -D the launcher passed is already in the file, from jvm_args; only the
+    # properties it does not carry are appended, so no option is listed twice
+    printf '%s\n' "$out" | grep '=' | grep -v '^#' \
+        | sed 's/\\:/:/g; s/\\=/=/g; s/\\!/!/g; s/\\#/#/g; s/^/-D/' \
+        | awk 'NR==FNR { if (substr($0,1,2) == "-D") { split($0, kv, "="); seen[kv[1]] = 1 } next }
+               { split($0, kv, "="); if (!(kv[1] in seen)) print }' "$dst" - > "${dst}.sp" 2>/dev/null
+    cat "${dst}.sp" >> "$dst" 2>/dev/null
+    rm -f "${dst}.sp" 2>/dev/null
+    [ -s "$dst" ] || { rm -f "$dst" 2>/dev/null; return 1; }
+    _JCMD_RECOVERED="$_JCMD_RECOVERED $pid"
+    return 0
 }
 
 # _jvm_sysprop PID KEY -> the last -DKEY=value seen across all argument
@@ -630,25 +700,60 @@ _jvm_sysprop() {
     _all_jvm_args "$1" 2>/dev/null | grep "^-D$2=" | tail -n1 | sed "s/^-D$2=//"
 }
 
-# _is_jvm PID -> success if the process is a JVM (resolved binary, comm, or a
-# JVM-only argument). Launchers rename the process, so comm alone is not enough.
+# _jvm_maps_lib PID -> the VM shared library mapped into the process, or empty.
+# Every JVM maps one, whoever started it: the `java` launcher, jsvc, or a
+# native program that called JNI_CreateJavaVM itself. HotSpot and its
+# derivatives map libjvm.so; OpenJ9 / IBM J9 map libj9vm<ver>.so beside their
+# own libjvm.so. The mapping is matched, not a name list of launchers.
+_jvm_maps_lib() {
+    [ -r "/proc/$1/maps" ] || return 1
+    grep -m1 -oE '/[^[:space:]]*/(libjvm\.so|libj9vm[^/[:space:]]*\.so)' "/proc/$1/maps" 2>/dev/null \
+        | head -n1
+}
+
+_IS_JVM_WHY=""
+# _is_jvm PID -> success if the process is a JVM (resolved binary, comm, a
+# JVM-only argument, or a mapped VM shared library). On success _IS_JVM_WHY
+# holds the test that settled it, which section D reports per process.
+# Launchers rename the process, so comm alone is not enough.
 # A launcher may rename the process (JBoss run.jar, jsvc, custom start
 # scripts), so comm alone is not enough; a JVM-only option is accepted as
 # evidence, but only as a WHOLE argument. A shell wrapper whose command line
 # merely contains a java invocation as text keeps the whole command in one
 # argument, and interpreters are excluded outright, so start.sh is not
 # reported as a JVM.
+#
+# The fourth and last test reads /proc/<pid>/maps. A NATIVE LAUNCHER that
+# creates the VM in its own process through the JNI Invocation API
+# (JNI_CreateJavaVM) leaves nothing for the first three: comm and exe are the
+# launcher's own name, and the JVM options it hands to JNI_CreateJavaVM are an
+# array it built in memory, so they never reach /proc/<pid>/cmdline. What such
+# a process does have, like every other JVM, is the VM shared library mapped
+# into it. Axway API Gateway (`vshell`) is one launcher of this shape;
+# the test names none of them and matches the mapping instead, so a launcher
+# this collector has never seen is reported the same way (CONTRACT rule 2).
+# It runs LAST, only for the processes the three cheaper tests did not settle,
+# because it opens one more file per remaining process.
 _is_jvm() {
-    local pid="$1" comm exe
+    local pid="$1" comm exe lib
+    _IS_JVM_WHY=""
     comm="$(cat "/proc/$pid/comm" 2>/dev/null)"
-    case "$comm" in java|java.*|jsvc*|jexec*) return 0 ;; esac
+    case "$comm" in java|java.*|jsvc*|jexec*) _IS_JVM_WHY="comm is $comm"; return 0 ;; esac
     exe="$(readlink -f "/proc/$pid/exe" 2>/dev/null)"
     case "${exe##*/}" in
-        java|jsvc|jsvc.exec) return 0 ;;
+        java|jsvc|jsvc.exec) _IS_JVM_WHY="resolved exe is $exe"; return 0 ;;
         sh|bash|dash|ksh|zsh|busybox|python*|perl|ruby|node|nodejs|awk|sed|grep|tr) return 1 ;;
     esac
-    tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null \
-        | grep -qE '^-(javaagent:|Xmx|Xms|XX:|Dcatalina\.|Djava\.|Dwhatap\.)' && return 0
+    if tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null \
+        | grep -qE '^-(javaagent:|Xmx|Xms|XX:|Dcatalina\.|Djava\.|Dwhatap\.)'; then
+        _IS_JVM_WHY="a JVM-only whole argument on the command line"
+        return 0
+    fi
+    lib="$(_jvm_maps_lib "$pid")"
+    if [ -n "$lib" ]; then
+        _IS_JVM_WHY="$lib mapped in /proc/$pid/maps (comm ${comm:-n/a}, exe ${exe:-n/a}, no JVM argument on the command line)"
+        return 0
+    fi
     return 1
 }
 
@@ -669,7 +774,15 @@ _whatap_attached() {
 #   D_JAVA_EXES   distinct java binaries (running processes + PATH + JAVA_HOME)
 #   D_AGENT_JARS  newline-joined "path|source" records for whatap agent jars
 #   D_HOMES       newline-joined "path|source" records for agent home candidates
+#   D_JVM_WHY     newline-joined "pid|test that settled it" records
+#   D_JVM_NOARGS  pids found only by a mapped VM library: no options in /proc
+#   D_PROC_SCANNED / D_PROC_SKIPPED  what the /proc walk covered, so section D
+#                 states the basis of an empty result instead of only the result
 D_JVM_PIDS=""
+D_JVM_WHY=""
+D_JVM_NOARGS=""
+D_PROC_SCANNED=0
+D_PROC_SKIPPED=0
 D_MARKED=""
 D_JAVA_EXES=""
 D_JAVA_KEYS=""
@@ -806,16 +919,33 @@ _add_java() {
 
 discover() {
     progress "discovery: JVM processes, agent jars, agent homes, java binaries"
-    local pid exe v a rest marked
+    local pid exe v a rest marked _jr
 
     for pid in $(ls /proc 2>/dev/null | grep -E '^[0-9]+$'); do
+        D_PROC_SCANNED=$((D_PROC_SCANNED + 1))
         [ "$pid" = "$$" ] && continue
-        [ -r "/proc/$pid/cmdline" ] || continue
+        [ -r "/proc/$pid/cmdline" ] || { D_PROC_SKIPPED=$((D_PROC_SKIPPED + 1)); continue; }
         _is_jvm "$pid" || continue
         D_JVM_PIDS="$D_JVM_PIDS $pid"
+        D_JVM_WHY="$D_JVM_WHY
+$pid|$_IS_JVM_WHY"
+        case "$_IS_JVM_WHY" in *' mapped in /proc/'*) D_JVM_NOARGS="$D_JVM_NOARGS $pid" ;; esac
         exe="$(readlink -f "/proc/$pid/exe" 2>/dev/null)"
         [ -n "$exe" ] && _add_java "$exe"
     done
+
+    # A JVM found by its mapped VM library has no options in /proc. When --jcmd
+    # was passed, recover them from the VM before anything reads them — the
+    # WhaTap attach marker below is one of the things read.
+    if [ "$OPT_JCMD" != 0 ] && [ -n "$D_JVM_NOARGS" ]; then
+        progress "discovery: jcmd argument recovery for JVMs whose options are not in /proc"
+        _jr=0
+        for pid in $D_JVM_NOARGS; do
+            _jr=$((_jr + 1))
+            [ "$_jr" -gt 4 ] && break
+            _jcmd_recover "$pid"
+        done
+    fi
 
     # WhaTap-attached JVMs take the per-process detail slots before unrelated
     # JVMs (build daemons, IDE helpers) when the cap applies
@@ -997,6 +1127,11 @@ run_report() {
     section "D. JVM processes and agent attachment"
     _n="$(echo $D_JVM_PIDS | wc -w | tr -d ' ')"
     _nm="$(echo $D_MARKED | wc -w | tr -d ' ')"
+    # what an empty result rests on: the walk that produced it and the tests
+    # applied to each entry, so the reader can tell "no JVM is running here"
+    # from "the walk could not see one"
+    fact "/proc walk: $D_PROC_SCANNED numeric pid entries scanned, $D_PROC_SKIPPED skipped (cmdline unreadable)"
+    fact "tests applied to each, in order: /proc/<pid>/comm; resolved /proc/<pid>/exe; a JVM-only whole argument in /proc/<pid>/cmdline; a libjvm.so or libj9vm*.so mapping in /proc/<pid>/maps"
     if [ "${_n:-0}" -eq 0 ]; then
         fact "JVM processes: none found in /proc (this pid namespace)"
     else
@@ -1006,6 +1141,7 @@ run_report() {
             _shown=$((_shown + 1))
             [ "$_shown" -gt 20 ] && { fact "-- remaining $((_n - 20)) JVM processes not detailed (cap: 20)"; break; }
             printf '        -- pid %s (ppid %s)\n' "$pid" "$(awk '/^PPid:/{print $2}' "/proc/$pid/status" 2>/dev/null)"
+            printf '           detected as a JVM by: %s\n' "$(printf '%s\n' "$D_JVM_WHY" | awk -F'|' -v p="$pid" '$1==p{sub(/^[^|]*\|/,""); print; exit}')"
             printf '           comm: %s\n' "$(cat "/proc/$pid/comm" 2>/dev/null)"
             printf '           exe: %s\n' "$(readlink -f "/proc/$pid/exe" 2>/dev/null || echo 'n/a (permission denied or gone)')"
             printf '           uid/state/threads: %s\n' "$(awk '/^Uid:/{u=$2} /^State:/{s=$2} /^Threads:/{t=$2} END{print u" / "s" / "t}' "/proc/$pid/status" 2>/dev/null)"
@@ -1017,6 +1153,22 @@ run_report() {
             printf '           stderr (fd 2) -> %s\n' "$(readlink "/proc/$pid/fd/2" 2>/dev/null || echo 'n/a (permission denied or gone)')"
             printf '           cmdline (verbatim):\n'
             tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null | while IFS= read -r _l; do printf '             %s\n' "$_l"; done
+            # a JVM the mapping test found holds no options in /proc; state
+            # whether they were read back from the VM, and with which command
+            case " $D_JVM_NOARGS " in
+                *" $pid "*)
+                    case " $_JCMD_RECOVERED " in
+                        *" $pid "*)
+                            printf '           JVM options are absent from /proc/%s/cmdline; the sections below read them from the VM via jcmd VM.command_line and jcmd VM.system_properties (--jcmd): %s lines recovered\n' \
+                                "$pid" "$(grep -c . "${_errfile}.jcmdargs.$pid" 2>/dev/null)" ;;
+                        *)
+                            if [ "$OPT_JCMD" = 0 ]; then
+                                printf '           JVM options are absent from /proc/%s/cmdline; --jcmd was not passed, so the VM was not asked for them and the sections below read only what /proc holds\n' "$pid"
+                            else
+                                printf '           JVM options are absent from /proc/%s/cmdline; --jcmd was passed and the recovery returned nothing (jcmd absent, attach refused, or the cap of 4 such processes reached)\n' "$pid"
+                            fi ;;
+                    esac ;;
+            esac
             # every -javaagent reaching this JVM, from all four argument sources
             _ja="$(_all_jvm_args "$pid" 2>/dev/null | grep -c '^-javaagent:')"
             printf '           -javaagent options reaching this JVM: %s\n' "${_ja:-0}"
@@ -1044,6 +1196,18 @@ run_report() {
             # program identity: the option values (-cp, -jar, --module-path …)
             # are skipped so a classpath is never reported as a main class
             _jarv="$(_all_jvm_args "$pid" 2>/dev/null | awk 'p=="-jar"{print; exit} {p=$0}')"
+            # a launcher's own argv is not a java command line, so nothing on
+            # it is read as a program; what the VM itself recorded is printed
+            case " $D_JVM_NOARGS " in
+                *" $pid "*)
+                    _jc="$(cat "${_errfile}.jcmdmain.$pid" 2>/dev/null)"
+                    if [ -n "$_jc" ]; then
+                        printf '           program: java_command recorded by the VM: %s\n' "$(printf '%s' "$_jc" | cut -c1-200)"
+                    else
+                        printf '           program: n/a (the command line above belongs to the launcher, not to a JVM; the VM was not asked for its java_command)\n'
+                    fi
+                    continue ;;
+            esac
             if [ -n "$_jarv" ]; then
                 printf '           program: executable jar %s\n' "$_jarv"
             else
@@ -1640,17 +1804,22 @@ run_report() {
         if ! have jcmd; then
             fact "jcmd data: n/a (command not found: jcmd)"
         else
-            _jp=0
-            for pid in $D_MARKED; do
+            # A JVM whose options are not in /proc is queried here too, whether
+            # or not it carries an attach marker: /proc showed nothing about
+            # it, so this output is the only verbatim record of what it runs.
+            _jp=0; _jseen=""
+            for pid in $D_MARKED $D_JVM_NOARGS; do
+                case "$_jseen" in *"|$pid|"*) continue ;; esac
+                _jseen="$_jseen|$pid|"
                 _jp=$((_jp + 1))
-                [ "$_jp" -gt 3 ] && { fact "-- remaining attached JVMs not queried (cap: 3)"; break; }
+                [ "$_jp" -gt 3 ] && { fact "-- remaining JVMs not queried (cap: 3)"; break; }
                 warn "[Tier2] jcmd: pid $pid — uses the JVM attach mechanism on the target process"
                 probe "-- jcmd $pid VM.command_line" jcmd "$pid" VM.command_line
                 probe "-- jcmd $pid VM.system_properties" jcmd "$pid" VM.system_properties
                 probe "-- jcmd $pid VM.flags" jcmd "$pid" VM.flags
                 probe "-- jcmd $pid VM.version" jcmd "$pid" VM.version
             done
-            [ "$_jp" = 0 ] && fact "jcmd data: n/a (no JVM carrying a WhaTap attach marker)"
+            [ "$_jp" = 0 ] && fact "jcmd data: n/a (no JVM carrying a WhaTap attach marker, and none whose options are absent from /proc)"
         fi
     fi
 
