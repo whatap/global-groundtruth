@@ -63,6 +63,11 @@
 #     two `vshell` processes connected to the collection server).
 #   * Tier 2, opt-in: thread dumps (--threads) and jcmd VM data (--jcmd) of the
 #     target JVM — the artifact that decided both transaction-entry cases.
+#   * Which of the application's own classes implement, extend or call a
+#     given type? The console answers it with an Interfaces column; from the
+#     artifact it is answered by the constant pool, which carries the type as
+#     a UTF8 entry in every class that names it. --class-refs does that scan
+#     (case 2026-09-17 FIF: which of 72 batchprocess classes are Quartz jobs).
 #   * A thread dump the field already holds (WhaTap console dump, jstack file,
 #     kill -3 output) enters the same counts through --dump-file, without
 #     touching any JVM (case 2026-09-17 FIF: the dump arrived over Slack and
@@ -94,7 +99,7 @@ export LC_ALL=C
 
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-apmjava"
-VERSION="0.7.0"
+VERSION="0.8.0"
 DOMAIN="apm/java"
 TARGET="host/$(hostname 2>/dev/null || echo unknown)"
 
@@ -109,6 +114,7 @@ OPT_LIBALL=0      # --library-all: detail every enumerated jar (capped)
 OPT_CLASSES=""    # --class FQCN (repeatable): member signatures via javap
 OPT_APPCLASSES=0  # --appclasses: application class index (section N)
 OPT_DUMPS=""      # --dump-file: thread dump files taken elsewhere (section L)
+OPT_REFS=""       # --class-refs: types to look for in the class constant pools
 
 usage() {
     cat <<EOF
@@ -146,6 +152,12 @@ module covers has to be located without access to the customer's source:
                  webapp directories each server product configures: package
                  histogram, a name-pattern index, and the class list
 
+  --class-refs T  with --appclasses: list the indexed classes whose bytecode
+                 names type T (e.g. org.quartz.Job, javax.servlet.Filter;
+                 repeatable). The constant pool carries the type whether the
+                 class implements, extends, calls or merely references it, so
+                 the list is "names it", not "implements it"
+
 Thread dumps taken elsewhere (off by default; read-only, no contact with the JVM):
   --dump-file PATH  a thread dump file produced outside this collector (WhaTap
                  console thread dump, jstack output, kill -3 output; repeatable).
@@ -179,6 +191,8 @@ while [ $# -gt 0 ]; do
         --class)        shift; OPT_CLASSES="$OPT_CLASSES $1" ;;
         --class=*)      OPT_CLASSES="$OPT_CLASSES ${1#*=}" ;;
         --appclasses)   OPT_APPCLASSES=1 ;;
+        --class-refs)   shift; OPT_REFS="$OPT_REFS $1" ;;
+        --class-refs=*) OPT_REFS="$OPT_REFS ${1#*=}" ;;
         --dump-file)    shift; OPT_DUMPS="$OPT_DUMPS
 $1" ;;
         --dump-file=*)  OPT_DUMPS="$OPT_DUMPS
@@ -2015,6 +2029,7 @@ EOF_DUMPS
         [ "$OPT_LIBALL" = 1 ] && fact "patterns requested: --library-all (every enumerated jar)"
         [ -n "$OPT_CLASSES" ] && fact "member signatures requested for:$OPT_CLASSES"
         _dn=0
+        : > "${_errfile}.jarsha" 2>/dev/null
         sort -u "$_PATHSINK" 2>/dev/null > "${_errfile}.paths.u" 2>/dev/null
         while IFS= read -r _rec; do
             [ -n "$_rec" ] || continue
@@ -2023,10 +2038,23 @@ EOF_DUMPS
                 file)
                     _p="${_rec#file|}"
                     _lib_match "$_p" || continue
-                    _dn=$((_dn + 1))
-                    [ "$_dn" -gt 40 ] && { fact "-- cap reached: 40 jars detailed, later matches skipped"; break; }
                     _fsp="$(resolve_fs "$_p")"
                     if [ -z "$_fsp" ]; then fact "-- $_p: n/a (path not visible from this mount namespace)"; continue; fi
+                    # Several deployment units of one application carry the same
+                    # jar. Detailing each copy spends the cap on identical
+                    # content and hides the other units entirely (case
+                    # 2026-09-17 FIF: all 40 came from one unit of two), so a
+                    # byte-identical copy is named rather than detailed again.
+                    _sh=""
+                    if have sha256sum; then _sh="$(sha256sum "$_fsp" 2>/dev/null | cut -d' ' -f1)"
+                    elif have shasum; then _sh="$(shasum -a 256 "$_fsp" 2>/dev/null | cut -d' ' -f1)"; fi
+                    if [ -n "$_sh" ] && grep -q "^$_sh " "${_errfile}.jarsha" 2>/dev/null; then
+                        fact "-- $(basename "$_p"): byte-identical copy of a jar already detailed above (sha256 $_sh); path: $_p"
+                        continue
+                    fi
+                    [ -n "$_sh" ] && printf '%s %s\n' "$_sh" "$_p" >> "${_errfile}.jarsha" 2>/dev/null
+                    _dn=$((_dn + 1))
+                    [ "$_dn" -gt 40 ] && { fact "-- cap reached: 40 distinct jars detailed, later matches skipped"; break; }
                     detail_jar "$(basename "$_p")" "$_fsp"
                     ;;
                 nested)
@@ -2200,6 +2228,64 @@ EOF_DUMPS
             fact "-- classes matching none of those patterns: $(grep -vE "(^|\.)[^.]*($(printf '%s' "$_APPPAT" | tr ' ' '|'))[^.]*$" "${_NAMES}.u" 2>/dev/null | grep -c .)"
             fact "-- full class list (first 2000, alphabetical):"
             head -n 2000 "${_NAMES}.u" 2>/dev/null | while IFS= read -r _l; do printf '        %s\n' "$_l"; done
+            # --class-refs: which of these classes name a given type. A class
+            # file carries every type it implements, extends, calls or
+            # references as a UTF8 constant-pool entry in internal form, so the
+            # scan is a byte search of the class files of the same roots. It
+            # reports "names it", never "implements it".
+            if [ -n "$OPT_REFS" ]; then
+                _refdir="${_errfile}.refx"
+                for _tk in $OPT_REFS; do
+                    _tki="$(printf '%s' "$_tk" | tr '.' '/')"
+                    _hits="${_errfile}.refhits"; : > "$_hits" 2>/dev/null
+                    _rr=0
+                    while IFS= read -r _rrec; do
+                        [ -n "$_rrec" ] || continue
+                        _rr=$((_rr + 1)); [ "$_rr" -gt 72 ] && break
+                        case "$_rrec" in
+                            dir\|*)
+                                _rt="${_rrec#dir|}"
+                                [ -d "$_rt" ] || continue
+                                grep -rl -a --include='*.class' -- "$_tki" "$_rt" 2>/dev/null | head -n 400 \
+                                  | while IFS= read -r _hf; do
+                                        _fq="${_hf#"$_rt"/}"; _fq="${_fq%.class}"
+                                        _fq="${_fq#BOOT-INF/classes/}"; _fq="${_fq#WEB-INF/classes/}"
+                                        printf '%s\n' "$_fq" | tr '/' '.' >> "$_hits" 2>/dev/null
+                                    done
+                                ;;
+                            libjar\|*|archive\|*)
+                                case "$_rrec" in libjar\|*) _rt="${_rrec#libjar|}" ;; *) _rt="${_rrec#archive|}" ;; esac
+                                _fsr="$(resolve_fs "$_rt")"
+                                [ -n "$_fsr" ] || continue
+                                have unzip || continue
+                                _sz="$(wc -c < "$_fsr" 2>/dev/null)"
+                                if [ -n "$_sz" ] && [ "$_sz" -gt 83886080 ] 2>/dev/null; then
+                                    fact "   $_rt: skipped for this scan (above the 80 MB unpack bound)"
+                                    continue
+                                fi
+                                rm -rf "$_refdir" 2>/dev/null; mkdir -p "$_refdir" 2>/dev/null || continue
+                                if [ -n "$_timeout_bin" ]; then "$_timeout_bin" "$CMD_TIMEOUT" unzip -qq -o -d "$_refdir" "$_fsr" '*.class' >/dev/null 2>&1
+                                else unzip -qq -o -d "$_refdir" "$_fsr" '*.class' >/dev/null 2>&1; fi
+                                grep -rl -a --include='*.class' -- "$_tki" "$_refdir" 2>/dev/null | head -n 400 \
+                                  | while IFS= read -r _hf; do
+                                        _fq="${_hf#"$_refdir"/}"; _fq="${_fq%.class}"
+                                        _fq="${_fq#BOOT-INF/classes/}"; _fq="${_fq#WEB-INF/classes/}"
+                                        printf '%s\n' "$_fq" | tr '/' '.' >> "$_hits" 2>/dev/null
+                                    done
+                                rm -rf "$_refdir" 2>/dev/null
+                                ;;
+                        esac
+                    done < "${_errfile}.approots.u"
+                    sort -u "$_hits" 2>/dev/null > "${_hits}.u" 2>/dev/null
+                    _hn="$(grep -c . "${_hits}.u" 2>/dev/null)"
+                    fact "-- classes naming $_tk in their bytecode: ${_hn:-0} (searched for the internal form $_tki in the class files of the roots above; a class is listed whether it implements, extends, calls or only references the type)"
+                    if [ "${_hn:-0}" -gt 0 ]; then
+                        head -n 200 "${_hits}.u" 2>/dev/null | while IFS= read -r _l; do printf '        %s\n' "$_l"; done
+                    else
+                        printf '        (no class of these roots carries the token)\n'
+                    fi
+                done
+            fi
             # Join with section L: which classes of THIS index appear as frames in
             # the dumps counted there. A zero is a fact worth a line — it says the
             # dumps were taken while no application code was on any stack.
