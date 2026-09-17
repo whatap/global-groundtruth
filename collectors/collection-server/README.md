@@ -8,7 +8,7 @@
 > | ---------- | ----- | ----- | ------ |
 > | [`collect-collserver.sh`](collect-collserver.sh) 0.3.0 | `collserver` | the WhaTap backend itself | **not yet run against a live production yard** — validate once on a staging backend |
 > | [`collect-collzfs.sh`](collect-collzfs.sh) 0.1.0 | `collzfs` | ZFS under the backend's data path | validated non-root on two live hosts (zfs 2.2.2 and 2.2.6), one of them a real collection server with `yardbase` on ZFS; `--zdb` and the root-only probes still unvalidated |
-> | [`collect-collmysql.sh`](collect-collmysql.sh) 0.1.0 | `collmysql` | the MySQL that holds the backend's `account` / `notihub` metadata | **not yet run against a live MySQL** — smoke-tested only on a host with no MySQL client, where every section reported its reason and the footer was reached |
+> | [`collect-collmysql.sh`](collect-collmysql.sh) 0.4.0 | `collmysql` | the MySQL that holds the backend's `account` / `notihub` metadata | run end to end on MySQL 5.6.51, 5.7.32, 8.4.10 and MariaDB 10.11.19 under a scheduler-shaped write load; a replicating pair, section I on 8.4 and real `iostat` sampling are still unverified |
 >
 > Which one to run: `collect-collserver.sh` for anything about the backend
 > (services, ports, configs, logs). `collect-collzfs.sh` when the question is
