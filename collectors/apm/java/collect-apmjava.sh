@@ -94,7 +94,7 @@ export LC_ALL=C
 
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-apmjava"
-VERSION="0.5.0"
+VERSION="0.5.1"
 DOMAIN="apm/java"
 TARGET="host/$(hostname 2>/dev/null || echo unknown)"
 
@@ -1243,7 +1243,8 @@ run_report() {
     # [6] E. Agent home resolution and configuration
     section "E. Agent home resolution and configuration"
     fact "resolution the agent performs (whatap.agent.Configure.getPropertyFile):"
-    fact "  env WHATAP_CONFIG_FILE  >  -Dwhatap.config.file  >  -Dwhatap.home (default \".\" = process working directory) + -Dwhatap.config (default \"whatap.conf\")"
+    fact "  env WHATAP_CONFIG_FILE  >  -Dwhatap.config.file  >  -Dwhatap.home + -Dwhatap.config (default \"whatap.conf\")"
+    fact "  when -Dwhatap.home is absent the agent sets it itself to the directory of its own jar before reading the file (whatap.agent.boot.AgentBoot, JarUtil.getJarLocation); Configure's literal default \".\" is reached only when no -javaagent jar location is known"
     fact "  values in the file are then overlaid with environment variables and system properties (whatap.lang.conf.ConfigValueUtil.replaceSysProp); env names may contain dots"
     if [ "${_nm:-0}" -eq 0 ]; then
         fact "per-process resolution: n/a (no JVM carrying a WhaTap attach marker)"
@@ -1254,7 +1255,11 @@ run_report() {
         if [ -z "$_cf" ]; then _cf="$(_jvm_sysprop "$pid" whatap.config.file)"; _src="-Dwhatap.config.file"; fi
         if [ -z "$_cf" ]; then
             _hm="$(_jvm_sysprop "$pid" whatap.home)"; _src="-Dwhatap.home"
-            if [ -z "$_hm" ]; then _hm="$(readlink -f "/proc/$pid/cwd" 2>/dev/null)"; _src="process working directory (whatap.home unset, default \".\")"; fi
+            if [ -z "$_hm" ]; then
+                _aj="$(_all_jvm_args "$pid" 2>/dev/null | grep -i '^-javaagent:.*whatap' | head -n1 | sed 's/^-javaagent://; s/=.*$//')"
+                if [ -n "$_aj" ]; then _hm="$(dirname "$_aj" 2>/dev/null)"; _src="directory of the -javaagent jar (whatap.home unset; the agent sets it from its jar location, AgentBoot)"
+                else _hm="$(readlink -f "/proc/$pid/cwd" 2>/dev/null)"; _src="process working directory (whatap.home unset and no -javaagent jar path known, default \".\")"; fi
+            fi
             _cn="$(_jvm_sysprop "$pid" whatap.config)"
             [ -z "$_cn" ] && _cn="whatap.conf"
             _cf="$_hm/$_cn"
@@ -1406,6 +1411,73 @@ run_report() {
         # GlassFish / Payara name the instance directory with com.sun.aas.instanceRoot;
         # its deployments are expanded under <instanceRoot>/applications/<app>/
         _gr="$(_jvm_sysprop "$pid" com.sun.aas.instanceRoot)"
+        # WebLogic names the server with -Dweblogic.Name and starts it in the
+        # domain directory; -Ddomain.home is not set by the stock start
+        # scripts. The domain is therefore read from the process working
+        # directory and from the DOMAIN_HOME variable of the process, and the
+        # deployment staging area is servers/<weblogic.Name>/tmp/_WL_user/.
+        _wn="$(_jvm_sysprop "$pid" weblogic.Name)"
+        if [ -n "$_wn" ]; then
+            _wdh=""
+            for _cand in "$(_proc_env "$pid" DOMAIN_HOME)" "$(readlink -f "/proc/$pid/cwd" 2>/dev/null)"; do
+                [ -n "$_cand" ] || continue
+                _fsc="$(resolve_fs "$_cand")"
+                [ -n "$_fsc" ] && [ -d "$_fsc/servers/$_wn" ] && { _wdh="$_cand"; break; }
+            done
+            if [ -n "$_wdh" ]; then
+                _fsd="$(resolve_fs "$_wdh")"
+                fact "   weblogic domain directory (weblogic.Name=$_wn; from DOMAIN_HOME or the process working directory): $_wdh"
+                [ -d "$_fsd/lib" ] && list_jars "             " "$_fsd/lib" 60
+                _wst="$_fsd/servers/$_wn/tmp/_WL_user"
+                if [ -d "$_wst" ]; then
+                    probe "     staging directory servers/$_wn/tmp/_WL_user (deployment units)" sh -c "ls '$_wst' 2>/dev/null | head -n 60"
+                    if [ -n "$_timeout_bin" ]; then
+                        "$_timeout_bin" "$CMD_TIMEOUT" find "$_wst" -maxdepth 7 -type d -path '*/WEB-INF/classes' 2>/dev/null | head -n 12 > "${_errfile}.wl" 2>/dev/null
+                    else
+                        find "$_wst" -maxdepth 7 -type d -path '*/WEB-INF/classes' 2>/dev/null | head -n 12 > "${_errfile}.wl" 2>/dev/null
+                    fi
+                    if [ -s "${_errfile}.wl" ]; then
+                        fact "     WEB-INF/classes directories under the staging area (depth 7, first 12):"
+                        while IFS= read -r _w; do
+                            [ -n "$_w" ] || continue
+                            printf '             %s\n' "$_w"
+                            _appclass_record "dir|$_w"
+                            [ -d "${_w%/classes}/lib" ] && list_jars "               " "${_w%/classes}/lib" 120
+                        done < "${_errfile}.wl"
+                    else
+                        fact "     WEB-INF/classes directories under the staging area (depth 7): none found"
+                    fi
+                else
+                    fact "     staging directory servers/$_wn/tmp/_WL_user: absent"
+                fi
+                # the deployment sources config.xml names (archives or exploded dirs)
+                if [ -r "$_fsd/config/config.xml" ]; then
+                    _wsp="$(grep -o '<source-path>[^<]*</source-path>' "$_fsd/config/config.xml" 2>/dev/null | sed 's/<source-path>//; s/<\/source-path>//' | sort -u | head -n 40)"
+                    if [ -n "$_wsp" ]; then
+                        fact "     deployment source paths in config/config.xml (<source-path>, first 40):"
+                        printf '%s\n' "$_wsp" | while IFS= read -r _sp1; do
+                            [ -n "$_sp1" ] || continue
+                            case "$_sp1" in /*) _spa="$_sp1" ;; *) _spa="$_fsd/$_sp1" ;; esac
+                            if [ -d "$_spa/WEB-INF/classes" ]; then
+                                printf '             %s   (exploded, WEB-INF/classes present)\n' "$_sp1"; _appclass_record "dir|$_spa/WEB-INF/classes"
+                            elif [ -f "$_spa" ]; then
+                                printf '             %s   (archive, read in place)\n' "$_sp1"; _appclass_record "archive|$_spa"
+                            elif [ -d "$_spa" ]; then
+                                printf '             %s   (directory)\n' "$_sp1"
+                            else
+                                printf '             %s   (path not found from here)\n' "$_sp1"
+                            fi
+                        done
+                    else
+                        fact "     deployment source paths in config/config.xml: none"
+                    fi
+                else
+                    fact "     config/config.xml: n/a (not readable at $_wdh/config/config.xml)"
+                fi
+            else
+                fact "   weblogic domain directory (weblogic.Name=$_wn): n/a (neither DOMAIN_HOME nor the process working directory holds servers/$_wn)"
+            fi
+        fi
         # catalina.base and catalina.home are one directory in a single-instance
         # install and two in a split install; list each distinct path once
         _seen_d=""
@@ -1582,7 +1654,10 @@ run_report() {
         [ -z "$_cf2" ] && _cf2="$(_jvm_sysprop "$pid" whatap.config.file)"
         if [ -z "$_cf2" ]; then
             _hm2="$(_jvm_sysprop "$pid" whatap.home)"
-            [ -z "$_hm2" ] && _hm2="$(readlink -f "/proc/$pid/cwd" 2>/dev/null)"
+            if [ -z "$_hm2" ]; then
+                _aj2="$(_all_jvm_args "$pid" 2>/dev/null | grep -i '^-javaagent:.*whatap' | head -n1 | sed 's/^-javaagent://; s/=.*$//')"
+                if [ -n "$_aj2" ]; then _hm2="$(dirname "$_aj2" 2>/dev/null)"; else _hm2="$(readlink -f "/proc/$pid/cwd" 2>/dev/null)"; fi
+            fi
             _cn2="$(_jvm_sysprop "$pid" whatap.config)"
             [ -z "$_cn2" ] && _cn2="whatap.conf"
             _cf2="$_hm2/$_cn2"
