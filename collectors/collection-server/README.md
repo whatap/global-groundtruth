@@ -410,6 +410,18 @@ Re-validate after edits:
   and a log with no row events now states that instead of printing an empty
   list. Section F also reports the indexes of the 15 largest tables, so a reader
   can see the index a query actually has.
+- **Version matrix (2026-09-17, v0.4.0).** Run end to end on MySQL **5.6.51**,
+  **5.7.32**, **8.4.10** and **MariaDB 10.11.19**, each seeded with a
+  scheduler-shaped write load. All four reach the footer and attribute binary
+  log rows to the right tables (8.4 excepted: the `mysql:8` image ships no
+  `mysqlbinlog`). 5.7 is the cleanest: the only reasoned absences are the 8.0+
+  statements the collector issues on purpose alongside their older spelling.
+  Three defects came out of this matrix and are fixed in 0.4.0: MariaDB opens
+  transactions with `START TRANSACTION`, not `BEGIN`, so the transaction count
+  read 0; `SELECT @@read_only, @@super_read_only` lost both values on 5.6 and
+  MariaDB because the second variable does not exist there; and MariaDB echoes
+  the statement between dashed rules before its error, so every reason read
+  `error: --------------`.
 - **Still unverified:** section I on 8.4 (the `mysql:8` image ships no
   `mysqlbinlog`), section J sampling against real `iostat` (absent in both
   images; `vmstat` was exercised on the collecting host), a replicating pair

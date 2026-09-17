@@ -28,7 +28,7 @@ export LC_ALL=C
 
 # ---- collector metadata -----------------------------------------------------
 COLLECTOR_NAME="whatap-collection-server-mysql"
-VERSION="0.3.0"
+VERSION="0.4.0"
 DOMAIN="collection-server"
 TARGET="collection-server-mysql/$(hostname 2>/dev/null || echo unknown)"
 
@@ -136,7 +136,15 @@ _classify_err() {
         *"an't connect"*|*"onnection refused"*)              echo "cannot connect"; return ;;
         *"o such file"*|*"annot access"*|*"oes not exist"*)   echo "path not found"; return ;;
     esac
-    if [ -n "$txt" ]; then printf 'error: %s' "$(printf '%s' "$txt" | head -n1 | cut -c1-120)"
+    # MariaDB's client echoes the statement between dashed rules before the
+    # error, so the first line is often "--------------". Prefer the line that
+    # actually carries the error.
+    if [ -n "$txt" ]; then
+        local line
+        line="$(printf '%s\n' "$txt" | grep -m1 -E 'ERROR|error|denied|failed' 2>/dev/null)"
+        [ -z "$line" ] && line="$(printf '%s\n' "$txt" | grep -m1 -vE '^[-[:space:]]*$' 2>/dev/null)"
+        [ -z "$line" ] && line="$(printf '%s' "$txt" | head -n1)"
+        printf 'error: %s' "$(printf '%s' "$line" | cut -c1-120)"
     else echo "nonzero exit"; fi
 }
 
@@ -263,7 +271,10 @@ run_report() {
     sql "server_id"      "SELECT @@server_id"
     sql "server_uuid"    "SELECT @@server_uuid"
     sql "uptime(s)"      "SHOW GLOBAL STATUS LIKE 'Uptime'"
-    sql "read_only"      "SELECT @@read_only, @@super_read_only"
+    # super_read_only arrived in 5.7; asking for both in one row loses read_only
+    # on 5.6 and on MariaDB.
+    sql "read_only"      "SELECT @@read_only"
+    sql "super_read_only" "SELECT @@super_read_only"
     sql "port / socket"  "SELECT @@port, @@socket"
     sql "datadir"        "SELECT @@datadir"
     # pgrep -f would match this collector's own timeout wrapper, so filter the
@@ -433,8 +444,11 @@ run_report() {
                     /^### INSERT INTO / { c["INSERT " $4]++; rows++; next }
                     /^### UPDATE /      { c["UPDATE " $3]++; rows++; next }
                     /^### DELETE FROM / { c["DELETE " $4]++; rows++; next }
-                    /^BEGIN/            { begins++; next }
-                    # only the event header line, not the SET pseudo_thread_id it emits
+                    # MySQL writes BEGIN; MariaDB writes START TRANSACTION
+                    /^BEGIN/ || /^START TRANSACTION/ { begins++; next }
+                    # Only the event header line, not the SET pseudo_thread_id it
+                    # emits. MariaDB opens transactions with a GTID event instead,
+                    # so this counts statement and DDL events, not transactions.
                     /^#[0-9]/ && /thread_id=/ { queries++ }
                     /^#[0-9][0-9][0-9][0-9][0-9][0-9] / {
                         if (first == "") first = $1 " " $2; last = $1 " " $2
@@ -465,7 +479,7 @@ run_report() {
                 fi
                 sub "row events (count): ${_rows:-0}"
                 sub "transactions (BEGIN count): $(awk -F'\t' '$2=="begins"{print $3}' "$_sum")"
-                sub "Query events (count, incl. BEGIN/COMMIT/DDL): $(awk -F'\t' '$2=="queries"{print $3}' "$_sum")"
+                sub "statement and DDL events (Query, count): $(awk -F'\t' '$2=="queries"{print $3}' "$_sum")"
                 sub "first event timestamp: $(awk -F'\t' '$2=="first"{print $3}' "$_sum")"
                 sub "last event timestamp:  $(awk -F'\t' '$2=="last"{print $3}' "$_sum")"
                 rm -f "$_sum" 2>/dev/null
