@@ -392,9 +392,20 @@ Re-validate after edits:
 
 #### Status notes / open items
 
-- **Validate against a live MySQL.** This v0.1.0 was only smoke-tested on a host
-  with no MySQL client present, which exercises every reasoned-absence path and
-  the footer but none of the SQL.
+- **Verified against a live MySQL (2026-09-17, v0.2.0).** Run end to end on
+  MySQL **5.7.32** and **8.4.10** containers seeded with a scheduler-shaped
+  write load (a lock row updated in a loop, inserts and deletes on a second
+  table). Every section returned rows or a reason; section I attributed the row
+  events to the right tables on 5.7. Five defects found that way are fixed in
+  0.2.0: the unbounded `SHOW BINARY LOGS` listing (647 files became 647 lines
+  and two thirds of the report), the missing 8.4 binlog position, the group
+  replication query that 5.7 rejects whole, a missing `ps`/`ss` reported as
+  "empty output", and a delimiter count labelled "statement-format queries".
+- **Still unverified:** section I on 8.4 (the `mysql:8` image ships no
+  `mysqlbinlog`), section J sampling against real `iostat` (absent in both
+  images; `vmstat` was exercised on the collecting host), a replicating pair
+  (both servers were standalone, so `replica status` only ever returned "none"),
+  and any MariaDB build.
 - `SHOW REPLICA STATUS` (8.0.22+) and `SHOW SLAVE STATUS` (older) are both
   issued on purpose; one of them always reports a reason instead of rows. The
   same applies to `SHOW REPLICAS` / `SHOW SLAVE HOSTS`.

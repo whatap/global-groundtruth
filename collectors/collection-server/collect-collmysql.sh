@@ -28,7 +28,7 @@ export LC_ALL=C
 
 # ---- collector metadata -----------------------------------------------------
 COLLECTOR_NAME="whatap-collection-server-mysql"
-VERSION="0.1.0"
+VERSION="0.2.0"
 DOMAIN="collection-server"
 TARGET="collection-server-mysql/$(hostname 2>/dev/null || echo unknown)"
 
@@ -266,10 +266,15 @@ run_report() {
     sql "datadir"        "SELECT @@datadir"
     # pgrep -f would match this collector's own timeout wrapper, so filter the
     # process table instead and drop the matcher processes themselves.
+    # `; true` would turn a missing ps into "empty output", which reads as
+    # "no mysqld here". Fail loudly when the tool is absent; stay silent-but-
+    # zero when the tool ran and simply matched nothing.
     probe "local mysqld process" sh -c \
-        "ps -eo pid,user,args 2>/dev/null | grep -E '[m]ysqld|[m]ariadbd' | grep -v timeout; true"
+        "command -v ps >/dev/null || { echo 'command not found: ps' >&2; exit 3; }; \
+         ps -eo pid,user,args 2>/dev/null | grep -E '[m]ysqld|[m]ariadbd' | grep -v timeout; true"
     probe "listening sockets" sh -c \
-        "{ ss -lntp 2>/dev/null || netstat -lntp 2>/dev/null; } | grep -E ':3306|:33060'; true"
+        "command -v ss >/dev/null || command -v netstat >/dev/null || { echo 'command not found: ss, netstat' >&2; exit 3; }; \
+         { ss -lntp 2>/dev/null || netstat -lntp 2>/dev/null; } | grep -E ':3306|:33060'; true"
 
     section B "HA and replication"
     sql  "binlog_format"       "SELECT @@binlog_format"
@@ -278,11 +283,15 @@ run_report() {
     sql  "log_replica_updates" "SHOW VARIABLES LIKE 'log_slave_updates'"
     sqlv "replica status"      "SHOW REPLICA STATUS"
     sqlv "slave status"        "SHOW SLAVE STATUS"
+    # 8.4 removed SHOW MASTER STATUS; 5.7/8.0 do not know SHOW BINARY LOG
+    # STATUS. Ask both so one of them always answers with the binlog position.
+    sqlv "binary log status"   "SHOW BINARY LOG STATUS"
     sqlv "source status"       "SHOW MASTER STATUS"
     sql  "connected replicas"  "SHOW REPLICAS"
     sql  "connected slaves"    "SHOW SLAVE HOSTS"
     sql  "galera wsrep"        "SHOW STATUS LIKE 'wsrep_cluster_size'"
-    sql  "group replication"   "SELECT MEMBER_HOST, MEMBER_STATE, MEMBER_ROLE FROM performance_schema.replication_group_members"
+    # MEMBER_ROLE arrived in 8.0; naming it breaks the whole row on 5.7.
+    sql  "group replication"   "SELECT MEMBER_HOST, MEMBER_STATE FROM performance_schema.replication_group_members"
     sql  "semi-sync"           "SHOW STATUS LIKE 'Rpl_semi_sync%_status'"
 
     section C "Binary log inventory and retention"
@@ -295,7 +304,23 @@ run_report() {
     sql "binlog_row_image"            "SHOW VARIABLES LIKE 'binlog_row_image'"
     sql "binlog_rows_query_log_events" "SHOW VARIABLES LIKE 'binlog_rows_query_log_events'"
     sql "sync_binlog"                 "SELECT @@sync_binlog"
-    sql "binary logs (name, bytes)"   "SHOW BINARY LOGS"
+    # A host whose binary logs accumulate can hold thousands of files, and the
+    # full listing would be the whole report. Report the inventory as totals
+    # plus both ends; section I attributes the content.
+    if [ "$MYSQL_OK" != 1 ]; then
+        fact "binary logs: n/a ($MYSQL_WHY)"
+    else
+        _bl_rows="$(mysql_q "SHOW BINARY LOGS")"
+        if [ -z "$_bl_rows" ]; then
+            fact "binary logs: none"
+        else
+            fact "binary logs: $(printf '%s\n' "$_bl_rows" | wc -l | tr -d ' ') files, $(printf '%s\n' "$_bl_rows" | awk '{s+=$2} END {printf "%.0f", s+0}') bytes total (SHOW BINARY LOGS)"
+            fact "binary logs (oldest 3, name bytes):"
+            printf '%s\n' "$_bl_rows" | head -3 | while IFS= read -r _l; do sub "$_l"; done
+            fact "binary logs (newest 20, name bytes):"
+            printf '%s\n' "$_bl_rows" | tail -20 | while IFS= read -r _l; do sub "$_l"; done
+        fi
+    fi
     sql "binlog cache use / disk use" "SHOW GLOBAL STATUS LIKE 'Binlog_cache%'"
     sql "Binlog_bytes_written"        "SHOW GLOBAL STATUS LIKE 'Binlog%bytes%'"
 
@@ -399,7 +424,10 @@ run_report() {
                     | sort | uniq -c | sort -rn | head -30 \
                     | while IFS= read -r _l; do printf '            %s\n' "$_l"; done
                 sub "transactions (BEGIN count): $(printf '%s\n' "$_dec" | grep -c '^BEGIN')"
-                sub "statement-format queries (count): $(printf '%s\n' "$_dec" | grep -cE '^### |^BEGIN|^COMMIT' >/dev/null; printf '%s\n' "$_dec" | grep -c '^/\*!\*/;')"
+                # Query events cover BEGIN, COMMIT, DDL and any statement-format
+                # write. Row events are the ### lines counted above.
+                sub "Query events (count, incl. BEGIN/COMMIT/DDL): $(printf '%s\n' "$_dec" | grep -c 'Query[[:space:]]*$\|Query[[:space:]].*thread_id=')"
+                sub "row-event lines (count): $(printf '%s\n' "$_dec" | grep -cE '^### (INSERT INTO|UPDATE|DELETE FROM)')"
                 sub "first event timestamp: $(printf '%s\n' "$_dec" | grep -m1 -oE '#[0-9]{6} +[0-9:]+' | head -1)"
                 sub "last event timestamp:  $(printf '%s\n' "$_dec" | grep -oE '#[0-9]{6} +[0-9:]+' | tail -1)"
             done
