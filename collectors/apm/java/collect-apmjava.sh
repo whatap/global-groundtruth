@@ -63,6 +63,13 @@
 #     two `vshell` processes connected to the collection server).
 #   * Tier 2, opt-in: thread dumps (--threads) and jcmd VM data (--jcmd) of the
 #     target JVM — the artifact that decided both transaction-entry cases.
+#   * A thread dump the field already holds (WhaTap console dump, jstack file,
+#     kill -3 output) enters the same counts through --dump-file, without
+#     touching any JVM (case 2026-09-17 FIF: the dump arrived over Slack and
+#     was counted by hand). The counts also cover what the FRAMES of an idle
+#     JVM do not show: thread names (a cache or scheduler thread carries the
+#     application's package in its name), thread states, and the frame and
+#     thread footprint of other APM agents attached to the same JVM.
 #
 # THE CONTRACT (../../../CONTRACT.md):
 #   1. Facts only. No conclusion is stated on any emitted line.
@@ -87,7 +94,7 @@ export LC_ALL=C
 
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-apmjava"
-VERSION="0.4.0"
+VERSION="0.5.0"
 DOMAIN="apm/java"
 TARGET="host/$(hostname 2>/dev/null || echo unknown)"
 
@@ -101,6 +108,7 @@ OPT_LIBS=""       # --library PATTERN (repeatable): library detail pack
 OPT_LIBALL=0      # --library-all: detail every enumerated jar (capped)
 OPT_CLASSES=""    # --class FQCN (repeatable): member signatures via javap
 OPT_APPCLASSES=0  # --appclasses: application class index (section N)
+OPT_DUMPS=""      # --dump-file: thread dump files taken elsewhere (section L)
 
 usage() {
     cat <<EOF
@@ -136,6 +144,13 @@ module covers has to be located without access to the customer's source:
                  webapp directories each server product configures: package
                  histogram, a name-pattern index, and the class list
 
+Thread dumps taken elsewhere (off by default; read-only, no contact with the JVM):
+  --dump-file PATH  a thread dump file produced outside this collector (WhaTap
+                 console thread dump, jstack output, kill -3 output; repeatable).
+                 It enters the same per-frame and per-thread counts as a
+                 --threads dump, so a dump the field already holds is counted
+                 without pausing any JVM
+
 Tier 2 (off by default; each announces its impact on stderr before running):
   --threads[=N]  N thread dumps per WhaTap-attached JVM (default N=1) via
                  jstack -l; pauses the target JVM at a safepoint for the dump
@@ -162,6 +177,10 @@ while [ $# -gt 0 ]; do
         --class)        shift; OPT_CLASSES="$OPT_CLASSES $1" ;;
         --class=*)      OPT_CLASSES="$OPT_CLASSES ${1#*=}" ;;
         --appclasses)   OPT_APPCLASSES=1 ;;
+        --dump-file)    shift; OPT_DUMPS="$OPT_DUMPS
+$1" ;;
+        --dump-file=*)  OPT_DUMPS="$OPT_DUMPS
+${1#*=}" ;;
         -h|--help)   usage; exit 0 ;;
         *) printf 'unknown argument: %s\n' "$1" >&2; usage >&2; exit 2 ;;
     esac
@@ -1185,7 +1204,7 @@ run_report() {
             # ProcessTypeDetector reads to name the process type
             _smk=0
             printf '           server markers:\n'
-            for _sp in catalina.base catalina.home catalina.useNaming jboss.home.dir jboss.server.name jboss.server.base.dir jetty.base jetty.home jeus.home weblogic.Name domain.home was.install.root server.root java.protocol.handler.pkgs spring.profiles.active; do
+            for _sp in catalina.base catalina.home catalina.useNaming jboss.home.dir jboss.server.name jboss.server.base.dir jetty.base jetty.home jeus.home weblogic.Name domain.home com.sun.aas.instanceRoot com.sun.aas.installRoot com.sun.aas.instanceName com.sun.aas.domainName was.install.root server.root java.protocol.handler.pkgs spring.profiles.active; do
                 _v="$(_jvm_sysprop "$pid" "$_sp")"
                 if [ -n "$_v" ]; then _smk=$((_smk + 1)); printf '             -D%s=%s\n' "$_sp" "$(printf '%s' "$_v" | cut -c1-200)"; fi
             done
@@ -1384,6 +1403,9 @@ run_report() {
         _cb="$(_jvm_sysprop "$pid" catalina.base)"; _ch="$(_jvm_sysprop "$pid" catalina.home)"
         _jb="$(_jvm_sysprop "$pid" jboss.home.dir)"; _jsb="$(_jvm_sysprop "$pid" jboss.server.base.dir)"
         _je="$(_jvm_sysprop "$pid" jeus.home)"; _dh="$(_jvm_sysprop "$pid" domain.home)"
+        # GlassFish / Payara name the instance directory with com.sun.aas.instanceRoot;
+        # its deployments are expanded under <instanceRoot>/applications/<app>/
+        _gr="$(_jvm_sysprop "$pid" com.sun.aas.instanceRoot)"
         # catalina.base and catalina.home are one directory in a single-instance
         # install and two in a split install; list each distinct path once
         _seen_d=""
@@ -1450,12 +1472,14 @@ run_report() {
             _fsd="$(resolve_fs "$_jsb")"
             [ -n "$_fsd" ] && { fact "   server base directory (jboss.server.base.dir): $_jsb"; list_deploy "             " "$_fsd/deployments"; }
         fi
-        for _d in "$_je" "$_dh"; do
+        for _d in "$_je" "$_dh" "$_gr"; do
             [ -n "$_d" ] || continue
             _fsd="$(resolve_fs "$_d")"
             [ -n "$_fsd" ] || continue
             fact "   server directory: $_d"
             probe "     listing" sh -c "ls '$_fsd' 2>/dev/null | head -n 40"
+            [ -d "$_fsd/lib" ] && list_jars "             " "$_fsd/lib" 60
+            [ -d "$_fsd/applications" ] && probe "     applications directory listing" sh -c "ls '$_fsd/applications' 2>/dev/null | head -n 40"
             # these products compose the staging path of a deployment at
             # runtime, so the class roots are found by searching for them
             # rather than by naming a layout
@@ -1531,6 +1555,20 @@ run_report() {
             if [ -d "$fshome/weaving" ]; then
                 fact "-- on-disk plugin directory $home/weaving (every jar here is loaded while weaving_plugin_enabled is true, independent of the weaving list):"
                 list_jars "             " "$fshome/weaving" 120
+            fi
+            # script plugins (<name>.x, compiled by the agent's PluginLoadThread,
+            # re-read when the file's mtime changes) live in <home>/plugin
+            if [ -d "$fshome/plugin" ]; then
+                _pxl="$(ls -l "$fshome/plugin" 2>/dev/null | grep '\.x$')"
+                _pxn="$(printf '%s\n' "$_pxl" | grep -c .)"
+                fact "-- script plugin directory $home/plugin: ${_pxn:-0} .x file(s) (size, mtime, name as ls -l prints them):"
+                if [ "${_pxn:-0}" -gt 0 ]; then
+                    printf '%s\n' "$_pxl" | head -n 40 | while IFS= read -r _l; do printf '             %s\n' "$_l"; done
+                else
+                    printf '             (directory present, no .x file)\n'
+                fi
+            else
+                fact "-- script plugin directory $home/plugin: absent"
             fi
         done
     fi
@@ -1737,12 +1775,12 @@ run_report() {
 
     # [13] L. Tier 2 — only when explicitly requested
     section "L. Tier 2 artifacts (opt-in)"
-    if [ "$OPT_THREADS" = 0 ] && [ "$OPT_JCMD" = 0 ]; then
-        fact "not requested (--threads / --jcmd absent); no attach, signal, or pause was applied to any JVM"
+    if [ "$OPT_THREADS" = 0 ] && [ "$OPT_JCMD" = 0 ] && [ -z "$OPT_DUMPS" ]; then
+        fact "not requested (--threads / --jcmd / --dump-file absent); no attach, signal, or pause was applied to any JVM"
     fi
+    _TDUMPS=0
+    : > "${_errfile}.tframes" 2>/dev/null
     if [ "$OPT_THREADS" != 0 ] 2>/dev/null; then
-        _TDUMPS=0
-        : > "${_errfile}.tframes" 2>/dev/null
         _tn="$OPT_THREADS"
         [ "$_tn" -ge 1 ] 2>/dev/null || _tn=1
         _tp=0
@@ -1777,12 +1815,30 @@ run_report() {
             done
         done
         [ "$_tp" = 0 ] && fact "thread dumps: n/a (no JVM carrying a WhaTap attach marker)"
-        # Frame frequency over the dumps just taken. A transaction entry point
+    fi
+    # Dump files taken elsewhere enter the same counts. No JVM is contacted;
+    # the file is read as it is, and which JVM produced it is whatever the
+    # reader knows about the file.
+    # one path per line: a dump file name may carry spaces (console downloads do)
+    while IFS= read -r _df; do
+        [ -n "$_df" ] || continue
+        if [ ! -e "$_df" ]; then fact "-- supplied dump file $_df: n/a (path not found)"; continue; fi
+        if [ ! -r "$_df" ]; then fact "-- supplied dump file $_df: n/a (permission denied)"; continue; fi
+        _dfl="$(grep -c . "$_df" 2>/dev/null)"; _dfh="$(grep -c '^"' "$_df" 2>/dev/null)"
+        fact "-- supplied dump file $_df: ${_dfl:-0} non-empty lines, ${_dfh:-0} thread header lines; first line: $(head -n 1 "$_df" 2>/dev/null | cut -c1-120)"
+        fact "   read as supplied (--dump-file); not taken by this collector"
+        cat "$_df" >> "${_errfile}.tframes" 2>/dev/null
+        _TDUMPS=$((_TDUMPS + 1))
+    done <<EOF_DUMPS
+$OPT_DUMPS
+EOF_DUMPS
+    if [ "${_TDUMPS:-0}" -gt 0 ]; then
+        # Frame frequency over the dumps above. A transaction entry point
         # that no weaving module covers is read off the frames that recur in
         # every dump, and counting them by hand across N dumps is the step the
         # field repeats on every such case. The three buckets are defined by
         # the package prefixes printed with them; no frame is filtered away.
-        if [ "${_TDUMPS:-0}" -gt 0 ] && [ -s "${_errfile}.tframes" ]; then
+        if [ -s "${_errfile}.tframes" ]; then
             grep -E '^[[:space:]]*at ' "${_errfile}.tframes" 2>/dev/null \
                 | sed 's/^[[:space:]]*at //; s/(.*$//' \
                 | sort | uniq -c | sort -rn > "${_errfile}.tfreq" 2>/dev/null
@@ -1798,6 +1854,44 @@ run_report() {
             fact "   bucket 3 of 3 — every remaining frame, top 80:"
             grep -vE '[0-9]+ (java|javax|jakarta|sun|jdk|com\.sun|oracle|org\.graalvm|whatap)\.' "${_errfile}.tfreq" 2>/dev/null | head -n 80 > "${_errfile}.tb" 2>/dev/null
             if [ -s "${_errfile}.tb" ]; then while IFS= read -r _l; do printf '        %s\n' "$_l"; done < "${_errfile}.tb"; else printf '        (no frame in this bucket)\n'; fi
+            # Thread-level counts. On an idle JVM the frames carry no application
+            # class at all, while the thread NAMES still do (cache regions named
+            # after entity classes, a scheduler instance id, a pool prefix), so
+            # the names are counted separately from the frames.
+            grep '^"' "${_errfile}.tframes" 2>/dev/null | sed 's/^"\([^"]*\)".*$/\1/' > "${_errfile}.tnames" 2>/dev/null
+            _thn="$(grep -c . "${_errfile}.tnames" 2>/dev/null)"
+            fact "-- thread header lines over the $_TDUMPS dump(s): ${_thn:-0}"
+            fact "   thread states (java.lang.Thread.State lines, counted):"
+            grep -oE 'java\.lang\.Thread\.State: [A-Z_]+' "${_errfile}.tframes" 2>/dev/null | sed 's/^java.lang.Thread.State: //' | sort | uniq -c | sort -rn > "${_errfile}.tb" 2>/dev/null
+            if [ -s "${_errfile}.tb" ]; then while IFS= read -r _l; do printf '        %s\n' "$_l"; done < "${_errfile}.tb"; else printf '        (no state line in the dump text)\n'; fi
+            fact "   thread name shapes, every digit run replaced by N so pool members collapse into one line (names that are themselves a dotted class-like name are counted in the next block instead), top 40:"
+            sed 's/[0-9][0-9]*/N/g' "${_errfile}.tnames" 2>/dev/null | grep -vE '^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_$][A-Za-z0-9_$]*){2,}$' | sort | uniq -c | sort -rn | head -n 40 > "${_errfile}.tb" 2>/dev/null
+            if [ -s "${_errfile}.tb" ]; then while IFS= read -r _l; do printf '        %s\n' "$_l"; done < "${_errfile}.tb"; else printf '        (no thread header line in the dump text)\n'; fi
+            grep -oE '[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_$][A-Za-z0-9_$]*){2,}' "${_errfile}.tnames" 2>/dev/null | sort | uniq -c | sort -rn > "${_errfile}.tdot" 2>/dev/null
+            fact "   package roots of dotted names carried inside thread names (first three dot-separated parts, thread count):"
+            awk '{ n=split($2, p, "."); if (n >= 3) print $1, p[1] "." p[2] "." p[3] }' "${_errfile}.tdot" 2>/dev/null | awk '{ c[$2]+=$1 } END { for (k in c) print c[k], k }' | sort -rn | head -n 20 > "${_errfile}.tb" 2>/dev/null
+            if [ -s "${_errfile}.tb" ]; then while IFS= read -r _l; do printf '        %s\n' "$_l"; done < "${_errfile}.tb"; else printf '        (none)\n'; fi
+            fact "   the dotted names themselves (three or more parts, as written), distinct, top 80:"
+            head -n 80 "${_errfile}.tdot" > "${_errfile}.tb" 2>/dev/null
+            if [ -s "${_errfile}.tb" ]; then while IFS= read -r _l; do printf '        %s\n' "$_l"; done < "${_errfile}.tb"; else printf '        (none)\n'; fi
+            # Other APM agents on the same JVM show up as frames and threads of
+            # their own packages. The prefix list is fixed and printed verbatim.
+            # <frame package prefix>:<word looked for in thread names, case-insensitive>
+            _OTHERAPM="oracle.apmaas.:apmaas com.dynatrace.:dynatrace com.appdynamics.:appdynamics com.newrelic.:newrelic io.opentelemetry.javaagent.:opentelemetry com.instana.:instana datadog.trace.:datadog scouter.:scouter com.jennifersoft.:jennifer com.ibm.tivoli.:tivoli co.elastic.apm.:elastic"
+            fact "   frames and thread names of other APM agents on the same JVM (fixed list of frame-package prefix and thread-name word, printed here verbatim; an entry with no match is not listed):"
+            fact "   $_OTHERAPM"
+            _oam=0
+            for _op in $_OTHERAPM; do
+                _opp="${_op%%:*}"; _opw="${_op#*:}"
+                _ope="$(printf '%s' "$_opp" | sed 's/\./\\./g')"
+                _ofc="$(grep -E "^ *[0-9]+ ${_ope}" "${_errfile}.tfreq" 2>/dev/null | awk '{s+=$1} END{print s+0}')"
+                _otc="$(grep -c -i "$_opw" "${_errfile}.tnames" 2>/dev/null)"
+                if [ "${_ofc:-0}" -gt 0 ] || [ "${_otc:-0}" -gt 0 ]; then
+                    _oam=$((_oam + 1))
+                    printf '        %s  frames=%s  thread names containing "%s" (case-insensitive)=%s\n' "$_opp" "${_ofc:-0}" "$_opw" "${_otc:-0}"
+                fi
+            done
+            [ "$_oam" = 0 ] && printf '        (no frame or thread name under any listed prefix)\n'
         fi
     fi
     if [ "$OPT_JCMD" != 0 ]; then
@@ -1972,6 +2066,22 @@ run_report() {
             fact "-- classes matching none of those patterns: $(grep -vE "(^|\.)[^.]*($(printf '%s' "$_APPPAT" | tr ' ' '|'))[^.]*$" "${_NAMES}.u" 2>/dev/null | grep -c .)"
             fact "-- full class list (first 2000, alphabetical):"
             head -n 2000 "${_NAMES}.u" 2>/dev/null | while IFS= read -r _l; do printf '        %s\n' "$_l"; done
+            # Join with section L: which classes of THIS index appear as frames in
+            # the dumps counted there. A zero is a fact worth a line — it says the
+            # dumps were taken while no application code was on any stack.
+            if [ -s "${_errfile}.tfreq" ]; then
+                awk 'NR==FNR { a[$0]=1; next } { c=$2; sub(/\.[^.]*$/, "", c); if (c in a) print }' "${_NAMES}.u" "${_errfile}.tfreq" > "${_errfile}.tjoin" 2>/dev/null
+                _tjn="$(grep -c . "${_errfile}.tjoin" 2>/dev/null)"
+                _tjs="$(awk '{s+=$1} END{print s+0}' "${_errfile}.tjoin" 2>/dev/null)"
+                fact "-- frames in the section L dump(s) whose class is in this index: ${_tjn:-0} distinct frames, ${_tjs:-0} occurrences (top 60):"
+                if [ "${_tjn:-0}" -gt 0 ]; then
+                    head -n 60 "${_errfile}.tjoin" 2>/dev/null | while IFS= read -r _l; do printf '        %s\n' "$_l"; done
+                else
+                    printf '        (no frame of any counted dump belongs to a class in this index)\n'
+                fi
+            else
+                fact "-- frames in the section L dump(s) whose class is in this index: n/a (no thread dump was counted in this run: --threads and --dump-file absent, or no dump text)"
+            fi
         fi
     fi
 
