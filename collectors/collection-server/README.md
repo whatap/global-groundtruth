@@ -401,6 +401,15 @@ Re-validate after edits:
   and two thirds of the report), the missing 8.4 binlog position, the group
   replication query that 5.7 rejects whole, a missing `ps`/`ss` reported as
   "empty output", and a delimiter count labelled "statement-format queries".
+- **Scale-tested (2026-09-17, v0.3.0).** Decoding an 82 MB binary log produced
+  95 MB of text (1.15x). v0.2.0 held that in a shell variable and walked it six
+  times: 27 s for an 85 MB pair. At the default `max_binlog_size` of 1 GiB that
+  is gigabytes of RSS on a host already short of I/O. 0.3.0 streams each file
+  once through `awk` and keeps only counters: the same run takes 4 s. The decode
+  is capped per file (`BINLOG_TIMEOUT`, 300 s) and says so when it truncates,
+  and a log with no row events now states that instead of printing an empty
+  list. Section F also reports the indexes of the 15 largest tables, so a reader
+  can see the index a query actually has.
 - **Still unverified:** section I on 8.4 (the `mysql:8` image ships no
   `mysqlbinlog`), section J sampling against real `iostat` (absent in both
   images; `vmstat` was exercised on the collecting host), a replicating pair

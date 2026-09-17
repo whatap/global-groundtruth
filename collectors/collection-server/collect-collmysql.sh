@@ -28,7 +28,7 @@ export LC_ALL=C
 
 # ---- collector metadata -----------------------------------------------------
 COLLECTOR_NAME="whatap-collection-server-mysql"
-VERSION="0.2.0"
+VERSION="0.3.0"
 DOMAIN="collection-server"
 TARGET="collection-server-mysql/$(hostname 2>/dev/null || echo unknown)"
 
@@ -41,6 +41,7 @@ BINLOG_FILES=2        # how many of the newest binary logs to decode
 OPT_SAMPLE=0          # interval iostat/vmstat sampling
 SAMPLE_SEC=5
 SAMPLE_COUNT=6
+BINLOG_TIMEOUT=300   # per-file cap for the mysqlbinlog decode
 MYSQL_ARGS=""         # extra arguments handed to the mysql client
 DEFAULTS_FILE=""
 
@@ -57,7 +58,8 @@ explicit action flag so nothing starts by accident.
   --defaults-file PATH   option file handed to the mysql client (credentials)
   --mysql-args "ARGS"    extra arguments for the mysql client, e.g. "-h 10.0.0.5 -P 3306 -u whatap -p..."
   --binlog[=N]           decode the N newest binary logs and count events per
-                         table (default N=$BINLOG_FILES). Reads log files; off by default
+                         table (default N=$BINLOG_FILES). Reads log files; off by default.
+                         Each file is streamed once and capped at ${BINLOG_TIMEOUT}s
   --sample[=SEC]         add SEC-interval iostat/vmstat samples (default $SAMPLE_SEC s x $SAMPLE_COUNT)
   --quiet                silence progress on stderr
 
@@ -374,6 +376,10 @@ run_report() {
         "SELECT table_schema, table_name, table_rows, ROUND(data_length/1024/1024,1), ROUND(index_length/1024/1024,1) FROM information_schema.tables WHERE table_schema NOT IN ('information_schema','performance_schema','mysql','sys') ORDER BY data_length+index_length DESC LIMIT 25"
     sql "tables whose name contains lock/metering/event/audit" \
         "SELECT table_schema, table_name, table_rows FROM information_schema.tables WHERE table_schema NOT IN ('information_schema','performance_schema','mysql','sys') AND (table_name LIKE '%lock%' OR table_name LIKE '%meter%' OR table_name LIKE '%event%' OR table_name LIKE '%audit%') ORDER BY table_rows DESC"
+    # A reader asking "is this query scanning?" needs the index the deployed
+    # schema has, not the one the entity declares.
+    sql "indexes of the 15 largest tables (schema, table, index, seq, column, cardinality)" \
+        "SELECT s.TABLE_SCHEMA, s.TABLE_NAME, s.INDEX_NAME, s.SEQ_IN_INDEX, s.COLUMN_NAME, s.CARDINALITY FROM information_schema.statistics s JOIN (SELECT table_schema, table_name FROM information_schema.tables WHERE table_schema NOT IN ('information_schema','performance_schema','mysql','sys') ORDER BY data_length+index_length DESC LIMIT 15) t ON t.table_schema = s.TABLE_SCHEMA AND t.table_name = s.TABLE_NAME ORDER BY s.TABLE_SCHEMA, s.TABLE_NAME, s.INDEX_NAME, s.SEQ_IN_INDEX"
     sql "columns of DeniedIPAddress and ApmRegion" \
         "SELECT table_schema, table_name, column_name, is_nullable, column_type FROM information_schema.columns WHERE table_name IN ('DeniedIPAddress','ApmRegion') ORDER BY table_schema, table_name, ordinal_position"
 
@@ -410,26 +416,59 @@ run_report() {
         else
             for _bl in $_bl_list; do
                 _path="$BINLOG_DIR/$_bl"
-                fact "file: $_bl ($(ls -l "$_path" 2>/dev/null | awk '{print $5}') bytes)"
-                _dec="$(mysqlbinlog --no-defaults --base64-output=DECODE-ROWS -v "$_path" 2>"$_errfile")"
-                if [ -z "$_dec" ]; then
+                _bytes="$(ls -l "$_path" 2>/dev/null | awk '{print $5}')"
+                fact "file: $_bl ($_bytes bytes)"
+                # A production binary log is max_binlog_size (1 GiB by default),
+                # and decoded row events run about 1.15x that. Holding it in a
+                # shell variable and walking it six times costs gigabytes of RSS
+                # on a host that is already short of I/O, so stream it once
+                # through awk and keep only the counters.
+                _sum="$(mktemp 2>/dev/null || echo "${TMPDIR:-/tmp}/.ggt.$$.bl")"
+                if [ -n "$_timeout_bin" ]; then
+                    "$_timeout_bin" "$BINLOG_TIMEOUT" mysqlbinlog --no-defaults \
+                        --base64-output=DECODE-ROWS -v "$_path" 2>"$_errfile"
+                else
+                    mysqlbinlog --no-defaults --base64-output=DECODE-ROWS -v "$_path" 2>"$_errfile"
+                fi | awk '
+                    /^### INSERT INTO / { c["INSERT " $4]++; rows++; next }
+                    /^### UPDATE /      { c["UPDATE " $3]++; rows++; next }
+                    /^### DELETE FROM / { c["DELETE " $4]++; rows++; next }
+                    /^BEGIN/            { begins++; next }
+                    # only the event header line, not the SET pseudo_thread_id it emits
+                    /^#[0-9]/ && /thread_id=/ { queries++ }
+                    /^#[0-9][0-9][0-9][0-9][0-9][0-9] / {
+                        if (first == "") first = $1 " " $2; last = $1 " " $2
+                    }
+                    END {
+                        for (k in c) printf "T\t%d\t%s\n", c[k], k
+                        printf "S\trows\t%d\n",    rows + 0
+                        printf "S\tbegins\t%d\n",  begins + 0
+                        printf "S\tqueries\t%d\n", queries + 0
+                        printf "S\tfirst\t%s\n",   first
+                        printf "S\tlast\t%s\n",    last
+                    }' > "$_sum" 2>/dev/null
+                _rc=$?
+                if [ ! -s "$_sum" ]; then
                     sub "n/a ($(_classify_err))"
+                    rm -f "$_sum" 2>/dev/null
                     continue
                 fi
-                sub "events per table (count, table):"
-                printf '%s\n' "$_dec" \
-                    | grep -E '^### (INSERT INTO|UPDATE|DELETE FROM)' \
-                    | awk '{print $2" "$3" "$4}' \
-                    | sed 's/INSERT INTO /INSERT /; s/DELETE FROM /DELETE /' \
-                    | sort | uniq -c | sort -rn | head -30 \
-                    | while IFS= read -r _l; do printf '            %s\n' "$_l"; done
-                sub "transactions (BEGIN count): $(printf '%s\n' "$_dec" | grep -c '^BEGIN')"
-                # Query events cover BEGIN, COMMIT, DDL and any statement-format
-                # write. Row events are the ### lines counted above.
-                sub "Query events (count, incl. BEGIN/COMMIT/DDL): $(printf '%s\n' "$_dec" | grep -c 'Query[[:space:]]*$\|Query[[:space:]].*thread_id=')"
-                sub "row-event lines (count): $(printf '%s\n' "$_dec" | grep -cE '^### (INSERT INTO|UPDATE|DELETE FROM)')"
-                sub "first event timestamp: $(printf '%s\n' "$_dec" | grep -m1 -oE '#[0-9]{6} +[0-9:]+' | head -1)"
-                sub "last event timestamp:  $(printf '%s\n' "$_dec" | grep -oE '#[0-9]{6} +[0-9:]+' | tail -1)"
+                [ "$_rc" -eq 124 ] && sub "note: decoding stopped at the ${BINLOG_TIMEOUT}s cap, counts below are partial"
+                _rows="$(awk -F'\t' '$2=="rows"{print $3}' "$_sum")"
+                if [ "${_rows:-0}" -eq 0 ]; then
+                    sub "events per table: none (no row events decoded; check binlog_format in section C)"
+                else
+                    sub "events per table (count, table):"
+                    awk -F'\t' '$1=="T"{printf "%12d %s\n", $2, $3}' "$_sum" \
+                        | sort -rn | head -30 \
+                        | while IFS= read -r _l; do printf '            %s\n' "$_l"; done
+                fi
+                sub "row events (count): ${_rows:-0}"
+                sub "transactions (BEGIN count): $(awk -F'\t' '$2=="begins"{print $3}' "$_sum")"
+                sub "Query events (count, incl. BEGIN/COMMIT/DDL): $(awk -F'\t' '$2=="queries"{print $3}' "$_sum")"
+                sub "first event timestamp: $(awk -F'\t' '$2=="first"{print $3}' "$_sum")"
+                sub "last event timestamp:  $(awk -F'\t' '$2=="last"{print $3}' "$_sum")"
+                rm -f "$_sum" 2>/dev/null
             done
         fi
     fi
