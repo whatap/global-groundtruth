@@ -8,12 +8,15 @@
 > | ---------- | ----- | ----- | ------ |
 > | [`collect-collserver.sh`](collect-collserver.sh) 0.3.0 | `collserver` | the WhaTap backend itself | **not yet run against a live production yard** — validate once on a staging backend |
 > | [`collect-collzfs.sh`](collect-collzfs.sh) 0.1.0 | `collzfs` | ZFS under the backend's data path | validated non-root on two live hosts (zfs 2.2.2 and 2.2.6), one of them a real collection server with `yardbase` on ZFS; `--zdb` and the root-only probes still unvalidated |
+> | [`collect-collmysql.sh`](collect-collmysql.sh) 0.1.0 | `collmysql` | the MySQL that holds the backend's `account` / `notihub` metadata | **not yet run against a live MySQL** — smoke-tested only on a host with no MySQL client, where every section reported its reason and the footer was reached |
 >
 > Which one to run: `collect-collserver.sh` for anything about the backend
 > (services, ports, configs, logs). `collect-collzfs.sh` when the question is
 > about the ZFS filesystem under it — block sizing, allocation classes, the
-> write path, free-space fragmentation. They are each self-contained; running
-> both is fine and normal.
+> write path, free-space fragmentation. `collect-collmysql.sh` when the question
+> is about the backend's own MySQL — replication and HA state, binary log growth
+> and what is inside those logs, InnoDB I/O counters. They are each
+> self-contained; running any combination is fine and normal.
 
 The **collection server** is the WhaTap backend that receives agent data and
 stores/aggregates it: `yard` (core store/aggregate), `proxy` (agent TCP
@@ -290,3 +293,114 @@ Two habits worth keeping when extending it:
   command fallback chains. Verified on GNU awk 5.2 / bash 5.2; re-check `awk`
   user-function support and `find -printf` on the oldest OS you must support
   (`--filesizes` needs GNU `find`, and says so when it is absent).
+
+---
+
+## `collect-collmysql.sh` — the backend's MySQL
+
+The WhaTap backend keeps `account` and `notihub` metadata in MySQL. When the
+question is about that database rather than about yard, this is the collector.
+It was written for a case where the binary logs kept growing and the disk I/O
+was high for a service whose usage is low, so its centre of gravity is the write
+path.
+
+### (a) Facts it collects
+
+One `.txt` report, sections `[0]` and A..K:
+
+- **`[0]` Collection environment** — bash, uid, tool presence, which mysql client
+  was resolved, whether it could connect and why not, and which opt-in tiers this
+  run enabled.
+- **A. Server identity and version** — version, hostname, `server_id`,
+  `server_uuid`, uptime, `read_only` / `super_read_only`, port, socket, datadir,
+  the local `mysqld` process and the listening sockets.
+- **B. HA and replication** — `binlog_format`, GTID mode, `SHOW REPLICA STATUS`
+  and the older `SHOW SLAVE STATUS`, `SHOW MASTER STATUS`, connected replicas,
+  Galera `wsrep_cluster_size`, Group Replication members, semi-sync status. It
+  asks for all of them and reports the reason for each one that does not answer,
+  so the topology is read off the server rather than assumed.
+- **C. Binary log inventory and retention** — `log_bin`, basename and index,
+  `max_binlog_size`, `binlog_expire_logs_seconds` and the older
+  `expire_logs_days`, `binlog_row_image`, `sync_binlog`, `SHOW BINARY LOGS`,
+  the binlog cache counters, and the on-disk file list with mtimes and sizes so
+  growth over time can be read from one snapshot.
+- **D. Storage and I/O** — `df -hT`, mounts, the datadir's filesystem,
+  `/proc/diskstats`, and the `Innodb_data_*`, `Innodb_os_log*`,
+  `Innodb_buffer_pool_*`, `Innodb_rows_*` and `Com_*` counters.
+- **E. InnoDB configuration** — page size, buffer pool size,
+  `innodb_flush_log_at_trx_commit`, flush method, doublewrite, I/O capacity, log
+  file settings, and `SHOW ENGINE INNODB STATUS`.
+- **F. Schema footprint** — per-schema table count and size, the 25 largest
+  tables, the tables whose names contain `lock` / `meter` / `event` / `audit`,
+  and the columns of `DeniedIPAddress` and `ApmRegion`.
+- **G. Per-table I/O and statement digests, from `performance_schema`** — the
+  tables with the most I/O wait, the tables with the most rows written, the
+  statement digests with the most latency and the most rows examined, and file
+  I/O by event name. This is what attributes load to a caller.
+- **H. Current activity** — processlist, thread counters, `max_connections`.
+- **I. Binary log content attribution** — opt-in, see below.
+- **J. Interval samples** — opt-in `iostat -x` and `vmstat`.
+- **K. MySQL error log** — the resolved `log_error` tail, or the journal.
+
+### (b) Delivery mechanism
+
+```sh
+./collect-collmysql.sh --file                       # -> whatap-collection-server-mysql-<host>-<UTC>.txt
+./collect-collmysql.sh --file --defaults-file ~/.my.cnf
+./collect-collmysql.sh --file --mysql-args "-h 10.0.0.5 -u whatap -p"
+./collect-collmysql.sh --file --binlog --sample     # add the two opt-in tiers
+./collect-collmysql.sh                              # no arguments -> prints help
+```
+
+With neither `--defaults-file` nor `--mysql-args`, the mysql client is invoked
+with no connection arguments and uses its own option files. A run without
+credentials still produces the host-side facts; every SQL-backed line then reads
+`n/a (<reason>)`.
+
+Run it **on the MySQL host** when you can. Sections A, C, D and K read files and
+the process table locally, and fall back to `n/a (...)` when run from elsewhere.
+
+#### Collection-load tiers
+
+- **Tier 0** (the default `--file` / `--stdout` report) runs `SHOW` statements,
+  `information_schema` and `performance_schema` queries, and near-instant local
+  reads. No table scan of user data, no log decode.
+- **Tier 1** — `--sample[=SEC]` adds `iostat -x` and `vmstat` samples (default
+  5 s x 6, so about 30 seconds of wall clock). Read-only.
+- **Tier 2** — `--binlog[=N]` decodes the N newest binary logs (default 2) with
+  `mysqlbinlog --base64-output=DECODE-ROWS` and counts row events per table.
+  This reads whole log files, so it costs I/O proportional to their size and is
+  off by default. Start with `--binlog=1` on a host under pressure.
+
+### (c) Security note
+
+The report contains schema and table names, statement digests, the processlist
+(including the `INFO` column, truncated to 120 characters) and a binary-log
+event summary by table. It does not print row values or credentials, and it
+never writes to the database. Section I prints table names and event counts, not
+the decoded rows themselves. Move the file over a trusted channel and delete it
+when the case is closed.
+
+### (d) How it was built / how to maintain
+
+Copied from [../../templates/collector-skeleton/](../../templates/collector-skeleton/).
+Re-validate after edits:
+
+```sh
+../../tools/validate.sh collect-collmysql.sh
+```
+
+#### Status notes / open items
+
+- **Validate against a live MySQL.** This v0.1.0 was only smoke-tested on a host
+  with no MySQL client present, which exercises every reasoned-absence path and
+  the footer but none of the SQL.
+- `SHOW REPLICA STATUS` (8.0.22+) and `SHOW SLAVE STATUS` (older) are both
+  issued on purpose; one of them always reports a reason instead of rows. The
+  same applies to `SHOW REPLICAS` / `SHOW SLAVE HOSTS`.
+- Section I parses `mysqlbinlog` text output. It assumes row-based events render
+  as `### INSERT INTO`, `### UPDATE` and `### DELETE FROM`. A server running
+  `binlog_format=STATEMENT` produces no such lines, and the section then reports
+  only the transaction and statement counts. Confirm the parse on a live server.
+- MariaDB is resolved as a client but the MariaDB-specific replication and
+  `performance_schema` differences are unvalidated.
