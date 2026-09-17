@@ -99,7 +99,7 @@ export LC_ALL=C
 
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-apmjava"
-VERSION="0.8.0"
+VERSION="0.9.0"
 DOMAIN="apm/java"
 TARGET="host/$(hostname 2>/dev/null || echo unknown)"
 
@@ -490,6 +490,33 @@ list_deploy() {
     done
 }
 
+# _build_libroots -> the jars section N will index: every --library match,
+# capped. Built once, before section M, because M asks it whether a jar it is
+# about to detail will appear in that index: the package histogram of a jar
+# whose class names section N prints is the same information twice, and a
+# report a field engineer pastes into a chat is not the place to send it twice
+# (case 2026-09-17 FIF: 40 jars, 988 of the report's 2738 lines).
+_LIBROOTS=""
+_build_libroots() {
+    _LIBROOTS="${_errfile}.libroots"
+    : > "$_LIBROOTS" 2>/dev/null
+    [ "$OPT_APPCLASSES" = 1 ] || return 0
+    [ -n "$OPT_LIBS" ] || [ "$OPT_LIBALL" = 1 ] || return 0
+    [ -s "$_PATHSINK" ] || return 0
+    sort -u "$_PATHSINK" 2>/dev/null | while IFS= read -r _lrec; do
+        case "$_lrec" in
+            file\|*) _lp="${_lrec#file|}"; _lib_match "$_lp" || continue
+                     printf 'libjar|%s\n' "$_lp" ;;
+        esac
+    done | head -n 60 > "$_LIBROOTS" 2>/dev/null
+}
+
+# _in_libroots PATH -> success when section N will index this jar
+_in_libroots() {
+    [ -s "$_LIBROOTS" ] || return 1
+    grep -qxF "libjar|$1" "$_LIBROOTS" 2>/dev/null
+}
+
 # _lib_match NAME -> success when NAME matches a --library pattern (or when
 # --library-all was given). Case-insensitive substring match.
 _lib_match() {
@@ -569,9 +596,13 @@ detail_jar() {
     # package map: reveals the real namespace, including relocation/shading
     cnt="$(unzip -Z1 "$jar" '*.class' 2>/dev/null | grep -c .)"
     fact "       class entries: ${cnt:-0}"
-    fact "       packages by class count (top 25):"
-    unzip -Z1 "$jar" '*.class' 2>/dev/null | sed 's|/[^/]*$||' | sort | uniq -c | sort -rn | head -n 25 \
-        | while IFS= read -r _l; do printf '             %s\n' "$(printf '%s' "$_l" | sed 's|/|.|g')"; done
+    if [ "${_DJ_IN_INDEX:-0}" = 1 ]; then
+        fact "       packages by class count: not repeated here — the class names of this jar are in the section N index (--library with --appclasses)"
+    else
+        fact "       packages by class count (top 25):"
+        unzip -Z1 "$jar" '*.class' 2>/dev/null | sed 's|/[^/]*$||' | sort | uniq -c | sort -rn | head -n 25 \
+            | while IFS= read -r _l; do printf '             %s\n' "$(printf '%s' "$_l" | sed 's|/|.|g')"; done
+    fi
     _mr="$(unzip -Z1 "$jar" 'META-INF/versions/*' 2>/dev/null | sed 's|^META-INF/versions/\([0-9]*\)/.*|\1|' | sort -u | tr '\n' ' ')"
     [ -n "$_mr" ] && fact "       multi-release jar, versioned class trees for: $_mr"
     unzip -Z1 "$jar" 'module-info.class' >/dev/null 2>&1 && fact "       module-info.class: present"
@@ -2030,6 +2061,10 @@ EOF_DUMPS
         [ -n "$OPT_CLASSES" ] && fact "member signatures requested for:$OPT_CLASSES"
         _dn=0
         : > "${_errfile}.jarsha" 2>/dev/null
+        _build_libroots
+        if [ -s "$_LIBROOTS" ]; then
+            fact "the class names of the jars section N indexes are not repeated in this section; their package histogram is left out and named as such"
+        fi
         sort -u "$_PATHSINK" 2>/dev/null > "${_errfile}.paths.u" 2>/dev/null
         while IFS= read -r _rec; do
             [ -n "$_rec" ] || continue
@@ -2055,7 +2090,9 @@ EOF_DUMPS
                     [ -n "$_sh" ] && printf '%s %s\n' "$_sh" "$_p" >> "${_errfile}.jarsha" 2>/dev/null
                     _dn=$((_dn + 1))
                     [ "$_dn" -gt 40 ] && { fact "-- cap reached: 40 distinct jars detailed, later matches skipped"; break; }
+                    if _in_libroots "$_p"; then _DJ_IN_INDEX=1; else _DJ_IN_INDEX=0; fi
                     detail_jar "$(basename "$_p")" "$_fsp"
+                    _DJ_IN_INDEX=0
                     ;;
                 nested)
                     _cj="${_rec#nested|}"; _ent="${_cj#*|}"; _cj="${_cj%%|*}"
@@ -2123,16 +2160,8 @@ EOF_DUMPS
         fact "not requested (--appclasses absent)"
     else
         # jars named with --library join the roots below
-        _LIBROOTS="${_errfile}.libroots"; : > "$_LIBROOTS" 2>/dev/null
+        [ -n "$_LIBROOTS" ] || _build_libroots
         if [ -n "$OPT_LIBS" ] || [ "$OPT_LIBALL" = 1 ]; then
-            if [ -s "$_PATHSINK" ]; then
-                sort -u "$_PATHSINK" 2>/dev/null | while IFS= read -r _lrec; do
-                    case "$_lrec" in
-                        file\|*) _lp="${_lrec#file|}"; _lib_match "$_lp" || continue
-                                 printf 'libjar|%s\n' "$_lp" >> "$_LIBROOTS" 2>/dev/null ;;
-                    esac
-                done
-            fi
             _lrn="$(grep -c . "$_LIBROOTS" 2>/dev/null)"
             fact "-- jars named with --library that join this index: ${_lrn:-0} (cap 60). Naming them is the reader's statement that they carry the application's own code; this collector does not judge a jar by its name"
         fi
