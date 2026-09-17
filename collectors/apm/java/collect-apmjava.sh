@@ -94,7 +94,7 @@ export LC_ALL=C
 
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-apmjava"
-VERSION="0.6.0"
+VERSION="0.7.0"
 DOMAIN="apm/java"
 TARGET="host/$(hostname 2>/dev/null || echo unknown)"
 
@@ -129,7 +129,9 @@ Library detail pack (off by default; read-only, no contact with the JVM) —
 for the case where a new weaving module has to be written for a library:
   --library PAT  detail every enumerated jar whose name or path contains PAT
                  (case-insensitive, repeatable): Maven coordinates, manifest
-                 versions, class-file version, package map, class list
+                 versions, class-file version, package map. With --appclasses
+                 the classes of those jars also enter the section N index, for
+                 an application that ships its own code as jars
   --library-all  detail every enumerated jar (cap 40)
   --class FQCN   member signatures of that class via javap -p -s (the JVM
                  descriptor of every member included), from each detailed jar
@@ -2083,21 +2085,42 @@ EOF_DUMPS
     # inventories the LIBRARIES; this section inventories the classes the
     # application itself ships, from the same roots the JVM loads them from.
     section "N. Application class index (opt-in)"
+    # The jars named with --library are read into this index too. An
+    # application can ship its own code as jars inside WEB-INF/lib rather than
+    # as class files under WEB-INF/classes; which of several hundred jars are
+    # the application's own is the reader's call, and --library is where the
+    # reader states it. Nothing is inferred from a jar name here.
     _APPPAT="Controller Action Servlet Handler Endpoint Resource Service Facade Manager Delegate Listener Consumer Processor Job Task Batch Adapter Gateway"
     if [ "$OPT_APPCLASSES" = 0 ]; then
         fact "not requested (--appclasses absent)"
-    elif [ ! -s "$_APPSINK" ]; then
-        fact "requested, but section F enumerated no application class root (no directory classpath entry, no WEB-INF/classes, no BOOT-INF/classes). Section F states, per JVM, what its -cp, its -jar, its working directory and its server directories yielded"
     else
+        # jars named with --library join the roots below
+        _LIBROOTS="${_errfile}.libroots"; : > "$_LIBROOTS" 2>/dev/null
+        if [ -n "$OPT_LIBS" ] || [ "$OPT_LIBALL" = 1 ]; then
+            if [ -s "$_PATHSINK" ]; then
+                sort -u "$_PATHSINK" 2>/dev/null | while IFS= read -r _lrec; do
+                    case "$_lrec" in
+                        file\|*) _lp="${_lrec#file|}"; _lib_match "$_lp" || continue
+                                 printf 'libjar|%s\n' "$_lp" >> "$_LIBROOTS" 2>/dev/null ;;
+                    esac
+                done
+            fi
+            _lrn="$(grep -c . "$_LIBROOTS" 2>/dev/null)"
+            fact "-- jars named with --library that join this index: ${_lrn:-0} (cap 60). Naming them is the reader's statement that they carry the application's own code; this collector does not judge a jar by its name"
+        fi
+        if [ ! -s "$_APPSINK" ] && [ ! -s "$_LIBROOTS" ]; then
+            fact "requested, but section F enumerated no application class root (no directory classpath entry, no WEB-INF/classes, no BOOT-INF/classes) and no jar was named with --library. Section F states, per JVM, what its -cp, its -jar, its working directory and its server directories yielded"
+        else
         fact "-- names are reported as the JVM loads them: a BOOT-INF/classes or WEB-INF/classes segment at the head of a path inside a root is a layout artifact, not part of the class name, and is not printed"
-        sort -u "$_APPSINK" 2>/dev/null > "${_errfile}.approots.u" 2>/dev/null
+        { sort -u "$_APPSINK" 2>/dev/null; head -n 60 "$_LIBROOTS" 2>/dev/null; } > "${_errfile}.approots.u" 2>/dev/null
         _NAMES="${_errfile}.appnames"
         : > "$_NAMES" 2>/dev/null
         _rn=0
         while IFS= read -r _rec; do
             [ -n "$_rec" ] || continue
             _rn=$((_rn + 1))
-            [ "$_rn" -gt 12 ] && { fact "-- cap reached: 12 class roots read, later roots skipped"; break; }
+            _rcap=12; [ -s "$_LIBROOTS" ] && _rcap=72
+            [ "$_rn" -gt "$_rcap" ] && { fact "-- cap reached: $_rcap class roots read, later roots skipped"; break; }
             case "$_rec" in
                 dir\|*)
                     _rt="${_rec#dir|}"
@@ -2121,6 +2144,23 @@ EOF_DUMPS
                     fi
                     find "$_rt" -name '*.class' -type f 2>/dev/null | head -n 20000 | while IFS= read -r _cf; do
                         _fq="${_cf#"$_rt"/}"; _fq="${_fq%.class}"
+                        _fq="${_fq#BOOT-INF/classes/}"; _fq="${_fq#WEB-INF/classes/}"
+                        printf '%s\n' "$_fq" | tr '/' '.' >> "$_NAMES" 2>/dev/null
+                    done
+                    ;;
+                libjar\|*)
+                    _rt="${_rec#libjar|}"
+                    _fsl="$(resolve_fs "$_rt")"
+                    if [ -z "$_fsl" ]; then fact "-- named jar $_rt: n/a (path not visible from this mount namespace)"; continue; fi
+                    if ! have unzip; then fact "-- named jar $_rt: n/a (command not found: unzip)"; continue; fi
+                    if [ -n "$_timeout_bin" ]; then _lst="$("$_timeout_bin" "$CMD_TIMEOUT" unzip -Z1 "$_fsl" '*.class' 2>/dev/null)"
+                    else _lst="$(unzip -Z1 "$_fsl" '*.class' 2>/dev/null)"; fi
+                    _lst="$(printf '%s\n' "$_lst" | grep -v '^META-INF/versions/')"
+                    _cnt="$(printf '%s\n' "$_lst" | grep -c .)"
+                    fact "-- named jar $(basename "$_rt"): ${_cnt:-0} class entries (named with --library)"
+                    printf '%s\n' "$_lst" | head -n 20000 | while IFS= read -r _ce; do
+                        [ -n "$_ce" ] || continue
+                        _fq="${_ce%.class}"
                         _fq="${_fq#BOOT-INF/classes/}"; _fq="${_fq#WEB-INF/classes/}"
                         printf '%s\n' "$_fq" | tr '/' '.' >> "$_NAMES" 2>/dev/null
                     done
@@ -2176,6 +2216,7 @@ EOF_DUMPS
             else
                 fact "-- frames in the section L dump(s) whose class is in this index: n/a (no thread dump was counted in this run: --threads and --dump-file absent, or no dump text)"
             fi
+        fi
         fi
     fi
 
