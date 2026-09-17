@@ -94,7 +94,7 @@ export LC_ALL=C
 
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-apmjava"
-VERSION="0.5.1"
+VERSION="0.6.0"
 DOMAIN="apm/java"
 TARGET="host/$(hostname 2>/dev/null || echo unknown)"
 
@@ -432,10 +432,15 @@ list_jars() {
     if [ -z "$out" ]; then printf '%s%s: 0 jar files\n' "$ind" "$d"; return; fi
     out="$(printf '%s\n' "$out" | grep -v -i 'whatap\.agent')"
     n="$(printf '%s\n' "$out" | grep -c . )"
-    printf '%s%s: %s jar files (first %s)\n' "$ind" "$d" "${n:-0}" "$cap"
-    printf '%s\n' "$out" | head -n "$cap" | while IFS= read -r _l; do
+    printf '%s%s: %s jar files (%s printed; every one of the %s is recorded, so --library matches beyond the printed part)\n' "$ind" "$d" "${n:-0}" "$cap" "${n:-0}"
+    # record every jar, print only the first CAP: a deployment unit can carry
+    # several hundred jars, and the application's own ones sort anywhere in
+    # that list (case 2026-09-17 FIF: 282 jars, the customer's own at "f")
+    _lj=0
+    printf '%s\n' "$out" | while IFS= read -r _l; do
         [ -n "$_l" ] || continue
-        printf '%s  %s\n' "$ind" "$_l"
+        _lj=$((_lj + 1))
+        [ "$_lj" -le "$cap" ] && printf '%s  %s\n' "$ind" "$_l"
         _lib_record "$_l"
         _path_record "file|$d/$_l"
     done
@@ -2100,6 +2105,20 @@ EOF_DUMPS
                     if [ ! -r "$_rt" ]; then fact "-- directory root $_rt: n/a (permission denied)"; continue; fi
                     _cnt="$(find "$_rt" -name '*.class' -type f 2>/dev/null | head -n 20000 | grep -c .)"
                     fact "-- directory root $_rt: ${_cnt:-0} class files (read bound: 20000)"
+                    # A deployment unit can ship the application's own code as
+                    # jars next to this directory rather than as class files in
+                    # it. When the directory holds nothing, the count of the
+                    # sibling lib directory is the fact that says where else to
+                    # look; --library <name> then details those jars (section M).
+                    if [ "${_cnt:-0}" -eq 0 ]; then
+                        _sib="${_rt%/classes}/lib"
+                        if [ -d "$_sib" ]; then
+                            _sibn="$(ls "$_sib" 2>/dev/null | grep -i -c '\.jar$')"
+                            fact "   sibling ${_sib}: ${_sibn:-0} jar files (this root contributed no class name; section F lists them and --library <name> details the ones you name)"
+                        else
+                            fact "   sibling ${_sib}: absent"
+                        fi
+                    fi
                     find "$_rt" -name '*.class' -type f 2>/dev/null | head -n 20000 | while IFS= read -r _cf; do
                         _fq="${_cf#"$_rt"/}"; _fq="${_fq%.class}"
                         _fq="${_fq#BOOT-INF/classes/}"; _fq="${_fq#WEB-INF/classes/}"
