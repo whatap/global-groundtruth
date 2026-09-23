@@ -10,3 +10,6 @@ whatap-k8s-*.tar.gz
 .DS_Store
 *.swp
 *~
+
+# 세션 워크트리. 레포 안에 박힌 별도 git 이라 추적하지 않는다
+.claude/
