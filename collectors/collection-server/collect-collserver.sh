@@ -28,13 +28,20 @@ export LC_ALL=C
 
 # ---- collector metadata -----------------------------------------------------
 COLLECTOR_NAME="whatap-collection-server"
+# 0.4.1  D/F/G say WHY a WHATAP_HOME-relative path came back empty. "WHATAP_HOME
+#        not resolved" was printed even when the report had just printed the
+#        resolved path, and permission problems were reported as "path not
+#        found". Four reasons now: not resolved / resolved but unreachable /
+#        unsearchable / genuinely absent. Reason: two Smartfren bundles carried
+#        no conf/ at all and the stated reason sent the reader after root access
+#        when the fix was to run as the owning account (2026-09-23).
 # 0.4.0  bundle logs get a total cap, not just a per-file one. Rotated logs are
 #        opt-in (--with-rotated) and the per-file default drops 50MB -> 5MB. What
 #        is left out is written to logs/SELECTION.txt with a reason per file and
 #        summarized in the report's G section. Reason: a production collection
 #        server produced a 393MB bundle that the field could not move; 99.95% of
 #        it was logs (sf-whatap-web02-bsd, 2026-09-23).
-VERSION="0.4.0"
+VERSION="0.4.1"
 DOMAIN="collection-server"
 TARGET="collection-server/$(hostname 2>/dev/null || echo unknown)"   # refined after WHATAP_HOME is resolved
 
@@ -522,10 +529,10 @@ run_report() {
     fact "WHATAP_HOME resolved by: $WHOME_SRC"
     if [ -n "$WHOME" ] && [ -d "$WHOME" ]; then
         probe "top-level (depth 1)" ls -1 "$WHOME"
-        if [ -d "$WHOME/lib" ]; then probe "lib jars" ls -1 "$WHOME/lib"; else fact "lib jars: n/a (path not found: $WHOME/lib)"; fi
-        if [ -d "$WHOME/conf" ]; then probe "conf files" ls -1 "$WHOME/conf"; else fact "conf files: n/a (path not found: $WHOME/conf)"; fi
+        if [ -d "$WHOME/lib" ]; then probe "lib jars" ls -1 "$WHOME/lib"; else fact "lib jars: n/a ($(home_why lib))"; fi
+        if [ -d "$WHOME/conf" ]; then probe "conf files" ls -1 "$WHOME/conf"; else fact "conf files: n/a ($(home_why conf))"; fi
     else
-        fact "layout: n/a (WHATAP_HOME not resolved)"
+        fact "layout: n/a ($(home_why))"
     fi
 
     # -- E. Runtime processes (current state) ---------------------------------
@@ -551,7 +558,7 @@ run_report() {
         i=$((i + 1))
     done
     subsection "PID run-files"
-    if [ -n "$WHOME" ]; then probe "*.run" ls -1 "$WHOME"/*.run; else fact "*.run: n/a (WHATAP_HOME not resolved)"; fi
+    if [ -n "$WHOME" ] && [ -d "$WHOME" ]; then probe "*.run" ls -1 "$WHOME"/*.run; else fact "*.run: n/a ($(home_why))"; fi
     subsection "listening ports"
     local lports p name port
     lports=" $(get_listen_ports | tr '\n' ' ') "
@@ -587,7 +594,7 @@ run_report() {
             dump_file "$cf"
         done
     else
-        fact "conf/: n/a (path not found or WHATAP_HOME not resolved)"
+        fact "conf/: n/a ($(home_why conf))"
     fi
 
     # -- G. Logs & recent events ----------------------------------------------
@@ -679,7 +686,7 @@ run_report() {
         if [ -n "$chk" ]; then fact "$chk (last 20 lines):"; tail -n 20 "$chk" 2>/dev/null | while IFS= read -r _l; do printf '        %s\n' "$_l"; done
         else fact "checker log: n/a (path not found)"; fi
     else
-        fact "logs/: n/a (path not found or WHATAP_HOME not resolved)"
+        fact "logs/: n/a ($(home_why logs))"
     fi
     subsection "heap dumps / GC log / restart"
     if [ -n "$WHOME" ]; then
@@ -706,6 +713,42 @@ run_report() {
 # =============================================================================
 # Bundle (Tier 1 default; Tier 2 opt-in)
 # =============================================================================
+# Why a WHATAP_HOME-relative path produced nothing. "not resolved" and "resolved
+# but this account cannot read it" lead to different next steps: the first needs
+# --home, the second needs a different account. The collector used to print
+# "WHATAP_HOME not resolved" for both, two lines after printing the resolved
+# path, which reads as a contradiction and sends the reader the wrong way.
+#
+# Real case (Smartfren, 2026-09-23): three hosts, collector run as uid 3103 on
+# all three, WhaTap installed under uid 1001 (whatap). On web02-bsd uid 3103
+# could traverse /data/whatap and conf/ + logs/ came back; on both web01 hosts
+# it could not, and the bundles carried no conf/ at all. The report blamed
+# "WHATAP_HOME not resolved" and the reader concluded the collector needed root.
+# It did not. It needed the account that owns the installation.
+home_why() {
+    local sub="$1" path="$WHOME"
+    [ -n "$sub" ] && path="$WHOME/$sub"
+    local uid; uid="$(id -u 2>/dev/null || echo '?')"
+    if [ -z "$WHOME" ]; then
+        printf 'WHATAP_HOME not resolved; pass --home DIR'
+    elif [ ! -d "$WHOME" ]; then
+        # stat() on WHOME itself failed, so its parent is not searchable by us.
+        printf 'WHATAP_HOME resolved to %s (via %s) but uid %s cannot reach it; run as the account that owns the installation' \
+            "$WHOME" "$WHOME_SRC" "$uid"
+    elif [ ! -x "$WHOME" ]; then
+        # WHOME stats but we cannot search it, so every path under it would come
+        # back "not found". Say permission, not absence — they are different bugs.
+        printf 'uid %s cannot search %s (no execute permission); run as the account that owns the installation' \
+            "$uid" "$WHOME"
+    elif [ ! -d "$path" ]; then
+        printf 'path not found: %s' "$path"
+    elif [ ! -r "$path" ]; then
+        printf 'uid %s cannot read %s' "$uid" "$path"
+    else
+        printf 'unreadable: %s' "$path"
+    fi
+}
+
 collect_conf() {
     local dest="$1"
     [ -n "$WHOME" ] && [ -d "$WHOME/conf" ] || { warn "conf: skipped (no WHATAP_HOME/conf)"; return; }
