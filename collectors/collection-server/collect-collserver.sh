@@ -28,6 +28,10 @@ export LC_ALL=C
 
 # ---- collector metadata -----------------------------------------------------
 COLLECTOR_NAME="whatap-collection-server"
+# 0.5.0  the report ends with a Collection status section, and the operator is
+#        told on stderr when a run did not obtain what it came for (even under
+#        --quiet). Goals: running modules, WHATAP_HOME contents, module configs,
+#        log inventory, and yard data path on hosts that run yard.
 # 0.4.1  D/F/G say WHY a WHATAP_HOME-relative path came back empty. "WHATAP_HOME
 #        not resolved" was printed even when the report had just printed the
 #        resolved path, and permission problems were reported as "path not
@@ -41,7 +45,7 @@ COLLECTOR_NAME="whatap-collection-server"
 #        summarized in the report's G section. Reason: a production collection
 #        server produced a 393MB bundle that the field could not move; 99.95% of
 #        it was logs (sf-whatap-web02-bsd, 2026-09-23).
-VERSION="0.4.1"
+VERSION="0.5.0"
 DOMAIN="collection-server"
 TARGET="collection-server/$(hostname 2>/dev/null || echo unknown)"   # refined after WHATAP_HOME is resolved
 
@@ -181,6 +185,104 @@ _classify_err() {
         printf 'error: %s' "$(printf '%s' "$txt" | head -n1 | cut -c1-100)"
     else
         echo "nonzero exit"
+    fi
+}
+
+# ---- collection completeness — DO NOT EDIT ----------------------------------
+# A collector knows, at the host, whether it obtained what it came for. Saying so
+# is a fact about THIS COLLECTION RUN, not a claim about the environment, so it
+# stays inside CONTRACT rule 1. (Rule 1 is spelled out for this case in
+# CONTRACT.md, "Saying whether the collection worked".)
+#
+# Why it exists. A report full of `n/a (permission denied)` reads as finished to
+# an operator whose terminal only said ">> done.". They package it and send it,
+# and the gap surfaces days later in another time zone. Real case: two of three
+# collection-server bundles came back carrying no conf/ at all, and nobody knew
+# until the files had crossed a time zone (Smartfren, 2026-09-23). Every fact
+# needed to catch that was already on the host while the operator was still
+# logged in.
+#
+# It also serves rule 3 ("one field command → paste output"): deciding whether a
+# run is worth sending is interpretation, and the field is not asked to do it.
+#
+# Usage, from the report body:
+#     goal   conf "module configs"                    # what this run is for
+#     got    conf                                     # obtained
+#     missed conf "uid 3103 cannot reach /data/whatap" # not obtained, and why
+#
+# Declare a goal once, then resolve it exactly once with got/missed. A goal left
+# unresolved counts as not obtained with reason "not reached", which is itself
+# worth seeing: it means the run ended before that step.
+_goal_keys='' _goal_labels='' _ok_keys='' _gap_keys='' _gap_reasons=''
+
+goal()   { _goal_keys="$_goal_keys$1
+"; _goal_labels="$_goal_labels$2
+"; }
+got()    { _ok_keys="$_ok_keys$1
+"; }
+missed() { _gap_keys="$_gap_keys$1
+"; _gap_reasons="$_gap_reasons$2
+"; }
+
+# _label_of KEY -> the label declared for KEY (falls back to the key itself)
+_label_of() {
+    local i=1 k
+    while IFS= read -r k; do
+        [ "$k" = "$1" ] && { printf '%s' "$(printf '%s' "$_goal_labels" | sed -n "${i}p")"; return; }
+        i=$((i + 1))
+    done <<EOF
+$_goal_keys
+EOF
+    printf '%s' "$1"
+}
+
+# _reason_of KEY -> the reason recorded for KEY, or empty
+_reason_of() {
+    local i=1 k
+    while IFS= read -r k; do
+        [ "$k" = "$1" ] && { printf '%s' "$(printf '%s' "$_gap_reasons" | sed -n "${i}p")"; return; }
+        i=$((i + 1))
+    done <<EOF
+$_gap_keys
+EOF
+}
+
+# notice: like progress, but NOT silenced by --quiet. Reserved for the
+# completeness roll-up. --quiet exists to keep run narration out of automation
+# logs; the one line that decides whether a run is worth sending is not
+# narration, and an automated caller wants it most of all.
+notice() { printf '>> %s\n' "$*" >&3 2>/dev/null; }
+
+# emit_status -> the roll-up section. Call it immediately before emit_footer.
+# Also repeats each gap on fd 3 so the operator sees it while still logged in.
+emit_status() {
+    [ -n "$_goal_keys" ] || return 0
+    local k total=0 obtained=0 gaps='' oks=''
+    while IFS= read -r k; do
+        [ -n "$k" ] || continue
+        total=$((total + 1))
+        if printf '%s' "$_ok_keys" | grep -qxF "$k"; then
+            obtained=$((obtained + 1)); oks="$oks $(_label_of "$k"),"
+        else
+            local r; r="$(_reason_of "$k")"; [ -n "$r" ] || r='not reached'
+            gaps="$gaps$(_label_of "$k") — $r
+"
+        fi
+    done <<EOF
+$_goal_keys
+EOF
+    section "Collection status"
+    fact "goals: $total declared, $obtained obtained, $((total - obtained)) not obtained"
+    [ -n "$oks" ] && fact "obtained:${oks%,}"
+    if [ "$obtained" -eq "$total" ]; then
+        fact "status: COMPLETE"
+        notice "status: COMPLETE — $obtained of $total goals obtained"
+    else
+        fact "not obtained:"
+        printf '%s' "$gaps" | while IFS= read -r l; do [ -n "$l" ] && fact "    $l"; done
+        fact "status: INCOMPLETE"
+        notice "status: INCOMPLETE — $((total - obtained)) of $total goals not obtained"
+        printf '%s' "$gaps" | while IFS= read -r l; do [ -n "$l" ] && notice "  $l"; done
     fi
 }
 
@@ -401,6 +503,23 @@ time_ref_probe() {
 run_report() {
     emit_header
 
+    # What this run is for. `home` and `conf` are the two that decide whether a
+    # bundle is worth sending: without the WhaTap config files nothing about an
+    # upgrade or a misbehaving module can be settled remotely.
+    goal services "running whatap modules"
+    goal home     "WHATAP_HOME contents"
+    goal conf     "module configs"
+    goal logs     "log inventory"
+    # yardbase only matters on a host that runs yard. Declaring it everywhere
+    # would mark a healthy web/proxy-only host INCOMPLETE for a path it is not
+    # supposed to have.
+    _runs_yard=0
+    _i=0; while [ "$_i" -lt "${#MODS[@]}" ]; do
+        case "${MODS[$_i]}" in *yard*) _runs_yard=1 ;; esac
+        _i=$((_i + 1))
+    done
+    [ "$_runs_yard" = 1 ] && goal yardbase "yard data path"
+
     section "Collection environment"
     fact "collector: $COLLECTOR_NAME $VERSION"
     fact "bash: ${BASH_VERSION:-unknown}"
@@ -484,8 +603,11 @@ run_report() {
     section "C. Storage & filesystem"
     if [ -n "$YARDBASE" ]; then
         fact "yardbase path: $YARDBASE ($( [ -d "$YARDBASE" ] && echo present || echo 'path not found' ))"
+        if [ -d "$YARDBASE" ]; then got yardbase
+        else missed yardbase "resolved to $YARDBASE, not reachable by uid $(id -u 2>/dev/null || echo '?')"; fi
     else
         fact "yardbase path: n/a (not resolved from yard.conf or WHATAP_HOME/yardbase)"
+        missed yardbase "not resolved from yard.conf or WHATAP_HOME/yardbase"
     fi
     local ypath fstype src
     ypath="$YARDBASE"; [ -z "$ypath" ] && ypath="$WHOME"; [ -z "$ypath" ] && ypath="."
@@ -531,14 +653,19 @@ run_report() {
         probe "top-level (depth 1)" ls -1 "$WHOME"
         if [ -d "$WHOME/lib" ]; then probe "lib jars" ls -1 "$WHOME/lib"; else fact "lib jars: n/a ($(home_why lib))"; fi
         if [ -d "$WHOME/conf" ]; then probe "conf files" ls -1 "$WHOME/conf"; else fact "conf files: n/a ($(home_why conf))"; fi
+        got home
     else
         fact "layout: n/a ($(home_why))"
+        missed home "$(home_why)"
     fi
 
     # -- E. Runtime processes (current state) ---------------------------------
     section "E. Runtime processes (current state)"
     if [ "${#PIDS[@]}" -eq 0 ]; then
         fact "no whatap.server.* / whatap.opslake.* JVM found in /proc (none running, or /proc unreadable)"
+        missed services "no whatap JVM found in /proc (none running, or /proc unreadable)"
+    else
+        got services
     fi
     local i pid mod cl jar xmx xx rss st
     i=0
@@ -587,14 +714,18 @@ run_report() {
     # -- F. Configuration (raw) -----------------------------------------------
     section "F. Configuration"
     if [ -n "$WHOME" ] && [ -d "$WHOME/conf" ]; then
-        local cf
+        local cf _cfn=0
         for cf in "$WHOME"/conf/*.conf; do
             [ -e "$cf" ] || { fact "no *.conf files under $WHOME/conf"; break; }
+            _cfn=$((_cfn + 1))
             fact "$(basename "$cf") ($(wc -c < "$cf" 2>/dev/null | tr -d ' ') bytes, mtime $(date -u -r "$cf" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo n/a)):"
             dump_file "$cf"
         done
+        # A readable but empty conf/ is not the same as an unreadable one.
+        if [ "$_cfn" -gt 0 ]; then got conf; else missed conf "no *.conf files under $WHOME/conf"; fi
     else
         fact "conf/: n/a ($(home_why conf))"
+        missed conf "$(home_why conf)"
     fi
 
     # -- G. Logs & recent events ----------------------------------------------
@@ -612,7 +743,12 @@ run_report() {
             _cur=1
             fact "$(printf '%s\t%s bytes\t%s' "${_f#"$WHOME"/}" "$(wc -c < "$_f" 2>/dev/null | tr -d ' ')" "$(date -u -r "$_f" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo n/a)")"
         done
-        [ "$_cur" = 0 ] && fact "no non-rotated *.log found under $WHOME/logs"
+        if [ "$_cur" = 0 ]; then
+            fact "no non-rotated *.log found under $WHOME/logs"
+            missed logs "no non-rotated *.log found under $WHOME/logs"
+        else
+            got logs
+        fi
 
         subsection "rotated logs (summary per base: count / total bytes / date span)"
         # ls -l is metadata only (no content read) — safe with hundreds of files.
@@ -687,6 +823,7 @@ run_report() {
         else fact "checker log: n/a (path not found)"; fi
     else
         fact "logs/: n/a ($(home_why logs))"
+        missed logs "$(home_why logs)"
     fi
     subsection "heap dumps / GC log / restart"
     if [ -n "$WHOME" ]; then
@@ -707,6 +844,7 @@ run_report() {
         fact "journal: n/a (command not found: journalctl)"
     fi
 
+    emit_status
     emit_footer
 }
 

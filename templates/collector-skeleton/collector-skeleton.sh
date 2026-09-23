@@ -115,6 +115,104 @@ emit_footer() {
     printf '\n==== END OF COLLECTION (no diagnosis by design) ====\n'
 }
 
+# ---- collection completeness — DO NOT EDIT ----------------------------------
+# A collector knows, at the host, whether it obtained what it came for. Saying so
+# is a fact about THIS COLLECTION RUN, not a claim about the environment, so it
+# stays inside CONTRACT rule 1. (Rule 1 is spelled out for this case in
+# CONTRACT.md, "Saying whether the collection worked".)
+#
+# Why it exists. A report full of `n/a (permission denied)` reads as finished to
+# an operator whose terminal only said ">> done.". They package it and send it,
+# and the gap surfaces days later in another time zone. Real case: two of three
+# collection-server bundles came back carrying no conf/ at all, and nobody knew
+# until the files had crossed a time zone (Smartfren, 2026-09-23). Every fact
+# needed to catch that was already on the host while the operator was still
+# logged in.
+#
+# It also serves rule 3 ("one field command → paste output"): deciding whether a
+# run is worth sending is interpretation, and the field is not asked to do it.
+#
+# Usage, from the report body:
+#     goal   conf "module configs"                    # what this run is for
+#     got    conf                                     # obtained
+#     missed conf "uid 3103 cannot reach /data/whatap" # not obtained, and why
+#
+# Declare a goal once, then resolve it exactly once with got/missed. A goal left
+# unresolved counts as not obtained with reason "not reached", which is itself
+# worth seeing: it means the run ended before that step.
+_goal_keys='' _goal_labels='' _ok_keys='' _gap_keys='' _gap_reasons=''
+
+goal()   { _goal_keys="$_goal_keys$1
+"; _goal_labels="$_goal_labels$2
+"; }
+got()    { _ok_keys="$_ok_keys$1
+"; }
+missed() { _gap_keys="$_gap_keys$1
+"; _gap_reasons="$_gap_reasons$2
+"; }
+
+# _label_of KEY -> the label declared for KEY (falls back to the key itself)
+_label_of() {
+    local i=1 k
+    while IFS= read -r k; do
+        [ "$k" = "$1" ] && { printf '%s' "$(printf '%s' "$_goal_labels" | sed -n "${i}p")"; return; }
+        i=$((i + 1))
+    done <<EOF
+$_goal_keys
+EOF
+    printf '%s' "$1"
+}
+
+# _reason_of KEY -> the reason recorded for KEY, or empty
+_reason_of() {
+    local i=1 k
+    while IFS= read -r k; do
+        [ "$k" = "$1" ] && { printf '%s' "$(printf '%s' "$_gap_reasons" | sed -n "${i}p")"; return; }
+        i=$((i + 1))
+    done <<EOF
+$_gap_keys
+EOF
+}
+
+# notice: like progress, but NOT silenced by --quiet. Reserved for the
+# completeness roll-up. --quiet exists to keep run narration out of automation
+# logs; the one line that decides whether a run is worth sending is not
+# narration, and an automated caller wants it most of all.
+notice() { printf '>> %s\n' "$*" >&3 2>/dev/null; }
+
+# emit_status -> the roll-up section. Call it immediately before emit_footer.
+# Also repeats each gap on fd 3 so the operator sees it while still logged in.
+emit_status() {
+    [ -n "$_goal_keys" ] || return 0
+    local k total=0 obtained=0 gaps='' oks=''
+    while IFS= read -r k; do
+        [ -n "$k" ] || continue
+        total=$((total + 1))
+        if printf '%s' "$_ok_keys" | grep -qxF "$k"; then
+            obtained=$((obtained + 1)); oks="$oks $(_label_of "$k"),"
+        else
+            local r; r="$(_reason_of "$k")"; [ -n "$r" ] || r='not reached'
+            gaps="$gaps$(_label_of "$k") — $r
+"
+        fi
+    done <<EOF
+$_goal_keys
+EOF
+    section "Collection status"
+    fact "goals: $total declared, $obtained obtained, $((total - obtained)) not obtained"
+    [ -n "$oks" ] && fact "obtained:${oks%,}"
+    if [ "$obtained" -eq "$total" ]; then
+        fact "status: COMPLETE"
+        notice "status: COMPLETE — $obtained of $total goals obtained"
+    else
+        fact "not obtained:"
+        printf '%s' "$gaps" | while IFS= read -r l; do [ -n "$l" ] && fact "    $l"; done
+        fact "status: INCOMPLETE"
+        notice "status: INCOMPLETE — $((total - obtained)) of $total goals not obtained"
+        printf '%s' "$gaps" | while IFS= read -r l; do [ -n "$l" ] && notice "  $l"; done
+    fi
+}
+
 # progress: operational narration to the terminal (fd 3, saved from stderr in main
 # before any redirection). It NEVER lands in the report — stdout stays the report
 # even in --file mode. Silenced by --quiet. Keep the text a fact about collection
@@ -192,6 +290,12 @@ read_proc() {
 run_report() {
     emit_header
 
+    # Declare what this run is for, before collecting anything. Keep the list
+    # short: a goal is something whose absence makes the bundle not worth
+    # sending, not every value the collector happens to print.
+    goal identity "host identity"
+    goal example  "the thing this collector exists to obtain"
+
     # Guideline 4: a capability preamble makes every downstream "command not found"
     # self-explanatory. List the tools your collector relies on.
     section "Collection environment"
@@ -207,13 +311,17 @@ run_report() {
     section "Host identity"
     probe "hostname" hostname
     probe "kernel" uname -sr
+    if hostname >/dev/null 2>&1; then got identity; else missed identity "hostname unavailable"; fi
 
     # Placeholder: resolve rather than assume (Contract rule 2). Replace the target
     # with whatever your domain actually needs to resolve.
     section "Example resolved value"
     fact "replace this section with your domain's facts"
     fact "when a value is absent, print it as a fact with its reason — n/a (...)"
+    missed example "replace this with got/missed at the point the value is resolved"
 
+    # Always last, immediately before the footer.
+    emit_status
     emit_footer
 }
 

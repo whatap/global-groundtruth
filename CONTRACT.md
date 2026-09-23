@@ -27,6 +27,27 @@ developer, but also the engineer on site).
 > If a line could start with "so you should…", "this is probably…", or
 > "the problem is…", it violates this rule. Delete the judgment; keep the fact.
 
+### Saying whether the collection worked
+
+Rule 1 governs claims about **the environment**. It does not stop a collector
+from stating facts about **its own run**.
+
+`goal` / `got` / `missed` and the `Collection status` section exist for that.
+`status: INCOMPLETE — module configs not obtained: uid 3103 cannot reach
+/data/whatap` says nothing about the customer's system; it says what this
+process did and did not read. A reader still draws every conclusion about the
+environment themselves.
+
+This is required rather than optional, because the alternative breaks rule 3. A
+report full of `n/a (permission denied)` reads as finished to an operator whose
+terminal only said `>> done.`; deciding whether the run is worth sending then
+becomes interpretation, and rule 3 says the field is not asked to interpret.
+The facts are on the host while the operator is still logged in, so the
+collector says so there.
+
+The wording stays inside rule 1's vocabulary: name what was not obtained and
+why, never what it means or what to do about the system.
+
 `validate.sh` fails any collector whose **source** contains the words
 `likely`, `diagnos`, `recommend`, `should`, `root cause`, or `fix`
 (case-insensitive) on a non-comment line — that is, in any string the script
