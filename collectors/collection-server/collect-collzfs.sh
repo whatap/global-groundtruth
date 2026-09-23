@@ -57,7 +57,7 @@ export LC_ALL=C
 
 # ---- collector metadata -----------------------------------------------------
 COLLECTOR_NAME="whatap-collection-server-zfs"
-VERSION="0.1.0"
+VERSION="0.2.0"
 DOMAIN="collection-server"
 TARGET="collection-server-zfs/$(hostname 2>/dev/null || echo unknown)"   # refined after pool discovery
 
@@ -72,8 +72,22 @@ OPT_HOURS=24         # journal window
 OPT_SAMPLE=0         # Tier 1: interval iostat/arcstat samples
 SAMPLE_SECS=10
 OPT_ZDB=0            # Tier 2: zdb -C / -Lbbbs / -mm
-OPT_FILESIZES=0      # Tier 2: file-size histogram (tree walk)
+# File-size histogram. On by default since 0.2.0: it is the only thing in this
+# collector that says what size the workload actually writes, and recordsize
+# cannot be judged without it. It reads metadata only (find -printf '%s'), never
+# file contents. It was opt-in until 0.1.0 and therefore absent from the runs
+# that mattered — the XLSMART web01 bundles of 2026-09-23 came back with
+# filesizes=off because the runbook did not pass the flag.
+OPT_FILESIZES=1
 FILESIZES_PATH=""
+FILESIZES_SECS=300   # bound on the tree walk; a partial result is labelled as such
+# zpool events window, in days. The ring buffer holds everything back to pool
+# creation when zfs_zevent_len_max is large, and `zpool events -v` of that is
+# hundreds of MB (192MB on XLSMART web01-bsd, 2026-09-23). The per-event detail
+# is only useful for recent events, but the TALLY is useful over the whole buffer
+# because what matters is when a class STARTED and when it STOPPED. So: tally
+# everything, keep the detail for this window. 0 keeps the detail for everything.
+OPT_EVENT_DAYS=30
 
 usage() {
     cat <<'EOF'
@@ -91,21 +105,34 @@ explicit action flag (--file / --stdout / --bundle) so nothing starts by acciden
   collect-collzfs.sh --hours N              journal window in hours (default: 24)
 
   Tier 0 always includes the cumulative-since-boot zpool iostat histograms
-  (-r request size, -w latency), which are instant kstat reads.
+  (-r request size, -w latency), which are instant kstat reads, and the
+  file-size histogram under yardbase (see --no-filesizes to turn it off).
+
+  zpool events. The tally (count, first date, last date per class) always covers
+  the WHOLE ring buffer, because what the buffer answers is when a class started
+  and when it stopped. The per-event detail is kept only for a recent window,
+  because the full -v dump of a deep buffer is hundreds of MB.
+  collect-collzfs.sh --event-days N         detail window in days (default: 30)
+                                            0 keeps the detail for everything
 
   Tier 1 sampling (read-only; costs wall-clock, not disk load):
   collect-collzfs.sh --file --sample[=SEC]  add interval samples of zpool iostat
                                             -lqv / -r / -w and arcstat
                                             (default SEC=10; adds about 6 x SEC seconds)
 
+  File-size histogram (on by default since 0.2.0). recordsize cannot be judged
+  without knowing what size the workload actually writes, so this is no longer
+  opt-in. It reads metadata only (find -printf '%s'), never file contents, and a
+  walk that hits its bound is labelled PARTIAL rather than passed off as whole.
+  collect-collzfs.sh --filesizes=PATH       walk PATH instead of yardbase
+  collect-collzfs.sh --filesizes-secs N     bound on the walk (default: 300)
+  collect-collzfs.sh --no-filesizes         skip it
+
   Tier 2 (opt-in, adds pool or disk load — announced on stderr before running):
   collect-collzfs.sh --file --zdb           zdb -C, -Lbbbs, -mm per pool: block/psize
                                             histograms, measured compression, metaslab
                                             free-space histograms. Traverses pool
                                             metadata — minutes on a large pool.
-  collect-collzfs.sh --file --filesizes[=PATH]
-                                            file-size histogram under yardbase (or PATH)
-                                            by walking the tree (metadata only, bounded)
 EOF
 }
 
@@ -127,6 +154,11 @@ while [ $# -gt 0 ]; do
         --zdb) OPT_ZDB=1 ;;
         --filesizes) OPT_FILESIZES=1 ;;
         --filesizes=*) OPT_FILESIZES=1; FILESIZES_PATH="${1#*=}" ;;
+        --no-filesizes) OPT_FILESIZES=0 ;;
+        --filesizes-secs) FILESIZES_SECS="$2"; shift ;;
+        --filesizes-secs=*) FILESIZES_SECS="${1#*=}" ;;
+        --event-days) OPT_EVENT_DAYS="$2"; shift ;;
+        --event-days=*) OPT_EVENT_DAYS="${1#*=}" ;;
         -h|--help) usage; exit 0 ;;
         *) printf 'unknown argument: %s\n' "$1" >&2; usage >&2; exit 2 ;;
     esac
@@ -613,9 +645,24 @@ objset_kstat_view() {
 
 # File-size histogram (Tier 2 --filesizes). Buckets chosen at the power-of-two
 # steps a recordsize decision moves through.
+# filesize_histogram PATH -> bucketed file-size histogram, or a partial one.
+#
+# The walk is bounded. When the bound is hit the reader must not read the result
+# as the whole tree, so the sizes are staged in a file, the walk's exit status is
+# read, and a truncated walk says so in its own line. Piping find straight into
+# awk would hide this: awk still prints a complete-looking END block from
+# whatever it received before find was killed.
 filesize_histogram() {
-    local p="$1"
-    run_bounded 600 find "$p" -xdev -type f -printf '%s\n' 2>/dev/null | awk '
+    local p="$1" tmp rc
+    tmp="$(mktemp 2>/dev/null || echo "${TMPDIR:-/tmp}/.ggt.fsz.$$")"
+    run_bounded "$FILESIZES_SECS" find "$p" -xdev -type f -printf '%s\n' 2>/dev/null > "$tmp"
+    rc=$?
+    if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+        printf '(PARTIAL: the walk hit the %ss bound and was stopped. The buckets below\n' "$FILESIZES_SECS"
+        printf ' cover only the files reached by then, in directory order, not the whole tree.\n'
+        printf ' Raise it with --filesizes-secs N.)\n'
+    fi
+    awk '
         {
             n++; t += $1; s = $1
             if      (s == 0)         b = "0"
@@ -640,7 +687,8 @@ filesize_histogram() {
             for (i = 1; i <= m; i++) { k = ord[i]; if (k in c) printf "%-8s %14d %20d\n", k, c[k], z[k] }
             printf "%-8s %14d %20d\n", "TOTAL", n, t
         }
-    '
+    ' "$tmp"
+    rm -f "$tmp" 2>/dev/null
 }
 
 # =============================================================================
@@ -1069,6 +1117,30 @@ run_report() {
     # these two write "permission denied" to stderr and still print their header
     # line to stdout, so discarding stderr would leave a header that reads like
     # "no events" / "no history". Folding it in keeps the reason visible.
+    # The tally comes before the last-100 list on purpose. The list answers "what
+    # is happening now", the tally answers "when did this class start and when did
+    # it stop" — and the second question is the one a recent-only view cannot
+    # answer. A host with no deadman event this month reads identically whether it
+    # never had one or whether they ended in July. This uses the short form of
+    # `zpool events` (one line per event), not -v, so it stays cheap here; the
+    # per-event detail is bundled by zevents_split.
+    probe_pipe_t 180 "zpool events: tally over the whole ring buffer (count, first, last)" zpool \
+        "zpool events 2>/dev/null | awk '
+            BEGIN { split(\"Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec\", mn, \" \")
+                    for (i = 1; i <= 12; i++) M[mn[i]] = i }
+            NF >= 5 && \$3 ~ /^[0-9][0-9][0-9][0-9]\$/ && (\$1 in M) {
+                d = sprintf(\"%04d-%02d-%02d\", \$3, M[\$1], \$2); t++
+                n[\$5]++
+                if (!(\$5 in f) || d < f[\$5]) f[\$5] = d
+                if (!(\$5 in l) || d > l[\$5]) l[\$5] = d
+            }
+            END {
+                if (t == 0) { print \"(no event parsed)\"; exit }
+                printf \"%10s  %-10s %-10s  %s\n\", \"COUNT\", \"FIRST\", \"LAST\", \"CLASS\"
+                for (c in n) printf \"%10d  %-10s %-10s  %s\n\", n[c], f[c], l[c], c
+                printf \"%10d  %-10s %-10s  %s\n\", t, \"\", \"\", \"(total)\"
+            }' | sort -rn || true"
+    fact "note: the tally above covers the whole ring buffer, whose depth is set by zfs_zevent_len_max (section B)"
     probe_pipe_t 60 "zpool events (last 100, stderr folded in)" zpool "zpool events 2>&1 | tail -n 100 || true"
     for p in $ZPOOLS; do
         probe_pipe_t 60 "$p: zpool history (last 200, stderr folded in)" zpool "zpool history '$p' 2>&1 | tail -n 200 || true"
@@ -1157,7 +1229,7 @@ run_report() {
         elif ! find /dev/null -maxdepth 0 -printf '' 2>/dev/null; then
             fact "n/a (find -printf not supported by this build; GNU find is needed)"
         else
-            warn "[Tier2] file-size histogram: walking $fp — metadata-only tree read, bounded to 600s"
+            warn "file-size histogram: walking $fp — metadata-only tree read, bounded to ${FILESIZES_SECS}s (--no-filesizes to skip)"
             progress "walking $fp for the file-size histogram ..."
             fact "path: $fp (single filesystem, -xdev)"
             local fh; fh="$(filesize_histogram "$fp")"
@@ -1165,7 +1237,7 @@ run_report() {
             else fact "n/a (empty output or timed out: 600s)"; fi
         fi
     else
-        fact "n/a (not applicable: --filesizes not given)"
+        fact "n/a (skipped: --no-filesizes was given. This histogram is on by default)"
     fi
 
     emit_footer
@@ -1238,6 +1310,81 @@ report_whatap_paths() {
     fi
 }
 
+# zevents_split DESTDIR -> split `zpool events -v` into a tally and a window.
+#
+# The zevent ring buffer holds every event back to pool creation when
+# zfs_zevent_len_max is large (it is INT_MAX on the XLSMART hosts), so the -v
+# dump is hundreds of MB and cannot travel or live in a repo. But truncating it
+# to a recent window loses the one thing the buffer is good for: **when a class
+# started and when it stopped**. A host with zero deadman events in the last
+# month reads the same whether it never had any or whether they ended in July.
+#
+# So the stream is read ONCE and split three ways:
+#   zpool-events-tally.tsv     class x date x vdev, counted over the whole buffer
+#   zpool-events-overview.tsv  class, count, first date, last date
+#   zpool-events-v.txt         full detail, but only for the last OPT_EVENT_DAYS
+#
+# Reading it once matters: a second pass costs the same minutes again and sees a
+# buffer that has moved.
+zevents_split() {
+    local d="$1" cut=""
+    if [ "$OPT_EVENT_DAYS" -gt 0 ] 2>/dev/null; then
+        # No GNU date -> cut stays empty -> the detail window is "everything".
+        # That is the old behaviour, which is safe, and the tally still works.
+        cut="$(date -u -d "$OPT_EVENT_DAYS days ago" +%Y-%m-%d 2>/dev/null || true)"
+    fi
+    progress "zfs: reading the zevent ring buffer (tally over all of it, detail for ${OPT_EVENT_DAYS}d) ..."
+    run_bounded 600 zpool events -v 2>/dev/null | awk -v CUT="$cut" \
+        -v TALLY="$d/zpool-events-tally.tsv" \
+        -v OVER="$d/zpool-events-overview.tsv" \
+        -v DETAIL="$d/zpool-events-v.txt" '
+        BEGIN {
+            split("Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec", mn, " ")
+            for (i = 1; i <= 12; i++) M[mn[i]] = i
+            kept = 0; seen = 0
+        }
+        # An event header looks like:
+        #   Aug 13 2024 00:44:15.230790956 ereport.fs.zfs.deadman
+        # Everything indented under it belongs to that event.
+        function flush(  key) {
+            if (!inev) return
+            key = cls "\t" date "\t" vdev
+            cnt[key]++
+            n[cls]++
+            if (!(cls in first) || date < first[cls]) first[cls] = date
+            if (!(cls in last)  || date > last[cls])  last[cls]  = date
+            if (keep) { printf "%s", buf > DETAIL; kept++ }
+            inev = 0
+        }
+        /^[A-Z][a-z][a-z] +[0-9]+ [0-9][0-9][0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]\./ {
+            flush()
+            date = sprintf("%04d-%02d-%02d", $3, M[$1], $2)
+            cls = $5; vdev = "-"; seen++
+            keep = (CUT == "" || date >= CUT)
+            buf = $0 "\n"; inev = 1
+            next
+        }
+        inev {
+            buf = buf $0 "\n"
+            if ($1 == "vdev_path") { vdev = $3; gsub(/"/, "", vdev) }
+        }
+        END {
+            flush()
+            printf "class\tdate\tvdev\tcount\n" > TALLY
+            for (k in cnt) printf "%s\t%d\n", k, cnt[k] > TALLY
+            printf "class\tcount\tfirst\tlast\n" > OVER
+            for (c in n) printf "%s\t%d\t%s\t%s\n", c, n[c], first[c], last[c] > OVER
+            printf "# events in the ring buffer: %d\n", seen > OVER
+            printf "# detail kept in zpool-events-v.txt: %d", kept > OVER
+            if (CUT != "") printf " (since %s)\n", CUT > OVER; else printf " (all)\n" > OVER
+        }
+    '
+    # A pool with no events at all leaves no files; say so rather than leaving a
+    # reader to wonder whether the collector skipped the step.
+    [ -f "$d/zpool-events-overview.tsv" ] || printf 'class\tcount\tfirst\tlast\n# no events returned (empty buffer, or permission denied for this uid)\n' > "$d/zpool-events-overview.tsv"
+    [ -f "$d/zpool-events-v.txt" ] || : > "$d/zpool-events-v.txt"
+}
+
 # =============================================================================
 # Bundle (Tier 1 raw artifacts; Tier 2 only when its flag was given)
 # =============================================================================
@@ -1253,7 +1400,7 @@ bundle_zfs() {
         run_bounded 30 zpool iostat -qv       > "$d/zpool-iostat-qv.txt"
         run_bounded 30 zpool iostat -r        > "$d/zpool-iostat-r.txt"
         run_bounded 30 zpool iostat -w        > "$d/zpool-iostat-w.txt"
-        run_bounded 60 zpool events -v        > "$d/zpool-events-v.txt"
+        zevents_split "$d"
         for p in $ZPOOLS; do
             run_bounded 30 zpool get all "$p" > "$d/zpool-get-all-$p.txt"
             run_bounded 60 zpool history "$p" > "$d/zpool-history-$p.txt"

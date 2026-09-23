@@ -7,7 +7,7 @@
 > | Entrypoint | Token | Scope | Status |
 > | ---------- | ----- | ----- | ------ |
 > | [`collect-collserver.sh`](collect-collserver.sh) 0.3.0 | `collserver` | the WhaTap backend itself | **not yet run against a live production yard** — validate once on a staging backend |
-> | [`collect-collzfs.sh`](collect-collzfs.sh) 0.1.0 | `collzfs` | ZFS under the backend's data path | validated non-root on two live hosts (zfs 2.2.2 and 2.2.6), one of them a real collection server with `yardbase` on ZFS; `--zdb` and the root-only probes still unvalidated |
+> | [`collect-collzfs.sh`](collect-collzfs.sh) 0.2.0 | `collzfs` | ZFS under the backend's data path | validated non-root on two live hosts (zfs 2.2.2 and 2.2.6), one of them a real collection server with `yardbase` on ZFS; `--zdb` and the root-only probes still unvalidated |
 > | [`collect-collmysql.sh`](collect-collmysql.sh) 0.4.0 | `collmysql` | the MySQL that holds the backend's `account` / `notihub` metadata | run end to end on MySQL 5.6.51, 5.7.32, 8.4.10 and MariaDB 10.11.19 under a scheduler-shaped write load; a replicating pair, section I on 8.4 and real `iostat` sampling are still unverified |
 >
 > Which one to run: `collect-collserver.sh` for anything about the backend
@@ -187,16 +187,32 @@ One `.txt` report, MECE domains `[0]` + A..N:
 - **K. Underlying block devices** — `lsblk`, `/sys/block/*/queue/*`
   (rotational, scheduler, nr_requests, physical/logical block size, optimal_io_size,
   write_cache), `/dev/disk/by-id` links, `iostat -x`.
-- **L. Pool events, errors & maintenance** — `zpool events`, `zpool history` per
-  pool, the `fm` kstat, zfs-filtered `dmesg`, the `dbgmsg` ring, journal for
-  zfs-* units, and scrub/trim/snapshot automation (systemd timers, cron, sanoid /
-  syncoid / zrepl / zed presence).
+- **L. Pool events, errors & maintenance** — a **tally of `zpool events` over the
+  whole ring buffer** (count, first date, last date per class), then the last 100
+  events, `zpool history` per pool, the `fm` kstat, zfs-filtered `dmesg`, the
+  `dbgmsg` ring, journal for zfs-* units, and scrub/trim/snapshot automation
+  (systemd timers, cron, sanoid / syncoid / zrepl / zed presence).
+
+  The tally covers the whole buffer on purpose. What that buffer answers is **when
+  a class started and when it stopped**, and a recent-only view cannot answer it:
+  a host with no `deadman` event this month reads identically whether it never had
+  one or whether they ended two months ago. On XLSMART `web01-bsd` (2026-09-23)
+  the buffer held 136,337 `deadman` events whose last one was 2026-07-29, and that
+  last date is what decided the case. The per-event **detail** is a separate
+  question and is bundled only for a recent window (`--event-days`, default 30),
+  because the full `-v` dump of that buffer was 192MB.
 - **M. WhaTap collection-server paths → dataset mapping** — for `WHATAP_HOME`,
   `yardbase`, `logs`, `conf`, `db`, `keeperbase`, `logsink`: which filesystem and
   which **dataset** each lives on, that dataset's full property set, and `df`.
   This is the only WhaTap-specific section; backend services, configs and logs
   are `collect-collserver.sh`'s job.
-- **N. Deep block & metaslab statistics** — opt-in only (see tiers).
+- **N. Deep block & metaslab statistics** — `zdb` is opt-in (see tiers). The
+  **file-size histogram under `yardbase` is on by default** since 0.2.0: it reads
+  metadata only (`find -printf '%s'`), and `recordsize` cannot be judged without
+  knowing what size the workload actually writes. It was opt-in until 0.1.0 and so
+  was missing from the runs that needed it. A walk that hits its bound
+  (`--filesizes-secs`, default 300) is labelled `PARTIAL` instead of being passed
+  off as a complete tree. `--no-filesizes` skips it.
 
 Values are **discovered, not assumed**; an absent value is reported as
 `n/a (<why>)`. A tunable that does not exist in the installed build is reported as
