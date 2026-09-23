@@ -41,7 +41,7 @@ export LC_ALL=C
 
 # ---- collector metadata -----------------------------------------------------
 COLLECTOR_NAME="whatap-k8s"
-VERSION="0.4.4"
+VERSION="0.5.0"
 DOMAIN="k8s"
 TARGET="k8s-cluster/unresolved"      # refined after CLI/context/namespace discovery
 
@@ -258,7 +258,11 @@ emit_status() {
     done <<EOF
 $_goal_keys
 EOF
-    section "Collection status"
+    # Most collectors' `section` takes (TITLE) and numbers it automatically. A
+    # few take (LETTER, TITLE) because their sections are lettered by hand; those
+    # set STATUS_LABEL to the letter they want this roll-up to carry.
+    if [ -n "${STATUS_LABEL:-}" ]; then section "$STATUS_LABEL" "Collection status"
+    else section "Collection status"; fi
     fact "goals: $total declared, $obtained obtained, $((total - obtained)) not obtained"
     [ -n "$oks" ] && fact "obtained:${oks%,}"
     if [ "$obtained" -eq "$total" ]; then
@@ -603,6 +607,9 @@ pick_sample_pods() {
 # =============================================================================
 run_report() {
     emit_header
+
+    goal api "Kubernetes API reachable"
+    goal cr  "WhatapAgent CR"
 
     section "Collection environment"
     fact "collector: $COLLECTOR_NAME $VERSION"
@@ -1439,6 +1446,13 @@ run_report() {
         [ "${#APM_TGTS[@]}" -gt 5 ] && fact "targets capped: first 5 of ${#APM_TGTS[@]} processed"
     fi
 
+    if [ -n "$KCTL_BIN" ] && run_k version --request-timeout=5s >/dev/null 2>&1; then got api
+    elif [ -z "$KCTL_BIN" ]; then missed api "command not found: kubectl (and no oc)"
+    else missed api "kubectl found but the API did not answer (see section A for the reason)"; fi
+    if [ "${#CR_NAMES[@]}" -gt 0 ]; then got cr
+    else missed cr "no WhatapAgent CR found in any namespace"; fi
+
+    emit_status
     emit_footer
 }
 

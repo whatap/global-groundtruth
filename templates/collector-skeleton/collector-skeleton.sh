@@ -198,7 +198,11 @@ emit_status() {
     done <<EOF
 $_goal_keys
 EOF
-    section "Collection status"
+    # Most collectors' `section` takes (TITLE) and numbers it automatically. A
+    # few take (LETTER, TITLE) because their sections are lettered by hand; those
+    # set STATUS_LABEL to the letter they want this roll-up to carry.
+    if [ -n "${STATUS_LABEL:-}" ]; then section "$STATUS_LABEL" "Collection status"
+    else section "Collection status"; fi
     fact "goals: $total declared, $obtained obtained, $((total - obtained)) not obtained"
     [ -n "$oks" ] && fact "obtained:${oks%,}"
     if [ "$obtained" -eq "$total" ]; then

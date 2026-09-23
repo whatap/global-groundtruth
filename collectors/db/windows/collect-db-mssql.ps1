@@ -24,7 +24,7 @@ param(
 )
 
 $COLLECTOR_NAME = "whatap-db-mssql"
-$VERSION        = "0.1.0"
+$VERSION        = "0.2.0"
 $DOMAIN         = "db"
 $TARGET         = "db-host/$env:COMPUTERNAME"
 
@@ -64,6 +64,59 @@ function Section([string]$t) {
     Emit ""
     Emit ("[{0}] {1}" -f $script:SectionN, $t)
     if (-not $Quiet) { Write-Host ">> [$script:SectionN] $t" }
+}
+
+# ---- collection completeness — DO NOT EDIT ----------------------------------
+# A collector knows, at the host, whether it obtained what it came for. Saying so
+# is a fact about THIS COLLECTION RUN, not a claim about the environment, so it
+# stays inside CONTRACT rule 1 ("Saying whether the collection worked").
+#
+# Why it exists. A report full of "n/a (permission denied)" reads as finished to
+# an operator whose console only said ">> done.". They package it and send it,
+# and the gap surfaces days later in another time zone. Real case: two of three
+# collection-server bundles came back carrying no conf at all (Smartfren,
+# 2026-09-23). Every fact needed to catch that was already on the host.
+#
+# This is the PowerShell port of the shell block in
+# templates/collector-skeleton/collector-skeleton.sh. Keep the two in step.
+$script:Goals = [ordered]@{}   # key -> label
+$script:Oks   = @{}            # key -> $true
+$script:Gaps  = @{}            # key -> reason
+
+function Add-Goal([string]$key, [string]$label) { $script:Goals[$key] = $label }
+function Set-Got([string]$key)                  { $script:Oks[$key] = $true }
+function Set-Missed([string]$key, [string]$why) { $script:Gaps[$key] = $why }
+
+# Notice: like Progress, but NOT silenced by -Quiet. The one line that decides
+# whether a run is worth sending is not narration; an automated caller wants it.
+function Notice([string]$s) { Write-Host ">> $s" }
+
+function Emit-Status {
+    if ($script:Goals.Count -eq 0) { return }
+    $total = $script:Goals.Count
+    $ok    = @($script:Goals.Keys | Where-Object { $script:Oks.ContainsKey($_) })
+    $gapKeys = @($script:Goals.Keys | Where-Object { -not $script:Oks.ContainsKey($_) })
+    Section "Collection status"
+    Fact ("goals: {0} declared, {1} obtained, {2} not obtained" -f $total, $ok.Count, $gapKeys.Count)
+    if ($ok.Count -gt 0) {
+        Fact ("obtained: " + (($ok | ForEach-Object { $script:Goals[$_] }) -join ", "))
+    }
+    if ($gapKeys.Count -eq 0) {
+        Fact "status: COMPLETE"
+        Notice ("status: COMPLETE — {0} of {1} goals obtained" -f $ok.Count, $total)
+    } else {
+        Fact "not obtained:"
+        foreach ($k in $gapKeys) {
+            $why = if ($script:Gaps.ContainsKey($k)) { $script:Gaps[$k] } else { "not reached" }
+            Fact ("    {0} — {1}" -f $script:Goals[$k], $why)
+        }
+        Fact "status: INCOMPLETE"
+        Notice ("status: INCOMPLETE — {0} of {1} goals not obtained" -f $gapKeys.Count, $total)
+        foreach ($k in $gapKeys) {
+            $why = if ($script:Gaps.ContainsKey($k)) { $script:Gaps[$k] } else { "not reached" }
+            Notice ("  {0} — {1}" -f $script:Goals[$k], $why)
+        }
+    }
 }
 function TryFact([string]$label, [scriptblock]$sb) {
     try { FactBlock $label (& $sb) }
@@ -133,6 +186,11 @@ Emit ("Timestamp(UTC): {0}" -f (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd
 Emit ("Domain:         {0}" -f $DOMAIN)
 Emit ("Target:         {0}" -f $TARGET)
 Emit "==============================================="
+
+# What this run is for. Resolved just before Emit-Status, where the discovery
+# variables are final.
+Add-Goal install  "whatap agent install dir"
+Add-Goal instance "agent instance (a dir holding whatap.conf)"
 
 Section "Collection environment"
 Fact "powershell: $($PSVersionTable.PSVersion)"
@@ -246,6 +304,11 @@ Fact "run windows\mssql.sql via sqlcmd with the monitoring account and paste its
 Fact "  sqlcmd -S <db_ip>,<db_port> -U <monitoring_user> -P *** -i mssql.sql -o mssql-facts.txt"
 
 Emit ""
+if ($homes.Count -gt 0) { Set-Got install }
+else { Set-Missed install "no whatap agent process found and no -Home given" }
+if ($instances.Count -gt 0) { Set-Got instance }
+else { Set-Missed instance "no directory holding whatap.conf under any discovered install dir" }
+Emit-Status
 Emit "==== END OF COLLECTION (no diagnosis by design) ===="
 
 # ---- output --------------------------------------------------------------------

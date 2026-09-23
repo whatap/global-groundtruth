@@ -72,6 +72,48 @@ each to appear in the collector's output:
 > emitted by the shared `section` helper and is purely positional. Both name
 > the same section — when cross-referencing, prefer the letter.
 
+## Collection status (last section)
+
+Every report ends, just before the footer, with a roll-up of what the run came
+for and whether it got it:
+
+```
+[12] Collection status
+    goals: 4 declared, 2 obtained, 2 not obtained
+    obtained: running whatap modules, log inventory
+    not obtained:
+        WHATAP_HOME contents — uid 3103 cannot reach /data/whatap
+        module configs — uid 3103 cannot reach /data/whatap
+    status: INCOMPLETE
+```
+
+The same gaps are repeated on **stderr**, and that repetition is **not**
+silenced by `--quiet`, so the operator sees them while still logged in to the
+host. A report can be full of `n/a (...)` and still look finished to someone
+whose console only said `>> done.`.
+
+This is a fact about the run, not about the environment, so it does not cross
+CONTRACT rule 1 — see CONTRACT.md, "Saying whether the collection worked".
+`validate.sh` fails a collector that declares no goals or never calls
+`emit_status` (`Emit-Status` in PowerShell).
+
+Authors declare goals at the top of the report body and resolve each exactly
+once:
+
+```sh
+goal   conf "module configs"
+got    conf
+missed conf "uid 3103 cannot reach /data/whatap"
+```
+
+Keep the list short. A goal is something whose absence makes the report not
+worth sending — not every value the collector happens to print. Resolve goals
+where the discovery variables are final, not inside a `| while` pipeline: that
+runs in a subshell and the assignment does not survive.
+
+The helper block is identical in every collector and owned by the skeleton.
+`tools/sync-shared-block.sh --check` reports drift; `--apply` re-copies it.
+
 ## Footer
 
 The last line is **exactly**:

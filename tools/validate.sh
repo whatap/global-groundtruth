@@ -90,7 +90,24 @@ for f in "${targets[@]}"; do
     grep -v '^[[:space:]]*#' "$f" | grep -qF "$FOOTER" \
         || problems+=("missing exact footer line on a non-comment line: $FOOTER")
 
-    # (3) judgment words in emitted lines (exclude comments + footer sentinel,
+    # (3) the completeness roll-up: a collector must declare what it came for and
+    #     say whether it got it (CONTRACT, "Saying whether the collection worked").
+    #     Shell only — the PowerShell collectors carry their own port of the block
+    #     and are checked by the Emit-Status name instead.
+    case "$bn" in
+        *.ps1)
+            grep -v '^[[:space:]]*#' "$f" | grep -qF 'Emit-Status' \
+                || problems+=("no completeness roll-up: nothing calls Emit-Status")
+            grep -v '^[[:space:]]*#' "$f" | grep -qE '^\s*Add-Goal' \
+                || problems+=("no goals declared: nothing calls Add-Goal") ;;
+        *)
+            grep -v '^[[:space:]]*#' "$f" | grep -qE '(^|[[:space:]])emit_status([[:space:]]|$)' \
+                || problems+=("no completeness roll-up: nothing calls emit_status")
+            grep -v '^[[:space:]]*#' "$f" | grep -qE '(^|[[:space:]])goal[[:space:]]' \
+                || problems+=("no goals declared: nothing calls goal") ;;
+    esac
+
+    # (4) judgment words in emitted lines (exclude comments + footer sentinel,
     #     keeping the file's true line numbers). .NET identifiers containing
     #     "Diagnostics" are stripped first (line structure is preserved, so
     #     grep -n line numbers stay true).

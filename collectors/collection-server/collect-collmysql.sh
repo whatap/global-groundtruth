@@ -27,8 +27,12 @@
 export LC_ALL=C
 
 # ---- collector metadata -----------------------------------------------------
+# 0.5.0  Collection status section + operator notice on stderr. Goals: mysql
+#        login, host-side facts, and binary log attribution when --binlog is
+#        given. The binlog n/a reason now separates "path not resolved" from
+#        "path not readable" — they are answered by different things.
 COLLECTOR_NAME="whatap-collection-server-mysql"
-VERSION="0.4.0"
+VERSION="0.5.0"
 DOMAIN="collection-server"
 TARGET="collection-server-mysql/$(hostname 2>/dev/null || echo unknown)"
 
@@ -209,7 +213,11 @@ emit_status() {
     done <<EOF
 $_goal_keys
 EOF
-    section "Collection status"
+    # Most collectors' `section` takes (TITLE) and numbers it automatically. A
+    # few take (LETTER, TITLE) because their sections are lettered by hand; those
+    # set STATUS_LABEL to the letter they want this roll-up to carry.
+    if [ -n "${STATUS_LABEL:-}" ]; then section "$STATUS_LABEL" "Collection status"
+    else section "Collection status"; fi
     fact "goals: $total declared, $obtained obtained, $((total - obtained)) not obtained"
     [ -n "$oks" ] && fact "obtained:${oks%,}"
     if [ "$obtained" -eq "$total" ]; then
@@ -350,6 +358,16 @@ _resolve_mysql() {
 run_report() {
     emit_header
 
+    # This collector's sections are lettered by hand, so the roll-up carries one too.
+    STATUS_LABEL=Z
+
+    # Nearly everything here comes from SQL, so the login is the goal that
+    # decides whether a run answers anything at all. `binlog` is declared only
+    # when it was asked for: without --binlog its absence is a choice, not a gap.
+    goal login  "mysql login"
+    goal host   "host-side facts (process, sockets, disk)"
+    [ "$OPT_BINLOG" = 1 ] && goal binlog "binary log content attribution"
+
     section 0 "Collection environment"
     fact "bash: ${BASH_VERSION:-unknown}"
     fact "uid: $(id -u 2>/dev/null || echo unknown)"
@@ -360,6 +378,7 @@ run_report() {
     done
     fact "mysql client: ${MYSQL_BIN:-n/a (command not found)}"
     fact "mysql connection: $MYSQL_WHY"
+    if [ "$MYSQL_OK" = 1 ]; then got login; else missed login "$MYSQL_WHY"; fi
     fact "binlog decode tier: $([ "$OPT_BINLOG" = 1 ] && echo "on (newest $BINLOG_FILES files)" || echo "off")"
     fact "sampling tier: $([ "$OPT_SAMPLE" = 1 ] && echo "on (${SAMPLE_SEC}s x ${SAMPLE_COUNT})" || echo "off")"
 
@@ -386,6 +405,10 @@ run_report() {
     probe "listening sockets" sh -c \
         "command -v ss >/dev/null || command -v netstat >/dev/null || { echo 'command not found: ss, netstat' >&2; exit 3; }; \
          { ss -lntp 2>/dev/null || netstat -lntp 2>/dev/null; } | grep -E ':3306|:33060'; true"
+    # These two are the part that survives a failed login, so they are their own
+    # goal: a run with no SQL at all is still worth sending if they came back.
+    if have ps || have ss || have netstat; then got host
+    else missed host "no ps, ss or netstat on this host"; fi
 
     section B "HA and replication"
     sql  "binlog_format"       "SELECT @@binlog_format"
@@ -515,14 +538,24 @@ run_report() {
         fact "n/a (not requested: pass --binlog to enable)"
     elif ! have mysqlbinlog; then
         fact "n/a (command not found: mysqlbinlog)"
-    elif [ -z "$BINLOG_DIR" ] || [ ! -r "$BINLOG_DIR" ]; then
-        fact "n/a (binary log directory not readable from this host)"
+        missed binlog "command not found: mysqlbinlog"
+    elif [ -z "$BINLOG_DIR" ]; then
+        # Splitting these two matters: an unresolved path is answered by getting
+        # a login, an unreadable one by getting a different account. The old
+        # wording covered both and answered neither (Smartfren, 2026-09-23).
+        fact "n/a (binary log directory not resolved: log_bin_basename and datadir both unavailable)"
+        missed binlog "binary log directory not resolved (log_bin_basename and datadir unavailable)"
+    elif [ ! -r "$BINLOG_DIR" ]; then
+        fact "n/a (binary log directory $BINLOG_DIR not readable by uid $(id -u 2>/dev/null || echo '?'))"
+        missed binlog "$BINLOG_DIR not readable by uid $(id -u 2>/dev/null || echo '?')"
     else
         fact "decoding the $BINLOG_FILES newest binary logs under $BINLOG_DIR"
         _bl_list="$(ls -1t "$BINLOG_DIR" 2>/dev/null | grep -E '\.[0-9]{6}$' | head -n "$BINLOG_FILES")"
         if [ -z "$_bl_list" ]; then
             fact "n/a (no binary log files matched under $BINLOG_DIR)"
+            missed binlog "no binary log files matched under $BINLOG_DIR"
         else
+            got binlog
             for _bl in $_bl_list; do
                 _path="$BINLOG_DIR/$_bl"
                 _bytes="$(ls -l "$_path" 2>/dev/null | awk '{print $5}')"
@@ -606,6 +639,7 @@ run_report() {
             "journalctl -u mysql -u mysqld -u mariadb -n 60 --no-pager 2>/dev/null"
     fi
 
+    emit_status
     emit_footer
 }
 

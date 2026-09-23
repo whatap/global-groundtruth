@@ -99,7 +99,7 @@ export LC_ALL=C
 
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-apmjava"
-VERSION="0.9.0"
+VERSION="0.10.0"
 DOMAIN="apm/java"
 TARGET="host/$(hostname 2>/dev/null || echo unknown)"
 
@@ -313,7 +313,11 @@ emit_status() {
     done <<EOF
 $_goal_keys
 EOF
-    section "Collection status"
+    # Most collectors' `section` takes (TITLE) and numbers it automatically. A
+    # few take (LETTER, TITLE) because their sections are lettered by hand; those
+    # set STATUS_LABEL to the letter they want this roll-up to carry.
+    if [ -n "${STATUS_LABEL:-}" ]; then section "$STATUS_LABEL" "Collection status"
+    else section "Collection status"; fi
     fact "goals: $total declared, $obtained obtained, $((total - obtained)) not obtained"
     [ -n "$oks" ] && fact "obtained:${oks%,}"
     if [ "$obtained" -eq "$total" ]; then
@@ -1168,6 +1172,12 @@ $pid|$_IS_JVM_WHY"
 # ---- report body ---------------------------------------------------------------
 run_report() {
     emit_header
+
+    # Without an agent on disk and a config to read, nothing downstream can be
+    # settled remotely. Both are resolved just before emit_status, where the
+    # discovery variables are final.
+    goal agent "whatap agent artifacts on disk"
+    goal conf  "agent configuration"
 
     # [1] capability preamble: every downstream "command not found" is
     # pre-explained here.
@@ -2433,6 +2443,20 @@ EOF_DUMPS
         fi
     fi
 
+    # Resolved here, not at the point of use: the config dumps above run inside
+    # `| while` pipelines, and an assignment made in a subshell does not survive.
+    if [ -n "$D_HOMES" ] || [ -n "$D_AGENT_JARS" ]; then got agent
+    else missed agent "no agent jar or agent home discovered on disk or in any JVM command line"; fi
+    _cseen=0
+    for _h in $(printf '%s\n' "$D_HOMES" | cut -d'|' -f1 | sort -u); do
+        [ -n "$_h" ] || continue
+        _fh="$(resolve_fs "$_h")"; [ -n "$_fh" ] || continue
+        [ -r "$_fh/whatap.conf" ] && _cseen=1
+    done
+    if [ "$_cseen" = 1 ]; then got conf
+    else missed conf "no readable whatap.conf under any discovered agent home"; fi
+
+    emit_status
     emit_footer
 }
 

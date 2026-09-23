@@ -57,7 +57,7 @@ export LC_ALL=C
 
 # ---- collector metadata -----------------------------------------------------
 COLLECTOR_NAME="whatap-collection-server-zfs"
-VERSION="0.2.0"
+VERSION="0.3.0"
 DOMAIN="collection-server"
 TARGET="collection-server-zfs/$(hostname 2>/dev/null || echo unknown)"   # refined after pool discovery
 
@@ -295,7 +295,11 @@ emit_status() {
     done <<EOF
 $_goal_keys
 EOF
-    section "Collection status"
+    # Most collectors' `section` takes (TITLE) and numbers it automatically. A
+    # few take (LETTER, TITLE) because their sections are lettered by hand; those
+    # set STATUS_LABEL to the letter they want this roll-up to carry.
+    if [ -n "${STATUS_LABEL:-}" ]; then section "$STATUS_LABEL" "Collection status"
+    else section "Collection status"; fi
     fact "goals: $total declared, $obtained obtained, $((total - obtained)) not obtained"
     [ -n "$oks" ] && fact "obtained:${oks%,}"
     if [ "$obtained" -eq "$total" ]; then
@@ -795,6 +799,9 @@ filesize_histogram() {
 run_report() {
     emit_header
 
+    goal zfs   "ZFS present on this host"
+    goal pools "pool topology and properties"
+
     # -- [0] Collection environment -------------------------------------------
     section "Collection environment"
     fact "collector: $COLLECTOR_NAME $VERSION"
@@ -822,6 +829,12 @@ run_report() {
         fact "sections B..L of this collector cover ZFS only and are omitted for the same reason"
         section "M. WhaTap collection-server paths"
         report_whatap_paths
+        # This early return is exactly the case the status is for: a host with no
+        # ZFS produces a short, tidy-looking report that answers none of the
+        # questions this collector exists for. Say so before leaving.
+        missed zfs "no zfs/zpool command and no $KSTAT_DIR on this host"
+        missed pools "sections B..L cover ZFS only and were omitted"
+        emit_status
         emit_footer
         return
     fi
@@ -1338,6 +1351,12 @@ run_report() {
         fact "n/a (skipped: --no-filesizes was given. This histogram is on by default)"
     fi
 
+    if [ "$ZFS_ON_HOST" = 1 ]; then got zfs
+    else missed zfs "no zfs/zpool command and no kstat tree on this host"; fi
+    if [ "$ZPOOL_COUNT" -gt 0 ] 2>/dev/null; then got pools
+    else missed pools "zpool list returned no pools (none imported, or not permitted for uid $(id -u 2>/dev/null || echo '?'))"; fi
+
+    emit_status
     emit_footer
 }
 

@@ -33,7 +33,7 @@ export LC_ALL=C
 
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-db"
-VERSION="0.1.0"
+VERSION="0.2.0"
 DOMAIN="db"
 TARGET="db-host/$(hostname 2>/dev/null || echo unknown)"
 
@@ -210,7 +210,11 @@ emit_status() {
     done <<EOF
 $_goal_keys
 EOF
-    section "Collection status"
+    # Most collectors' `section` takes (TITLE) and numbers it automatically. A
+    # few take (LETTER, TITLE) because their sections are lettered by hand; those
+    # set STATUS_LABEL to the letter they want this roll-up to carry.
+    if [ -n "${STATUS_LABEL:-}" ]; then section "$STATUS_LABEL" "Collection status"
+    else section "Collection status"; fi
     fact "goals: $total declared, $obtained obtained, $((total - obtained)) not obtained"
     [ -n "$oks" ] && fact "obtained:${oks%,}"
     if [ "$obtained" -eq "$total" ]; then
@@ -726,6 +730,8 @@ sample_in_win() { # LABEL ERE [N] -> first N matching lines, verbatim
 # ---- report body ----------------------------------------------------------------
 run_report() {
     emit_header
+
+    goal components "whatap DB-monitoring components on this host"
 
     # [1] capability preamble — makes downstream "command not found" self-evident
     section "Collection environment"
@@ -1335,6 +1341,10 @@ $(_run_jdbc_pack "$pack" "$alturl" "$jar")"
         fi
     fi
 
+    if [ "${#AG_PIDS[@]}" -gt 0 ]; then got components
+    else missed components "no dbx/dmx/prx/dbxc process found on this host (see section B for the host role)"; fi
+
+    emit_status
     emit_footer
 }
 

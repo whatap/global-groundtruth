@@ -39,7 +39,7 @@ export LC_ALL=C
 
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-nms"
-VERSION="0.3.0"
+VERSION="0.4.0"
 DOMAIN="nms"
 TARGET="host/$(hostname 2>/dev/null || echo unknown)"
 
@@ -205,7 +205,11 @@ emit_status() {
     done <<EOF
 $_goal_keys
 EOF
-    section "Collection status"
+    # Most collectors' `section` takes (TITLE) and numbers it automatically. A
+    # few take (LETTER, TITLE) because their sections are lettered by hand; those
+    # set STATUS_LABEL to the letter they want this roll-up to carry.
+    if [ -n "${STATUS_LABEL:-}" ]; then section "$STATUS_LABEL" "Collection status"
+    else section "Collection status"; fi
     fact "goals: $total declared, $obtained obtained, $((total - obtained)) not obtained"
     [ -n "$oks" ] && fact "obtained:${oks%,}"
     if [ "$obtained" -eq "$total" ]; then
@@ -376,6 +380,8 @@ NMS_UNITS="uvicorn nmscore icmptcphealthd icmphealthd"
 # ---- report body ---------------------------------------------------------------
 run_report() {
     emit_header
+
+    goal install "NMS installation on disk"
 
     # [1] capability preamble — pre-explains every downstream "command not found"
     section "Collection environment"
@@ -721,6 +727,10 @@ run_report() {
         fi
     fi
 
+    if [ -n "$NMS_ROOT" ]; then got install
+    else missed install "whatap-nms install root not found (package scan, process scan and /usr/share/whatap-nms all empty)"; fi
+
+    emit_status
     emit_footer
 }
 
