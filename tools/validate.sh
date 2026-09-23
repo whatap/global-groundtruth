@@ -22,6 +22,13 @@
 #       line before this scan: they are proper names a .NET collector must
 #       emit as facts, not judgment prose. The prose words "diagnose /
 #       diagnosis / diagnostic(s)" outside such identifiers still fail.
+#   (3b) a PowerShell collector does not parse. `bash -n` has no counterpart for
+#        .ps1, so this runs the PowerShell parser when `pwsh` is present. When it
+#        is not, the line "~ not checked" is printed instead: a check that could
+#        not run is not a check that passed. On Linux, pwsh installs without root:
+#          curl -sSL <PowerShell release>/powershell-<ver>-linux-x64.tar.gz | \
+#            tar -xz -C ~/.local/share/powershell-dist
+#          ln -s ~/.local/share/powershell-dist/pwsh ~/.local/bin/pwsh
 #   (4) its filename is not collect-<token>.sh (or .ps1) — the required
 #       entrypoint name,
 #       so collectors never collide when copied side by side or into a shared
@@ -69,6 +76,7 @@ for f in "${targets[@]}"; do
     [ "$bn" = "validate.sh" ] && continue
 
     problems=()
+    skipped=()
 
     # (0) entrypoint naming: collect-<token>.sh, never a bare collect.sh, so
     #     collectors never collide when copied side by side or into a shared bin/.
@@ -89,6 +97,25 @@ for f in "${targets[@]}"; do
     # (2) exact footer sentinel — same non-comment rule
     grep -v '^[[:space:]]*#' "$f" | grep -qF "$FOOTER" \
         || problems+=("missing exact footer line on a non-comment line: $FOOTER")
+
+    # (2b) PowerShell collectors: parse them. `bash -n` has no counterpart here,
+    #      so before pwsh was available on a reviewer's machine a .ps1 could ship
+    #      with a syntax error that no check would catch. Skipped, with a line
+    #      saying so, when pwsh is absent — a missing tool must not silently
+    #      turn into a pass.
+    case "$bn" in
+        *.ps1)
+            if command -v pwsh >/dev/null 2>&1; then
+                perr="$(pwsh -NoProfile -Command "
+                    \$e = \$null
+                    \$null = [System.Management.Automation.Language.Parser]::ParseFile('$(cd "$(dirname "$f")" && pwd)/$bn', [ref]\$null, [ref]\$e)
+                    if (\$e) { \$e | ForEach-Object { 'line ' + \$_.Extent.StartLineNumber + ': ' + \$_.Message } }
+                " 2>&1)"
+                [ -n "$perr" ] && while IFS= read -r l; do problems+=("powershell parse error -> $l"); done <<< "$perr"
+            else
+                skipped+=("powershell parse (pwsh not installed)")
+            fi ;;
+    esac
 
     # (3) the completeness roll-up: a collector must declare what it came for and
     #     say whether it got it (CONTRACT, "Saying whether the collection worked").
@@ -128,6 +155,8 @@ for f in "${targets[@]}"; do
         for p in "${problems[@]}"; do echo "      - $p"; done
         rc=1
     fi
+    # A check that could not run is not a check that passed. Say which.
+    for sk in ${skipped[@]+"${skipped[@]}"}; do echo "      ~ not checked: $sk"; done
 done
 
 exit $rc
