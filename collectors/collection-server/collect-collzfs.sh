@@ -57,7 +57,7 @@ export LC_ALL=C
 
 # ---- collector metadata -----------------------------------------------------
 COLLECTOR_NAME="whatap-collection-server-zfs"
-VERSION="0.3.0"
+VERSION="0.4.0"
 DOMAIN="collection-server"
 TARGET="collection-server-zfs/$(hostname 2>/dev/null || echo unknown)"   # refined after pool discovery
 
@@ -71,6 +71,12 @@ OPT_HOME=""
 OPT_HOURS=24         # journal window
 OPT_SAMPLE=0         # Tier 1: interval iostat/arcstat samples
 SAMPLE_SECS=10
+# Block-layer sampling bucket, in seconds. `iostat -x` with no interval prints
+# the average since boot, which on a long-lived host averages a busy hour into a
+# year and reads as idle. A reader cannot tell the two apart from the output, so
+# --sample takes buckets too and keeps every one of them: a peak that a single
+# window would average away stays visible as one tall bucket.
+IOSTAT_BUCKET=5
 OPT_ZDB=0            # Tier 2: zdb -C / -Lbbbs / -mm
 # File-size histogram. On by default since 0.2.0: it is the only thing in this
 # collector that says what size the workload actually writes, and recordsize
@@ -117,8 +123,13 @@ explicit action flag (--file / --stdout / --bundle) so nothing starts by acciden
 
   Tier 1 sampling (read-only; costs wall-clock, not disk load):
   collect-collzfs.sh --file --sample[=SEC]  add interval samples of zpool iostat
-                                            -lqv / -r / -w and arcstat
-                                            (default SEC=10; adds about 6 x SEC seconds)
+                                            -lqv / -r / -w, arcstat, and iostat -x
+                                            in 5s buckets over 3 x SEC seconds
+                                            (default SEC=10; adds about 9 x SEC seconds)
+                                            Without this, every block-layer number
+                                            (%util, await, aqu-sz) is the average
+                                            since boot and cannot answer "is the
+                                            device busy now".
 
   File-size histogram (on by default since 0.2.0). recordsize cannot be judged
   without knowing what size the workload actually writes, so this is no longer
@@ -1207,6 +1218,17 @@ run_report() {
             "zpool iostat -w ${SAMPLE_SECS} 2 2>/dev/null | head -n 500 || true"
         progress "sampling arcstat over ${SAMPLE_SECS}s ..."
         probe_pipe_t "$st" "arcstat 1 ${SAMPLE_SECS}" arcstat "arcstat 1 ${SAMPLE_SECS} 2>/dev/null || true"
+        # Block layer, bucketed. J's `iostat -x` is the since-boot average and
+        # says nothing about now; these buckets do. Both are kept because the
+        # since-boot one still serves device-to-device comparison over the same
+        # span. The first block printed here is the since-boot one again — the
+        # interval blocks are the ones after it.
+        local ic=$(( SAMPLE_SECS * 3 / IOSTAT_BUCKET + 1 ))
+        [ "$ic" -lt 2 ] && ic=2
+        progress "sampling iostat -x in ${IOSTAT_BUCKET}s buckets over $(( (ic - 1) * IOSTAT_BUCKET ))s ..."
+        probe_pipe_t $(( ic * IOSTAT_BUCKET + 30 )) \
+            "iostat -x ${IOSTAT_BUCKET} ${ic} (first block is since boot; the rest are ${IOSTAT_BUCKET}s intervals)" \
+            iostat "iostat -x ${IOSTAT_BUCKET} ${ic} 2>/dev/null || true"
         progress "sampling txgs delta over ${SAMPLE_SECS}s ..."
         for kd in "$KSTAT_DIR"/*/; do
             [ -d "$kd" ] || continue
@@ -1646,6 +1668,13 @@ bundle_sample() {
     run_bounded $((SAMPLE_SECS * 3 + 30)) zpool iostat -r "$SAMPLE_SECS" 2   > "$d/iostat-r.txt"
     run_bounded $((SAMPLE_SECS * 3 + 30)) zpool iostat -w "$SAMPLE_SECS" 2   > "$d/iostat-w.txt"
     have arcstat && run_bounded $((SAMPLE_SECS * 3 + 30)) arcstat 1 "$SAMPLE_SECS" > "$d/arcstat.txt"
+    if have iostat; then
+        local ic=$(( SAMPLE_SECS * 3 / IOSTAT_BUCKET + 1 ))
+        [ "$ic" -lt 2 ] && ic=2
+        progress "sample: iostat -x in ${IOSTAT_BUCKET}s buckets over $(( (ic - 1) * IOSTAT_BUCKET ))s ..."
+        run_bounded $(( ic * IOSTAT_BUCKET + 30 )) iostat -x "$IOSTAT_BUCKET" "$ic" \
+            > "$d/iostat-x-interval.txt"
+    fi
     progress "sample: written"
 }
 
