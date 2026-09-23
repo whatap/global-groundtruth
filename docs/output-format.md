@@ -79,13 +79,37 @@ for and whether it got it:
 
 ```
 [12] Collection status
-    goals: 4 declared, 2 obtained, 2 not obtained
+    goals: 5 declared, 2 obtained, 1 not applicable here, 2 blocked
     obtained: running whatap modules, log inventory
-    not obtained:
+    not applicable to this host (this is an answer, not a gap):
+        yard data path — this host runs no yard
+    blocked (running this differently would obtain these):
         WHATAP_HOME contents — uid 3103 cannot reach /data/whatap
         module configs — uid 3103 cannot reach /data/whatap
     status: INCOMPLETE
 ```
+
+### Three outcomes, not two
+
+The status answers one question for the operator: **send this, or change
+something and run again?** So an absence is split.
+
+| outcome | meaning | effect |
+|---|---|---|
+| `got` | obtained | — |
+| `na` | legitimately absent. It IS the answer, and no re-run changes it | still COMPLETE |
+| `missed` | this run was blocked. Running it differently would obtain the value | INCOMPLETE |
+
+`na` covers the normal shape of a host: no ZFS on a host that does not use ZFS,
+no DBX component on a database host, no binary logs when `log_bin` is off, no
+agent on a machine where the product is not installed. `missed` covers a
+permission, a missing tool, a timeout, an unreadable path.
+
+**Getting this wrong in the `missed` direction is the expensive mistake.** A
+collector that marks an ordinary environment INCOMPLETE teaches the field to
+ignore the line, and then it protects nothing. When unsure, look at whether a
+second run — as another user, with another flag, from another host — would
+change the outcome. If not, it is `na`.
 
 The same gaps are repeated on **stderr**, and that repetition is **not**
 silenced by `--quiet`, so the operator sees them while still logged in to the
@@ -102,9 +126,12 @@ once:
 
 ```sh
 goal   conf "module configs"
-got    conf
-missed conf "uid 3103 cannot reach /data/whatap"
+got    conf                                      # obtained
+na     conf "WhaTap is not installed on this host" # the answer; still COMPLETE
+missed conf "uid 3103 cannot reach /data/whatap"   # blocked; INCOMPLETE
 ```
+
+In PowerShell the same three are `Set-Got`, `Set-Na` and `Set-Missed`.
 
 Keep the list short. A goal is something whose absence makes the report not
 worth sending — not every value the collector happens to print. Resolve goals

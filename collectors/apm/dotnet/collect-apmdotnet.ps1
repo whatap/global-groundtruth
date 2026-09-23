@@ -118,12 +118,20 @@ function Section([string]$t) {
 #
 # This is the PowerShell port of the shell block in
 # templates/collector-skeleton/collector-skeleton.sh. Keep the two in step.
+# Three outcomes, not two. The status answers one question: send this, or change
+# something and run again? An absence is Set-Na when it IS the answer and no
+# re-run would change it (the product is not installed here); it is Set-Missed
+# when this run was blocked and running it differently would obtain the value.
+# Only Set-Missed makes a run INCOMPLETE — marking a normal environment
+# INCOMPLETE would teach the field to ignore the line.
 $script:Goals = [ordered]@{}   # key -> label
 $script:Oks   = @{}            # key -> $true
-$script:Gaps  = @{}            # key -> reason
+$script:Nas   = @{}            # key -> reason it does not apply here
+$script:Gaps  = @{}            # key -> reason this run was blocked
 
 function Add-Goal([string]$key, [string]$label) { $script:Goals[$key] = $label }
 function Set-Got([string]$key)                  { $script:Oks[$key] = $true }
+function Set-Na([string]$key, [string]$why)     { $script:Nas[$key] = $why }
 function Set-Missed([string]$key, [string]$why) { $script:Gaps[$key] = $why }
 
 # Notice: like Progress, but NOT silenced by -Quiet. The one line that decides
@@ -133,24 +141,30 @@ function Notice([string]$s) { Write-Host ">> $s" }
 function Emit-Status {
     if ($script:Goals.Count -eq 0) { return }
     $total = $script:Goals.Count
-    $ok    = @($script:Goals.Keys | Where-Object { $script:Oks.ContainsKey($_) })
-    $gapKeys = @($script:Goals.Keys | Where-Object { -not $script:Oks.ContainsKey($_) })
+    $ok      = @($script:Goals.Keys | Where-Object { $script:Oks.ContainsKey($_) })
+    $naKeys  = @($script:Goals.Keys | Where-Object { -not $script:Oks.ContainsKey($_) -and $script:Nas.ContainsKey($_) })
+    $gapKeys = @($script:Goals.Keys | Where-Object { -not $script:Oks.ContainsKey($_) -and -not $script:Nas.ContainsKey($_) })
     Section "Collection status"
-    Fact ("goals: {0} declared, {1} obtained, {2} not obtained" -f $total, $ok.Count, $gapKeys.Count)
+    Fact ("goals: {0} declared, {1} obtained, {2} not applicable here, {3} blocked" -f $total, $ok.Count, $naKeys.Count, $gapKeys.Count)
     if ($ok.Count -gt 0) {
         Fact ("obtained: " + (($ok | ForEach-Object { $script:Goals[$_] }) -join ", "))
     }
+    if ($naKeys.Count -gt 0) {
+        Fact "not applicable to this host (this is an answer, not a gap):"
+        foreach ($k in $naKeys) { Fact ("    {0} — {1}" -f $script:Goals[$k], $script:Nas[$k]) }
+    }
     if ($gapKeys.Count -eq 0) {
         Fact "status: COMPLETE"
-        Notice ("status: COMPLETE — {0} of {1} goals obtained" -f $ok.Count, $total)
+        $suffix = if ($naKeys.Count -gt 0) { " ({0} not applicable to this host)" -f $naKeys.Count } else { "" }
+        Notice ("status: COMPLETE — nothing was blocked" + $suffix)
     } else {
-        Fact "not obtained:"
+        Fact "blocked (running this differently would obtain these):"
         foreach ($k in $gapKeys) {
             $why = if ($script:Gaps.ContainsKey($k)) { $script:Gaps[$k] } else { "not reached" }
             Fact ("    {0} — {1}" -f $script:Goals[$k], $why)
         }
         Fact "status: INCOMPLETE"
-        Notice ("status: INCOMPLETE — {0} of {1} goals not obtained" -f $gapKeys.Count, $total)
+        Notice ("status: INCOMPLETE — {0} of {1} goals blocked" -f $gapKeys.Count, $total)
         foreach ($k in $gapKeys) {
             $why = if ($script:Gaps.ContainsKey($k)) { $script:Gaps[$k] } else { "not reached" }
             Notice ("  {0} — {1}" -f $script:Goals[$k], $why)
@@ -817,12 +831,14 @@ foreach ($ap in $appPaths) {
 
 Emit ""
 if ($existingHomes.Count -gt 0 -or $uninstallEntries.Count -gt 0) { Set-Got agent }
-else { Set-Missed agent "no agent home and no whatap uninstall registry entry found" }
+else { Set-Na agent "the whatap .NET agent is not installed on this host" }
 $confSeen = $false
 foreach ($h in $existingHomes) {
     if (Test-Path -LiteralPath (Join-Path $h "whatap.conf")) { $confSeen = $true }
 }
-if ($confSeen) { Set-Got conf } else { Set-Missed conf "no readable whatap.conf under any discovered agent home" }
+if ($confSeen) { Set-Got conf }
+elseif ($existingHomes.Count -eq 0) { Set-Na conf "no agent home exists to hold a whatap.conf" }
+else { Set-Missed conf "agent home discovered but no whatap.conf under it is readable" }
 Emit-Status
 Emit "==== END OF COLLECTION (no diagnosis by design) ===="
 

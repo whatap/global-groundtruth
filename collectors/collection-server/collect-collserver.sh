@@ -205,20 +205,36 @@ _classify_err() {
 # It also serves rule 3 ("one field command → paste output"): deciding whether a
 # run is worth sending is interpretation, and the field is not asked to do it.
 #
-# Usage, from the report body:
-#     goal   conf "module configs"                    # what this run is for
-#     got    conf                                     # obtained
-#     missed conf "uid 3103 cannot reach /data/whatap" # not obtained, and why
+# The status answers ONE question for the operator: send this, or change
+# something and run again? So there are three outcomes, not two.
 #
-# Declare a goal once, then resolve it exactly once with got/missed. A goal left
-# unresolved counts as not obtained with reason "not reached", which is itself
-# worth seeing: it means the run ended before that step.
-_goal_keys='' _goal_labels='' _ok_keys='' _gap_keys='' _gap_reasons=''
+#     goal   conf "module configs"                     # what this run is for
+#     got    conf                                      # obtained
+#     na     conf "this host runs no yard"             # legitimately absent
+#     missed conf "uid 3103 cannot reach /data/whatap"  # this run was blocked
+#
+# `na` and `missed` are both absences, and telling them apart is the whole point.
+# An absence is `na` when it IS the answer and no re-run would change it: no ZFS
+# on a host that does not use ZFS, no DBX component on a database host, no binary
+# logs when log_bin is off. An absence is `missed` when this run was blocked and
+# running it differently would get the value: a permission, a missing tool, a
+# timeout, an unreadable path.
+#
+# Only `missed` makes a run INCOMPLETE. Marking a normal environment INCOMPLETE
+# would teach the field to ignore the line, and then it protects nothing.
+#
+# Declare a goal once, then resolve it exactly once. A goal left unresolved
+# counts as missed with reason "not reached", which is itself worth seeing: it
+# means the run ended before that step.
+_goal_keys='' _goal_labels='' _ok_keys='' _na_keys='' _na_reasons='' _gap_keys='' _gap_reasons=''
 
 goal()   { _goal_keys="$_goal_keys$1
 "; _goal_labels="$_goal_labels$2
 "; }
 got()    { _ok_keys="$_ok_keys$1
+"; }
+na()     { _na_keys="$_na_keys$1
+"; _na_reasons="$_na_reasons$2
 "; }
 missed() { _gap_keys="$_gap_keys$1
 "; _gap_reasons="$_gap_reasons$2
@@ -236,14 +252,14 @@ EOF
     printf '%s' "$1"
 }
 
-# _reason_of KEY -> the reason recorded for KEY, or empty
-_reason_of() {
+# _reason_in LIST REASONS KEY -> the reason recorded for KEY in that pair, or empty
+_reason_in() {
     local i=1 k
     while IFS= read -r k; do
-        [ "$k" = "$1" ] && { printf '%s' "$(printf '%s' "$_gap_reasons" | sed -n "${i}p")"; return; }
+        [ "$k" = "$3" ] && { printf '%s' "$(printf '%s' "$2" | sed -n "${i}p")"; return; }
         i=$((i + 1))
     done <<EOF
-$_gap_keys
+$1
 EOF
 }
 
@@ -257,35 +273,44 @@ notice() { printf '>> %s\n' "$*" >&3 2>/dev/null; }
 # Also repeats each gap on fd 3 so the operator sees it while still logged in.
 emit_status() {
     [ -n "$_goal_keys" ] || return 0
-    local k total=0 obtained=0 gaps='' oks=''
+    local k total=0 obtained=0 nacount=0 gaps='' nas='' oks=''
     while IFS= read -r k; do
         [ -n "$k" ] || continue
         total=$((total + 1))
         if printf '%s' "$_ok_keys" | grep -qxF "$k"; then
             obtained=$((obtained + 1)); oks="$oks $(_label_of "$k"),"
+        elif printf '%s' "$_na_keys" | grep -qxF "$k"; then
+            nacount=$((nacount + 1))
+            nas="$nas$(_label_of "$k") — $(_reason_in "$_na_keys" "$_na_reasons" "$k")
+"
         else
-            local r; r="$(_reason_of "$k")"; [ -n "$r" ] || r='not reached'
+            local r; r="$(_reason_in "$_gap_keys" "$_gap_reasons" "$k")"; [ -n "$r" ] || r='not reached'
             gaps="$gaps$(_label_of "$k") — $r
 "
         fi
     done <<EOF
 $_goal_keys
 EOF
+    local blocked=$((total - obtained - nacount))
     # Most collectors' `section` takes (TITLE) and numbers it automatically. A
     # few take (LETTER, TITLE) because their sections are lettered by hand; those
     # set STATUS_LABEL to the letter they want this roll-up to carry.
     if [ -n "${STATUS_LABEL:-}" ]; then section "$STATUS_LABEL" "Collection status"
     else section "Collection status"; fi
-    fact "goals: $total declared, $obtained obtained, $((total - obtained)) not obtained"
+    fact "goals: $total declared, $obtained obtained, $nacount not applicable here, $blocked blocked"
     [ -n "$oks" ] && fact "obtained:${oks%,}"
-    if [ "$obtained" -eq "$total" ]; then
+    if [ -n "$nas" ]; then
+        fact "not applicable to this host (this is an answer, not a gap):"
+        printf '%s' "$nas" | while IFS= read -r l; do [ -n "$l" ] && fact "    $l"; done
+    fi
+    if [ "$blocked" -eq 0 ]; then
         fact "status: COMPLETE"
-        notice "status: COMPLETE — $obtained of $total goals obtained"
+        notice "status: COMPLETE — nothing was blocked${nas:+ ($nacount not applicable to this host)}"
     else
-        fact "not obtained:"
+        fact "blocked (running this differently would obtain these):"
         printf '%s' "$gaps" | while IFS= read -r l; do [ -n "$l" ] && fact "    $l"; done
         fact "status: INCOMPLETE"
-        notice "status: INCOMPLETE — $((total - obtained)) of $total goals not obtained"
+        notice "status: INCOMPLETE — $blocked of $total goals blocked"
         printf '%s' "$gaps" | while IFS= read -r l; do [ -n "$l" ] && notice "  $l"; done
     fi
 }
@@ -660,14 +685,16 @@ run_report() {
         got home
     else
         fact "layout: n/a ($(home_why))"
-        missed home "$(home_why)"
+        if _no_whatap_here; then na home "WhaTap is not installed on this host"
+        else missed home "$(home_why)"; fi
     fi
 
     # -- E. Runtime processes (current state) ---------------------------------
     section "E. Runtime processes (current state)"
     if [ "${#PIDS[@]}" -eq 0 ]; then
         fact "no whatap.server.* / whatap.opslake.* JVM found in /proc (none running, or /proc unreadable)"
-        missed services "no whatap JVM found in /proc (none running, or /proc unreadable)"
+        if [ -r /proc ]; then na services "no whatap module is running on this host"
+        else missed services "/proc is not readable by uid $(id -u 2>/dev/null || echo '?')"; fi
     else
         got services
     fi
@@ -726,10 +753,11 @@ run_report() {
             dump_file "$cf"
         done
         # A readable but empty conf/ is not the same as an unreadable one.
-        if [ "$_cfn" -gt 0 ]; then got conf; else missed conf "no *.conf files under $WHOME/conf"; fi
+        if [ "$_cfn" -gt 0 ]; then got conf; else na conf "conf/ is readable and holds no *.conf"; fi
     else
         fact "conf/: n/a ($(home_why conf))"
-        missed conf "$(home_why conf)"
+        if _no_whatap_here; then na conf "WhaTap is not installed on this host"
+        else missed conf "$(home_why conf)"; fi
     fi
 
     # -- G. Logs & recent events ----------------------------------------------
@@ -749,7 +777,7 @@ run_report() {
         done
         if [ "$_cur" = 0 ]; then
             fact "no non-rotated *.log found under $WHOME/logs"
-            missed logs "no non-rotated *.log found under $WHOME/logs"
+            na logs "logs/ is readable and holds no non-rotated *.log"
         else
             got logs
         fi
@@ -827,7 +855,8 @@ run_report() {
         else fact "checker log: n/a (path not found)"; fi
     else
         fact "logs/: n/a ($(home_why logs))"
-        missed logs "$(home_why logs)"
+        if _no_whatap_here; then na logs "WhaTap is not installed on this host"
+        else missed logs "$(home_why logs)"; fi
     fi
     subsection "heap dumps / GC log / restart"
     if [ -n "$WHOME" ]; then
@@ -867,6 +896,19 @@ run_report() {
 # it could not, and the bundles carried no conf/ at all. The report blamed
 # "WHATAP_HOME not resolved" and the reader concluded the collector needed root.
 # It did not. It needed the account that owns the installation.
+# _no_whatap_here -> true when nothing on this host says WhaTap is installed.
+# Then an unresolved WHATAP_HOME is not a blocked run, it is the answer, and
+# passing --home would only point the collector at a path that is not there.
+_no_whatap_here() {
+    [ -z "$WHOME" ] || return 1
+    [ "${#PIDS[@]}" -eq 0 ] || return 1
+    if have systemctl && systemctl list-unit-files 2>/dev/null \
+        | grep -qE '^(yard|proxy|gateway|keeper|account|notihub|eureka|front|flexreport)\.service'; then
+        return 1
+    fi
+    return 0
+}
+
 home_why() {
     local sub="$1" path="$WHOME"
     [ -n "$sub" ] && path="$WHOME/$sub"

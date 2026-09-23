@@ -48,6 +48,13 @@ collector says so there.
 The wording stays inside rule 1's vocabulary: name what was not obtained and
 why, never what it means or what to do about the system.
 
+It also does not turn a normal environment into a failure. An absence is marked
+`na` when it is itself the answer — no ZFS on a host that does not use ZFS, no
+DBX component on a database host, no agent where the product is not installed —
+and the run is still COMPLETE. Only a **blocked** value, one a different run
+would obtain, makes it INCOMPLETE. A collector that reports an ordinary host as
+INCOMPLETE teaches the field to ignore the line, and then it protects nothing.
+
 `validate.sh` fails any collector whose **source** contains the words
 `likely`, `diagnos`, `recommend`, `should`, `root cause`, or `fix`
 (case-insensitive) on a non-comment line — that is, in any string the script
