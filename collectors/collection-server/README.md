@@ -6,7 +6,7 @@
 >
 > | Entrypoint | Token | Scope | Status |
 > | ---------- | ----- | ----- | ------ |
-> | [`collect-collserver.sh`](collect-collserver.sh) 0.3.0 | `collserver` | the WhaTap backend itself | **not yet run against a live production yard** — validate once on a staging backend |
+> | [`collect-collserver.sh`](collect-collserver.sh) 0.4.0 | `collserver` | the WhaTap backend itself | run against three live production backends (Smartfren, 2026-09-23); log selection re-measured against that bundle's own log tree. Tier 2 probes still unvalidated |
 > | [`collect-collzfs.sh`](collect-collzfs.sh) 0.2.0 | `collzfs` | ZFS under the backend's data path | validated non-root on two live hosts (zfs 2.2.2 and 2.2.6), one of them a real collection server with `yardbase` on ZFS; `--zdb` and the root-only probes still unvalidated |
 > | [`collect-collmysql.sh`](collect-collmysql.sh) 0.4.0 | `collmysql` | the MySQL that holds the backend's `account` / `notihub` metadata | run end to end on MySQL 5.6.51, 5.7.32, 8.4.10 and MariaDB 10.11.19 under a scheduler-shaped write load; a replicating pair, section I on 8.4 and real `iostat` sampling are still unverified |
 >
@@ -81,10 +81,21 @@ so nothing starts by accident.
 - **Tier 0** (the `--file` / `--stdout` report) runs only read-only, near-instant
   commands. It never attaches to a JVM, never walks the data tree, never reads
   whole rotated logs. Safe to run any time.
-- **Tier 1** (`--bundle`) additionally copies real logs — current logs plus
-  rotated ones from the last `--log-days` (default 14), capped per file by
-  `--max-log-mb` (default 50) — configs, filesystem/ZFS/time snapshots, journal
-  (`--hours`, default 24) and an OS snapshot. Still no JVM pause.
+- **Tier 1** (`--bundle`) additionally copies real logs, configs,
+  filesystem/ZFS/time snapshots, the journal (`--hours`, default 24) and an OS
+  snapshot. Still no JVM pause.
+
+  Logs decide the size of a bundle, so they have their own rules. Current
+  (non-rotated) logs are copied; rotated ones need `--with-rotated`. Each file is
+  capped at `--max-log-mb` (default 5) and all of them together at
+  `--max-total-mb` (default 100); a file over the per-file cap is tail-copied so
+  its newest end survives. With `--with-rotated`, `--log-days` (default 14)
+  bounds how far back to go.
+
+  **Whatever is not copied is written down.** `logs/SELECTION.txt` lists every
+  candidate with its state (`kept` / `truncated` / `dropped`), its size and the
+  reason; the report's G section carries the totals. A log that is missing from a
+  bundle must never read as a log that did not exist on the host.
 - **Tier 2** (opt-in, may add load — announced on stderr first):
   `--threads[=N]` (jstack), `--histo` (`jmap -histo`, not `:live`), `--heap`
   (full heap dump), `--du` (recursive du of yardbase), `--time-ref` (external
@@ -113,9 +124,40 @@ and re-validate after edits:
 
 #### Status notes / open items
 
-- Validate once on a **live/staging yard** (this v0 was verified on a host
-  without a backend installed, plus a simulated JVM). Confirm module labels,
-  yardbase/ZFS facts, and Tier 2 load impact there.
+- **Run on three live production backends (2026-09-23, v0.3.0).** Smartfren
+  `sf-whatap-web01-bsd`, `web02-bsd`, `web01-sby`. Module labels, ports, systemd
+  state, yardbase ZFS facts and the journal all came back correct. Two things
+  came out of it:
+  - As a non-root user that could not read `WHATAP_HOME`, the two `web01`
+    bundles returned `n/a (path not found or WHATAP_HOME not resolved)` for
+    D/F/G and `permission denied` for `df`. The reasons were right and the
+    bundles were still 272 KB and 284 KB. Run it as the account that owns the
+    installation.
+  - The `web02-bsd` bundle was **63,327,061 bytes** (393.3 MB unpacked, 180
+    entries) and the field struggled to move it. Logs were 412,175,707 of those
+    bytes against 220,834 for everything else, i.e. **99.95%**. The per-file cap
+    worked exactly as designed (`access.log` was tail-cut to 50 MiB and carried
+    its `.trunc` marker); there was simply no cap on the total.
+- **Log selection re-measured (2026-09-23, v0.4.0).** Against that bundle's own
+  log tree replayed as `WHATAP_HOME/logs` (127 files, 412,175,707 bytes):
+
+  | run | tar.gz | logs in bundle | copied | left out |
+  | --- | -----: | -------------: | -----: | -------: |
+  | 0.3.0, as collected in the field | 63,327,061 | 412,175,707 | 127 | 0 |
+  | 0.4.0 defaults | 532,099 | 12,963,143 | 17 | 110 |
+  | 0.4.0 `--max-total-mb 5` | 260,084 | 3,310,276 | 15 | 112 |
+  | 0.4.0 `--with-rotated` | 19,871,166 | 104,846,391 | 70 | 57 |
+  | 0.4.0 `--with-rotated --max-total-mb 50` | 8,274,635 | 52,434,658 | 58 | 69 |
+
+  Defaults cut the copied logs from 412 MB to 13 MB and the archive from 63.3 MB
+  to 0.53 MB. The total cap binds where it should: with `--with-rotated` the
+  copied logs stop at 104,838,469 bytes under the 100 MB cap. In every run the
+  three numbers in `SELECTION.txt` add back up to 412,175,707.
+
+  Only the log figures transfer; the non-log part of the replay is this
+  workstation's, not a backend's.
+- Validate the **Tier 2** probes (`--threads`, `--histo`, `--heap`, `--du`) on a
+  live/staging yard. Those still have not been run against a real backend.
 - `WHATAP_HOME` auto-resolution order: running-JVM `-Dwhatap.server.home` →
   systemd `WorkingDirectory` → script parent (if copied into `bin/`) → `n/a`.
 - Portability target: bash 3.2+, `/proc`+`/sys` first, command fallback chains;

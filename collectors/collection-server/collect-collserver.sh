@@ -28,7 +28,13 @@ export LC_ALL=C
 
 # ---- collector metadata -----------------------------------------------------
 COLLECTOR_NAME="whatap-collection-server"
-VERSION="0.3.0"
+# 0.4.0  bundle logs get a total cap, not just a per-file one. Rotated logs are
+#        opt-in (--with-rotated) and the per-file default drops 50MB -> 5MB. What
+#        is left out is written to logs/SELECTION.txt with a reason per file and
+#        summarized in the report's G section. Reason: a production collection
+#        server produced a 393MB bundle that the field could not move; 99.95% of
+#        it was logs (sf-whatap-web02-bsd, 2026-09-23).
+VERSION="0.4.0"
 DOMAIN="collection-server"
 TARGET="collection-server/$(hostname 2>/dev/null || echo unknown)"   # refined after WHATAP_HOME is resolved
 
@@ -40,8 +46,10 @@ OPT_QUIET=0          # suppress progress narration on stderr
 OPT_HOME=""
 OPT_OUT="."
 OPT_HOURS=24
-OPT_MAXLOG_MB=50
-OPT_LOG_DAYS=14      # bundle: copy rotated logs only from the last N days
+OPT_MAXLOG_MB=5      # bundle: per-file log copy cap (tail keeps the newest end)
+OPT_MAXTOTAL_MB=100  # bundle: cap on ALL copied logs together
+OPT_ROTATED=0        # bundle: copy rotated logs too (opt-in)
+OPT_LOG_DAYS=14      # bundle: with --with-rotated, only from the last N days
 OPT_THREADS=0        # Tier 2: jstack iterations (0 = off)
 OPT_HISTO=0          # Tier 2: jmap -histo (no :live)
 OPT_HEAP=0           # Tier 2: full heap dump
@@ -63,8 +71,14 @@ explicit action flag (--file / --stdout / --bundle) so nothing starts by acciden
   collect-collserver.sh --home DIR               force WHATAP_HOME (else auto-resolved)
   collect-collserver.sh --out DIR                output directory (default: .)
   collect-collserver.sh --bundle --hours N       journal window for the bundle (default: 24)
-  collect-collserver.sh --bundle --max-log-mb M  per-file log copy cap (default: 50)
-  collect-collserver.sh --bundle --log-days N    copy rotated logs from the last N days (default: 14)
+  collect-collserver.sh --bundle --max-log-mb M    per-file log copy cap (default: 5)
+  collect-collserver.sh --bundle --max-total-mb M  cap on all copied logs together (default: 100)
+  collect-collserver.sh --bundle --with-rotated    also copy rotated logs (default: current logs only)
+  collect-collserver.sh --bundle --log-days N      with --with-rotated, only the last N days (default: 14)
+
+  Logs are the whole size of a bundle on a busy collection server. Current logs
+  are always copied; rotated ones are opt-in. Whatever is left out is listed,
+  with the reason, in logs/SELECTION.txt and summarized in the report.
 
   Tier 2 (opt-in, may add load — printed to stderr before running):
   collect-collserver.sh --bundle --threads[=N]   jstack -l each JVM N times (default N=1)
@@ -91,6 +105,9 @@ while [ $# -gt 0 ]; do
         --hours=*) OPT_HOURS="${1#*=}" ;;
         --max-log-mb) OPT_MAXLOG_MB="$2"; shift ;;
         --max-log-mb=*) OPT_MAXLOG_MB="${1#*=}" ;;
+        --max-total-mb) OPT_MAXTOTAL_MB="$2"; shift ;;
+        --max-total-mb=*) OPT_MAXTOTAL_MB="${1#*=}" ;;
+        --with-rotated) OPT_ROTATED=1 ;;
         --log-days) OPT_LOG_DAYS="$2"; shift ;;
         --log-days=*) OPT_LOG_DAYS="${1#*=}" ;;
         --threads) OPT_THREADS=1 ;;
@@ -608,6 +625,24 @@ run_report() {
         if [ -n "$_rot" ]; then printf '%s\n' "$_rot" | while IFS= read -r _l; do fact "$_l"; done
         else fact "no rotated logs"; fi
 
+        # What this bundle actually carries, as opposed to what exists on the host
+        # above. Without this the reader cannot tell "no such log" from "we left
+        # it out", and the two lead to different next steps.
+        if [ "$LOGSEL_RAN" = 1 ]; then
+            subsection "logs copied into this bundle (selection)"
+            fact "policy: $LOGSEL_REASON; caps ${OPT_MAXLOG_MB}MB per file, ${OPT_MAXTOTAL_MB}MB total"
+            fact "copied: $LOGSEL_KEPT_N files, $LOGSEL_KEPT_BYTES bytes ($LOGSEL_TRUNC_N truncated to their newest end)"
+            fact "not copied: $LOGSEL_DROP_N files, $LOGSEL_DROP_BYTES bytes"
+            fact "per-file detail with the reason for each: logs/SELECTION.txt"
+            if [ "$LOGSEL_DROP_N" -gt 0 ]; then
+                if [ "$OPT_ROTATED" = 1 ]; then
+                    fact "to collect more: raise --max-total-mb / --max-log-mb, or --log-days for older rotated logs"
+                else
+                    fact "to collect more: re-run with --with-rotated, and raise --max-total-mb if needed"
+                fi
+            fi
+        fi
+
         subsection "recent ERROR/WARN/Exception counts (current logs only, last 2MB each)"
         for _f in $(ls -1 "$WHOME"/logs/*.log "$WHOME"/logs/*/*.log 2>/dev/null); do
             [ -f "$_f" ] || continue
@@ -679,26 +714,107 @@ collect_conf() {
     progress "conf: copied $WHOME/conf"
 }
 
+# Results of the last collect_logs run, read back by the report's G section.
+LOGSEL_RAN=0 LOGSEL_KEPT_N=0 LOGSEL_KEPT_BYTES=0 LOGSEL_SRC_BYTES=0
+LOGSEL_TRUNC_N=0 LOGSEL_DROP_N=0 LOGSEL_DROP_BYTES=0 LOGSEL_REASON=""
+
 collect_logs() {
     local dest="$1"
     [ -n "$WHOME" ] && [ -d "$WHOME/logs" ] || { warn "logs: skipped (no WHATAP_HOME/logs)"; return; }
-    local cap=$((OPT_MAXLOG_MB * 1024 * 1024)) days="$OPT_LOG_DAYS"
-    find "$WHOME/logs" -maxdepth 2 -type f \( -name '*.log' -o -name '*.log.*' \) 2>/dev/null | while IFS= read -r f; do
-        # rotated logs (date-stamped or .log.N/.gz): only copy those from the last
-        # $days days, so a year of history does not balloon the bundle. Current
-        # (non-rotated) logs are always copied.
+
+    # Two caps, because one file being huge and many files being large are
+    # different failures. The per-file cap alone let a production collection
+    # server produce a 393MB bundle whose logs were 99.95% of it (sf-whatap-web02
+    # -bsd, 2026-09-23: 129 log files, 412,175,707 bytes; everything else was
+    # 220,834). The field could not get that file out. So:
+    #   * per-file cap  — tail, so the newest end of a big log survives
+    #   * total cap     — stop once all copied logs together reach it
+    #   * rotated logs  — opt-in; current logs alone answer most questions
+    # Whatever is not copied is written down with its reason. CONTRACT.md 1 says
+    # facts only: a file we left out is a fact, and it must not read as a file
+    # that did not exist.
+    local cap=$((OPT_MAXLOG_MB * 1024 * 1024))
+    local total_cap=$((OPT_MAXTOTAL_MB * 1024 * 1024))
+    local days="$OPT_LOG_DAYS"
+    local list sel
+    list="$(mktemp 2>/dev/null || echo "/tmp/.collsel.$$.list")"
+    sel="$dest/SELECTION.txt"
+    mkdir -p "$dest" 2>/dev/null
+
+    # Candidates, newest first. Current (non-rotated) logs sort ahead of rotated
+    # ones so the total cap never spends itself on history before the live logs.
+    find "$WHOME/logs" -maxdepth 2 -type f \( -name '*.log' -o -name '*.log.*' \) 2>/dev/null |
+    while IFS= read -r f; do
+        local kind=current
         case "$f" in
-            *.[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].*.log|*.log.[0-9]*|*.log.gz)
-                [ -n "$(find "$f" -mtime "-$days" 2>/dev/null)" ] || continue ;;
+            *.[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].*.log|*.log.[0-9]*|*.log.gz) kind=rotated ;;
         esac
-        local rel sub sz
-        rel="${f#"$WHOME"/logs/}"; sub="$(dirname "$rel")"
-        mkdir -p "$dest/$sub" 2>/dev/null
+        printf '%s\t%s\t%s\n' "$kind" "$(date -u -r "$f" +%s 2>/dev/null || echo 0)" "$f"
+    done | sort -t"$(printf '\t')" -k1,1 -k2,2nr > "$list"
+
+    : > "$sel"
+    printf 'log selection by %s %s\n' "$COLLECTOR_NAME" "$VERSION" >> "$sel"
+    printf 'caps: %sMB per file, %sMB total; rotated logs: %s\n' \
+        "$OPT_MAXLOG_MB" "$OPT_MAXTOTAL_MB" \
+        "$([ "$OPT_ROTATED" = 1 ] && printf 'included (last %sd)' "$days" || printf 'not copied (--with-rotated to include)')" >> "$sel"
+    printf '\nstate\tkept_bytes\tsource_bytes\tfile\treason\n' >> "$sel"
+
+    LOGSEL_RAN=1 LOGSEL_KEPT_N=0 LOGSEL_KEPT_BYTES=0 LOGSEL_SRC_BYTES=0
+    LOGSEL_TRUNC_N=0 LOGSEL_DROP_N=0 LOGSEL_DROP_BYTES=0
+
+    # Redirect (not a pipe) so the loop runs in this shell and the totals survive.
+    local kind mt f rel sub sz take
+    while IFS="$(printf '\t')" read -r kind mt f; do
+        [ -n "$f" ] && [ -f "$f" ] || continue
+        rel="${f#"$WHOME"/logs/}"
         sz="$(wc -c < "$f" 2>/dev/null | tr -d ' ')"; [ -z "$sz" ] && sz=0
-        if [ "$sz" -le "$cap" ]; then cp -a "$f" "$dest/$rel" 2>/dev/null
-        else tail -c "$cap" "$f" > "$dest/$rel" 2>/dev/null; printf 'truncated to last %sMB of %s bytes\n' "$OPT_MAXLOG_MB" "$sz" > "$dest/$rel.trunc"; fi
-    done
-    progress "logs: copied (current + rotated within ${days}d, cap ${OPT_MAXLOG_MB}MB/file)"
+        LOGSEL_SRC_BYTES=$((LOGSEL_SRC_BYTES + sz))
+
+        if [ "$kind" = rotated ] && [ "$OPT_ROTATED" != 1 ]; then
+            LOGSEL_DROP_N=$((LOGSEL_DROP_N + 1)); LOGSEL_DROP_BYTES=$((LOGSEL_DROP_BYTES + sz))
+            printf 'dropped\t0\t%s\t%s\trotated log, --with-rotated not given\n' "$sz" "$rel" >> "$sel"
+            continue
+        fi
+        if [ "$kind" = rotated ] && [ -z "$(find "$f" -mtime "-$days" 2>/dev/null)" ]; then
+            LOGSEL_DROP_N=$((LOGSEL_DROP_N + 1)); LOGSEL_DROP_BYTES=$((LOGSEL_DROP_BYTES + sz))
+            printf 'dropped\t0\t%s\t%s\trotated log older than %s days\n' "$sz" "$rel" "$days" >> "$sel"
+            continue
+        fi
+
+        take="$sz"; [ "$take" -gt "$cap" ] && take="$cap"
+        if [ $((LOGSEL_KEPT_BYTES + take)) -gt "$total_cap" ]; then
+            LOGSEL_DROP_N=$((LOGSEL_DROP_N + 1)); LOGSEL_DROP_BYTES=$((LOGSEL_DROP_BYTES + sz))
+            printf 'dropped\t0\t%s\t%s\ttotal cap %sMB reached\n' "$sz" "$rel" "$OPT_MAXTOTAL_MB" >> "$sel"
+            continue
+        fi
+
+        sub="$(dirname "$rel")"; mkdir -p "$dest/$sub" 2>/dev/null
+        if [ "$sz" -le "$cap" ]; then
+            cp -a "$f" "$dest/$rel" 2>/dev/null
+            printf 'kept\t%s\t%s\t%s\t-\n' "$sz" "$sz" "$rel" >> "$sel"
+        else
+            tail -c "$cap" "$f" > "$dest/$rel" 2>/dev/null
+            printf 'truncated to last %sMB of %s bytes\n' "$OPT_MAXLOG_MB" "$sz" > "$dest/$rel.trunc"
+            LOGSEL_TRUNC_N=$((LOGSEL_TRUNC_N + 1))
+            printf 'truncated\t%s\t%s\t%s\tper-file cap %sMB, tail kept\n' "$cap" "$sz" "$rel" "$OPT_MAXLOG_MB" >> "$sel"
+        fi
+        LOGSEL_KEPT_N=$((LOGSEL_KEPT_N + 1)); LOGSEL_KEPT_BYTES=$((LOGSEL_KEPT_BYTES + take))
+    done < "$list"
+    rm -f "$list" 2>/dev/null
+
+    # kept_bytes is what landed in the bundle; a truncated file contributes its
+    # cap, not its source size. So kept_bytes + dropped_bytes does not add up to
+    # the candidate total, and the third line says where the rest went.
+    printf '\ncandidates: %s files, %s bytes on the host\n' \
+        "$((LOGSEL_KEPT_N + LOGSEL_DROP_N))" "$LOGSEL_SRC_BYTES" >> "$sel"
+    printf 'copied:     %s files, %s bytes in this bundle (%s truncated)\n' \
+        "$LOGSEL_KEPT_N" "$LOGSEL_KEPT_BYTES" "$LOGSEL_TRUNC_N" >> "$sel"
+    printf 'not copied: %s files, %s bytes; plus %s bytes cut off the tail-truncated ones\n' \
+        "$LOGSEL_DROP_N" "$LOGSEL_DROP_BYTES" \
+        "$((LOGSEL_SRC_BYTES - LOGSEL_DROP_BYTES - LOGSEL_KEPT_BYTES))" >> "$sel"
+
+    LOGSEL_REASON="$([ "$OPT_ROTATED" = 1 ] && printf 'current + rotated within %sd' "$days" || printf 'current logs only')"
+    progress "logs: copied $LOGSEL_KEPT_N files ($LOGSEL_KEPT_BYTES bytes), left out $LOGSEL_DROP_N ($LOGSEL_DROP_BYTES bytes) — see logs/SELECTION.txt"
 }
 
 collect_fs() {
@@ -822,10 +938,14 @@ do_bundle() {
     local work tarball
     work="$(mktemp -d 2>/dev/null || echo "$OPT_OUT/$BASENAME.tmp.$$")"
     mkdir -p "$work" 2>/dev/null
+    # Logs are selected BEFORE the report is written so the report can state what
+    # this bundle carries and what it left out (G section, "logs copied into this
+    # bundle"). The report otherwise describes the host only, and the reader
+    # cannot tell an absent log from a dropped one.
+    collect_logs    "$work/logs"
     run_report > "$work/report.txt" 2>/dev/null
     progress "report: written to bundle"
     collect_conf    "$work/conf"
-    collect_logs    "$work/logs"
     collect_fs      "$work/fs"
     collect_time    "$work/time"
     collect_os      "$work/os"
