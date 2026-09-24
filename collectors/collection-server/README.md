@@ -7,7 +7,7 @@
 > | Entrypoint | Token | Scope | Status |
 > | ---------- | ----- | ----- | ------ |
 > | [`collect-collserver.sh`](collect-collserver.sh) 0.4.1 | `collserver` | the WhaTap backend itself | run against three live production backends (Smartfren, 2026-09-23); log selection re-measured against that bundle's own log tree. Tier 2 probes still unvalidated |
-> | [`collect-collzfs.sh`](collect-collzfs.sh) 0.2.0 | `collzfs` | ZFS under the backend's data path | validated non-root on two live hosts (zfs 2.2.2 and 2.2.6), one of them a real collection server with `yardbase` on ZFS; `--zdb` and the root-only probes still unvalidated |
+> | [`collect-collzfs.sh`](collect-collzfs.sh) 0.4.1 | `collzfs` | ZFS under the backend's data path | validated non-root on two live hosts (zfs 2.2.2 and 2.2.6), one of them a real collection server with `yardbase` on ZFS; `--zdb` and the root-only probes still unvalidated |
 > | [`collect-collmysql.sh`](collect-collmysql.sh) 0.4.0 | `collmysql` | the MySQL that holds the backend's `account` / `notihub` metadata | run end to end on MySQL 5.6.51, 5.7.32, 8.4.10 and MariaDB 10.11.19 under a scheduler-shaped write load; a replicating pair, section I on 8.4 and real `iostat` sampling are still unverified |
 >
 > Which one to run: `collect-collserver.sh` for anything about the backend

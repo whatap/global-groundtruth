@@ -57,7 +57,7 @@ export LC_ALL=C
 
 # ---- collector metadata -----------------------------------------------------
 COLLECTOR_NAME="whatap-collection-server-zfs"
-VERSION="0.4.0"
+VERSION="0.4.1"
 DOMAIN="collection-server"
 TARGET="collection-server-zfs/$(hostname 2>/dev/null || echo unknown)"   # refined after pool discovery
 
@@ -886,8 +886,23 @@ run_report() {
     fact "uid: $(id -u 2>/dev/null || echo unknown) ($( [ "$(id -u 2>/dev/null)" = 0 ] && echo root || echo non-root ))"
     _note_privilege
     fact "privilege: $PRIV_WHY"
+
+    # Boot time is the denominator for every since-boot counter in this report:
+    # [J] zpool iostat, the kstat trees, and metaslab_stats are all cumulative,
+    # so without it they are sums with no denominator and cannot be read as a
+    # rate. This comes from /proc rather than `uptime` so it still arrives on a
+    # host without procps. Smartfren, 2026-09-23: the 869-day uptime had to be
+    # reconstructed from kstat snaptime, a pool_create event and dmesg monotonic
+    # time, because no bundle field carried it.
+    local _btime t
+    _btime="$(awk '/^btime/{print $2; exit}' /proc/stat 2>/dev/null)"
+    if [ -n "$_btime" ]; then
+        fact "host boot(UTC): $(date -u -d "@$_btime" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "n/a (epoch $_btime, date -d unavailable)")"
+    else
+        fact "host boot(UTC): n/a (no btime in /proc/stat)"
+    fi
+    fact "host uptime(s): $(cut -d. -f1 /proc/uptime 2>/dev/null || echo 'n/a (/proc/uptime not readable)')"
     fact "tools:"
-    local t
     for t in zfs zpool zdb arcstat arc_summary findmnt df stat lsblk iostat modinfo dkms \
              systemctl journalctl dmesg timeout tar awk find sort head tail nproc free; do
         if command -v "$t" >/dev/null 2>&1; then printf '        %-12s present\n' "$t"; else printf '        %-12s absent\n' "$t"; fi
