@@ -28,6 +28,15 @@ export LC_ALL=C
 
 # ---- collector metadata -----------------------------------------------------
 COLLECTOR_NAME="whatap-collection-server"
+# 0.6.0  the systemd journal is a goal of its own, and an empty one now says
+#        which kind of empty it is. journalctl does not fail for an
+#        unprivileged uid: it narrows to that user's own entries and prints
+#        "-- No entries --", which reads the same as a unit that logged nothing.
+#        journal_why() reports whether this uid can read the system journal, so
+#        the two are told apart. dmesg keeps its error message instead of
+#        leaving a 0-byte file. Reason: all three Smartfren bundles carried 8-9
+#        unit journals of exactly "-- No entries --" and a 0-byte dmesg-tail.txt,
+#        and nothing in the report or the status mentioned either (2026-09-23).
 # 0.5.0  the report ends with a Collection status section, and the operator is
 #        told on stderr when a run did not obtain what it came for (even under
 #        --quiet). Goals: running modules, WHATAP_HOME contents, module configs,
@@ -45,7 +54,7 @@ COLLECTOR_NAME="whatap-collection-server"
 #        summarized in the report's G section. Reason: a production collection
 #        server produced a 393MB bundle that the field could not move; 99.95% of
 #        it was logs (sf-whatap-web02-bsd, 2026-09-23).
-VERSION="0.5.0"
+VERSION="0.6.0"
 DOMAIN="collection-server"
 TARGET="collection-server/$(hostname 2>/dev/null || echo unknown)"   # refined after WHATAP_HOME is resolved
 
@@ -548,6 +557,14 @@ run_report() {
         _i=$((_i + 1))
     done
     [ "$_runs_yard" = 1 ] && goal yardbase "yard data path"
+    # journal: only where there is a systemd unit whose journal could exist.
+    # On a host that runs the modules some other way, an absent journal is the
+    # shape of the host, not a gap, so no goal is declared at all.
+    _has_unit=0
+    if have systemctl; then
+        for _u in $WHATAP_UNITS; do unit_loaded "$_u" && { _has_unit=1; break; }; done
+    fi
+    [ "$_has_unit" = 1 ] && goal journal "systemd journal for whatap units"
 
     section "Collection environment"
     fact "collector: $COLLECTOR_NAME $VERSION"
@@ -866,15 +883,30 @@ run_report() {
         else fact "restart.out: n/a (path not found)"; fi
     fi
     subsection "journal errors (last ${OPT_HOURS}h, bounded, installed units only)"
+    _jwhy="$(journal_why)"
+    _jhits=0
     if have journalctl; then
         for unit in $WHATAP_UNITS; do
             unit_loaded "$unit" || continue
             local jout
             jout="$(journalctl -u "$unit.service" -p err --since "${OPT_HOURS} hours ago" -n 20 --no-pager 2>/dev/null)"
-            [ -n "$jout" ] && { fact "$unit.service (last 20 err):"; printf '%s\n' "$jout" | while IFS= read -r _l; do printf '        %s\n' "$_l"; done; }
+            case "$jout" in
+                ''|*'-- No entries --'*) ;;
+                *) _jhits=$((_jhits + 1))
+                   fact "$unit.service (last 20 err):"
+                   printf '%s\n' "$jout" | while IFS= read -r _l; do printf '        %s\n' "$_l"; done ;;
+            esac
         done
+    fi
+    # An empty journal has two causes that print the same thing. Say which.
+    if [ -n "$_jwhy" ]; then
+        fact "journal: n/a ($_jwhy)"
+        missed journal "$_jwhy"
+    elif [ "$_jhits" -gt 0 ]; then
+        got journal
     else
-        fact "journal: n/a (command not found: journalctl)"
+        fact "journal: readable by uid $(id -u 2>/dev/null || echo '?'); no err entries for the loaded whatap units in the last ${OPT_HOURS}h"
+        na journal "the system journal is readable and holds no entries for the whatap units in the last ${OPT_HOURS}h"
     fi
 
     emit_status
@@ -931,6 +963,32 @@ home_why() {
     else
         printf 'unreadable: %s' "$path"
     fi
+}
+
+# journal_why -> empty when this uid can read the SYSTEM journal, otherwise the
+# reason it cannot. This exists because journalctl does not fail for an
+# unprivileged user: it silently narrows to that user's own entries and prints
+# "-- No entries --" for every unit, which is byte-identical to a unit that
+# logged nothing. Without this probe the report cannot tell a quiet host from a
+# journal it was never allowed to open, and the reader cannot either.
+journal_why() {
+    have journalctl || { printf 'command not found: journalctl'; return; }
+    [ "$(id -u 2>/dev/null)" = 0 ] && return
+    local d f uid; uid="$(id -u 2>/dev/null || echo '?')"
+    for d in /var/log/journal /run/log/journal; do
+        [ -d "$d" ] || continue
+        if [ ! -x "$d" ]; then
+            printf 'uid %s cannot search %s' "$uid" "$d"; return
+        fi
+        for f in "$d"/*/system.journal; do
+            [ -e "$f" ] || continue
+            [ -r "$f" ] && return
+            printf 'uid %s cannot read %s (groups: %s); journalctl then shows only entries from this user' \
+                "$uid" "$f" "$(id -nG 2>/dev/null | tr ' ' ',')"
+            return
+        done
+    done
+    printf 'no system journal file under /var/log/journal or /run/log/journal'
 }
 
 collect_conf() {
@@ -1070,7 +1128,12 @@ collect_os() {
     have df && df -h > "$dest/df-h.txt" 2>/dev/null
     have free && free -m > "$dest/free.txt" 2>/dev/null
     cat /proc/loadavg > "$dest/loadavg.txt" 2>/dev/null
-    dmesg 2>/dev/null | tail -n 200 > "$dest/dmesg-tail.txt" 2>/dev/null
+    # dmesg is refused for an unprivileged uid when kernel.dmesg_restrict=1, and
+    # discarding stderr turned that into a 0-byte file carrying no reason. Keep
+    # whatever the command said instead (all three Smartfren bundles: 0 bytes).
+    { dmesg 2>&1 || true; } | tail -n 200 > "$dest/dmesg-tail.txt" 2>/dev/null
+    [ -s "$dest/dmesg-tail.txt" ] || printf 'dmesg produced no output and no message (uid %s)\n' \
+        "$(id -u 2>/dev/null || echo '?')" > "$dest/dmesg-tail.txt" 2>/dev/null
     have top && top -bn1 2>/dev/null | head -n 40 > "$dest/top.txt" 2>/dev/null
     local i pid
     i=0
