@@ -27,6 +27,11 @@
 export LC_ALL=C
 
 # ---- collector metadata -----------------------------------------------------
+# 0.6.3  Section 0 states the host's boot time and uptime, read from /proc. The
+#        kernel counters in section D are totals since boot, so a report without
+#        it carries a sum with no denominator. It is deliberately not SQL: the
+#        run that most needs the denominator is the one whose login failed, and
+#        on 2026-09-23 it had to be asked for by hand afterwards.
 # 0.6.2  The reason an elevation did not happen comes from sudo's own words.
 #        0.6.1 chose between "no terminal" and "this account" by testing
 #        /dev/tty, so an account that is not in sudoers was reported as a
@@ -52,7 +57,7 @@ export LC_ALL=C
 #        given. The binlog n/a reason now separates "path not resolved" from
 #        "path not readable" — they are answered by different things.
 COLLECTOR_NAME="whatap-collection-server-mysql"
-VERSION="0.6.2"
+VERSION="0.6.3"
 DOMAIN="collection-server"
 TARGET="collection-server-mysql/$(hostname 2>/dev/null || echo unknown)"
 
@@ -560,6 +565,18 @@ run_report() {
     fact "bash: ${BASH_VERSION:-unknown}"
     fact "uid: $(id -u 2>/dev/null || echo unknown)"
     fact "privilege: $PRIV_WHY"
+    # Section D's kernel counters are totals since boot, so without the boot
+    # time they are a sum with no denominator and cannot be read as a rate. This
+    # comes from /proc rather than SQL on purpose: a run whose login fails still
+    # has the disk counters, and that is exactly when the denominator is missing
+    # (Smartfren, 2026-09-23, where it had to be asked for by hand afterwards).
+    _btime="$(awk '/^btime/{print $2; exit}' /proc/stat 2>/dev/null)"
+    if [ -n "$_btime" ]; then
+        fact "host boot(UTC): $(date -u -d "@$_btime" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "n/a (epoch $_btime, date -d unavailable)")"
+    else
+        fact "host boot(UTC): n/a (no btime in /proc/stat)"
+    fi
+    fact "host uptime(s): $(cut -d. -f1 /proc/uptime 2>/dev/null || echo 'n/a (/proc/uptime not readable)')"
     fact "tools:"
     for t in mysql mysqlbinlog iostat vmstat ss findmnt lsblk timeout; do
         if have "$t"; then sub "$(printf '%-12s present' "$t")"
