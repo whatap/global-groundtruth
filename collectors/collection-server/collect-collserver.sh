@@ -619,7 +619,10 @@ run_report() {
     section "Collection environment"
     fact "collector: $COLLECTOR_NAME $VERSION"
     fact "bash: ${BASH_VERSION:-unknown}"
-    fact "uid: $(id -u 2>/dev/null || echo unknown) ($( [ "$(id -u 2>/dev/null)" = 0 ] && echo root || echo non-root )$( [ -n "${SUDO_USER:-}" ] && printf ', via sudo from %s' "$SUDO_USER" ))"
+    # Just the uid and, under sudo, the login it came from. Whether that uid is
+    # root is the `privilege:` line's job two lines down; saying it twice in
+    # adjacent lines only makes the reader check whether they disagree.
+    fact "uid: $(id -u 2>/dev/null || echo unknown)$( [ -n "${SUDO_USER:-}" ] && printf ' (via sudo from %s)' "$SUDO_USER" )"
     _note_privilege
     fact "privilege: $PRIV_WHY"
     fact "tools:"
