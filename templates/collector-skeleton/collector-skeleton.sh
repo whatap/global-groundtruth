@@ -115,6 +115,47 @@ emit_footer() {
     printf '\n==== END OF COLLECTION (no diagnosis by design) ====\n'
 }
 
+# ---- privilege — DO NOT EDIT ------------------------------------------------
+# What a collection can read is decided by the privilege it was given. That is a
+# fact about this run, not a claim about the environment, so it stays inside
+# CONTRACT rule 1 and belongs in section 0 with the rest of the run's own facts.
+#
+# Two places, one sentence. Section 0 says which privilege this run had. Every
+# goal that privilege blocked repeats it on its own line, because the roll-up is
+# what reaches the operator's terminal while they are still logged in, and "this
+# is what was missing, this is what would have obtained it" is one thought.
+#
+# Real case: three collection-server bundles came back carrying no conf/ at all,
+# and nothing in the report or the status said the uid could not reach it
+# (Smartfren, 2026-09-23).
+#
+# A collector that elevates itself fills these in first, and _note_privilege
+# then leaves them alone. What it fills in has to come from whatever refused it
+# rather than from a guess: an account sudo does not permit and a run with no
+# terminal to be asked on fail the same way, and they are answered by different
+# people (collect-collmysql.sh 0.6.2).
+PRIV_WHY="unknown"
+PRIV_GAP=""   # what a further privilege would obtain; empty when the run is root
+
+# _priv_hint -> " (not elevated: REASON)", or nothing when the run is root.
+# Append it to the reason of any goal that a privilege blocked.
+_priv_hint() { [ -n "$PRIV_GAP" ] && printf ' (not elevated: %s)' "$PRIV_GAP"; return 0; }
+
+# _note_privilege -> describe this process. Call it once, before section 0 reads
+# PRIV_WHY. It yields to a value already set, so a self-elevating collector can
+# say something more exact.
+_note_privilege() {
+    [ "$PRIV_WHY" = unknown ] || return 0
+    _priv_uid="$(id -u 2>/dev/null || echo 0)"
+    if [ "$_priv_uid" = 0 ]; then
+        PRIV_WHY="root${SUDO_UID:+ (elevated by sudo from uid $SUDO_UID)}"
+        PRIV_GAP=""
+    else
+        PRIV_WHY="not root (uid $_priv_uid)"
+        PRIV_GAP="run again with sudo"
+    fi
+}
+
 # ---- collection completeness — DO NOT EDIT ----------------------------------
 # A collector knows, at the host, whether it obtained what it came for. Saying so
 # is a fact about THIS COLLECTION RUN, not a claim about the environment, so it
@@ -330,6 +371,8 @@ run_report() {
     section "Collection environment"
     fact "bash: ${BASH_VERSION:-unknown}"
     fact "uid: $(id -u 2>/dev/null || echo unknown)"
+    _note_privilege
+    fact "privilege: $PRIV_WHY"
     fact "tools:"
     for t in ss findmnt systemctl; do   # <- replace with the tools you use
         if command -v "$t" >/dev/null 2>&1; then printf '        %-12s present\n' "$t"

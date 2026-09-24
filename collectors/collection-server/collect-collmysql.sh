@@ -27,6 +27,14 @@
 export LC_ALL=C
 
 # ---- collector metadata -----------------------------------------------------
+# 0.6.2  The reason an elevation did not happen comes from sudo's own words.
+#        0.6.1 chose between "no terminal" and "this account" by testing
+#        /dev/tty, so an account that is not in sudoers was reported as a
+#        missing terminal whenever the run had none, and the guide then sent
+#        the operator to `ssh -t`, which changes nothing for that account.
+#        Measured on debian bookworm with a real sudo: the two states are told
+#        apart only by `sudo -v`, since `sudo -n true` answers "a password is
+#        required" for both.
 # 0.6.1  The elevation no longer decides for sudo whether it can ask. 0.6.0
 #        gated the interactive attempt on `[ -t 0 ]`, so a run started as
 #        `ssh host './collect-collmysql.sh ...'` skipped it without a word and
@@ -44,7 +52,7 @@ export LC_ALL=C
 #        given. The binlog n/a reason now separates "path not resolved" from
 #        "path not readable" — they are answered by different things.
 COLLECTOR_NAME="whatap-collection-server-mysql"
-VERSION="0.6.1"
+VERSION="0.6.2"
 DOMAIN="collection-server"
 TARGET="collection-server-mysql/$(hostname 2>/dev/null || echo unknown)"
 
@@ -154,6 +162,47 @@ CMD_TIMEOUT=20
 _init_probe() {
     _errfile="$(mktemp 2>/dev/null || echo "${TMPDIR:-/tmp}/.ggt.$$.err")"
     have timeout && _timeout_bin="$(command -v timeout)"
+}
+
+# ---- privilege — DO NOT EDIT ------------------------------------------------
+# What a collection can read is decided by the privilege it was given. That is a
+# fact about this run, not a claim about the environment, so it stays inside
+# CONTRACT rule 1 and belongs in section 0 with the rest of the run's own facts.
+#
+# Two places, one sentence. Section 0 says which privilege this run had. Every
+# goal that privilege blocked repeats it on its own line, because the roll-up is
+# what reaches the operator's terminal while they are still logged in, and "this
+# is what was missing, this is what would have obtained it" is one thought.
+#
+# Real case: three collection-server bundles came back carrying no conf/ at all,
+# and nothing in the report or the status said the uid could not reach it
+# (Smartfren, 2026-09-23).
+#
+# A collector that elevates itself fills these in first, and _note_privilege
+# then leaves them alone. What it fills in has to come from whatever refused it
+# rather than from a guess: an account sudo does not permit and a run with no
+# terminal to be asked on fail the same way, and they are answered by different
+# people (collect-collmysql.sh 0.6.2).
+PRIV_WHY="unknown"
+PRIV_GAP=""   # what a further privilege would obtain; empty when the run is root
+
+# _priv_hint -> " (not elevated: REASON)", or nothing when the run is root.
+# Append it to the reason of any goal that a privilege blocked.
+_priv_hint() { [ -n "$PRIV_GAP" ] && printf ' (not elevated: %s)' "$PRIV_GAP"; return 0; }
+
+# _note_privilege -> describe this process. Call it once, before section 0 reads
+# PRIV_WHY. It yields to a value already set, so a self-elevating collector can
+# say something more exact.
+_note_privilege() {
+    [ "$PRIV_WHY" = unknown ] || return 0
+    _priv_uid="$(id -u 2>/dev/null || echo 0)"
+    if [ "$_priv_uid" = 0 ]; then
+        PRIV_WHY="root${SUDO_UID:+ (elevated by sudo from uid $SUDO_UID)}"
+        PRIV_GAP=""
+    else
+        PRIV_WHY="not root (uid $_priv_uid)"
+        PRIV_GAP="run again with sudo"
+    fi
 }
 
 # ---- collection completeness — DO NOT EDIT ----------------------------------
@@ -342,16 +391,17 @@ MYSQL_BIN=""
 MYSQL_OK=0
 MYSQL_WHY="not attempted"
 
-# ---- privilege --------------------------------------------------------------
+# ---- sudo elevation (this collector only) -----------------------------------
 # Rule 2: discover, never assume. Whether this account may become root is a
 # property of the host, so it is tested rather than declared, and whatever the
-# test finds is reported as a fact in section 0.
+# test finds fills the shared PRIV_WHY and PRIV_GAP above.
 #
-# Why elevate at all. Nearly every section of this report comes from SQL, and on
-# a packaged MySQL the root@localhost account authenticates by unix socket
-# rather than by password. An elevated run therefore needs no credentials, and
-# the same elevation lets section I read the binary log directory. One run
-# instead of three, which is what rule 3 asks for: the field runs one thing.
+# Why elevate at all, here and nowhere else in the family. Nearly every section
+# of this report comes from SQL, and on a packaged MySQL the root@localhost
+# account authenticates by unix socket rather than by password. An elevated run
+# therefore needs no credentials, and the same elevation lets section I read the
+# binary log directory. One run instead of three, which is what rule 3 asks for:
+# the field runs one thing.
 #
 # Why it never ends the run. A host that forbids sudo still produces the
 # host-side facts, and those are worth sending. So sudo is only exec'd once it
@@ -365,25 +415,41 @@ MYSQL_WHY="not attempted"
 # went silently unelevated under `ssh host 'cmd'`, reporting it as an account
 # sudo had refused. Without a terminal sudo fails immediately, and the reason it
 # gives is the one worth reporting.
-PRIV_WHY="unknown"
-PRIV_GAP=""   # why this run is not root; empty once it is
 
-# _priv_hint -> " (not elevated: REASON)", or nothing when the run is root.
-# A blocked value and the privilege that would have obtained it belong on the
-# same line, because the roll-up puts that line on the operator's terminal while
-# they are still logged in, and the two answer different next steps: a terminal
-# sudo never got is answered by `ssh -t`, an account sudo refused is not.
-_priv_hint() { [ -n "$PRIV_GAP" ] && printf ' (not elevated: %s)' "$PRIV_GAP"; return 0; }
+# _priv_gap_is REASON -> record that this run stayed unelevated, and why, in the
+# shared vocabulary of PRIV_WHY and PRIV_GAP.
+_priv_gap_is() { PRIV_GAP="$1"; PRIV_WHY="not root (uid $(id -u 2>/dev/null || echo '?')): $1"; }
+
+# _sudo_gap TEXT -> why sudo did not elevate this run, in sudo's own terms.
+#
+# Guessing this from /dev/tty gets it wrong. An account that is not in sudoers
+# fails whether or not there is a terminal, and the remedy is a different one:
+# a missing terminal is answered by `ssh -t`, an account sudo does not permit is
+# answered by an administrator. 0.6.1 reported the first for both.
+#
+# `sudo -n true` cannot tell them apart either — it answers "a password is
+# required" in both cases (debian bookworm, sudo 1.9.13). Only `sudo -v` names
+# the account, so the text handed here is that call's output.
+_sudo_gap() {
+    case "$1" in
+        *"may not run sudo"*|*"not in the sudoers"*|*"not allowed to execute"*)
+            printf 'sudo does not permit this account' ;;
+        *"a terminal is required"*|*"no tty present"*|*"no askpass"*)
+            printf 'sudo found no terminal to ask for a password on' ;;
+        *"try again"*|*"ncorrect password"*|*"uthentication fail"*)
+            printf 'sudo asked for a password and did not accept it' ;;
+        '')
+            printf 'sudo did not elevate this run' ;;
+        *)
+            printf 'sudo: %s' "$(printf '%s' "$1" | grep -m1 -v '^[[:space:]]*$' 2>/dev/null | cut -c1-120)" ;;
+    esac
+}
 
 _elevate() {
     local uid; uid="$(id -u 2>/dev/null || echo 0)"
-    if [ "$uid" = 0 ]; then
-        PRIV_WHY="root${SUDO_UID:+ (elevated by sudo from uid $SUDO_UID)}"
-        PRIV_GAP=""
-        return 0
-    fi
-    if [ "$OPT_SUDO" = 0 ]; then PRIV_GAP="--no-sudo given"; PRIV_WHY="uid $uid ($PRIV_GAP)"; return 0; fi
-    if ! have sudo; then PRIV_GAP="command not found: sudo"; PRIV_WHY="uid $uid ($PRIV_GAP)"; return 0; fi
+    if [ "$uid" = 0 ]; then _note_privilege; return 0; fi
+    if [ "$OPT_SUDO" = 0 ]; then _priv_gap_is "--no-sudo given"; return 0; fi
+    if ! have sudo; then _priv_gap_is "command not found: sudo"; return 0; fi
 
     # Absolute path: sudo keeps the working directory, but $0 may have been
     # reached through PATH. A copy without the execute bit is run through bash.
@@ -399,20 +465,18 @@ _elevate() {
         printf '>> re-running under sudo (uid %s -> root)\n' "$uid" >&2
         # shellcheck disable=SC2086
         exec sudo -n $runner "$self" "$@"
-    elif sudo -v; then
+    fi
+    # Capturing this call's stderr does not swallow the password prompt: sudo
+    # writes the prompt to /dev/tty, and where there is no /dev/tty there is no
+    # prompt to lose. Verified in a container with a pty (2026-09-24).
+    local _sudo_said; _sudo_said="$(sudo -v 2>&1)"
+    if [ $? = 0 ]; then
         printf '>> re-running under sudo (uid %s -> root)\n' "$uid" >&2
         # shellcheck disable=SC2086
         exec sudo $runner "$self" "$@"
     fi
-    # sudo has answered. Which answer it was decides what a second run needs, so
-    # the two are not reported as one: a terminal sudo could have asked on is
-    # the thing that was absent, or it asked and did not authenticate.
-    if { : < /dev/tty; } 2>/dev/null; then
-        PRIV_GAP="sudo did not authorise this account"
-    else
-        PRIV_GAP="sudo found no terminal to ask for a password on"
-    fi
-    PRIV_WHY="uid $uid ($PRIV_GAP)"
+    [ -n "$_sudo_said" ] && printf '%s\n' "$_sudo_said" >&2
+    _priv_gap_is "$(_sudo_gap "$_sudo_said")"
 }
 
 _mysql_base() {

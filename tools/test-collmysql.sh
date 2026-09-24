@@ -43,10 +43,22 @@ done
 mkstub_sudo() {
     cat > "$S/sudo" <<'EOF'
 #!/bin/sh
-# A host whose sudo wants a password: -n cannot run, -v asks and does not
-# authenticate. Every invocation is logged so a test can assert it was tried.
+# A sudo that refuses, in sudo's own words. SUDO_STATE picks which refusal.
+# The wording is copied from a real sudo 1.9.13 on debian bookworm, measured
+# 2026-09-24, because the collector classifies on exactly these strings.
+#
+# Note what -n answers: the same line for both states. That is the reason the
+# collector reads -v instead, and a test that stubbed only -n would not notice
+# if it went back.
 [ -n "${STUBLOG:-}" ] && echo "sudo $*" >> "$STUBLOG"
-[ "$1" = "-v" ] && echo "[sudo] password for tester:" >&2
+case "$1" in
+    -n) echo "sudo: a password is required" >&2; exit 1 ;;
+    -v) case "${SUDO_STATE:-notty}" in
+            nosudoers) echo "Sorry, user tester may not run sudo on testhost." >&2 ;;
+            *)         echo "sudo: a terminal is required to read the password; either use the -S option to read from standard input or configure an askpass helper" >&2 ;;
+        esac
+        exit 1 ;;
+esac
 exit 1
 EOF
     chmod +x "$S/sudo"
@@ -71,36 +83,39 @@ printf '#!/bin/sh\nexit 0\n' > "$S/mysqlbinlog"
 chmod +x "$S/mysql" "$S/mysqlbinlog"
 UID_NOW="$(id -u)"
 
-echo "== 1. the four ways a run stays unelevated =="
+echo "== 1. the four ways a run stays unelevated, each named for what it is =="
 export STUBLOG="$ROOT/sudo.log"; : > "$STUBLOG"
-out="$(PATH="$S" bash "$C" --stdout </dev/null 2>/dev/null)"
-has "no terminal: the reason names the terminal, not the account" "$out" \
-    "privilege: uid $UID_NOW (sudo found no terminal to ask for a password on)"
+out="$(SUDO_STATE=notty PATH="$S" bash "$C" --stdout </dev/null 2>/dev/null)"
+has "no terminal to ask on: the reason names the terminal" "$out" \
+    "privilege: not root (uid $UID_NOW): sudo found no terminal to ask for a password on"
 has "and sudo was asked anyway, rather than skipped on a test of stdin" \
     "$(cat "$STUBLOG")" "sudo -v"
 
-if type -P script >/dev/null 2>&1; then
-    : > "$STUBLOG"
-    out="$(script -qec "PATH=$S STUBLOG=$STUBLOG bash $C --stdout" /dev/null 2>/dev/null)"
-    has "with a terminal: the reason names the account" "$out" \
-        "(sudo did not authorise this account)"
-else skip "the terminal case (no script(1) on this host)"; fi
+# The regression that made this file worth writing: 0.6.1 chose between these
+# two by testing /dev/tty, so an account sudo does not permit was reported as a
+# missing terminal on every run that had none, and the guide then sent the
+# operator to `ssh -t`, which that account cannot be helped by.
+out="$(SUDO_STATE=nosudoers PATH="$S" bash "$C" --stdout </dev/null 2>/dev/null)"
+has "not in sudoers, same absent terminal: the reason names the account" "$out" \
+    "privilege: not root (uid $UID_NOW): sudo does not permit this account"
 
 out="$(PATH="$S" bash "$C" --stdout --no-sudo </dev/null 2>/dev/null)"
-has "--no-sudo: the reason is the flag" "$out" "privilege: uid $UID_NOW (--no-sudo given)"
+has "--no-sudo: the reason is the flag" "$out" \
+    "privilege: not root (uid $UID_NOW): --no-sudo given"
 : > "$STUBLOG"; PATH="$S" bash "$C" --stdout --no-sudo </dev/null >/dev/null 2>&1
 chk "--no-sudo: sudo is not invoked at all" "0" "$(wc -l < "$STUBLOG")"
 
 rm -f "$S/sudo"
 out="$(PATH="$S" bash "$C" --stdout </dev/null 2>/dev/null)"
-has "no sudo on the host: the reason says so" "$out" "(command not found: sudo)"
+has "no sudo on the host: the reason says so" "$out" \
+    "privilege: not root (uid $UID_NOW): command not found: sudo"
 mkstub_sudo
 
 echo "== 2. the reason reaches the operator, not only the file =="
 err="$(MYSQL_FAIL=1 PATH="$S" bash "$C" --stdout --mysql-args "-u x" </dev/null 2>&1 >/dev/null)"
 has "the blocked line carries the refusal" "$err" "mysql login"
 has "and names it" "$err" "access denied"
-has "and the privilege that would have answered it" "$err" \
+has "and the privilege that would have answered it, in sudo's words" "$err" \
     "(not elevated: sudo found no terminal to ask for a password on)"
 has "and the run is INCOMPLETE" "$err" "status: INCOMPLETE"
 out="$(MYSQL_FAIL=1 PATH="$S" bash "$C" --stdout --mysql-args "-u x" </dev/null 2>/dev/null)"

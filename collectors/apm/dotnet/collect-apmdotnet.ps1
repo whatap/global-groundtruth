@@ -392,9 +392,22 @@ Section "Collection environment"
 Fact "collector: $COLLECTOR_NAME $VERSION"
 Fact "powershell: $($PSVersionTable.PSVersion) ($($PSVersionTable.PSEdition))"
 Fact "user: $env:USERDOMAIN\$env:USERNAME"
+# The Windows port of the shell collectors' privilege line. It states one thing:
+# whether this process carries an elevated token. It does not speak for any
+# other authority the collection needs, and goals name their own.
+#
+# IsInRole is the test, not group membership. Under UAC's split token an
+# unelevated process still lists Administrators, as a deny-only SID, so asking
+# by membership reports an unelevated run as elevated.
 $isAdmin = $false
 try { $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator) } catch { }
-Fact "administrator role: $isAdmin"
+if ($isAdmin) {
+    $PRIV_WHY = "elevated ($env:USERDOMAIN\$env:USERNAME)"; $PRIV_GAP = ""
+} else {
+    $PRIV_WHY = "not elevated ($env:USERDOMAIN\$env:USERNAME)"
+    $PRIV_GAP = "run PowerShell as Administrator"
+}
+Fact "privilege: $PRIV_WHY"
 Fact "64-bit OS: $([Environment]::Is64BitOperatingSystem)   64-bit collector process: $([Environment]::Is64BitProcess)"
 if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess) {
     Fact "note: 32-bit process on 64-bit OS -- HKLM\SOFTWARE and Program Files views below are WOW64-redirected"

@@ -209,7 +209,23 @@ Add-Goal instance "agent instance (a dir holding whatap.conf)"
 Section "Collection environment"
 Fact "powershell: $($PSVersionTable.PSVersion)"
 Fact "user: $env:USERDOMAIN\$env:USERNAME"
-TryFact "administrator role" { ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator) }
+# The Windows port of the shell collectors' privilege line. It states one thing:
+# whether this process carries an elevated token. SQL Server access is decided
+# by the login's server roles, not by this, so goals name their own authority.
+#
+# IsInRole is the test, not group membership. Under UAC's split token an
+# unelevated process still lists Administrators, as a deny-only SID, so asking
+# by membership reports an unelevated run as elevated. Not TryFact either: a
+# throw there would drop the line, and section 0 always states the privilege.
+$isAdmin = $false
+try { $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator) } catch { }
+if ($isAdmin) {
+    $PRIV_WHY = "elevated ($env:USERDOMAIN\$env:USERNAME)"; $PRIV_GAP = ""
+} else {
+    $PRIV_WHY = "not elevated ($env:USERDOMAIN\$env:USERNAME)"
+    $PRIV_GAP = "run PowerShell as Administrator"
+}
+Fact "privilege: $PRIV_WHY"
 
 Section "A. Host & platform"
 TryFact "os" { (Get-CimInstance Win32_OperatingSystem).Caption + " " + (Get-CimInstance Win32_OperatingSystem).Version }

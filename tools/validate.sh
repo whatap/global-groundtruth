@@ -129,17 +129,25 @@ for f in "${targets[@]}"; do
     #     say whether it got it (CONTRACT, "Saying whether the collection worked").
     #     Shell only — the PowerShell collectors carry their own port of the block
     #     and are checked by the Emit-Status name instead.
+    #     Section 0 states the privilege the run had. What a collection can read
+    #     is decided by it, and a report that omits it leaves the reader unable
+    #     to tell an absent value from an unreadable one. Shell collectors carry
+    #     the shared block; the PowerShell pair ports the same line by hand.
     case "$bn" in
         *.ps1)
             grep -v '^[[:space:]]*#' "$f" | grep -qF 'Emit-Status' \
                 || problems+=("no completeness roll-up: nothing calls Emit-Status")
             grep -v '^[[:space:]]*#' "$f" | grep -qE '^\s*Add-Goal' \
-                || problems+=("no goals declared: nothing calls Add-Goal") ;;
+                || problems+=("no goals declared: nothing calls Add-Goal")
+            grep -v '^[[:space:]]*#' "$f" | grep -qF 'Fact "privilege: ' \
+                || problems+=("section 0 does not state the privilege: no 'privilege:' fact") ;;
         *)
             grep -v '^[[:space:]]*#' "$f" | grep -qE '(^|[[:space:]])emit_status([[:space:]]|$)' \
                 || problems+=("no completeness roll-up: nothing calls emit_status")
             grep -v '^[[:space:]]*#' "$f" | grep -qE '(^|[[:space:]])goal[[:space:]]' \
-                || problems+=("no goals declared: nothing calls goal") ;;
+                || problems+=("no goals declared: nothing calls goal")
+            grep -v '^[[:space:]]*#' "$f" | grep -qF 'fact "privilege: ' \
+                || problems+=("section 0 does not state the privilege: no 'privilege:' fact") ;;
     esac
 
     # (4) judgment words in emitted lines (exclude comments + footer sentinel,

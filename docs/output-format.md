@@ -77,6 +77,49 @@ each to appear in the collector's output:
 > emitted by the shared `section` helper and is purely positional. Both name
 > the same section — when cross-referencing, prefer the letter.
 
+## Privilege (section 0)
+
+Section 0 carries one `privilege:` line, and `tools/validate.sh` requires it.
+
+```
+    uid: 3103
+    privilege: not root (uid 3103)
+```
+
+What a collection can read is decided by the privilege it was given, so a report
+that leaves it out gives the reader no way to tell an absent value from an
+unreadable one. Three shapes on a shell collector, and the Windows pair ports
+the same line with `elevated` / `not elevated (DOMAIN\user)`:
+
+| Line | What it says |
+|---|---|
+| `privilege: root` | The run was root already |
+| `privilege: root (elevated by sudo from uid 3103)` | It was reached through sudo |
+| `privilege: not root (uid 3103)` | It was not, and `run again with sudo` is the gap |
+
+The authoring side is the shared block in the skeleton. `_note_privilege` fills
+`PRIV_WHY` and `PRIV_GAP` once, before section 0 reads them, and `_priv_hint`
+appends the gap to the reason of any goal that privilege blocked — so the gap
+reaches the operator's terminal on the same line as what it cost:
+
+```
+>>   mysql login — access denied (not elevated: sudo does not permit this account)
+```
+
+Three rules for the author.
+
+- **A collector does not elevate itself, unless elevation is the whole job.**
+  One does (`collect-collmysql.sh`: nearly every section is SQL, and a packaged
+  MySQL admits root over the unix socket with no password). Everywhere else the
+  operator decides, because probing sudo logs a security event on a host whose
+  account is not in sudoers.
+- **A collector that does elevate takes its reason from whatever refused it.**
+  An account sudo does not permit and a run with no terminal to be asked on fail
+  identically, and they are answered by different people. `sudo -n` cannot tell
+  them apart — it answers "a password is required" to both.
+- **The line speaks for the process, not for every authority the run needs.**
+  A SQL login or a Kubernetes role is its own goal's business.
+
 ## Collection status (last section)
 
 Every report ends, just before the footer, with a roll-up of what the run came
