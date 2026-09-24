@@ -27,12 +27,18 @@
 export LC_ALL=C
 
 # ---- collector metadata -----------------------------------------------------
+# 0.6.0  Runs itself under sudo when the account is allowed to. On a packaged
+#        Ubuntu MySQL the root@localhost account authenticates by unix socket,
+#        so an elevated run needs no credentials at all, and root also reads
+#        the binary log directory that section I attributes events from. The
+#        run continues unelevated when sudo is absent or refused, so a host
+#        that forbids it still produces the host-side facts. --no-sudo opts out.
 # 0.5.0  Collection status section + operator notice on stderr. Goals: mysql
 #        login, host-side facts, and binary log attribution when --binlog is
 #        given. The binlog n/a reason now separates "path not resolved" from
 #        "path not readable" — they are answered by different things.
 COLLECTOR_NAME="whatap-collection-server-mysql"
-VERSION="0.5.0"
+VERSION="0.6.0"
 DOMAIN="collection-server"
 TARGET="collection-server-mysql/$(hostname 2>/dev/null || echo unknown)"
 
@@ -40,6 +46,7 @@ TARGET="collection-server-mysql/$(hostname 2>/dev/null || echo unknown)"
 OPT_FILE=0
 OPT_STDOUT=0
 OPT_QUIET=0
+OPT_SUDO=1           # re-run under sudo when this account is not root
 OPT_BINLOG=0          # decode binary logs and attribute events per table
 BINLOG_FILES=2        # how many of the newest binary logs to decode
 OPT_SAMPLE=0          # interval iostat/vmstat sampling
@@ -66,6 +73,13 @@ explicit action flag so nothing starts by accident.
                          Each file is streamed once and capped at ${BINLOG_TIMEOUT}s
   --sample[=SEC]         add SEC-interval iostat/vmstat samples (default $SAMPLE_SEC s x $SAMPLE_COUNT)
   --quiet                silence progress on stderr
+  --no-sudo              stay at the current privilege (see below)
+
+Privilege: when this account is not root, the collector re-runs itself under
+sudo, because a packaged MySQL usually lets root log in over the unix socket
+with no password, and root can also read the binary log directory. Passwordless
+sudo is used as-is; otherwise sudo asks once, and a refusal leaves the run at
+the current privilege instead of ending it. --no-sudo skips all of this.
 
 Connection: with neither --defaults-file nor --mysql-args, the mysql client is
 invoked with no connection arguments, so it uses its own option files
@@ -75,11 +89,15 @@ EOF
 }
 
 ARGC=$#
+# Kept for the sudo re-exec: the loop below consumes $@ with shift, and the
+# elevated run has to be given exactly what this one was given.
+_ARGV=("$@")
 while [ $# -gt 0 ]; do
     case "$1" in
         --file)    OPT_FILE=1 ;;
         --stdout)  OPT_STDOUT=1 ;;
         --quiet)   OPT_QUIET=1 ;;
+        --no-sudo) OPT_SUDO=0 ;;
         --binlog)  OPT_BINLOG=1 ;;
         --binlog=*) OPT_BINLOG=1; BINLOG_FILES="${1#*=}" ;;
         --sample)  OPT_SAMPLE=1 ;;
@@ -316,6 +334,55 @@ MYSQL_BIN=""
 MYSQL_OK=0
 MYSQL_WHY="not attempted"
 
+# ---- privilege --------------------------------------------------------------
+# Rule 2: discover, never assume. Whether this account may become root is a
+# property of the host, so it is tested rather than declared, and whatever the
+# test finds is reported as a fact in section 0.
+#
+# Why elevate at all. Nearly every section of this report comes from SQL, and on
+# a packaged MySQL the root@localhost account authenticates by unix socket
+# rather than by password. An elevated run therefore needs no credentials, and
+# the same elevation lets section I read the binary log directory. One run
+# instead of three, which is what rule 3 asks for: the field runs one thing.
+#
+# Why it never ends the run. A host that forbids sudo still produces the
+# host-side facts, and those are worth sending. So sudo is only exec'd once it
+# is known to succeed: passwordless sudo is tested with `sudo -n true`, and an
+# interactive prompt goes through `sudo -v`, which returns nonzero when the
+# operator refuses instead of taking the process with it.
+PRIV_WHY="unknown"
+
+_elevate() {
+    local uid; uid="$(id -u 2>/dev/null || echo 0)"
+    if [ "$uid" = 0 ]; then
+        PRIV_WHY="root${SUDO_UID:+ (elevated by sudo from uid $SUDO_UID)}"
+        return 0
+    fi
+    if [ "$OPT_SUDO" = 0 ]; then PRIV_WHY="uid $uid (--no-sudo given)"; return 0; fi
+    if ! have sudo; then PRIV_WHY="uid $uid (command not found: sudo)"; return 0; fi
+
+    # Absolute path: sudo keeps the working directory, but $0 may have been
+    # reached through PATH. A copy without the execute bit is run through bash.
+    local self="$0" dir
+    case "$self" in
+        /*) ;;
+        *)  dir="$(cd "$(dirname "$self")" 2>/dev/null && pwd)" || dir=""
+            [ -n "$dir" ] && self="$dir/$(basename "$self")" ;;
+    esac
+    local runner=""; [ -x "$self" ] || runner="$(command -v bash || echo sh)"
+
+    if sudo -n true 2>/dev/null; then
+        printf '>> re-running under sudo (uid %s -> root)\n' "$uid" >&2
+        # shellcheck disable=SC2086
+        exec sudo -n $runner "$self" "$@"
+    elif [ -t 0 ] && sudo -v; then
+        printf '>> re-running under sudo (uid %s -> root)\n' "$uid" >&2
+        # shellcheck disable=SC2086
+        exec sudo $runner "$self" "$@"
+    fi
+    PRIV_WHY="uid $uid (sudo not available to this account)"
+}
+
 _mysql_base() {
     local args=""
     [ -n "$DEFAULTS_FILE" ] && args="--defaults-file=$DEFAULTS_FILE"
@@ -396,6 +463,7 @@ run_report() {
     section 0 "Collection environment"
     fact "bash: ${BASH_VERSION:-unknown}"
     fact "uid: $(id -u 2>/dev/null || echo unknown)"
+    fact "privilege: $PRIV_WHY"
     fact "tools:"
     for t in mysql mysqlbinlog iostat vmstat ss findmnt lsblk timeout; do
         if have "$t"; then sub "$(printf '%-12s present' "$t")"
@@ -685,6 +753,7 @@ if [ "$OPT_FILE" = 0 ] && [ "$OPT_STDOUT" = 0 ]; then
     exit 2
 fi
 
+_elevate "${_ARGV[@]}"
 _init_probe
 _resolve_mysql
 TARGET="collection-server-mysql/$(hostname 2>/dev/null || echo unknown)@${MYSQL_WHY}"
@@ -699,6 +768,10 @@ else
     OUTFILE="./$COLLECTOR_NAME-$HOST-$TS.txt"
     progress "collecting facts (read-only) -> writing $OUTFILE"
     run_report > "$OUTFILE" 2>/dev/null
+    # Written by root after an elevation, so give it back to whoever asked for
+    # it; otherwise they cannot move or delete their own report.
+    [ -n "${SUDO_UID:-}" ] && [ "$(id -u 2>/dev/null || echo 0)" = 0 ] \
+        && chown "$SUDO_UID:${SUDO_GID:-$SUDO_UID}" "$OUTFILE" 2>/dev/null
     progress "report written: $OUTFILE"
 fi
 _end_probe
