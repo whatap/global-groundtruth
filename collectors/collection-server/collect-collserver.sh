@@ -28,6 +28,15 @@ export LC_ALL=C
 
 # ---- collector metadata -----------------------------------------------------
 COLLECTOR_NAME="whatap-collection-server"
+# 0.7.0  sudo is a first-class way to run this. The collector only reads the
+#        host; it writes into a mktemp work dir and the output tarball and
+#        nowhere else, so root adds reach without adding reach into anything
+#        else. Two things follow. The bundle is handed back to the invoking
+#        user (SUDO_UID) so the operator who started the run can still move and
+#        delete the one file they came for, and the header records that the run
+#        came through sudo and from whom. The blocked-goal reasons name sudo
+#        alongside the owning account: one of them gets the module configs, and
+#        only root also gets the system journal and dmesg.
 # 0.6.0  the systemd journal is a goal of its own, and an empty one now says
 #        which kind of empty it is. journalctl does not fail for an
 #        unprivileged uid: it narrows to that user's own entries and prints
@@ -54,7 +63,7 @@ COLLECTOR_NAME="whatap-collection-server"
 #        summarized in the report's G section. Reason: a production collection
 #        server produced a 393MB bundle that the field could not move; 99.95% of
 #        it was logs (sf-whatap-web02-bsd, 2026-09-23).
-VERSION="0.6.0"
+VERSION="0.7.0"
 DOMAIN="collection-server"
 TARGET="collection-server/$(hostname 2>/dev/null || echo unknown)"   # refined after WHATAP_HOME is resolved
 
@@ -569,7 +578,7 @@ run_report() {
     section "Collection environment"
     fact "collector: $COLLECTOR_NAME $VERSION"
     fact "bash: ${BASH_VERSION:-unknown}"
-    fact "uid: $(id -u 2>/dev/null || echo unknown) ($( [ "$(id -u 2>/dev/null)" = 0 ] && echo root || echo non-root ))"
+    fact "uid: $(id -u 2>/dev/null || echo unknown) ($( [ "$(id -u 2>/dev/null)" = 0 ] && echo root || echo non-root )$( [ -n "${SUDO_USER:-}" ] && printf ', via sudo from %s' "$SUDO_USER" ))"
     fact "tools:"
     local t
     for t in ss netstat findmnt df stat systemctl journalctl timedatectl chronyc ntpq zfs zpool jstack jmap jcmd java timeout du tar ps awk; do
@@ -949,12 +958,12 @@ home_why() {
         printf 'WHATAP_HOME not resolved; pass --home DIR'
     elif [ ! -d "$WHOME" ]; then
         # stat() on WHOME itself failed, so its parent is not searchable by us.
-        printf 'WHATAP_HOME resolved to %s (via %s) but uid %s cannot reach it; run as the account that owns the installation' \
+        printf 'WHATAP_HOME resolved to %s (via %s) but uid %s cannot reach it; run with sudo or as the account that owns the installation' \
             "$WHOME" "$WHOME_SRC" "$uid"
     elif [ ! -x "$WHOME" ]; then
         # WHOME stats but we cannot search it, so every path under it would come
         # back "not found". Say permission, not absence — they are different bugs.
-        printf 'uid %s cannot search %s (no execute permission); run as the account that owns the installation' \
+        printf 'uid %s cannot search %s (no execute permission); run with sudo or as the account that owns the installation' \
             "$uid" "$WHOME"
     elif [ ! -d "$path" ]; then
         printf 'path not found: %s' "$path"
@@ -983,7 +992,7 @@ journal_why() {
         for f in "$d"/*/system.journal; do
             [ -e "$f" ] || continue
             [ -r "$f" ] && return
-            printf 'uid %s cannot read %s (groups: %s); journalctl then shows only entries from this user' \
+            printf 'uid %s cannot read %s (groups: %s); journalctl then shows only entries from this user; run with sudo' \
                 "$uid" "$f" "$(id -nG 2>/dev/null | tr ' ' ',')"
             return
         done
@@ -1252,6 +1261,11 @@ do_bundle() {
         # deleted with it. -C changes only where tar reads inputs; $tarball stays
         # relative to the caller's CWD. Only remove $work if tar actually wrote it.
         if tar -C "$work" -czf "$tarball" . 2>/dev/null && [ -f "$tarball" ]; then
+            # Under sudo the tarball is root-owned, and the operator who started
+            # the run then cannot move or delete the one file they came for.
+            if [ "$(id -u 2>/dev/null)" = 0 ] && [ -n "${SUDO_UID:-}" ]; then
+                chown "$SUDO_UID:${SUDO_GID:-$SUDO_UID}" "$tarball" 2>/dev/null
+            fi
             progress "bundle: $tarball"
             rm -rf "$work" 2>/dev/null
         else
