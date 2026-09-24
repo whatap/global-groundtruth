@@ -27,6 +27,11 @@
 export LC_ALL=C
 
 # ---- collector metadata -----------------------------------------------------
+# 0.6.4  The report names the account. Section 0 says what the connection was
+#        attempted with, which survives a refusal, and section A says which
+#        grant row the server matched, which a refusal never reaches. On
+#        2026-09-23 both reports said only "access denied" and nothing said
+#        which account had been tried.
 # 0.6.3  Section 0 states the host's boot time and uptime, read from /proc. The
 #        kernel counters in section D are totals since boot, so a report without
 #        it carries a sum with no denominator. It is deliberately not SQL: the
@@ -57,7 +62,7 @@ export LC_ALL=C
 #        given. The binlog n/a reason now separates "path not resolved" from
 #        "path not readable" — they are answered by different things.
 COLLECTOR_NAME="whatap-collection-server-mysql"
-VERSION="0.6.3"
+VERSION="0.6.4"
 DOMAIN="collection-server"
 TARGET="collection-server-mysql/$(hostname 2>/dev/null || echo unknown)"
 
@@ -583,6 +588,16 @@ run_report() {
         else sub "$(printf '%-12s absent' "$t")"; fi
     done
     fact "mysql client: ${MYSQL_BIN:-n/a (command not found)}"
+    # What the connection was attempted WITH. Section A reports what the server
+    # matched, but only a successful login reaches section A, and a refused one
+    # is exactly when the question is asked. With no arguments the client takes
+    # the account name from the OS uid and goes over the unix socket, so an
+    # elevated run attempts root@localhost without anything being passed.
+    if [ -n "$DEFAULTS_FILE" ] || [ -n "$MYSQL_ARGS" ]; then
+        fact "connection attempted with:${DEFAULTS_FILE:+ --defaults-file=$DEFAULTS_FILE}${MYSQL_ARGS:+ $(printf '%s' "$MYSQL_ARGS" | sed -E 's/(-p)[^ ]+/\1<masked>/g; s/(password=)[^ ]+/\1<masked>/gI')}"
+    else
+        fact "connection attempted with: no arguments (client defaults: account from uid $(id -u 2>/dev/null || echo '?') = $(id -un 2>/dev/null || echo unknown), unix socket)"
+    fi
     fact "mysql connection: $MYSQL_WHY"
     if [ "$MYSQL_OK" = 1 ]; then got login
     elif [ -z "$MYSQL_ARGS" ] && [ -z "$DEFAULTS_FILE" ] \
@@ -595,6 +610,10 @@ run_report() {
     fact "sampling tier: $([ "$OPT_SAMPLE" = 1 ] && echo "on (${SAMPLE_SEC}s x ${SAMPLE_COUNT})" || echo "off")"
 
     section A "Server identity and version"
+    # Which account the server matched, not which one was asked for. They differ
+    # when a host pattern matches something wider than the literal name, and the
+    # difference is the grant row a later "access denied" belongs to.
+    sql "connected as"   "SELECT CONCAT(USER(), ' -> matched ', CURRENT_USER())"
     sql "version"        "SELECT VERSION()"
     sql "server host"    "SELECT @@hostname"
     sql "server_id"      "SELECT @@server_id"
