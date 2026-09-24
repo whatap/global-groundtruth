@@ -27,6 +27,12 @@
 export LC_ALL=C
 
 # ---- collector metadata -----------------------------------------------------
+# 0.6.1  The elevation no longer decides for sudo whether it can ask. 0.6.0
+#        gated the interactive attempt on `[ -t 0 ]`, so a run started as
+#        `ssh host './collect-collmysql.sh ...'` skipped it without a word and
+#        reported the same reason as an account sudo had actually refused. Now
+#        sudo is always asked and answers for itself, and the four ways a run
+#        can stay unelevated are four different reasons.
 # 0.6.0  Runs itself under sudo when the account is allowed to. On a packaged
 #        Ubuntu MySQL the root@localhost account authenticates by unix socket,
 #        so an elevated run needs no credentials at all, and root also reads
@@ -38,7 +44,7 @@ export LC_ALL=C
 #        given. The binlog n/a reason now separates "path not resolved" from
 #        "path not readable" — they are answered by different things.
 COLLECTOR_NAME="whatap-collection-server-mysql"
-VERSION="0.6.0"
+VERSION="0.6.1"
 DOMAIN="collection-server"
 TARGET="collection-server-mysql/$(hostname 2>/dev/null || echo unknown)"
 
@@ -78,8 +84,10 @@ explicit action flag so nothing starts by accident.
 Privilege: when this account is not root, the collector re-runs itself under
 sudo, because a packaged MySQL usually lets root log in over the unix socket
 with no password, and root can also read the binary log directory. Passwordless
-sudo is used as-is; otherwise sudo asks once, and a refusal leaves the run at
-the current privilege instead of ending it. --no-sudo skips all of this.
+sudo is used as-is; otherwise sudo asks once. Anything short of an elevation
+(no sudo, no terminal to ask on, an account sudo does not authorise) leaves the
+run at the current privilege instead of ending it, and section 0 names which of
+them it was. --no-sudo skips all of this.
 
 Connection: with neither --defaults-file nor --mysql-args, the mysql client is
 invoked with no connection arguments, so it uses its own option files
@@ -347,19 +355,35 @@ MYSQL_WHY="not attempted"
 #
 # Why it never ends the run. A host that forbids sudo still produces the
 # host-side facts, and those are worth sending. So sudo is only exec'd once it
-# is known to succeed: passwordless sudo is tested with `sudo -n true`, and an
-# interactive prompt goes through `sudo -v`, which returns nonzero when the
-# operator refuses instead of taking the process with it.
+# is known to succeed: passwordless sudo is tested with `sudo -n true`, and the
+# interactive attempt goes through `sudo -v`, which returns nonzero when it
+# cannot authenticate instead of taking the process with it.
+#
+# Why `sudo -v` is attempted unconditionally. Whether a password can be asked
+# for is sudo's question, not this script's: sudo prompts on /dev/tty, which a
+# test of stdin does not describe. 0.6.0 gated the attempt on `[ -t 0 ]` and so
+# went silently unelevated under `ssh host 'cmd'`, reporting it as an account
+# sudo had refused. Without a terminal sudo fails immediately, and the reason it
+# gives is the one worth reporting.
 PRIV_WHY="unknown"
+PRIV_GAP=""   # why this run is not root; empty once it is
+
+# _priv_hint -> " (not elevated: REASON)", or nothing when the run is root.
+# A blocked value and the privilege that would have obtained it belong on the
+# same line, because the roll-up puts that line on the operator's terminal while
+# they are still logged in, and the two answer different next steps: a terminal
+# sudo never got is answered by `ssh -t`, an account sudo refused is not.
+_priv_hint() { [ -n "$PRIV_GAP" ] && printf ' (not elevated: %s)' "$PRIV_GAP"; return 0; }
 
 _elevate() {
     local uid; uid="$(id -u 2>/dev/null || echo 0)"
     if [ "$uid" = 0 ]; then
         PRIV_WHY="root${SUDO_UID:+ (elevated by sudo from uid $SUDO_UID)}"
+        PRIV_GAP=""
         return 0
     fi
-    if [ "$OPT_SUDO" = 0 ]; then PRIV_WHY="uid $uid (--no-sudo given)"; return 0; fi
-    if ! have sudo; then PRIV_WHY="uid $uid (command not found: sudo)"; return 0; fi
+    if [ "$OPT_SUDO" = 0 ]; then PRIV_GAP="--no-sudo given"; PRIV_WHY="uid $uid ($PRIV_GAP)"; return 0; fi
+    if ! have sudo; then PRIV_GAP="command not found: sudo"; PRIV_WHY="uid $uid ($PRIV_GAP)"; return 0; fi
 
     # Absolute path: sudo keeps the working directory, but $0 may have been
     # reached through PATH. A copy without the execute bit is run through bash.
@@ -375,12 +399,20 @@ _elevate() {
         printf '>> re-running under sudo (uid %s -> root)\n' "$uid" >&2
         # shellcheck disable=SC2086
         exec sudo -n $runner "$self" "$@"
-    elif [ -t 0 ] && sudo -v; then
+    elif sudo -v; then
         printf '>> re-running under sudo (uid %s -> root)\n' "$uid" >&2
         # shellcheck disable=SC2086
         exec sudo $runner "$self" "$@"
     fi
-    PRIV_WHY="uid $uid (sudo not available to this account)"
+    # sudo has answered. Which answer it was decides what a second run needs, so
+    # the two are not reported as one: a terminal sudo could have asked on is
+    # the thing that was absent, or it asked and did not authenticate.
+    if { : < /dev/tty; } 2>/dev/null; then
+        PRIV_GAP="sudo did not authorise this account"
+    else
+        PRIV_GAP="sudo found no terminal to ask for a password on"
+    fi
+    PRIV_WHY="uid $uid ($PRIV_GAP)"
 }
 
 _mysql_base() {
@@ -477,7 +509,7 @@ run_report() {
         # No local server and no connection arguments: there is no database
         # here to log in to, so this is the answer rather than a blocked run.
         na login "no mysqld on this host and no connection arguments given"
-    else missed login "$MYSQL_WHY"; fi
+    else missed login "$MYSQL_WHY$(_priv_hint)"; fi
     fact "binlog decode tier: $([ "$OPT_BINLOG" = 1 ] && echo "on (newest $BINLOG_FILES files)" || echo "off")"
     fact "sampling tier: $([ "$OPT_SAMPLE" = 1 ] && echo "on (${SAMPLE_SEC}s x ${SAMPLE_COUNT})" || echo "off")"
 
@@ -646,7 +678,7 @@ run_report() {
         missed binlog "binary log directory not resolved (log_bin_basename and datadir unavailable)"
     elif [ ! -r "$BINLOG_DIR" ]; then
         fact "n/a (binary log directory $BINLOG_DIR not readable by uid $(id -u 2>/dev/null || echo '?'))"
-        missed binlog "$BINLOG_DIR not readable by uid $(id -u 2>/dev/null || echo '?')"
+        missed binlog "$BINLOG_DIR not readable by uid $(id -u 2>/dev/null || echo '?')$(_priv_hint)"
     else
         fact "decoding the $BINLOG_FILES newest binary logs under $BINLOG_DIR"
         _bl_list="$(ls -1t "$BINLOG_DIR" 2>/dev/null | grep -E '\.[0-9]{6}$' | head -n "$BINLOG_FILES")"
