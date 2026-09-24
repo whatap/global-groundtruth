@@ -406,6 +406,9 @@ run_report() {
     fact "uid: $(id -u 2>/dev/null || echo unknown)"
     _note_privilege
     fact "privilege: $PRIV_WHY"
+    # Say why this collector needs the denominator, then call it. Nearly every
+    # cumulative value a collector reports is since-boot.
+    _note_boot
     fact "tools:"
     for t in ss findmnt systemctl; do   # <- replace with the tools you use
         if command -v "$t" >/dev/null 2>&1; then printf '        %-12s present\n' "$t"
