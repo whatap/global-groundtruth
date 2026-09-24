@@ -63,7 +63,7 @@ COLLECTOR_NAME="whatap-collection-server"
 #        summarized in the report's G section. Reason: a production collection
 #        server produced a 393MB bundle that the field could not move; 99.95% of
 #        it was logs (sf-whatap-web02-bsd, 2026-09-23).
-VERSION="0.7.0"
+VERSION="0.7.1"
 DOMAIN="collection-server"
 TARGET="collection-server/$(hostname 2>/dev/null || echo unknown)"   # refined after WHATAP_HOME is resolved
 
@@ -245,6 +245,39 @@ _note_privilege() {
         PRIV_WHY="not root (uid $_priv_uid)"
         PRIV_GAP="run again with sudo"
     fi
+}
+
+# ---- boot time — DO NOT EDIT ------------------------------------------------
+# Most of what a collector reports is cumulative since boot: /proc/diskstats,
+# ZFS kstat trees, zpool iostat histograms, MySQL GLOBAL STATUS. Without the boot
+# time those are sums with no denominator and cannot be read as a rate, so the
+# reader either asks the site for it afterwards or reconstructs it. Both are work
+# the collector could have done, and it belongs in section 0 with the rest of the
+# facts about this run.
+#
+# Two real cases, both 2026-09-23 Smartfren. A MySQL bundle whose section D kernel
+# counters had no start time, so `uptime -s` had to be asked for by hand and a
+# runbook carried a step to write that one line down. And a ZFS bundle whose
+# 869-day uptime had to be rebuilt from kstat snaptime, a pool_create event and
+# dmesg monotonic time before `try_hard` 29,727,745 could be stated as 34,209/day.
+#
+# It reads /proc rather than running `uptime` on purpose. It arrives on a host
+# without procps, and it still arrives on a run whose main collection failed early
+# (a refused login, an absent zpool), which is exactly the run whose counters most
+# need a denominator.
+#
+# _note_boot -> emit the two facts. Call it from section 0, after the privilege
+# line. It prints rather than returning, because both values are always wanted
+# together and neither is read back by the collector.
+_note_boot() {
+    _boot_btime="$(awk '/^btime/{print $2; exit}' /proc/stat 2>/dev/null)"
+    if [ -n "$_boot_btime" ]; then
+        fact "host boot(UTC): $(date -u -d "@$_boot_btime" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+            || echo "n/a (epoch $_boot_btime, date -d unavailable)")"
+    else
+        fact "host boot(UTC): n/a (no btime in /proc/stat)"
+    fi
+    fact "host uptime(s): $(cut -d. -f1 /proc/uptime 2>/dev/null || echo 'n/a (/proc/uptime not readable)')"
 }
 
 # ---- collection completeness — DO NOT EDIT ----------------------------------
@@ -625,6 +658,7 @@ run_report() {
     fact "uid: $(id -u 2>/dev/null || echo unknown)$( [ -n "${SUDO_USER:-}" ] && printf ' (via sudo from %s)' "$SUDO_USER" )"
     _note_privilege
     fact "privilege: $PRIV_WHY"
+    _note_boot
     fact "tools:"
     local t
     for t in ss netstat findmnt df stat systemctl journalctl timedatectl chronyc ntpq zfs zpool jstack jmap jcmd java timeout du tar ps awk; do

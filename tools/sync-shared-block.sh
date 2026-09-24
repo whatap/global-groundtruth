@@ -22,6 +22,7 @@ SKELETON="$ROOT/templates/collector-skeleton/collector-skeleton.sh"
 # name|banner regex|last function in the block
 BLOCKS=(
     'privilege|^# ---- privilege|^_note_privilege[(][)]'
+    'boot|^# ---- boot time|^_note_boot[(][)]'
     'completeness|^# ---- collection completeness|^emit_status[(][)]'
 )
 

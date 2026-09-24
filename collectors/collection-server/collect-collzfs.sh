@@ -264,6 +264,39 @@ _note_privilege() {
     fi
 }
 
+# ---- boot time — DO NOT EDIT ------------------------------------------------
+# Most of what a collector reports is cumulative since boot: /proc/diskstats,
+# ZFS kstat trees, zpool iostat histograms, MySQL GLOBAL STATUS. Without the boot
+# time those are sums with no denominator and cannot be read as a rate, so the
+# reader either asks the site for it afterwards or reconstructs it. Both are work
+# the collector could have done, and it belongs in section 0 with the rest of the
+# facts about this run.
+#
+# Two real cases, both 2026-09-23 Smartfren. A MySQL bundle whose section D kernel
+# counters had no start time, so `uptime -s` had to be asked for by hand and a
+# runbook carried a step to write that one line down. And a ZFS bundle whose
+# 869-day uptime had to be rebuilt from kstat snaptime, a pool_create event and
+# dmesg monotonic time before `try_hard` 29,727,745 could be stated as 34,209/day.
+#
+# It reads /proc rather than running `uptime` on purpose. It arrives on a host
+# without procps, and it still arrives on a run whose main collection failed early
+# (a refused login, an absent zpool), which is exactly the run whose counters most
+# need a denominator.
+#
+# _note_boot -> emit the two facts. Call it from section 0, after the privilege
+# line. It prints rather than returning, because both values are always wanted
+# together and neither is read back by the collector.
+_note_boot() {
+    _boot_btime="$(awk '/^btime/{print $2; exit}' /proc/stat 2>/dev/null)"
+    if [ -n "$_boot_btime" ]; then
+        fact "host boot(UTC): $(date -u -d "@$_boot_btime" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+            || echo "n/a (epoch $_boot_btime, date -d unavailable)")"
+    else
+        fact "host boot(UTC): n/a (no btime in /proc/stat)"
+    fi
+    fact "host uptime(s): $(cut -d. -f1 /proc/uptime 2>/dev/null || echo 'n/a (/proc/uptime not readable)')"
+}
+
 # ---- collection completeness — DO NOT EDIT ----------------------------------
 # A collector knows, at the host, whether it obtained what it came for. Saying so
 # is a fact about THIS COLLECTION RUN, not a claim about the environment, so it
@@ -886,23 +919,10 @@ run_report() {
     fact "uid: $(id -u 2>/dev/null || echo unknown) ($( [ "$(id -u 2>/dev/null)" = 0 ] && echo root || echo non-root ))"
     _note_privilege
     fact "privilege: $PRIV_WHY"
-
-    # Boot time is the denominator for every since-boot counter in this report:
-    # [J] zpool iostat, the kstat trees, and metaslab_stats are all cumulative,
-    # so without it they are sums with no denominator and cannot be read as a
-    # rate. This comes from /proc rather than `uptime` so it still arrives on a
-    # host without procps. Smartfren, 2026-09-23: the 869-day uptime had to be
-    # reconstructed from kstat snaptime, a pool_create event and dmesg monotonic
-    # time, because no bundle field carried it.
-    local _btime t
-    _btime="$(awk '/^btime/{print $2; exit}' /proc/stat 2>/dev/null)"
-    if [ -n "$_btime" ]; then
-        fact "host boot(UTC): $(date -u -d "@$_btime" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "n/a (epoch $_btime, date -d unavailable)")"
-    else
-        fact "host boot(UTC): n/a (no btime in /proc/stat)"
-    fi
-    fact "host uptime(s): $(cut -d. -f1 /proc/uptime 2>/dev/null || echo 'n/a (/proc/uptime not readable)')"
+    # [J] zpool iostat, the kstat trees and metaslab_stats are all since-boot.
+    _note_boot
     fact "tools:"
+    local t
     for t in zfs zpool zdb arcstat arc_summary findmnt df stat lsblk iostat modinfo dkms \
              systemctl journalctl dmesg timeout tar awk find sort head tail nproc free; do
         if command -v "$t" >/dev/null 2>&1; then printf '        %-12s present\n' "$t"; else printf '        %-12s absent\n' "$t"; fi
