@@ -795,7 +795,7 @@ run_report() {
         # individually while rotated ones are summarized per base (metadata only).
         subsection "current logs (non-rotated) — name / size / mtime"
         local _f _cur=0
-        for _f in $(ls -1 "$WHOME"/logs/*.log "$WHOME"/logs/*/*.log 2>/dev/null); do
+        for _f in "$WHOME"/logs/*.log "$WHOME"/logs/*/*.log; do
             [ -f "$_f" ] || continue
             case "$_f" in *.[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].*.log) continue ;; esac
             _cur=1
@@ -845,7 +845,7 @@ run_report() {
         fi
 
         subsection "recent ERROR/WARN/Exception counts (current logs only, last 2MB each)"
-        for _f in $(ls -1 "$WHOME"/logs/*.log "$WHOME"/logs/*/*.log 2>/dev/null); do
+        for _f in "$WHOME"/logs/*.log "$WHOME"/logs/*/*.log; do
             [ -f "$_f" ] || continue
             case "$_f" in *.[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].*.log) continue ;; esac
             local c; c="$(tail -c 2097152 "$_f" 2>/dev/null | grep -cE 'ERROR|WARN|Exception' 2>/dev/null)"
@@ -857,9 +857,14 @@ run_report() {
         # one. Sorted by mtime (ls -t) so the actively-written logs come first;
         # excludes rotated .log.<date> and the _self/_api/access/checker/gc
         # streams. Bounded: 40 lines each, at most 12 logs (rest are in inventory).
-        local TAIL_LINES=40 LOG_TAIL_FILES=12 _lc=0 _lf
-        for _lf in $(ls -1t "$WHOME"/logs/*.log 2>/dev/null); do
-            [ -f "$_lf" ] || continue
+        local TAIL_LINES=40 LOG_TAIL_FILES=12 _lc=0 _lf _lslist
+        # `ls -1t` and not a glob: this wants newest-first and a glob cannot
+        # sort. Read it one line at a time so a log name containing a space
+        # survives, and feed the loop with a heredoc so it stays in this shell
+        # (a pipe would put _lc in a subshell and lose the count).
+        _lslist="$(ls -1t "$WHOME"/logs/*.log 2>/dev/null)"
+        while IFS= read -r _lf; do
+            [ -n "$_lf" ] && [ -f "$_lf" ] || continue
             # skip secondary streams and rotated (logback ".<yyyyMMdd>.<i>.log") files
             case "$_lf" in
                 *_self.log|*_api.log|*access*|*checker*|*/gc*.log) continue ;;
@@ -872,7 +877,9 @@ run_report() {
             fi
             fact "${_lf#"$WHOME"/} (mtime $(date -u -r "$_lf" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo n/a)):"
             tail -n "$TAIL_LINES" "$_lf" 2>/dev/null | while IFS= read -r _l || [ -n "$_l" ]; do printf '        %s\n' "$_l"; done
-        done
+        done <<EOF
+$_lslist
+EOF
         [ "$_lc" -eq 0 ] && fact "no base service logs found (only _self/_api/access streams, or none)"
         subsection "self-mon / checker"
         fact "yard_self.log: $( ls "$WHOME"/logs/*_self.log >/dev/null 2>&1 && echo present || echo 'n/a (path not found)' )"
@@ -1057,8 +1064,10 @@ collect_logs() {
     LOGSEL_TRUNC_N=0 LOGSEL_DROP_N=0 LOGSEL_DROP_BYTES=0
 
     # Redirect (not a pipe) so the loop runs in this shell and the totals survive.
-    local kind mt f rel sub sz take
-    while IFS="$(printf '\t')" read -r kind mt f; do
+    # The middle field is the mtime the candidate list was sorted on; it is
+    # consumed into _ because only the order it produced is wanted here.
+    local kind f rel sub sz take
+    while IFS="$(printf '\t')" read -r kind _ f; do
         [ -n "$f" ] && [ -f "$f" ] || continue
         rel="${f#"$WHOME"/logs/}"
         sz="$(wc -c < "$f" 2>/dev/null | tr -d ' ')"; [ -z "$sz" ] && sz=0

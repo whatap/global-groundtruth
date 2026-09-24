@@ -9,9 +9,14 @@ This shape is the contract's Rule 1 ("facts only") made concrete: sections hold
 facts, and nothing else.
 
 This shape is **stdout** (or the `.txt` / the bundle's `report.txt`). A collector's
-usage/help text and its run-progress narration are written to **stderr** and are
-**not** part of this shape — stdout stays byte-for-byte the report so a reader or a
-script can parse it. (See collector-engineering.md guideline 5.)
+run-progress narration is written to **stderr** and is **not** part of this shape —
+stdout stays byte-for-byte the report so a reader or a script can parse it. (See
+collector-engineering.md guideline 5.)
+
+Help text is the one thing that shares stdout, and only when no collection runs:
+with no arguments or `--help` a collector prints usage to **stdout** and exits,
+the ordinary convention for a help request. Usage printed *because a run failed*
+(an unknown argument) goes to **stderr** alongside the error.
 
 ---
 
