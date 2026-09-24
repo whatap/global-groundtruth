@@ -41,8 +41,11 @@
 #   - the footer sentinel line itself, which literally contains "no diagnosis".
 # Line numbers reported below are the true line numbers in the file.
 #
-# This validator is a tool, not a collector, so it is never validated against
-# itself (its judgment-word pattern below obviously contains the words).
+# Nothing in this directory is a collector, so nothing in it is validated:
+# not this validator (its judgment-word pattern below obviously contains the
+# words), and not the test harness or the sync helper beside it. Pass a
+# collector, or a directory of collectors, or the repo root — the tools/
+# directory is skipped either way.
 # -----------------------------------------------------------------------------
 
 set -u
@@ -58,8 +61,11 @@ usage() { echo "usage: $0 <collector.sh | directory> [more...]" >&2; exit 2; }
 targets=()
 for arg in "$@"; do
     if [ -d "$arg" ]; then
+        # Skip anything under a dotted directory (.git, .claude, a leftover
+        # worktree). Those hold copies of the very files being linted, and a
+        # stale copy failing is noise about a checkout, not about a collector.
         while IFS= read -r f; do targets+=("$f"); done \
-            < <(find "$arg" -type f \( -name '*.sh' -o -name '*.ps1' \) | sort)
+            < <(find "$arg" -type f \( -name '*.sh' -o -name '*.ps1' \) -not -path '*/.*/*' | sort)
     elif [ -f "$arg" ]; then
         targets+=("$arg")
     else
@@ -69,11 +75,13 @@ for arg in "$@"; do
 done
 [ ${#targets[@]} -gt 0 ] || { echo "no .sh/.ps1 collectors found" >&2; exit 2; }
 
+# This script's own directory. Everything in it is a tool, never a collector.
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+
 rc=0
 for f in "${targets[@]}"; do
     bn="$(basename "$f")"
-    # The validator is not a collector; never lint it.
-    [ "$bn" = "validate.sh" ] && continue
+    [ "$(cd "$(dirname "$f")" && pwd)" = "$SELF_DIR" ] && continue
 
     problems=()
     skipped=()
