@@ -133,6 +133,12 @@ for f in "${targets[@]}"; do
     #     is decided by it, and a report that omits it leaves the reader unable
     #     to tell an absent value from an unreadable one. Shell collectors carry
     #     the shared block; the PowerShell pair ports the same line by hand.
+    #     Section 0 also states the host boot time, because nearly everything a
+    #     collector reports is cumulative since boot and without it those are sums
+    #     with no denominator. This looks for the _note_boot CALL, not the label:
+    #     the label is printed from inside the shared block, so sync-shared-block
+    #     sees a collector that carries the block and never calls it as "ok".
+    #     Shell only. The PowerShell pair has no port of that block yet.
     case "$bn" in
         *.ps1)
             grep -v '^[[:space:]]*#' "$f" | grep -qF 'Emit-Status' \
@@ -147,7 +153,9 @@ for f in "${targets[@]}"; do
             grep -v '^[[:space:]]*#' "$f" | grep -qE '(^|[[:space:]])goal[[:space:]]' \
                 || problems+=("no goals declared: nothing calls goal")
             grep -v '^[[:space:]]*#' "$f" | grep -qF 'fact "privilege: ' \
-                || problems+=("section 0 does not state the privilege: no 'privilege:' fact") ;;
+                || problems+=("section 0 does not state the privilege: no 'privilege:' fact")
+            grep -v '^[[:space:]]*#' "$f" | grep -qE '(^|[[:space:]])_note_boot([[:space:]]|$)' \
+                || problems+=("section 0 does not state the host boot time: nothing calls _note_boot") ;;
     esac
 
     # (4) judgment words in emitted lines (exclude comments + footer sentinel,
