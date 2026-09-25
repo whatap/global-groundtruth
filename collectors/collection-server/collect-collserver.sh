@@ -27,7 +27,7 @@
 export LC_ALL=C
 
 # ---- collector metadata -----------------------------------------------------
-COLLECTOR_NAME="whatap-collection-server"
+COLLECTOR_NAME="whatap-collserver"
 # 0.7.0  sudo is a first-class way to run this. The collector only reads the
 #        host; it writes into a mktemp work dir and the output tarball and
 #        nowhere else, so root adds reach without adding reach into anything
@@ -63,7 +63,7 @@ COLLECTOR_NAME="whatap-collection-server"
 #        summarized in the report's G section. Reason: a production collection
 #        server produced a 393MB bundle that the field could not move; 99.95% of
 #        it was logs (sf-whatap-web02-bsd, 2026-09-23).
-VERSION="0.8.0"
+VERSION="0.8.1"
 DOMAIN="collection-server"
 TARGET="collection-server/$(hostname 2>/dev/null || echo unknown)"   # refined after WHATAP_HOME is resolved
 
@@ -397,8 +397,10 @@ _bounded() {
         # The kill has to reach whatever CMD started: an orphaned grandchild
         # holds a $(...) pipe open and the caller waits for it anyway. bash
         # under set -m gives the job its own group; _kill_tree covers dash.
+        # stdin through fd 4: POSIX gives an async list /dev/null as stdin
+        # before its own redirections, so a plain 0<&0 hands dash /dev/null.
         set -m 2>/dev/null
-        "$@" 0<&0 &
+        { "$@" 0<&4 4<&- & } 4<&0
         p=$!
         set +m 2>/dev/null
         ( i=0
@@ -1541,7 +1543,7 @@ progress "discovering WhaTap services / resolving WHATAP_HOME ..."
 discover_services
 resolve_home
 resolve_yardbase
-TARGET="collection-server/$(hostname 2>/dev/null || echo unknown)@${WHOME:-unresolved}"
+TARGET="collection-server/$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || echo unknown)${WHOME:+@$WHOME}"
 progress "WHATAP_HOME: ${WHOME:-n/a} (via $WHOME_SRC); whatap JVMs found: ${#PIDS[@]}"
 
 TS="$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null || echo unknown)"

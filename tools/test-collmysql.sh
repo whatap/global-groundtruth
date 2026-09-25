@@ -153,7 +153,7 @@ if sudo -n true 2>/dev/null; then
     has "the run reports itself as root" "$out" "privilege: root (elevated by sudo from uid $UID_NOW)"
     W="$ROOT/w"; mkdir -p "$W"
     ( cd "$W" && bash "$C" --file </dev/null >/dev/null 2>&1 )
-    f="$(ls "$W"/whatap-collection-server-mysql-*.txt 2>/dev/null | head -1)"
+    f="$(ls "$W"/whatap-collmysql-*.txt 2>/dev/null | head -1)"
     if [ -n "$f" ]; then
         chk "the report comes back to the caller" "$(id -un)" "$(stat -c %U "$f")"
     else bad "a report written under sudo" "one .txt" "none"; fi

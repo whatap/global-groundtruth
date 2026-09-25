@@ -309,8 +309,10 @@ _bounded() {
         # The kill has to reach whatever CMD started: an orphaned grandchild
         # holds a $(...) pipe open and the caller waits for it anyway. bash
         # under set -m gives the job its own group; _kill_tree covers dash.
+        # stdin through fd 4: POSIX gives an async list /dev/null as stdin
+        # before its own redirections, so a plain 0<&0 hands dash /dev/null.
         set -m 2>/dev/null
-        "$@" 0<&0 &
+        { "$@" 0<&4 4<&- & } 4<&0
         p=$!
         set +m 2>/dev/null
         ( i=0

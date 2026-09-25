@@ -121,7 +121,8 @@ tools/validate.sh --report /tmp/r.txt
 ```
 
 That checks the header values and order, the numbering, the environment
-section, the status arithmetic and the footer of a real report. Fix the
+section, the status arithmetic and the footer of a real report. `tools/test-framework.sh` does the same for every collector at once,
+and is the check to run after changing anything shared. Fix the
 **collector** until both pass — never edit the validator to make a collector
 pass.
 

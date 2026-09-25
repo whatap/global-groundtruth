@@ -66,8 +66,8 @@ param(
 )
 
 $COLLECTOR_NAME = "whatap-apmdotnet"
-$VERSION        = "0.2.0"
-$DOMAIN         = "apm/dotnet"
+$VERSION        = "0.2.1"
+$DOMAIN         = "apm"
 $CompName = $env:COMPUTERNAME; if (-not $CompName) { $CompName = [Environment]::MachineName }
 $TARGET         = "host/$CompName"
 

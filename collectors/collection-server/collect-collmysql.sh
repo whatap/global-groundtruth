@@ -61,8 +61,8 @@ export LC_ALL=C
 #        login, host-side facts, and binary log attribution when --binlog is
 #        given. The binlog n/a reason now separates "path not resolved" from
 #        "path not readable" — they are answered by different things.
-COLLECTOR_NAME="whatap-collection-server-mysql"
-VERSION="0.7.0"
+COLLECTOR_NAME="whatap-collmysql"
+VERSION="0.7.1"
 DOMAIN="collection-server"
 TARGET="collection-server-mysql/$(hostname 2>/dev/null || echo unknown)"
 
@@ -367,8 +367,10 @@ _bounded() {
         # The kill has to reach whatever CMD started: an orphaned grandchild
         # holds a $(...) pipe open and the caller waits for it anyway. bash
         # under set -m gives the job its own group; _kill_tree covers dash.
+        # stdin through fd 4: POSIX gives an async list /dev/null as stdin
+        # before its own redirections, so a plain 0<&0 hands dash /dev/null.
         set -m 2>/dev/null
-        "$@" 0<&0 &
+        { "$@" 0<&4 4<&- & } 4<&0
         p=$!
         set +m 2>/dev/null
         ( i=0
@@ -1063,7 +1065,8 @@ _elevate "${_ARGV[@]}"
 _run_init
 _init_probe
 _resolve_mysql
-TARGET="collection-server-mysql/$(hostname 2>/dev/null || echo unknown)@${MYSQL_WHY}"
+# An identity only. Whether the login worked is the status section's business.
+TARGET="collection-server-mysql/$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || echo unknown)"
 
 if [ "$OPT_STDOUT" = 1 ]; then
     progress "collecting facts (read-only) -> stdout"

@@ -41,7 +41,7 @@ export LC_ALL=C
 
 # ---- collector metadata -----------------------------------------------------
 COLLECTOR_NAME="whatap-k8s"
-VERSION="0.6.0"
+VERSION="0.6.1"
 DOMAIN="k8s"
 TARGET="k8s-cluster/unresolved"      # refined after CLI/context/namespace discovery
 
@@ -366,8 +366,10 @@ _bounded() {
         # The kill has to reach whatever CMD started: an orphaned grandchild
         # holds a $(...) pipe open and the caller waits for it anyway. bash
         # under set -m gives the job its own group; _kill_tree covers dash.
+        # stdin through fd 4: POSIX gives an async list /dev/null as stdin
+        # before its own redirections, so a plain 0<&0 hands dash /dev/null.
         set -m 2>/dev/null
-        "$@" 0<&0 &
+        { "$@" 0<&4 4<&- & } 4<&0
         p=$!
         set +m 2>/dev/null
         ( i=0
@@ -1917,7 +1919,10 @@ pick_sample_pods
 
 CTX_NAME="$OPT_CONTEXT"
 [ -z "$CTX_NAME" ] && [ -n "$KCTL_BIN" ] && CTX_NAME="$(kval config current-context)"
-TARGET="k8s-cluster/${CTX_NAME:-unknown}@ns:${NS:-unresolved}"
+# An identity only: the context when there is one, else the machine the run came
+# from. What could not be resolved is the status section's business.
+if [ -n "$CTX_NAME" ]; then TARGET="k8s-cluster/$(printf '%s' "$CTX_NAME" | tr ' ' '_')${NS:+@ns:$NS}"
+else TARGET="host/$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || echo unknown)${NS:+@ns:$NS}"; fi
 progress "cli: ${KCTL_BIN:-none}; context: ${CTX_NAME:-unknown}; namespace: ${NS:-unresolved} (via $NS_SRC); node-agent pods: ${#SP_POD[@]}"
 
 TS="$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null || echo unknown)"

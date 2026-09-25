@@ -408,7 +408,7 @@ One `.txt` report, sections `[0]` and A..K:
 ### (b) Delivery mechanism
 
 ```sh
-./collect-collmysql.sh --file                       # -> whatap-collection-server-mysql-<host>-<UTC>.txt
+./collect-collmysql.sh --file                       # -> whatap-collmysql-<host>-<UTC>.txt
 ./collect-collmysql.sh --file --defaults-file ~/.my.cnf
 ./collect-collmysql.sh --file --mysql-args "-h 10.0.0.5 -u whatap -p"
 ./collect-collmysql.sh --file --binlog --sample     # add the two opt-in tiers

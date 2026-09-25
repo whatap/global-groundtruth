@@ -80,4 +80,6 @@ Four blocks are **synced**, not just copied: privilege, boot time, run helpers
 and collection completeness. Each runs from its `# ---- <name> — DO NOT EDIT`
 banner to its `# ---- end <name>` line, and `tools/sync-shared-block.sh
 --apply` overwrites whatever a collector changed between them. Change them
-here, in the skeleton, and run `--apply`; `--check` reports drift.
+here, in the skeleton, and run `--apply`; `--check` reports drift. Then run
+`tools/test-framework.sh`: it tests the blocks under bash and dash, and runs
+every collector through `validate.sh --report`.
