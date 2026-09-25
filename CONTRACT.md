@@ -5,8 +5,11 @@ Every collector in this repository — in every domain, now and in the future �
 breaks any of them does not belong in `global-groundtruth`.
 
 `tools/validate.sh` mechanically enforces the parts that can be checked by a
-machine (Rule 1's vocabulary, the required header, the exact footer). The rest
-is enforced by review.
+machine: on the source, Rule 1's vocabulary as a keyword list, the presence of
+the header labels, the footer, the goals and the environment-section calls; on
+a report (`--report`), the header, the numbering, the environment section, the
+status arithmetic and the footer. A keyword list is not a reading of every sentence, so the rest of
+Rule 1, and all of Rules 2 to 4, are enforced by review.
 
 ---
 
@@ -26,6 +29,19 @@ developer, but also the engineer on site).
 
 > If a line could start with "so you should…", "this is probably…", or
 > "the problem is…", it violates this rule. Delete the judgment; keep the fact.
+
+A fact section holds **observed values only**. Two kinds of line that are not
+judgments still do not belong there:
+
+- **Explanation** — what a field means, how the product behaves, what a
+  vendor's source says ("the 0.5.x line has no master agent"). It is true of
+  the product, not observed on this host, and it goes in the collector's
+  README.
+- **Next steps** — "check binlog_format in section C", "rerun with --sql". The
+  one next step a report may carry is *how to run this collector differently to
+  obtain what it did not*, and it lives only in the `Collection status` section
+  and on stderr, attached to the goal it would obtain (`run again with sudo`,
+  `rerun with --sql`, `run it on the DB host`).
 
 ### Saying whether the collection worked
 
@@ -50,15 +66,26 @@ why, never what it means or what to do about the system.
 
 It also does not turn a normal environment into a failure. An absence is marked
 `na` when it is itself the answer — no ZFS on a host that does not use ZFS, no
-DBX component on a database host, no agent where the product is not installed —
-and the run is still COMPLETE. Only a **blocked** value, one a different run
+DBX component on a database host, no agent where the product is not installed
+and every place it would show was read — and the run is still COMPLETE. Only a **blocked** value, one a different run
 would obtain, makes it INCOMPLETE. A collector that reports an ordinary host as
 INCOMPLETE teaches the field to ignore the line, and then it protects nothing.
 
+The opposite mistake is worse, because nobody notices it: a run that could not
+see reports "not there". So an absence is `na` only when **every input the
+judgment rests on was read**. If any of them was unreadable, or the call that
+would have shown it failed, was refused or timed out, the absence is `missed`.
+"No agent process" from a non-root run that could not read other users'
+`/proc/<pid>/environ` is `missed`; "no CR" from an API call that was forbidden
+is `missed`; "no ZFS" from a host whose `/proc/spl` does not exist is `na`. See
+[docs/output-format.md](docs/output-format.md), "Three outcomes, not two".
+
 `validate.sh` fails any collector whose **source** contains the words
 `likely`, `diagnos`, `recommend`, `should`, `root cause`, or `fix`
-(case-insensitive) on a non-comment line — that is, in any string the script
-could emit. See [tools/validate.sh](tools/validate.sh) for how comments and
+(case-insensitive) on a non-comment line. That is a keyword list, not a proof:
+a judgment phrased in other words ("probably", "the problem is") passes it, and
+a word inside a trailing comment fails it. It catches the common slip; review
+catches the rest. See [tools/validate.sh](tools/validate.sh) for how comments and
 the footer sentinel are excluded. Environment content **quoted verbatim** into
 a report (a distro-shipped file, a vendor config comment) may happen to
 contain these words; that is a fact being reported, not a judgment being made,

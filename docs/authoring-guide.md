@@ -31,7 +31,13 @@ cp templates/collector-skeleton/collector-skeleton.sh \
    collectors/<domain>/collect-<token>.sh
 ```
 
-Set `COLLECTOR_NAME`, `VERSION`, `DOMAIN`, `TARGET` at the top.
+Set `COLLECTOR_NAME`, `VERSION`, `DOMAIN`, `TARGET` at the top:
+
+- `COLLECTOR_NAME="whatap-<token>"`, the same token as the file name;
+- `VERSION` as `x.y.z`, bumped in every change to the script;
+- `DOMAIN` as the top-level directory name only (`apm`, not `apm/java`);
+- `TARGET` as `<kind>/<name>[@<qualifier>]` with no spaces and no run
+  outcome in it (output-format.md, "Header block").
 
 **Name the entrypoint `collect-<token>.sh`** — never a bare `collect.sh`. The
 `<token>` is this collector's unique short id, the **same token that prefixes its
@@ -55,14 +61,24 @@ per-language collectors (apm) gives each its own token (`collect-apmjava.sh`,
   cannot obtain is a fact too — emit `n/a` via the `try` helper, never a
   fabricated default. This is what lets one collector work in an environment its
   author never saw (see [coverage-kb/](coverage-kb/)).
-- **Dump configuration verbatim — do not mask.** Framework policy: WhaTap
-  config files carry no plaintext secrets worth masking (genuinely sensitive
-  material is stored encrypted), and a masked value destroys the very fact a
-  reader needs — a mistyped community string or a wrong server address must be
-  readable to be verified or refuted against the other side. If your domain
-  ever does hold a plaintext secret, state it in your
-  `collectors/<domain>/README.md` security note rather than silently altering
-  the report.
+- **Dump configuration verbatim — do not mask, and say what that exposes.**
+  Framework policy is not to alter what the report quotes: a masked value
+  destroys the very fact a reader needs — a mistyped community string or a
+  wrong server address must be readable to be verified or refuted against the
+  other side. That does **not** mean the report is free of secrets. WhaTap
+  configs can hold a license key or an `admin.password`, and a collector that
+  dumps customer-side material (a pod's environment, helm values, a process
+  manager config, a JDBC option string, a process's command line) carries
+  whatever the customer put there. So every collector's README has a
+  **What the report can contain** section listing each place a secret can
+  arrive from, and the Field Guide repeats it in one line per collector so the
+  operator knows before sending. A new dump source is added to that list in
+  the same change.
+- **Keep secrets out of the host, too.** Separately from what the report
+  quotes, a collector must not put a credential where other users of the host
+  can read it: never on a command line (it is in `ps` and in sudo's log for the
+  whole run). Pass it through the environment of the one child that needs it,
+  or a mode-600 file under `_tmp`.
 
 Use `section`, `fact`, and `try`; do not hand-format the header or footer.
 
@@ -97,14 +113,29 @@ tools/validate.sh collectors/<domain>/collect-<token>.sh
 ```
 
 It fails on judgment words in emitted lines, a missing header field, or a
-missing/edited footer. Fix the **collector** until it passes — never edit the
-validator to make a collector pass.
+missing/edited footer. Then run the collector and check what it produced:
+
+```sh
+collectors/<domain>/collect-<token>.sh --stdout > /tmp/r.txt
+tools/validate.sh --report /tmp/r.txt
+```
+
+That checks the header values and order, the numbering, the environment
+section, the status arithmetic and the footer of a real report. Fix the
+**collector** until both pass — never edit the validator to make a collector
+pass.
 
 ### 6. Own it
 
 Add or update `collectors/<domain>/README.md`: what facts it collects, how the
-field engineer runs it, and its status. From here the collector belongs to your
-team.
+field engineer runs it, what the report can contain (see step 3), and its
+status. From here the collector belongs to your team.
+
+The status table's version column is headed **validated at** and holds the
+last version that was run against a real environment of that kind, with what it
+was run on. It is not the current version: the script's `VERSION` is. A gap
+between the two is the reader's cue that later changes have not met a real
+host yet.
 
 ---
 
@@ -120,7 +151,9 @@ team.
       the language policy in the root [README.md](../README.md).
 - [ ] No-args prints usage; a run needs an explicit action flag; progress is
       narrated on stderr (`--quiet` to suppress). (engineering guideline 5)
-- [ ] `tools/validate.sh` passes.
-- [ ] `collectors/<domain>/README.md` describes facts, delivery, and status.
+- [ ] `tools/validate.sh` passes, and `tools/validate.sh --report` passes on a
+      report the collector produced.
+- [ ] `collectors/<domain>/README.md` describes facts, delivery, what the
+      report can contain, and status ("validated at").
 - [ ] [collector-engineering.md](collector-engineering.md) checklist met (MECE,
       load tiers, portability, reasoned `n/a`).

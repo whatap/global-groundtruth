@@ -4,13 +4,14 @@
 assume; one command; domain-owned). This document says **how** to build one that
 survives contact with a real, unknown, possibly-struggling production host.
 
-These four guidelines are the accumulated design philosophy of the framework.
-They are **advisory** (unlike the four contract rules, which `validate.sh`
-enforces), but a collector that ignores them will eventually mislead a reader,
-add load to a sick server, break on an OS its author never saw, or hide *why* a
-value is missing. Follow them; the seed collector
+These five guidelines are the accumulated design philosophy of the framework.
+They are enforced by review, as most of the contract is (`validate.sh` checks
+only what a machine can; see CONTRACT.md). A collector that ignores them will
+eventually mislead a reader, add load to a sick server, break on an OS its
+author never saw, or hide *why* a value is missing. Follow them; the seed
+collector
 [`collectors/collection-server/collect-collserver.sh`](../collectors/collection-server/collect-collserver.sh)
-is the reference implementation of all four.
+is the reference implementation.
 
 ---
 
@@ -36,8 +37,11 @@ A cut that works for a server-side component (adapt per domain):
 | Configuration | declared settings (config files) |
 | Logs / events | log inventory, error counts, recent tails |
 
-Prefix section titles so the structure is legible (`[0] Environment`,
-`[A] Host`, `[B] Storage`, …). Put a **capability preamble first** (see §4).
+Prefix section titles with a stable letter so the structure is legible and
+prose can cite it: `[1] Collection environment`, `[2] A. Host`,
+`[3] B. Storage`, …. The number comes from the shared `section` helper; the
+letter is part of the title (output-format.md, "Fact sections"). Put the
+**capability preamble first** (see §4).
 
 ## 2. Load-safe by tier — never make a sick server sicker
 
@@ -59,12 +63,25 @@ anything expensive **opt-in**:
 - **Tier 2 — intrusive, opt-in** (`--threads`, `--heap`, `--du`, …). May pause a
   JVM or hit the data disk. **Off by default**, and print the target and the
   expected impact to **stderr before running** so the operator consents.
-- **Budget the whole run, not just each probe.** The skeleton's `CMD_TIMEOUT`
-  (20s) caps a single probe, so a Tier 0 report with dozens of probes on a
-  host where many of them hang can still take minutes in the worst case. Aim
-  for a Tier 0 run that finishes in about a minute on a healthy host; if your
-  collector leans on network-dependent probes, lower `CMD_TIMEOUT` or give
-  those probes their own shorter cap.
+- **Every external command is bounded.** Run it through `probe` or
+  `_bounded` (shared block), which apply `CMD_TIMEOUT` with `timeout(1)` when
+  the host has it and with a shell watchdog when it does not. That includes
+  the commands that are easy to forget: capability checks
+  (`cmd --help >/dev/null`), version queries of a discovered runtime, bundle
+  copies, `journalctl`, `helm`, `zpool`, a DB client. A command that can hang
+  and is run bare is a collector that can hang.
+- **Budget the whole run, not just each probe.** `RUN_DEADLINE` (300s by
+  default) bounds the run: once it has passed, `_bounded` runs nothing more
+  and returns as timed out, the facts say `n/a (run deadline reached)`, and
+  the status names it, so a sick host still yields a report that reaches its
+  footer. Aim for a Tier 0 run that finishes in about a minute on a healthy
+  host. If your collector leans on network-dependent probes, fail fast: probe
+  reachability once, and when it fails skip the calls that depend on it with
+  that one reason instead of timing each of them out.
+- **Scale with the host, not per process.** Discovery that forks a command for
+  every pid in `/proc` takes seconds on a laptop and minutes on a busy node.
+  Filter on what the kernel already gives you (`/proc/<pid>/comm`, `cmdline`)
+  before forking anything.
 
 > `jmap -histo:live` forces a full GC. Never use it. If you need a histogram,
 > `jmap -histo` (without `:live`) and only under an opt-in flag.
@@ -119,7 +136,7 @@ n/a (empty output)                 the command ran clean but said nothing
 Two mechanisms make this cheap and consistent — copy them from the reference
 collector:
 
-- A **capability preamble** (`[0]`) recording bash version, uid/root, and which
+- A **capability preamble** (`[1]`) recording bash version, uid/root, and which
   tools are present/absent. Now every downstream `command not found` is
   pre-explained at the top of the report.
 - A **`probe` helper** that wraps a command: `command -v` check → run under
@@ -131,6 +148,14 @@ collector:
 Keep reason strings free of judgment words (`fix`, `should`, `likely`,
 `recommend`, `diagnos`, `root cause`) so they pass `validate.sh` — describe the
 mechanical cause, not what to do about it.
+
+A reason on a fact line and the outcome of a goal must agree. A fact reason of
+`permission denied`, `timed out`, `command not found` or a failed call means
+the goal it feeds is `missed`, never `na`: the run did not see, so it cannot
+say the thing is absent (output-format.md, "Three outcomes"). Test for the
+failure explicitly: a glob over an unreadable directory returns the pattern
+itself, `find` exits 1 on a denied subdirectory, and `awk`'s exit code is not
+the exit code of the command piped into it.
 
 ## 5. Operable — the operator sees it working, and discovers how to run it
 
@@ -176,9 +201,18 @@ and every collector must keep them.
   phases outside a section (discovery, artifact copy, "writing report to …").
   `--quiet` silences it for automation. Progress lines are facts about
   collection *state* and carry **no judgment words**, so `validate.sh` — which
-  greps the whole file — still passes. Keep messages the operator *must* see
+  greps the whole file — still passes. Messages the operator *must* see
   regardless of `--quiet` (Tier 2 impact/consent, a hard error, a skipped step)
-  on plain stderr (`warn`, fd 2), not on `progress`.
+  go through `warn`, which writes `!! …` to fd 3 and ignores `--quiet`. Never
+  write them to plain stderr: in `--file` mode the report body's stderr is
+  discarded.
+
+- **Leave nothing behind.** Put every temporary file under the run's own
+  directory (`_tmp NAME` in the shared block returns a path in it). The shared
+  block removes that directory on exit and on INT, TERM and HUP, so a Ctrl-C
+  does not leave copies of configs or thread dumps in `/tmp`. Never build a
+  temp path from `$$` under a shared directory; a root run writing to a
+  predictable name follows whatever symlink is planted there.
 
 ---
 
@@ -186,13 +220,19 @@ and every collector must keep them.
 
 - [ ] Sections are MECE — each fact appears once, in one domain; domains are named.
 - [ ] Default run is Tier 0: no JVM attach, no recursive `du`, no whole-log grep.
+- [ ] Every external command runs through `probe` / `_bounded`; the run
+      reaches its footer on a host where every command hangs.
 - [ ] Expensive work is opt-in and announces its impact on stderr first.
 - [ ] `/proc`/`/sys` used where possible; external commands have fallbacks.
 - [ ] bash 3.2+ only; no `set -e`/`set -u`; counter loops increment.
-- [ ] Every absent value carries a classified reason; a `[0]` capability
+- [ ] Every absent value carries a classified reason; the `[1]` capability
       preamble is present.
+- [ ] A goal is `na` only when every input behind it was read; a failed,
+      refused, unreadable or timed-out input makes it `missed`.
 - [ ] Reason/label strings contain no judgment words (`validate.sh` passes).
 - [ ] No-args prints usage and exits 0; a run needs an explicit action flag
       (`--file` / `--stdout` / `--bundle`).
 - [ ] Progress is narrated on stderr (fd 3), never into the report; `--quiet`
       suppresses it; progress strings carry no judgment words.
+- [ ] Must-see messages use `warn` (fd 3, not silenced), never plain stderr.
+- [ ] Temporary files live under `_tmp`; nothing is left after Ctrl-C.
