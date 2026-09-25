@@ -211,7 +211,7 @@ _classify_err() {
 # fact about this run, not a claim about the environment, so it stays inside
 # CONTRACT rule 1 and belongs in the environment section ([1]) with the rest of the run's own facts.
 #
-# Two places, one sentence. Section 0 says which privilege this run had. Every
+# Two places, one sentence. The environment section says which privilege this run had. Every
 # goal that privilege blocked repeats it on its own line, because the roll-up is
 # what reaches the operator's terminal while they are still logged in, and "this
 # is what was missing, this is what would have obtained it" is one thought.
@@ -320,6 +320,7 @@ _note_boot() {
 RUN_DEADLINE="${RUN_DEADLINE:-300}"
 _tmp_dir=""
 _run_t0=""
+_stdin_script=0   # 1 when the shell reads this script from stdin (sh -s)
 _nl='
 '
 _tab="$(printf '\t')"
@@ -355,8 +356,17 @@ _run_cleanup() {
 _run_init() {
     _run_t0="$(date +%s 2>/dev/null)"
     case "$_run_t0" in ''|*[!0-9]*) _run_t0="" ;; esac
+    # No predictable fallback name: without mktemp the run has no directory,
+    # and _tmp answers /dev/null.
     _tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/ggt.XXXXXX" 2>/dev/null)"
-    [ -n "$_tmp_dir" ] || { _tmp_dir="${TMPDIR:-/tmp}/ggt.$$.${_run_t0:-0}"; mkdir -m 700 "$_tmp_dir" 2>/dev/null || _tmp_dir=""; }
+    # Is this script read from stdin (`sh -s`, `kubectl exec ... sh -s`)? Then
+    # fd 0 is the script itself: a bounded command must not read it, and bash
+    # 5.2 kills a $(...) subshell that so much as duplicates fd 0 while it
+    # reads its script from there (`true 4<&0` is enough; found 2026-09-25).
+    case "$0" in
+        */*|*.sh) [ -f "$0" ] || _stdin_script=1 ;;
+        *)        _stdin_script=1 ;;
+    esac
     trap '_run_cleanup' EXIT
     trap '_run_cleanup; exit 129' HUP
     trap '_run_cleanup; exit 130' INT
@@ -385,22 +395,35 @@ _kill_tree() {
     kill -"$sig" $all 2>/dev/null
 }
 
-_bounded() {
-    local t="${CMD_TIMEOUT:-20}" left start rc p w
+# _bounded CMD... -> CMD under the caps. Its stdin is the caller's when this
+# script was run from a file, and /dev/null when the script itself is on stdin.
+# _bounded_in FILE CMD... -> the same, with FILE as CMD's stdin. Use it, not a
+# `< FILE` on the call, for any bounded command that needs input.
+_bounded() { _bounded_in "" "$@"; }
+
+_bounded_in() {
+    local in="$1" t="${CMD_TIMEOUT:-20}" left start rc p w
+    shift
     start="$(_elapsed)"
     left=$((RUN_DEADLINE - start))
     [ "$left" -le 0 ] && return 124
     [ "$left" -lt "$t" ] && t="$left"
     if [ -n "${_timeout_bin:-}" ] && [ "$(_cmd_kind "$1")" = file ]; then
-        "$_timeout_bin" "$t" "$@"; rc=$?
+        if [ -n "$in" ];                   then "$_timeout_bin" "$t" "$@" < "$in"
+        elif [ "$_stdin_script" = 1 ];     then "$_timeout_bin" "$t" "$@" < /dev/null
+        else                                    "$_timeout_bin" "$t" "$@"; fi
+        rc=$?
     else
         # The kill has to reach whatever CMD started: an orphaned grandchild
         # holds a $(...) pipe open and the caller waits for it anyway. bash
         # under set -m gives the job its own group; _kill_tree covers dash.
-        # stdin through fd 4: POSIX gives an async list /dev/null as stdin
-        # before its own redirections, so a plain 0<&0 hands dash /dev/null.
+        # stdin through fd 4 when it is passed on: POSIX gives an async list
+        # /dev/null as stdin before its own redirections, so a plain 0<&0
+        # hands dash /dev/null.
         set -m 2>/dev/null
-        { "$@" 0<&4 4<&- & } 4<&0
+        if [ -n "$in" ];                   then "$@" < "$in" &
+        elif [ "$_stdin_script" = 1 ];     then "$@" < /dev/null &
+        else                                    { "$@" 0<&4 4<&- & } 4<&0; fi
         p=$!
         set +m 2>/dev/null
         ( i=0
@@ -417,7 +440,8 @@ _bounded() {
 }
 
 _report_to_file() {
-    if ! { : > "$1"; } 2>/dev/null; then
+    # `true`, not `:`. A failed redirect on a special builtin exits dash.
+    if ! { true > "$1"; } 2>/dev/null; then
         warn "the report was not written: $1 cannot be created by uid $(id -u 2>/dev/null || echo '?')"
         return 1
     fi
