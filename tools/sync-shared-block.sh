@@ -11,31 +11,40 @@
 #   tools/sync-shared-block.sh --check    report drift, change nothing (exit 1 on drift)
 #   tools/sync-shared-block.sh --apply    rewrite each collector's block from the skeleton
 #
-# A block runs from its banner comment to the closing brace of its last function,
-# both named in BLOCKS below. Everything between is owned by the skeleton; an
-# edit made inside a collector is overwritten, which is what "DO NOT EDIT" means.
+# A block runs from its banner comment to its end line, both named in BLOCKS
+# below. Everything between is owned by the skeleton; an edit made inside a
+# collector is overwritten, which is what "DO NOT EDIT" means.
+#
+# The end is an explicit line, not "the first closing brace after the last
+# function". That rule read a one-line `f() { ...; }` as having no end, ran on to
+# the next function's brace, and --apply would have deleted the collector code in
+# between (found 2026-09-25).
+#
+# A collector that lacks a block entirely is reported MISSING; --apply inserts it
+# just before the block that follows it in the skeleton, so a new shared block
+# reaches every collector in one run.
 set -u
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SKELETON="$ROOT/templates/collector-skeleton/collector-skeleton.sh"
 
-# name|banner regex|last function in the block
+# name|banner regex|end regex, in skeleton order
 BLOCKS=(
-    'privilege|^# ---- privilege|^_note_privilege[(][)]'
-    'boot|^# ---- boot time|^_note_boot[(][)]'
-    'completeness|^# ---- collection completeness|^emit_status[(][)]'
+    'privilege|^# ---- privilege — DO NOT EDIT|^# ---- end privilege$'
+    'boot|^# ---- boot time — DO NOT EDIT|^# ---- end boot time$'
+    'run|^# ---- run helpers — DO NOT EDIT|^# ---- end run helpers$'
+    'completeness|^# ---- collection completeness — DO NOT EDIT|^# ---- end collection completeness$'
 )
 
-# block_range <file> <banner-re> <lastfn-re> -> "START END" on stdout, empty if absent
+# block_range <file> <banner-re> <end-re> -> "START END" on stdout; fails when the
+# banner or the end is absent, or either appears more than once
 block_range() {
-    local f="$1" banner="$2" lastfn="$3" s e
-    s="$(grep -nE "$banner" "$f" | head -1 | cut -d: -f1)"
-    [ -n "$s" ] || return 1
-    e="$(awk -v start="$s" -v fn="$lastfn" '
-        NR >= start && $0 ~ fn { inside = 1 }
-        inside && /^}$/ { print NR; exit }
-    ' "$f")"
-    [ -n "$e" ] || return 1
+    local f="$1" banner="$2" endre="$3" s e
+    [ "$(grep -cE "$banner" "$f")" = 1 ] || return 1
+    [ "$(grep -cE "$endre" "$f")" = 1 ] || return 1
+    s="$(grep -nE "$banner" "$f" | cut -d: -f1)"
+    e="$(grep -nE "$endre" "$f" | cut -d: -f1)"
+    [ "$e" -gt "$s" ] || return 1
     printf '%s %s\n' "$s" "$e"
 }
 
@@ -43,11 +52,15 @@ mode="${1:---check}"
 case "$mode" in --check|--apply) ;; *) echo "usage: $0 --check|--apply" >&2; exit 2 ;; esac
 
 rc=0
-for spec in "${BLOCKS[@]}"; do
-    IFS='|' read -r name banner lastfn <<EOF
+for bi in "${!BLOCKS[@]}"; do
+    spec="${BLOCKS[$bi]}"
+    IFS='|' read -r name banner endre <<EOF
 $spec
 EOF
-    sr="$(block_range "$SKELETON" "$banner" "$lastfn")" || {
+    # the banner of the next block, where a missing block is inserted
+    nextbanner=""
+    [ $((bi + 1)) -lt ${#BLOCKS[@]} ] && nextbanner="$(printf '%s' "${BLOCKS[$((bi + 1))]}" | cut -d'|' -f2)"
+    sr="$(block_range "$SKELETON" "$banner" "$endre")" || {
         echo "FAIL  block '$name' not found in the skeleton" >&2; exit 2; }
     # shellcheck disable=SC2086
     set -- $sr
@@ -56,8 +69,21 @@ EOF
     while IFS= read -r f; do
         [ "$f" = "$SKELETON" ] && continue
         short="${f#"$ROOT"/}"
-        r="$(block_range "$f" "$banner" "$lastfn")" || {
-            printf 'MISSING  %-52s (block %s)\n' "$short" "$name"; rc=1; continue; }
+        if ! r="$(block_range "$f" "$banner" "$endre")"; then
+            if grep -qE "$banner|$endre" "$f"; then
+                printf 'BROKEN   %-52s (block %s) — banner or end line missing or repeated\n' "$short" "$name"; rc=1; continue
+            fi
+            at=""
+            [ -n "$nextbanner" ] && at="$(grep -nE "$nextbanner" "$f" | head -1 | cut -d: -f1)"
+            if [ "$mode" = --check ] || [ -z "$at" ]; then
+                printf 'MISSING  %-52s (block %s)\n' "$short" "$name"; rc=1; continue
+            fi
+            { sed -n "1,$((at - 1))p" "$f"; printf '%s\n\n' "$src"; sed -n "$at,\$p" "$f"; } > "$f.tmp" \
+                && mv "$f.tmp" "$f" && chmod +x "$f"
+            if bash -n "$f" 2>/dev/null; then printf 'inserted %-52s (block %s)\n' "$short" "$name"
+            else printf 'BROKEN   %-52s (block %s) — syntax error after insert\n' "$short" "$name"; rc=1; fi
+            continue
+        fi
         # shellcheck disable=SC2086
         set -- $r
         if [ "$(sed -n "$1,$2p" "$f")" = "$src" ]; then

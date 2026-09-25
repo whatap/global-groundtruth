@@ -43,7 +43,7 @@ export LC_ALL=C
 
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-apmpython"
-VERSION="0.4.1"
+VERSION="0.5.0"
 DOMAIN="apm/python"
 TARGET="host/$(hostname 2>/dev/null || echo unknown)"
 
@@ -111,7 +111,7 @@ emit_footer() {
 # ---- privilege — DO NOT EDIT ------------------------------------------------
 # What a collection can read is decided by the privilege it was given. That is a
 # fact about this run, not a claim about the environment, so it stays inside
-# CONTRACT rule 1 and belongs in section 0 with the rest of the run's own facts.
+# CONTRACT rule 1 and belongs in the environment section ([1]) with the rest of the run's own facts.
 #
 # Two places, one sentence. Section 0 says which privilege this run had. Every
 # goal that privilege blocked repeats it on its own line, because the roll-up is
@@ -134,13 +134,18 @@ PRIV_GAP=""   # what a further privilege would obtain; empty when the run is roo
 # Append it to the reason of any goal that a privilege blocked.
 _priv_hint() { [ -n "$PRIV_GAP" ] && printf ' (not elevated: %s)' "$PRIV_GAP"; return 0; }
 
-# _note_privilege -> describe this process. Call it once, before section 0 reads
+# _note_privilege -> describe this process. Call it once, before the environment section reads
 # PRIV_WHY. It yields to a value already set, so a self-elevating collector can
 # say something more exact.
 _note_privilege() {
     [ "$PRIV_WHY" = unknown ] || return 0
-    _priv_uid="$(id -u 2>/dev/null || echo 0)"
-    if [ "$_priv_uid" = 0 ]; then
+    # No uid is not uid 0. A run that cannot tell says so, and claims no root.
+    _priv_uid="$(id -u 2>/dev/null)"
+    [ -n "$_priv_uid" ] || _priv_uid="$(awk '/^Uid:/{print $2; exit}' /proc/self/status 2>/dev/null)"
+    if [ -z "$_priv_uid" ]; then
+        PRIV_WHY="n/a (id -u failed and /proc/self/status is not readable)"
+        PRIV_GAP=""
+    elif [ "$_priv_uid" = 0 ]; then
         PRIV_WHY="root${SUDO_UID:+ (elevated by sudo from uid $SUDO_UID)}"
         PRIV_GAP=""
     else
@@ -148,13 +153,14 @@ _note_privilege() {
         PRIV_GAP="run again with sudo"
     fi
 }
+# ---- end privilege
 
 # ---- boot time — DO NOT EDIT ------------------------------------------------
 # Most of what a collector reports is cumulative since boot: /proc/diskstats,
 # ZFS kstat trees, zpool iostat histograms, MySQL GLOBAL STATUS. Without the boot
 # time those are sums with no denominator and cannot be read as a rate, so the
 # reader either asks the site for it afterwards or reconstructs it. Both are work
-# the collector could have done, and it belongs in section 0 with the rest of the
+# the collector could have done, and it belongs in the environment section ([1]) with the rest of the
 # facts about this run.
 #
 # Two real cases, both 2026-09-23 Smartfren. A MySQL bundle whose section D kernel
@@ -168,7 +174,7 @@ _note_privilege() {
 # (a refused login, an absent zpool), which is exactly the run whose counters most
 # need a denominator.
 #
-# _note_boot -> emit the two facts. Call it from section 0, after the privilege
+# _note_boot -> emit the two facts. Call it from the environment section, after the privilege
 # line. It prints rather than returning, because both values are always wanted
 # together and neither is read back by the collector.
 _note_boot() {
@@ -181,6 +187,147 @@ _note_boot() {
     fi
     fact "host uptime(s): $(cut -d. -f1 /proc/uptime 2>/dev/null || echo 'n/a (/proc/uptime not readable)')"
 }
+# ---- end boot time
+
+# ---- run helpers — DO NOT EDIT ----------------------------------------------
+# Four things every collector needs and none may get wrong on its own.
+#
+# warn. What the operator must see whatever --quiet says: a Tier 2 impact before
+# it runs, a hard error, a skipped step. It goes to fd 3, the terminal saved in
+# main, because --file mode discards the report body's stderr. Every collector
+# once wrote warn to plain stderr, and in --file mode the "[Tier2] ... pauses
+# the target JVM" line never reached the terminal while jstack still ran
+# (apmjava 0.10.1, found 2026-09-25).
+#
+# _bounded CMD... Every external command runs under a cap. timeout(1) when the
+# host has it and CMD is a file; otherwise a shell watchdog, which also covers
+# shell functions and hosts without coreutils. Returns 124 on a cap, whatever
+# the local timeout(1) returns for a kill (busybox gives 143).
+#
+# RUN_DEADLINE. The whole run is bounded too. Past it, _bounded runs nothing and
+# returns 124, so a host where every command hangs still yields a report that
+# reaches its footer, and emit_status says the deadline was reached.
+#
+# _tmp NAME. One private directory per run, removed on exit and on INT, TERM
+# and HUP. A Ctrl-C used to leave config copies and thread dumps in /tmp, and a
+# $$-named path in a shared /tmp is one a root run follows through a planted
+# symlink.
+#
+# _report_to_file FILE. --file mode's write, which says so and fails when the
+# file cannot be written instead of printing "report written".
+#
+# POSIX sh only in the synced blocks, because the apm collectors are piped into
+# `sh -s` inside containers, where sh is often dash or busybox: no SECONDS, no
+# `type -t`, no ${v//x/y}. The first draft of this block used all three.
+RUN_DEADLINE="${RUN_DEADLINE:-300}"
+_tmp_dir=""
+_run_t0=""
+_nl='
+'
+_tab="$(printf '\t')"
+
+# Falls back to stderr when fd 3 is not open yet (an error before main).
+warn() { { printf '!! %s\n' "$*" >&3; } 2>/dev/null || printf '!! %s\n' "$*" >&2; }
+
+# _elapsed -> seconds since _run_init; 0 when no clock is available, which
+# disables the deadline rather than tripping it at once
+_elapsed() {
+    if [ -n "${BASH_VERSION:-}" ]; then printf '%s' "${SECONDS:-0}"
+    elif [ -n "$_run_t0" ]; then printf '%s' "$(( $(date +%s 2>/dev/null || echo "$_run_t0") - _run_t0 ))"
+    else printf '0'; fi
+}
+_past_deadline() { [ "$(_elapsed)" -ge "$RUN_DEADLINE" ]; }
+
+# _cmd_kind CMD -> "file", "shell" (function or builtin) or "" (not found)
+_cmd_kind() {
+    case "$(command -v "$1" 2>/dev/null)" in
+        '') printf '' ;;
+        /*) printf 'file' ;;
+        *)  printf 'shell' ;;
+    esac
+}
+
+_run_cleanup() {
+    case "$_tmp_dir" in */ggt.*) rm -rf "$_tmp_dir" 2>/dev/null ;; esac
+    _tmp_dir=""
+}
+
+# _run_init -> the private temp directory, the traps, and timeout(1). Call it
+# once in main, before anything creates a temp file.
+_run_init() {
+    _run_t0="$(date +%s 2>/dev/null)"
+    case "$_run_t0" in ''|*[!0-9]*) _run_t0="" ;; esac
+    _tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/ggt.XXXXXX" 2>/dev/null)"
+    [ -n "$_tmp_dir" ] || { _tmp_dir="${TMPDIR:-/tmp}/ggt.$$.${_run_t0:-0}"; mkdir -m 700 "$_tmp_dir" 2>/dev/null || _tmp_dir=""; }
+    trap '_run_cleanup' EXIT
+    trap '_run_cleanup; exit 129' HUP
+    trap '_run_cleanup; exit 130' INT
+    trap '_run_cleanup; exit 143' TERM
+    [ -n "${_timeout_bin:-}" ] || _timeout_bin="$(command -v timeout 2>/dev/null)"
+}
+
+# _tmp NAME -> a path inside this run's directory. /dev/null when no directory
+# could be made, so a write is lost rather than landing somewhere shared.
+_tmp() { if [ -n "$_tmp_dir" ]; then printf '%s/%s' "$_tmp_dir" "$1"; else printf '/dev/null'; fi; }
+
+# _kill_tree SIG PID -> signal PID and every descendant. dash starts a background
+# job in the caller's process group even under set -m, so a group kill misses
+# the grandchildren; /proc/<pid>/status names each process's parent.
+_kill_tree() {
+    local sig="$1" all="$2" list="$2" next c
+    while [ -n "$list" ]; do
+        next=""
+        for c in $list; do
+            next="$next $(grep -l "^PPid:[[:space:]]*$c\$" /proc/[0-9]*/status 2>/dev/null | cut -d/ -f3)"
+        done
+        list="$(echo $next)"
+        all="$all $list"
+    done
+    # shellcheck disable=SC2086
+    kill -"$sig" $all 2>/dev/null
+}
+
+_bounded() {
+    local t="${CMD_TIMEOUT:-20}" left start rc p w
+    start="$(_elapsed)"
+    left=$((RUN_DEADLINE - start))
+    [ "$left" -le 0 ] && return 124
+    [ "$left" -lt "$t" ] && t="$left"
+    if [ -n "${_timeout_bin:-}" ] && [ "$(_cmd_kind "$1")" = file ]; then
+        "$_timeout_bin" "$t" "$@"; rc=$?
+    else
+        # The kill has to reach whatever CMD started: an orphaned grandchild
+        # holds a $(...) pipe open and the caller waits for it anyway. bash
+        # under set -m gives the job its own group; _kill_tree covers dash.
+        set -m 2>/dev/null
+        "$@" 0<&0 &
+        p=$!
+        set +m 2>/dev/null
+        ( i=0
+          while [ "$i" -lt "$t" ]; do sleep 1; kill -0 "$p" 2>/dev/null || exit 0; i=$((i + 1)); done
+          kill -TERM -- "-$p" 2>/dev/null; _kill_tree TERM "$p"
+          sleep 2
+          kill -KILL -- "-$p" 2>/dev/null; _kill_tree KILL "$p" ) >/dev/null 2>&1 &
+        w=$!
+        wait "$p"; rc=$?
+        kill "$w" 2>/dev/null; wait "$w" 2>/dev/null
+    fi
+    case "$rc" in 124|137|143) [ $(( $(_elapsed) - start )) -ge "$t" ] && rc=124 ;; esac
+    return "$rc"
+}
+
+_report_to_file() {
+    if ! { : > "$1"; } 2>/dev/null; then
+        warn "the report was not written: $1 cannot be created by uid $(id -u 2>/dev/null || echo '?')"
+        return 1
+    fi
+    run_report > "$1" 2>/dev/null
+    if ! tail -n 1 "$1" 2>/dev/null | grep -q '^==== END OF COLLECTION'; then
+        warn "the report was not written whole: $1 does not end with the footer"
+        return 1
+    fi
+}
+# ---- end run helpers
 
 # ---- collection completeness — DO NOT EDIT ----------------------------------
 # A collector knows, at the host, whether it obtained what it came for. Saying so
@@ -217,45 +364,31 @@ _note_boot() {
 # Only `missed` makes a run INCOMPLETE. Marking a normal environment INCOMPLETE
 # would teach the field to ignore the line, and then it protects nothing.
 #
-# Declare a goal once, then resolve it exactly once. A goal left unresolved
-# counts as missed with reason "not reached", which is itself worth seeing: it
-# means the run ended before that step.
-_goal_keys='' _goal_labels='' _ok_keys='' _na_keys='' _na_reasons='' _gap_keys='' _gap_reasons=''
+# `na` needs every input behind the absence to have been read. One unreadable
+# path, one refused call, one timeout, and it is `missed` (output-format.md,
+# "Three outcomes"). A non-root run that sees no agent process because it cannot
+# read other users' /proc/<pid>/environ has not seen that there is no agent.
+#
+# Declare a goal once, then resolve it exactly once, after the last fallback. A
+# goal left unresolved counts as missed with reason "not reached": the run ended
+# before that step. A goal resolved twice with different outcomes counts as
+# blocked and says so, because the second call usually hides the first (missed
+# then na turned a refused read into COMPLETE). A resolution for a goal never
+# declared is listed. A requested opt-in is a goal; an unrequested one is not.
+#
+# Storage is one line per record, KEY<TAB>VALUE, so a reason cannot shift the
+# others: tabs and newlines inside a reason are flattened on the way in.
+_goals='' _res=''
 
-goal()   { _goal_keys="$_goal_keys$1
-"; _goal_labels="$_goal_labels$2
-"; }
-got()    { _ok_keys="$_ok_keys$1
-"; }
-na()     { _na_keys="$_na_keys$1
-"; _na_reasons="$_na_reasons$2
-"; }
-missed() { _gap_keys="$_gap_keys$1
-"; _gap_reasons="$_gap_reasons$2
-"; }
+_flat() { printf '%s' "$1" | tr '\n\t' '  '; }
 
-# _label_of KEY -> the label declared for KEY (falls back to the key itself)
-_label_of() {
-    local i=1 k
-    while IFS= read -r k; do
-        [ "$k" = "$1" ] && { printf '%s' "$(printf '%s' "$_goal_labels" | sed -n "${i}p")"; return; }
-        i=$((i + 1))
-    done <<EOF
-$_goal_keys
-EOF
-    printf '%s' "$1"
+goal() {
+    case "$_nl$_goals" in *"$_nl$1$_tab"*) return 0 ;; esac
+    _goals="$_goals$1$_tab$(_flat "$2")$_nl"
 }
-
-# _reason_in LIST REASONS KEY -> the reason recorded for KEY in that pair, or empty
-_reason_in() {
-    local i=1 k
-    while IFS= read -r k; do
-        [ "$k" = "$3" ] && { printf '%s' "$(printf '%s' "$2" | sed -n "${i}p")"; return; }
-        i=$((i + 1))
-    done <<EOF
-$1
-EOF
-}
+got()    { _res="$_res$1${_tab}got$_tab$_nl"; }
+na()     { _res="$_res$1${_tab}na$_tab$(_flat "$2")$_nl"; }
+missed() { _res="$_res$1${_tab}missed$_tab$(_flat "$2")$_nl"; }
 
 # notice: like progress, but NOT silenced by --quiet. Reserved for the
 # completeness roll-up. --quiet exists to keep run narration out of automation
@@ -266,51 +399,67 @@ notice() { printf '>> %s\n' "$*" >&3 2>/dev/null; }
 # emit_status -> the roll-up section. Call it immediately before emit_footer.
 # Also repeats each gap on fd 3 so the operator sees it while still logged in.
 emit_status() {
-    [ -n "$_goal_keys" ] || return 0
-    local k total=0 obtained=0 nacount=0 gaps='' nas='' oks=''
-    while IFS= read -r k; do
+    [ -n "$_goals" ] || return 0
+    local k lab outs total=0 obtained=0 nacount=0 blocked=0 gaps='' nas='' oks='' stray deadline=''
+    while IFS="$_tab" read -r k lab; do
         [ -n "$k" ] || continue
         total=$((total + 1))
-        if printf '%s' "$_ok_keys" | grep -qxF "$k"; then
-            obtained=$((obtained + 1)); oks="$oks $(_label_of "$k"),"
-        elif printf '%s' "$_na_keys" | grep -qxF "$k"; then
-            nacount=$((nacount + 1))
-            nas="$nas$(_label_of "$k") — $(_reason_in "$_na_keys" "$_na_reasons" "$k")
-"
-        else
-            local r; r="$(_reason_in "$_gap_keys" "$_gap_reasons" "$k")"; [ -n "$r" ] || r='not reached'
-            gaps="$gaps$(_label_of "$k") — $r
-"
-        fi
+        # every outcome recorded for this key, in order, and the distinct set
+        outs="$(printf '%s' "$_res" | awk -F'\t' -v k="$k" '$1 == k { printf "%s%s", (n++ ? ", " : ""), $2 }')"
+        case "$outs" in
+            got|got,\ got*)
+                case "$outs" in *na*|*missed*) ;; *)
+                    obtained=$((obtained + 1)); oks="$oks $lab,"; continue ;; esac ;;
+        esac
+        case "$outs" in
+            na|na,\ na*)
+                case "$outs" in *got*|*missed*) ;; *)
+                    nacount=$((nacount + 1))
+                    nas="$nas$lab — $(printf '%s' "$_res" | awk -F'\t' -v k="$k" '$1 == k { print $3; exit }')$_nl"
+                    continue ;; esac ;;
+        esac
+        blocked=$((blocked + 1))
+        local why
+        why="$(printf '%s' "$_res" | awk -F'\t' -v k="$k" '$1 == k && $2 == "missed" { printf "%s%s", (n++ ? "; " : ""), $3 }')"
+        case "$outs" in
+            '')           why='not reached' ;;
+            missed|missed,\ missed*)
+                case "$outs" in *got*|*na*) why="resolved $(printf '%s' "$outs" | awk -F', ' '{print NF}') times: $outs${why:+ — $why}" ;; esac ;;
+            *)            why="resolved $(printf '%s' "$outs" | awk -F', ' '{print NF}') times: $outs${why:+ — $why}" ;;
+        esac
+        gaps="$gaps$lab — $why$_nl"
     done <<EOF
-$_goal_keys
+$_goals
 EOF
-    local blocked=$((total - obtained - nacount))
-    # Most collectors' `section` takes (TITLE) and numbers it automatically. A
-    # few take (LETTER, TITLE) because their sections are lettered by hand; those
-    # set STATUS_LABEL to the letter they want this roll-up to carry.
-    if [ -n "${STATUS_LABEL:-}" ]; then section "$STATUS_LABEL" "Collection status"
-    else section "Collection status"; fi
+    stray="$(printf '%s' "$_res" | _G="$_goals" awk -F'\t' '
+        BEGIN { n = split(ENVIRON["_G"], L, "\n"); for (i = 1; i <= n; i++) { split(L[i], f, "\t"); if (f[1] != "") d[f[1]] = 1 } }
+        $1 != "" && !($1 in d) && !($1 in seen) { seen[$1] = 1; printf "%s%s", (c++ ? ", " : ""), $1 }')"
+    _past_deadline && deadline="reached at ${RUN_DEADLINE}s; commands after it were not run"
+    section "Collection status"
     fact "goals: $total declared, $obtained obtained, $nacount not applicable here, $blocked blocked"
     [ -n "$oks" ] && fact "obtained:${oks%,}"
     if [ -n "$nas" ]; then
         fact "not applicable to this host (this is an answer, not a gap):"
         printf '%s' "$nas" | while IFS= read -r l; do [ -n "$l" ] && fact "    $l"; done
     fi
-    if [ "$blocked" -eq 0 ]; then
+    [ -n "$stray" ] && fact "resolved but never declared: $stray"
+    [ -n "$deadline" ] && fact "run deadline: $deadline"
+    if [ "$blocked" -eq 0 ] && [ -z "$deadline" ]; then
         fact "status: COMPLETE"
         notice "status: COMPLETE — nothing was blocked${nas:+ ($nacount not applicable to this host)}"
     else
-        fact "blocked (running this differently would obtain these):"
-        printf '%s' "$gaps" | while IFS= read -r l; do [ -n "$l" ] && fact "    $l"; done
+        if [ -n "$gaps" ]; then
+            fact "blocked (running this differently would obtain these):"
+            printf '%s' "$gaps" | while IFS= read -r l; do [ -n "$l" ] && fact "    $l"; done
+        fi
         fact "status: INCOMPLETE"
-        notice "status: INCOMPLETE — $blocked of $total goals blocked"
+        notice "status: INCOMPLETE — $blocked of $total goals blocked${deadline:+, run deadline reached}"
         printf '%s' "$gaps" | while IFS= read -r l; do [ -n "$l" ] && notice "  $l"; done
     fi
 }
+# ---- end collection completeness
 
 progress() { [ "$OPT_QUIET" = 1 ] && return; printf '>> %s\n' "$*" >&3 2>/dev/null; }
-warn() { printf '%s\n' "$*" >&2; }
 
 # ---- reasoned-absence helpers -------------------------------------------------
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -319,7 +468,7 @@ _errfile=""
 _timeout_bin=""
 CMD_TIMEOUT=15
 _init_probe() {
-    _errfile="$(mktemp 2>/dev/null || echo "${TMPDIR:-/tmp}/.ggt.$$.err")"
+    _errfile="$(_tmp probe.err)"
     have timeout && _timeout_bin="$(command -v timeout)"
 }
 _end_probe() { [ -n "$_errfile" ] && rm -f "$_errfile" 2>/dev/null; }
@@ -571,7 +720,7 @@ run_report() {
     goal agent "whatap-python package / agent home"
     goal conf  "agent configuration"
 
-    # [0] capability preamble: every downstream "command not found" is
+    # [1] capability preamble: every downstream "command not found" is
     # pre-explained here.
     section "Collection environment"
     fact "bash: ${BASH_VERSION:-unknown}"
@@ -1049,6 +1198,7 @@ if [ "$OPT_FILE" = 0 ] && [ "$OPT_STDOUT" = 0 ]; then
     exit 2
 fi
 
+_run_init
 _init_probe
 if [ "$OPT_STDOUT" = 1 ]; then
     progress "collecting facts (read-only) -> stdout"
@@ -1059,7 +1209,7 @@ else
     TS="$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null || echo unknown)"
     OUTFILE="./$COLLECTOR_NAME-$HOST-$TS.txt"
     progress "collecting facts (read-only) -> writing $OUTFILE"
-    run_report > "$OUTFILE" 2>/dev/null
+    _report_to_file "$OUTFILE" || exit 1
     progress "report written: $OUTFILE"
 fi
 _end_probe

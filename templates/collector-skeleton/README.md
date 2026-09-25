@@ -19,8 +19,9 @@ The starter for a new collector. It already emits the shared report shape
    copied side by side. `validate.sh` enforces this; see
    [../../docs/authoring-guide.md](../../docs/authoring-guide.md) step 2.
 
-2. Set the four metadata variables at the top: `COLLECTOR_NAME`, `VERSION`,
-   `DOMAIN`, `TARGET`.
+2. Set the four metadata variables at the top: `COLLECTOR_NAME`
+   (`whatap-<token>`), `VERSION` (`x.y.z`), `DOMAIN` (the top-level directory
+   name), `TARGET` (`<kind>/<name>[@<qualifier>]`, never an outcome).
 
 3. Replace the placeholder sections with your domain's facts, using the helpers:
 
@@ -31,16 +32,26 @@ The starter for a new collector. It already emits the shared report shape
    | `try CMD [ARGS]`       | the command's output as fact lines, or a bare `n/a`            |
    | `probe "label" CMD…`   | output as facts, or `label: n/a (<why>)` — the reasoned form   |
    | `read_proc "label" P`  | a `/proc` or `/sys` file's content, or a classified reason     |
+   | `_bounded CMD…`        | runs CMD under `CMD_TIMEOUT` and `RUN_DEADLINE`; 124 on a cap  |
+   | `warn "text"`          | `!! text` to the terminal (fd 3), not silenced by `--quiet`   |
+   | `_tmp NAME`            | a path in the run's private directory, removed on exit/Ctrl-C  |
+   | `goal` / `got` / `na` / `missed` | declare and resolve what the run came for      |
 
    Keep to **facts only** (Contract rule 1) and **discover, don't assume**
    (Contract rule 2 — resolve symlinks/mounts/config; when a value is absent,
    report `n/a` rather than a default). Prefer `probe`/`read_proc` over `try`
    so a missing value carries *why* it is missing (guideline 4).
 
-4. Validate before committing:
+   Run every external command through `probe` or `_bounded`, and resolve a
+   goal `na` only when every input behind it was read (output-format.md,
+   "Three outcomes").
+
+4. Validate before committing, the source and a report it produced:
 
    ```sh
    tools/validate.sh collectors/<domain>/collect-<token>.sh
+   collectors/<domain>/collect-<token>.sh --stdout > /tmp/r.txt
+   tools/validate.sh --report /tmp/r.txt
    ```
 
 Full walkthrough: [../../docs/authoring-guide.md](../../docs/authoring-guide.md).
@@ -64,3 +75,9 @@ prints usage** (a collection needs an explicit `--file` / `--stdout`), and it
 
 The `probe` / `read_proc` reasoned-absence helpers below them are recommended
 but optional — keep, trim, or extend them for your domain. See guideline 4.
+
+Four blocks are **synced**, not just copied: privilege, boot time, run helpers
+and collection completeness. Each runs from its `# ---- <name> — DO NOT EDIT`
+banner to its `# ---- end <name>` line, and `tools/sync-shared-block.sh
+--apply` overwrites whatever a collector changed between them. Change them
+here, in the skeleton, and run `--apply`; `--check` reports drift.
