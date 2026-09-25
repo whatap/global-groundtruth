@@ -58,6 +58,7 @@ probe "exit3" sh -c 'echo inactive; exit 3'
 probe "missing" no-such-command-ggt
 t0=$(date +%s); probe "slow file" sleep 30;           echo "took-file $(( $(date +%s) - t0 ))"
 t0=$(date +%s); probe "slow fn" slowfn;               echo "took-fn $(( $(date +%s) - t0 ))"
+t0=$(date +%s); probe "deaf to TERM" sh -c 'trap "" TERM; sleep 30'; echo "took-noterm $(( $(date +%s) - t0 )) k=${_timeout_k:-none}"
 _timeout_bin=""
 t0=$(date +%s); probe "slow grandchild" sh -c 'sleep 30'; echo "took-watchdog $(( $(date +%s) - t0 ))"
 echo "piped: $(echo abc | _bounded tr a-z A-Z)"
@@ -86,6 +87,14 @@ for sh in bash dash; do
     check "a missing command is named"                      'printf "%s" "$out" | grep -q "missing: n/a (command not found"'
     check "timeout(1) caps a file command"                  'printf "%s" "$out" | grep -Eq "took-file [23]$"'
     check "the watchdog caps a function"                    'printf "%s" "$out" | grep -Eq "took-fn [2-4]$"'
+    # timeout(1) without -k sends TERM once and waits: a command that ignores
+    # it ran its full 30s (2026-09-25). With -k 5 it is killed at 2+5s.
+    if timeout -k 1 5 true </dev/null >/dev/null 2>&1; then
+        check "timeout(1) kills a command that ignores TERM" 'printf "%s" "$out" | grep -Eq "took-noterm [6-8] k=5"' \
+              "$(printf '%s' "$out" | grep took-noterm)"
+    else
+        skip "timeout(1) here takes no -k"
+    fi
     check "the watchdog reaches a grandchild"               'printf "%s" "$out" | grep -Eq "took-watchdog [2-4]$"' \
           "an orphaned grandchild holds \$(...) open; took: $(printf '%s' "$out" | grep took-watchdog)"
     check "_bounded passes stdin through"                   'printf "%s" "$out" | grep -q "piped: ABC"'
@@ -165,10 +174,26 @@ echo "$_tmp_dir" > "$OUT"
 echo secret > "$(_tmp copy.conf)"
 sleep 30
 EOF
-LIB="$T/lib.sh" OUT="$T/intr.dir" bash "$T/intr.sh" 2>/dev/null &
-ip=$!; sleep 1; kill -INT "$ip" 2>/dev/null; wait "$ip" 2>/dev/null
-d="$(cat "$T/intr.dir" 2>/dev/null)"
-check "INT removes the run's directory" '[ -n "$d" ] && [ ! -e "$d" ]' "left: $d"
+# Under set -m, as a terminal's Ctrl-C does. A job started with & from a
+# non-interactive shell inherits SIGINT ignored, and a trap cannot catch what
+# was ignored at start, so the old form of this test passed after sleep 30
+# ended by itself (found 2026-09-25). The time check says the trap ran.
+# bash runs its EXIT trap when a signal kills it and dash does not, so only
+# dash shows a missing INT trap.
+for sh in bash dash; do
+    command -v "$sh" >/dev/null 2>&1 || { skip "$sh not installed"; continue; }
+    rm -f "$T/intr.dir"
+    set -m
+    LIB="$T/lib.sh" OUT="$T/intr.dir" "$sh" "$T/intr.sh" 2>/dev/null &
+    ip=$!
+    set +m
+    i=0; while [ ! -s "$T/intr.dir" ] && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+    t0=$(date +%s); kill -INT -- "-$ip" 2>/dev/null; wait "$ip" 2>/dev/null
+    irc=$?; took=$(( $(date +%s) - t0 ))
+    d="$(cat "$T/intr.dir" 2>/dev/null)"
+    check "$sh: INT ends the run at once, with 130" '[ "$irc" = 130 ] && [ "$took" -le 3 ]' "rc=$irc took=${took}s"
+    check "$sh: INT removes the run's directory" '[ -n "$d" ] && [ ! -e "$d" ]' "left: $d"
+done
 
 # ---- 2. sync-shared-block ---------------------------------------------------
 echo "== 2. sync-shared-block =="
@@ -220,18 +245,29 @@ if [ "$QUICK" = 1 ]; then
     skip "--quick: no collector runs"
 else
     R="$T/runs"; mkdir -p "$R"
-    for c in $(cd "$ROOT" && git ls-files 'collectors/*.sh'); do
+    # The runs are independent, so they run at once and are checked after: one
+    # after another they took 130s, most of it k8s alone.
+    cols="$(cd "$ROOT" && git ls-files 'collectors/*.sh')"
+    for c in $cols; do
         b="$(basename "$c" .sh)"; extra=""
         [ "$b" = collect-collmysql ] && extra=--no-sudo
         # shellcheck disable=SC2086
-        (cd "$R" && timeout 400 bash "$ROOT/$c" --stdout $extra </dev/null > "$R/$b.txt" 2> "$R/$b.err")
+        (cd "$R" && timeout 400 bash "$ROOT/$c" --stdout $extra </dev/null > "$R/$b.txt" 2> "$R/$b.err") &
+        case "$c" in collectors/apm/*)
+            if command -v dash >/dev/null 2>&1; then
+                (cd "$R" && timeout 400 dash -s -- --stdout < "$ROOT/$c" > "$R/$b.dash.txt" 2> "$R/$b.dash.err") &
+                (cd "$R" && timeout 400 bash -s -- --stdout < "$ROOT/$c" > "$R/$b.bashs.txt" 2> "$R/$b.bashs.err") &
+            fi ;;
+        esac
+    done
+    wait
+    for c in $cols; do
+        b="$(basename "$c" .sh)"
         check "$b: the report passes --report" '"$V" --report "$R/$b.txt" >/dev/null' \
               "$("$V" --report "$R/$b.txt" 2>&1 | sed -n 2,4p | tr '\n' ' ')"
         case "$c" in collectors/apm/*)
             if command -v dash >/dev/null 2>&1; then
-                (cd "$R" && timeout 400 dash -s -- --stdout < "$ROOT/$c" > "$R/$b.dash.txt" 2> "$R/$b.dash.err")
                 check "$b: under dash too" '"$V" --report "$R/$b.dash.txt" >/dev/null && ! grep -q "Bad substitution" "$R/$b.dash.err"'
-                (cd "$R" && timeout 400 bash -s -- --stdout < "$ROOT/$c" > "$R/$b.bashs.txt" 2> "$R/$b.bashs.err")
                 check "$b: under bash -s too" '"$V" --report "$R/$b.bashs.txt" >/dev/null'
             fi ;;
         esac

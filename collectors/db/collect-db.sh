@@ -229,7 +229,10 @@ _note_boot() {
 # _bounded CMD... Every external command runs under a cap. timeout(1) when the
 # host has it and CMD is a file; otherwise a shell watchdog, which also covers
 # shell functions and hosts without coreutils. Returns 124 on a cap, whatever
-# the local timeout(1) returns for a kill (busybox gives 143).
+# the local timeout(1) returns for a kill (busybox gives 143). timeout(1) gets
+# -k 5 where it takes it: without it a command that ignores SIGTERM ran on
+# past its cap (`timeout 1 bash -c 'trap "" TERM; sleep 4'` took 4s; found
+# 2026-09-25).
 #
 # RUN_DEADLINE. The whole run is bounded too. Past it, _bounded runs nothing and
 # returns 124, so a host where every command hangs still yields a report that
@@ -249,6 +252,7 @@ _note_boot() {
 RUN_DEADLINE="${RUN_DEADLINE:-300}"
 _tmp_dir=""
 _run_t0=""
+_timeout_k=""     # 5 when timeout(1) takes -k (_run_init)
 _stdin_script=0   # 1 when the shell reads this script from stdin (sh -s)
 _nl='
 '
@@ -281,13 +285,13 @@ _run_cleanup() {
 }
 
 # _cap_or NAME VALUE DEFAULT -> VALUE when it is 1..999999, else DEFAULT, and a
-# warn naming what was ignored
+# warn naming what was ignored. A leading zero is refused too: $((030)) is 24.
 _cap_or() {
     case "$2" in
         ''|*[!0-9]*|0*) ;;
         *) [ "${#2}" -le 6 ] && { printf '%s' "$2"; return 0; } ;;
     esac
-    warn "$1=$2 ignored (not a number 1..999999), using $3"
+    warn "$1=$2 ignored (not a whole number 1..999999 without leading zeros), using $3"
     printf '%s' "$3"
 }
 
@@ -317,6 +321,9 @@ _run_init() {
     trap '_run_cleanup; exit 130' INT
     trap '_run_cleanup; exit 143' TERM
     [ -n "${_timeout_bin:-}" ] || _timeout_bin="$(command -v timeout 2>/dev/null)"
+    if [ -n "${_timeout_bin:-}" ] && "$_timeout_bin" -k 1 5 true </dev/null >/dev/null 2>&1; then
+        _timeout_k=5
+    fi
 }
 
 # _tmp NAME -> a path inside this run's directory. /dev/null when no directory
@@ -354,9 +361,9 @@ _bounded_in() {
     [ "$left" -le 0 ] && return 124
     [ "$left" -lt "$t" ] && t="$left"
     if [ -n "${_timeout_bin:-}" ] && [ "$(_cmd_kind "$1")" = file ]; then
-        if [ -n "$in" ];                   then "$_timeout_bin" "$t" "$@" < "$in"
-        elif [ "$_stdin_script" = 1 ];     then "$_timeout_bin" "$t" "$@" < /dev/null
-        else                                    "$_timeout_bin" "$t" "$@"; fi
+        if [ -n "$in" ];                   then "$_timeout_bin" ${_timeout_k:+-k "$_timeout_k"} "$t" "$@" < "$in"
+        elif [ "$_stdin_script" = 1 ];     then "$_timeout_bin" ${_timeout_k:+-k "$_timeout_k"} "$t" "$@" < /dev/null
+        else                                    "$_timeout_bin" ${_timeout_k:+-k "$_timeout_k"} "$t" "$@"; fi
         rc=$?
     else
         # The kill has to reach whatever CMD started: an orphaned grandchild
