@@ -70,7 +70,11 @@ COLLECTOR_NAME="whatap-k8s"
 #        after it in that pod are not run (each would wait a full cap for the
 #        same cause): a common hang costs about two caps per pod, not five
 #        (2026-09-25).
-VERSION="0.8.2"
+# 0.8.3  Only a first re-run that also times out stops the re-runs. Once a
+#        probe run alone has answered, the pod still answers, so a later
+#        hang is that probe's own and the ones after it are still run
+#        (two separate hangs lost the last answer in 0.8.2; 2026-09-25).
+VERSION="0.8.3"
 DOMAIN="k8s"
 TARGET="k8s-cluster/unresolved"      # refined after CLI/context/namespace discovery
 
@@ -1089,7 +1093,10 @@ _pod_probe_emit() {
             return
         fi
         pod_exec_probe "$label" "$PX_POD" "$PX_CONT" "$cmd"
-        [ "$K_RC" = 124 ] && PX_RERUN_TO=1
+        # 1 stops the re-runs, 2 keeps them: a re-run that answered shows the
+        # pod still answers, so a later hang is that probe's own
+        if [ "$K_RC" != 124 ]; then PX_RERUN_TO=2
+        elif [ "$PX_RERUN_TO" = 0 ]; then PX_RERUN_TO=1; fi
         return
     else
         K_OUT=""; K_RC="$PX_RC"

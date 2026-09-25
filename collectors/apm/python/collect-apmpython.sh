@@ -61,7 +61,11 @@ COLLECTOR_NAME="whatap-apmpython"
 #        cause): a common hang costs about two caps per interpreter, not ten.
 #        A lookup cut short by the run deadline says so, not "timed out"
 #        (2026-09-25).
-VERSION="0.7.2"
+# 0.7.3  Only a first re-run that also times out stops the re-runs. Once a
+#        lookup run alone has answered, the interpreter still answers, so a later
+#        hang is that lookup's own and the ones after it are still run
+#        (two separate hangs lost the last answer in 0.7.2; 2026-09-25).
+VERSION="0.7.3"
 DOMAIN="apm"
 TARGET="host/$(hostname 2>/dev/null || echo unknown)"
 
@@ -849,7 +853,10 @@ _pyreport() {
             return
         fi
         pyprobe "$label" "$_pyrun_py" "$3"
-        [ "$_pyrc" = 124 ] && _pyrun_rerun_to=1
+        # 1 stops the re-runs, 2 keeps them: a re-run that answered shows the
+        # interpreter still answers, so a later hang is that lookup's own
+        if [ "$_pyrc" != 124 ]; then _pyrun_rerun_to=2
+        elif [ "$_pyrun_rerun_to" = 0 ]; then _pyrun_rerun_to=1; fi
         return
     fi
     # $(...) drops the trailing newlines
