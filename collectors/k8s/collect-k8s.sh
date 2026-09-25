@@ -66,7 +66,11 @@ COLLECTOR_NAME="whatap-k8s"
 #        calls are random per run and taken only in the expected order, so a
 #        CR value or a probe output holding marker-like text cannot replace
 #        another read's answer (2026-09-25).
-VERSION="0.8.1"
+# 0.8.2  When a probe run alone after a hang also times out, the probes
+#        after it in that pod are not run (each would wait a full cap for the
+#        same cause): a common hang costs about two caps per pod, not five
+#        (2026-09-25).
+VERSION="0.8.2"
 DOMAIN="k8s"
 TARGET="k8s-cluster/unresolved"      # refined after CLI/context/namespace discovery
 
@@ -1021,11 +1025,11 @@ kr_keep() {
 # (keys N/out, N/err, N/rc; N/start with an empty text);
 # _pod_probe_emit N "label" CMD then reports CMD N as pod_exec_probe did.
 _PX_DRV='m=$1; shift; i=0; for c in "$@"; do i=$((i + 1)); echo "$m $i/start"; echo "$m $i/out"; { e=$( { sh -c "$c" 2>&1 1>&3 3>&-; } ); } 3>&1; r=$?; echo; echo "$m $i/err"; printf "%s\n" "$e"; echo "$m $i/rc"; echo "$r"; done'
-PX_POD="" PX_CONT=""
+PX_POD="" PX_CONT="" PX_RERUN_TO=0
 _pod_probes_run() {
     local pod="$1" cont="$2" l key="" acc="" n=0 ni=1 st=start
     shift 2
-    PX_POD="$pod" PX_CONT="$cont" PX_ERR="" PX_K=() PX_S=()
+    PX_POD="$pod" PX_CONT="$cont" PX_RERUN_TO=0 PX_ERR="" PX_K=() PX_S=()
     run_k exec -n "$NS" "$pod" -c "$cont" -- sh -c "$_PX_DRV" sh "$_KM_M" "$@"
     PX_RC=$K_RC
     [ "$K_RC" -ne 0 ] && PX_ERR="$(cat "$_errfile" 2>/dev/null)"
@@ -1060,7 +1064,9 @@ _px() { local i=0; KG_V=""; while [ "$i" -lt "${#PX_K[@]}" ]; do [ "${PX_K[$i]}"
 # the exec's reason stands for each, as each exec would have failed alike;
 # one that never started while a probe before it did (it hung, or the stream
 # broke) runs alone in its own exec under its own cap. Past the run deadline
-# it is not run, and the reason says why.
+# it is not run, and the reason says why. Once one such re-run also times
+# out, the rest are not run either: each would wait a full cap for the same
+# cause.
 _pod_probe_emit() {
     local n="$1" label="$2" cmd="$3" out err rc
     if _px "$n/rc"; then
@@ -1078,7 +1084,12 @@ _pod_probe_emit() {
             fact "$label: n/a (not run: the probe before it did not finish within ${CMD_TIMEOUT}s, and the run deadline was reached: ${RUN_DEADLINE}s)"
             return
         fi
+        if [ "$PX_RERUN_TO" = 1 ]; then
+            fact "$label: n/a (not run: the probes before it did not finish within ${CMD_TIMEOUT}s)"
+            return
+        fi
         pod_exec_probe "$label" "$PX_POD" "$PX_CONT" "$cmd"
+        [ "$K_RC" = 124 ] && PX_RERUN_TO=1
         return
     else
         K_OUT=""; K_RC="$PX_RC"

@@ -56,7 +56,12 @@ COLLECTOR_NAME="whatap-apmpython"
 #        random per run and taken only in the order the driver prints them,
 #        so a path or value holding marker-like text cannot replace another
 #        lookup's answer (2026-09-25).
-VERSION="0.7.1"
+# 0.7.2  When a lookup run alone after a hang also times out, the lookups
+#        after it are not run (each would wait a full cap for the same
+#        cause): a common hang costs about two caps per interpreter, not ten.
+#        A lookup cut short by the run deadline says so, not "timed out"
+#        (2026-09-25).
+VERSION="0.7.2"
 DOMAIN="apm"
 TARGET="host/$(hostname 2>/dev/null || echo unknown)"
 
@@ -647,7 +652,12 @@ pyprobe() {
     _past_deadline && { _pyrc=124; fact "$label: n/a (run deadline reached: ${RUN_DEADLINE}s)"; return; }
     out="$(_bounded "$py" -c "$code" 2>"$_errfile")"; rc=$?
     _pyout="$out" _pyrc="$rc"
-    [ "$rc" -eq 124 ] && { fact "$label: n/a (timed out: ${CMD_TIMEOUT}s)"; return; }
+    # _bounded caps at what is left of RUN_DEADLINE when that is less
+    if [ "$rc" -eq 124 ]; then
+        if _past_deadline; then fact "$label: n/a (run deadline reached: ${RUN_DEADLINE}s)"
+        else fact "$label: n/a (timed out: ${CMD_TIMEOUT}s)"; fi
+        return
+    fi
     if [ "$rc" -ne 0 ]; then
         local err
         err="$(grep -E 'Error|Exception' "$_errfile" 2>/dev/null | tail -n1 | cut -c1-140)"
@@ -757,11 +767,11 @@ for i in order:
     out.write("%s %d rc %d\n" % (m, i + 1, rc))
     out.flush()
 '
-_pyrun_py="" _pyrun_rc=0 _pyrun_pre="" _pyrun_post="" _pyrun_err="" _pyrun_started=0
+_pyrun_py="" _pyrun_rc=0 _pyrun_pre="" _pyrun_post="" _pyrun_err="" _pyrun_started=0 _pyrun_rerun_to=0
 _pyrun() {
     local l n c ord="" cur="" step="" acc="" seen=0 i=1
     _pyrun_py="$1"; shift
-    _pyrun_rc=0 _pyrun_pre="" _pyrun_post="" _pyrun_err="" _pyrun_started=0
+    _pyrun_rc=0 _pyrun_pre="" _pyrun_post="" _pyrun_err="" _pyrun_started=0 _pyrun_rerun_to=0
     while [ "$i" -le "$#" ]; do eval "_pyr_$i='' _pyo_$i='' _pye_$i='' _pys_$i=''"; i=$((i + 1)); done
     [ -x "$_pyrun_py" ] || { _pyrun_rc=noexec; return; }
     _past_deadline && { _pyrun_rc=deadline; return; }
@@ -811,7 +821,9 @@ EOF
 #   * it never started because a CODE before it hung or ended the process,
 #     or the interpreter cannot run the driver: run alone with pyprobe, under
 #     its own cap, as before _pyrun. Past the run deadline it is not run, and
-#     the reason says why.
+#     the reason says why. Once one such re-run also times out, the hang has
+#     a common cause and the rest are not run either: each would wait a full
+#     cap for the same answer.
 _pyreport() {
     local n="$1" label="$2" out rc err started
     case "$_pyrun_rc" in
@@ -831,7 +843,14 @@ _pyreport() {
             fact "$label: n/a (not run: the lookup before it did not finish within ${CMD_TIMEOUT}s, and the run deadline was reached: ${RUN_DEADLINE}s)"
             return
         fi
-        pyprobe "$label" "$_pyrun_py" "$3"; return
+        if [ "$_pyrun_rerun_to" = 1 ]; then
+            _pyout="" _pyrc=124
+            fact "$label: n/a (not run: the lookups before it did not finish within ${CMD_TIMEOUT}s)"
+            return
+        fi
+        pyprobe "$label" "$_pyrun_py" "$3"
+        [ "$_pyrc" = 124 ] && _pyrun_rerun_to=1
+        return
     fi
     # $(...) drops the trailing newlines
     out="$_pyrun_pre$out$_pyrun_post"
