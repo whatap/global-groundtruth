@@ -100,6 +100,41 @@ for sh in bash dash; do
     [ "$sh" = dash ] && check "no bash-only construct in the blocks" '! printf "%s" "$out" | grep -q "Bad substitution\|Syntax error"'
 done
 
+# The same helpers when the shell reads the script from stdin, as
+# `kubectl exec ... sh -s` does. bash 5.2 kills a $(...) subshell that
+# duplicates fd 0 in that mode, which turned every bounded function into
+# "nonzero exit" (2026-09-25); and a bounded command that reads stdin would eat
+# the rest of the script.
+cat > "$T/stdin-tail.sh" <<'EOF'
+exec 3>&2
+_run_init; _init_probe
+myfn() { echo from-fn; }
+CMD_TIMEOUT=2
+probe "fn" myfn
+printf 'a\nb\n' > "$(_tmp in.txt)"
+echo "in: $(_bounded_in "$(_tmp in.txt)" wc -l | tr -d ' ')"
+_timeout_bin=""
+probe "fn-watchdog" myfn
+probe "reads stdin" cat
+echo "END-REACHED"
+EOF
+for sh in bash dash; do
+    echo "== 1c. shared helpers under $sh -s (script on stdin) =="
+    command -v "$sh" >/dev/null 2>&1 || { skip "$sh not installed"; continue; }
+    out="$(cat "$T/lib.sh" "$T/stdin-tail.sh" | "$sh" -s -- --stdout 2>&1)"
+    check "a function under probe"                 'printf "%s" "$out" | grep -q "    fn: from-fn"'
+    check "a function under the watchdog"          'printf "%s" "$out" | grep -q "fn-watchdog: from-fn"'
+    check "_bounded_in feeds its file"             'printf "%s" "$out" | grep -q "in: 2"'
+    check "a command reading stdin does not eat the script" 'printf "%s" "$out" | grep -q "END-REACHED"'
+done
+if command -v dash >/dev/null 2>&1; then
+    mkdir -p "$T/ro-dash" && chmod 555 "$T/ro-dash"
+    (cd "$T/ro-dash" && dash -s -- --file < "$SK" > "$T/ro-dash.out" 2> "$T/ro-dash.err")
+    # shellcheck disable=SC2034  # read inside check's eval
+    drc=$?
+    check "dash: an unwritable --file warns and exits 1" '[ "$drc" = 1 ] && grep -q "^!! the report was not written" "$T/ro-dash.err"'
+fi
+
 echo "== 1b. Ctrl-C leaves nothing behind =="
 cat > "$T/intr.sh" <<'EOF'
 set -- --stdout
@@ -176,6 +211,8 @@ else
             if command -v dash >/dev/null 2>&1; then
                 (cd "$R" && timeout 400 dash -s -- --stdout < "$ROOT/$c" > "$R/$b.dash.txt" 2> "$R/$b.dash.err")
                 check "$b: under dash too" '"$V" --report "$R/$b.dash.txt" >/dev/null && ! grep -q "Bad substitution" "$R/$b.dash.err"'
+                (cd "$R" && timeout 400 bash -s -- --stdout < "$ROOT/$c" > "$R/$b.bashs.txt" 2> "$R/$b.bashs.err")
+                check "$b: under bash -s too" '"$V" --report "$R/$b.bashs.txt" >/dev/null'
             fi ;;
         esac
     done

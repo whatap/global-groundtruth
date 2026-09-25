@@ -33,6 +33,7 @@ The starter for a new collector. It already emits the shared report shape
    | `probe "label" CMD…`   | output as facts, or `label: n/a (<why>)` — the reasoned form   |
    | `read_proc "label" P`  | a `/proc` or `/sys` file's content, or a classified reason     |
    | `_bounded CMD…`        | runs CMD under `CMD_TIMEOUT` and `RUN_DEADLINE`; 124 on a cap  |
+   | `_bounded_in FILE CMD…`| the same, with FILE as CMD's stdin (never `< FILE` on `_bounded`) |
    | `warn "text"`          | `!! text` to the terminal (fd 3), not silenced by `--quiet`   |
    | `_tmp NAME`            | a path in the run's private directory, removed on exit/Ctrl-C  |
    | `goal` / `got` / `na` / `missed` | declare and resolve what the run came for      |
