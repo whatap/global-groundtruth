@@ -41,7 +41,10 @@ emits the matching sections; what is absent is reported with its reason.
      `db` (falling back to `plan_db`), `connect_option` — the one thing the
      conf cannot supply is credentials (stored encrypted by `uid.sh`; this
      script does not decrypt them). Those are asked on the terminal, or read
-     from `WHATAP_GGT_USER` / `WHATAP_GGT_PW` for non-interactive runs.
+     from `WHATAP_GGT_USER` / `WHATAP_GGT_PW` for non-interactive runs. The
+     prompt waits no longer than what is left of the run deadline
+     (`RUN_DEADLINE`, 300 s); an unanswered prompt skips that instance, and
+     the `sql` goal names the timeout.
      Announced on stderr before anything is sent (Tier 2, read-only,
      20s/statement, 200 rows/query caps).
    - **(b) through a DB client**, where the customer's DBA already has one:

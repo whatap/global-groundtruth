@@ -41,7 +41,14 @@ export LC_ALL=C
 
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-db"
-VERSION="0.4.0"
+# 0.5.0  Discovery reads each /proc/<pid>/cmdline and comm with builtins, with
+#        no fork per process: `$(tr)`, `$(cat)` and `$(_db_kind_of_comm)` per
+#        pid made the scan cost about 15 ms per process (9.2 s -> 1.4 s on a
+#        720-process host, 38.7 s -> 2.0 s with 2000 more). The report is
+#        unchanged. The --sql terminal prompt waits no longer than what is
+#        left of RUN_DEADLINE; a prompt nobody answers skips that instance
+#        with the reason in the sql goal (2026-09-25).
+VERSION="0.5.0"
 DOMAIN="db"
 TARGET="db-host/$(hostname 2>/dev/null || echo unknown)"
 
@@ -787,19 +794,35 @@ _kind_of_cmdline() {
     esac
 }
 
+# _db_kind_of_comm COMM -> _DBK = the database engine a comm names, or "".
+# It sets a variable instead of printing: discovery calls it for every pid,
+# and a $(...) per pid is a fork per pid.
+_DBK=""
 _db_kind_of_comm() {
     case "$1" in
-        postgres|postmaster)      echo postgresql ;;
-        mysqld|mariadbd)          echo mysql/mariadb ;;
-        ora_pmon*|oracle*)        echo oracle ;;
-        tbsvr*)                   echo tibero ;;
-        redis-server|valkey-serv*) echo redis/valkey ;;
-        mongod)                   echo mongodb ;;
-        sqlservr)                 echo mssql ;;
-        db2sysc)                  echo db2 ;;
-        cub_master|cub_server|cub_broker) echo cubrid ;;
-        *)                        echo "" ;;
+        postgres|postmaster)      _DBK=postgresql ;;
+        mysqld|mariadbd)          _DBK=mysql/mariadb ;;
+        ora_pmon*|oracle*)        _DBK=oracle ;;
+        tbsvr*)                   _DBK=tibero ;;
+        redis-server|valkey-serv*) _DBK=redis/valkey ;;
+        mongod)                   _DBK=mongodb ;;
+        sqlservr)                 _DBK=mssql ;;
+        db2sysc)                  _DBK=db2 ;;
+        cub_master|cub_server|cub_broker) _DBK=cubrid ;;
+        *)                        _DBK="" ;;
     esac
+}
+
+# _read_nul FILE -> _RN = FILE with each NUL turned into a space and trailing
+# newlines dropped: what $(tr '\0' ' ' < FILE) gave, without the two forks.
+# A last argument with no NUL after it (setproctitle) is kept as it is.
+_RN=""
+_read_nul() {
+    local c
+    _RN=""
+    while IFS= read -r -d '' c; do _RN="$_RN$c "; done 2>/dev/null < "$1"
+    _RN="$_RN$c"
+    _RN="${_RN%"${_RN##*[!$_nl]}"}"
 }
 
 add_home() { # DIR SRC — dedupe on DIR; returns 1 with ADD_HOME_WHY when DIR is unusable
@@ -845,7 +868,7 @@ discover() {
             pid="${d#/proc/}"
             case "$self" in *" $pid "*) continue ;; esac
             # a cheap filter first: only a cmdline naming a component is read twice
-            cl="$(tr '\0' ' ' 2>/dev/null < "$d/cmdline")"
+            _read_nul "$d/cmdline"; cl="$_RN"
             [ -n "$cl" ] || continue
             case "$cl" in *whatap.agent.*|*dbxc*|*xcub*) ;; *) cl="" ;; esac
             kind=""
@@ -885,8 +908,10 @@ discover() {
                 fi
                 continue
             fi
-            comm="$(cat "$d/comm" 2>/dev/null)"
-            kind="$(_db_kind_of_comm "$comm")"
+            comm=""
+            IFS= read -r -d '' comm 2>/dev/null < "$d/comm"
+            comm="${comm%"${comm##*[!$_nl]}"}"
+            _db_kind_of_comm "$comm"; kind="$_DBK"
             if [ -n "$kind" ]; then
                 DBP_PIDS[${#DBP_PIDS[@]}]="$pid"
                 DBP_KINDS[${#DBP_KINDS[@]}]="$kind"
@@ -1146,19 +1171,49 @@ _find_jdbc_jar() { # GLOB... -> first matching jar under any home/instance jdbc 
     return 1
 }
 
-CRED_USER=""; CRED_PW=""
-_get_creds() { # LABEL -> 0 with CRED_USER/CRED_PW set, 1 = skip (with reason fact)
-    CRED_USER="${WHATAP_GGT_USER:-}"; CRED_PW="${WHATAP_GGT_PW:-}"
+CRED_USER=""; CRED_PW=""; CRED_WHY=""
+# _get_creds LABEL -> 0 with CRED_USER/CRED_PW set, 1 = skip, with CRED_WHY
+# for the sql goal. The terminal prompt waits no longer than what is left of
+# RUN_DEADLINE: a run nobody answers still reaches its footer.
+_get_creds() {
+    local left rc
+    CRED_USER="${WHATAP_GGT_USER:-}"; CRED_PW="${WHATAP_GGT_PW:-}"; CRED_WHY=""
     [ -n "$CRED_USER" ] && { fact "credentials: from WHATAP_GGT_USER env"; return 0; }
     if [ ! -r /dev/tty ] || [ ! -w /dev/tty ]; then
         fact "credentials: n/a (no terminal and WHATAP_GGT_USER unset — instance skipped)"
+        CRED_WHY="no credentials (set WHATAP_GGT_USER / WHATAP_GGT_PW, or run it on a terminal)"
+        return 1
+    fi
+    left=$((RUN_DEADLINE - $(_elapsed)))
+    if [ "$left" -le 0 ]; then
+        fact "credentials: n/a (run deadline reached — instance skipped)"
+        CRED_WHY="no credentials (run deadline ${RUN_DEADLINE}s reached before the terminal prompt)"
         return 1
     fi
     printf '!! monitoring account user for %s (empty = skip this instance): ' "$1" > /dev/tty
-    IFS= read -r CRED_USER < /dev/tty
-    [ -z "$CRED_USER" ] && { fact "credentials: none entered — instance skipped"; return 1; }
+    # read -t returns >128 on the timeout; end of input is "none entered"
+    IFS= read -r -t "$left" CRED_USER < /dev/tty; rc=$?
+    if [ "$rc" -gt 128 ]; then
+        printf '\n' > /dev/tty
+        CRED_USER=""
+        fact "credentials: n/a (timed out: ${left}s waiting for terminal input — instance skipped)"
+        CRED_WHY="no credentials (terminal prompt timed out after ${left}s, the rest of RUN_DEADLINE; set WHATAP_GGT_USER / WHATAP_GGT_PW)"
+        return 1
+    fi
+    [ -z "$CRED_USER" ] && { fact "credentials: none entered — instance skipped"
+        CRED_WHY="no credentials (set WHATAP_GGT_USER / WHATAP_GGT_PW, or run it on a terminal)"; return 1; }
     printf '!! password for %s: ' "$CRED_USER" > /dev/tty
-    IFS= read -rs CRED_PW < /dev/tty
+    left=$((RUN_DEADLINE - $(_elapsed)))
+    [ "$left" -gt 0 ] || left=1
+    IFS= read -rs -t "$left" CRED_PW < /dev/tty; rc=$?
+    if [ "$rc" -gt 128 ]; then
+        printf '\n' > /dev/tty
+        CRED_PW=""
+        fact "credentials: n/a (timed out: ${left}s waiting for the password — instance skipped)"
+        CRED_WHY="no credentials (password prompt timed out after ${left}s, the rest of RUN_DEADLINE; set WHATAP_GGT_USER / WHATAP_GGT_PW)"
+        CRED_USER=""
+        return 1
+    fi
     printf '\n' > /dev/tty
     fact "credentials: entered on terminal (user=$CRED_USER)"
     return 0
@@ -1861,7 +1916,7 @@ run_report() {
                     i=$((i + 1)); continue
                 fi
                 if ! _get_creds "$idir"; then
-                    sql_fail="$sql_fail $idir: no credentials (set WHATAP_GGT_USER / WHATAP_GGT_PW, or run it on a terminal);"
+                    sql_fail="$sql_fail $idir: $CRED_WHY;"
                     i=$((i + 1)); continue
                 fi
                 warn "sending read-only SQL pack $(basename "$pack") to $dbip:$dbport as $CRED_USER over JDBC"

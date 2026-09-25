@@ -60,6 +60,21 @@ Container notes (all verified against real images):
 | 8 | Odoo application facts | odoo master/worker processes, Odoo version (`odoo/release.py`, read as text — no odoo code runs), `odoo.conf` (path from `-c`/`ODOO_RC`/packaged defaults; see "What the report can contain" below) with the `logfile` key resolved and the worker log tailed (with `logfile` unset, odoo writes to the process stdout/stderr, e.g. the container log) (the HTTP-worker traceback lives there, not in the master/startup log), listening sockets (8069/8072), systemd unit facts (`Environment=`/`ExecStart` visibility for `whatap-start-agent` PATH issues), `injected odoo` hook-evidence counts. Cheap no-op on non-Odoo hosts. Interpretation aid: the agent's Odoo support matrix (14–19 from agent 2.1.3; JSON-RPC errors return HTTP 200 and are not captured; WebSocket/Longpolling/Cron not instrumented) is maintained in the internal "Odoo 지원" Notion document |
 | 9 | Kubernetes / operator injection context | `/whatap-agent` volume, `WHATAP_PYTHON_AGENT_PATH` (symlink vs regular file), k8s env facts |
 
+## How each interpreter is asked
+
+The lookups of section 3 (version, prefixes, whatap-python version and
+location, metadata dirs, setuptools, `pkg_resources`, bundled binaries,
+`sitecustomize.py`, `trace/mod`) run in **one** start of each interpreter,
+not one `python -c` each: every snippet runs with fresh globals, its own
+stdout, stderr and exit status, and an uncaught exception is printed by the
+interpreter's own `sys.excepthook`, so each line and each `n/a (...)` reads
+as a separate `python -c` would have made it. The `pkg_resources` import runs
+last, as it rewires namespace packages. When the interpreter cannot run the
+combined script at all (or a snippet ends the process), the snippets it did
+not report on are run one by one as before; when the shared call hits the
+per-call cap, those snippets say `timed out`. `pip list` stays a call of its
+own.
+
 ## How python processes are found
 
 A process is a python process when its `comm`, its `argv0` or its

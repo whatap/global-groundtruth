@@ -127,7 +127,7 @@ Load tiers:
 
 | Tier | Flags | Behavior |
 |---|---|---|
-| 0 (default) | `--file` / `--stdout` | read-only API GETs, bounded log tails (`--tail`, default 200), exec into at most 2 agent pods; every call double-bounded (kubectl `--request-timeout=15s` + the shared `_bounded` cap, 20 s, inside the 300 s run deadline); helm calls bounded the same way |
+| 0 (default) | `--file` / `--stdout` | read-only API GETs, bounded log tails (`--tail`, default 200), exec into at most 2 agent pods (one `kubectl exec` per pod runs all its probes, each through its own `sh -c` and exit status); the jsonpath reads of one object or list share one GET, split on marker lines, and a failed shared GET is the reason of every read it carried; every call double-bounded (kubectl `--request-timeout=15s` + the shared `_bounded` cap, 20 s, inside the 300 s run deadline); helm calls bounded the same way |
 | 1 | `--bundle` | Tier 0 report + full CR/DS/operator/webhook yaml, per-container logs of the whatap namespace pods (caps: 20 pods, tail 2000 lines and 2 MB per file, 60 MB in total across `logs/` and the `--apm-target` logs; `--previous` only for containers with restarts; `logs/CAPS.txt` states the caps and what was left out), events, nodes, helm values — all verbatim |
 | 2 (opt-in) | `--exec-per-node` | in-pod probes on every running node-agent pod (cap 30); announces the fan-out on stderr first |
 | 2 (opt-in) | `--apm-exec` | read-only probes **inside** the `--apm-target` application containers (up to 3 pods per target): pid 1 cmdline + environ, agent home, `whatap.conf`, agent logs, port registry, runtime version |

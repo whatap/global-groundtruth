@@ -51,7 +51,16 @@ export LC_ALL=C
 
 # ---- collector metadata -----------------------------------------------------
 COLLECTOR_NAME="whatap-k8s"
-VERSION="0.7.0"
+# 0.8.0  Fewer API round trips: the jsonpath reads of one object or list are
+#        asked in one call and split on marker lines (the cluster-scoped
+#        WhatapAgent list, the crd, each whatap webhook configuration, the
+#        node-agent daemonset, the first node), a list read twice is read once,
+#        and the in-pod probes of a pod run in one `kubectl exec`, each through
+#        its own sh -c with its own exit status. A merged call that fails
+#        gives every read it replaced that failure; one that fails on a
+#        template is made again read by read. The report is unchanged; 105 ->
+#        75 calls and 24.6 s -> 18.0 s on a 4-node lab cluster (2026-09-25).
+VERSION="0.8.0"
 DOMAIN="k8s"
 TARGET="k8s-cluster/unresolved"      # refined after CLI/context/namespace discovery
 
@@ -849,6 +858,178 @@ pod_exec_probe_ns() {
 # pod_exec_probe "label" POD CONTAINER CMDSTRING -> same, in the whatap namespace.
 pod_exec_probe() { pod_exec_probe_ns "$NS" "$1" "$2" "$3" "$4"; }
 
+# ---- merged calls ----------------------------------------------------------------
+# Every kubectl call is a round trip to the API server: 105 of them took 20 of
+# the 25 s a run spent on a lab cluster, and a remote API multiplies that. So
+# the jsonpath reads of one object (or one list) are asked in ONE call, each
+# template preceded by a marker line, and split back afterwards.
+#
+# km_get GROUP ARGS... -> `ARGS -o jsonpath=<KM_T joined>`, stored as GROUP:
+#   GROUP_USE=1, GROUP_RC / GROUP_ERR (exit status and stderr of the call),
+#   GROUP_FB=1 when the failure names jsonpath (a template error: one template
+#   would otherwise fail all of them), GROUP_K / GROUP_S (marker keys and the
+#   text after each, trailing newlines dropped as $(...) drops them).
+# Templates carry their marker: _km_mark KEY, or inside a range over items
+# {"\n@@ggt-seg@@ "}{.metadata.name}{"/KEY\n"}.
+# kg_run GROUP KEY ARGS... then stands in for `run_k ARGS` of the template it
+# replaced: K_OUT / K_RC / $_errfile as that call would have left them. A
+# failed merged call fails every template the same way; a template error or a
+# key the call did not print runs the original call instead.
+_KM_M='@@ggt-seg@@'
+KM_T=()
+_km_mark() { printf '{"\\n%s %s\\n"}' "$_KM_M" "$1"; }
+km_get() {
+    local g="$1" tpl="" i=0 l key="" acc="" n=0
+    shift
+    while [ "$i" -lt "${#KM_T[@]}" ]; do tpl="$tpl${KM_T[$i]}"; i=$((i + 1)); done
+    eval "${g}_USE=1 ${g}_FB=0 ${g}_ERR='' ${g}_K=() ${g}_S=()"
+    run_k "$@" -o "jsonpath=$tpl"
+    eval "${g}_RC=\$K_RC"
+    if [ "$K_RC" -ne 0 ]; then
+        eval "${g}_ERR=\"\$(cat \"\$_errfile\" 2>/dev/null)\""
+        grep -qi 'jsonpath' "$_errfile" 2>/dev/null && eval "${g}_FB=1"
+        return 1
+    fi
+    while IFS= read -r l; do
+        case "$l" in
+            "$_KM_M "*)
+                if [ -n "$key" ]; then
+                    while :; do case "$acc" in *"$_nl") acc="${acc%"$_nl"}" ;; *) break ;; esac; done
+                    eval "${g}_K[\${#${g}_K[@]}]=\$key; ${g}_S[\${#${g}_S[@]}]=\$acc"
+                fi
+                key="${l#"$_KM_M "}"; acc=""; n=0 ;;
+            *)
+                [ -n "$key" ] || continue
+                if [ "$n" = 0 ]; then acc="$l"; else acc="$acc$_nl$l"; fi
+                n=$((n + 1)) ;;
+        esac
+    done <<EOF
+$K_OUT
+EOF
+    if [ -n "$key" ]; then
+        while :; do case "$acc" in *"$_nl") acc="${acc%"$_nl"}" ;; *) break ;; esac; done
+        eval "${g}_K[\${#${g}_K[@]}]=\$key; ${g}_S[\${#${g}_S[@]}]=\$acc"
+    fi
+    return 0
+}
+
+# _kg GROUP KEY -> 0 with KG_V = the text for KEY; 1 when the merged call
+# failed (KG_RC / KG_ERR); 2 when the original call has to be made
+KG_V="" KG_RC=0 KG_ERR=""
+_kg() {
+    local g="$1" k="$2" use rc fb n i=0 kk
+    eval "use=\${${g}_USE:-0}"
+    [ "$use" = 1 ] || return 2
+    eval "rc=\$${g}_RC fb=\$${g}_FB"
+    if [ "$rc" -ne 0 ]; then
+        [ "$fb" = 1 ] && return 2
+        KG_RC="$rc"; eval "KG_ERR=\$${g}_ERR"
+        return 1
+    fi
+    eval "n=\${#${g}_K[@]}"
+    while [ "$i" -lt "$n" ]; do
+        eval "kk=\${${g}_K[$i]}"
+        [ "$kk" = "$k" ] && { eval "KG_V=\${${g}_S[$i]}"; return 0; }
+        i=$((i + 1))
+    done
+    return 2
+}
+
+kg_run() {
+    local g="$1" k="$2" r
+    shift 2
+    _kg "$g" "$k"; r=$?
+    case "$r" in
+        0) K_OUT="$KG_V"; K_RC=0; return 0 ;;
+        1) K_OUT=""; K_RC="$KG_RC"; printf '%s\n' "$KG_ERR" > "$_errfile" 2>/dev/null; return "$K_RC" ;;
+    esac
+    run_k "$@"
+}
+# kg_probe GROUP KEY "label" ARGS... -> kprobe, from the merged call
+kg_probe() {
+    local g="$1" k="$2" label="$3"
+    shift 3
+    if kg_run "$g" "$k" "$@" && [ -n "$K_OUT" ]; then _emit_labeled "$label" "$K_OUT"
+    else fact "$label: n/a ($(_k_reason))"; fi
+}
+# kg_kval GROUP KEY ARGS... -> kval, from the merged call (for $(...))
+kg_kval() {
+    local g="$1" k="$2"
+    shift 2
+    if kg_run "$g" "$k" "$@"; then : > "$(_tmp kval.why)" 2>/dev/null; printf '%s\n' "$K_OUT"
+    else _k_reason > "$(_tmp kval.why)" 2>/dev/null; return 1; fi
+}
+
+# _whg WEBHOOK -> _WHG = the merged-call group of that webhook configuration
+_WHG=""
+_whg() { local w j=0; _WHG="WHG_none"; for w in $WEBHOOKS; do [ "$w" = "$1" ] && { _WHG="WHG$j"; return; }; j=$((j + 1)); done; }
+
+# kr_keep GROUP KEY -> keep the last run_k as GROUP/KEY, for a later kg_run of
+# the same call
+kr_keep() {
+    eval "${1}_USE=1 ${1}_FB=0 ${1}_RC=\$K_RC ${1}_ERR='' ${1}_K=(\"\$2\") ${1}_S=(\"\$K_OUT\")"
+    [ "$K_RC" -ne 0 ] && eval "${1}_ERR=\"\$(cat \"\$_errfile\" 2>/dev/null)\""
+    return 0
+}
+
+# _pod_probes_run POD CONTAINER CMD... -> every CMD in one `kubectl exec`, each
+# through its own `sh -c` (a CMD that does not parse fails alone, as it did in
+# its own exec). Per CMD the pod prints a marker, the stdout, a marker, the
+# stderr, and "rc N". Stored as group PX (keys N/out, N/err, N/rc);
+# _pod_probe_emit N "label" then reports CMD N as pod_exec_probe did.
+_PX_DRV='i=0; for c in "$@"; do i=$((i + 1)); echo "@@ggt-seg@@ $i/out"; { e=$( { sh -c "$c" 2>&1 1>&3 3>&-; } ); } 3>&1; r=$?; echo; echo "@@ggt-seg@@ $i/err"; printf "%s\n" "$e"; echo "@@ggt-seg@@ $i/rc"; echo "$r"; done'
+_pod_probes_run() {
+    local pod="$1" cont="$2" l key="" acc="" n=0
+    shift 2
+    PX_ERR="" PX_K=() PX_S=()
+    run_k exec -n "$NS" "$pod" -c "$cont" -- sh -c "$_PX_DRV" sh "$@"
+    PX_RC=$K_RC
+    [ "$K_RC" -ne 0 ] && PX_ERR="$(cat "$_errfile" 2>/dev/null)"
+    # a call cut short keeps what the probes before the cut printed
+    while IFS= read -r l; do
+        case "$l" in
+            "$_KM_M "*)
+                if [ -n "$key" ]; then
+                    while :; do case "$acc" in *"$_nl") acc="${acc%"$_nl"}" ;; *) break ;; esac; done
+                    PX_K[${#PX_K[@]}]="$key"; PX_S[${#PX_S[@]}]="$acc"
+                fi
+                key="${l#"$_KM_M "}"; acc=""; n=0 ;;
+            *)
+                [ -n "$key" ] || continue
+                if [ "$n" = 0 ]; then acc="$l"; else acc="$acc$_nl$l"; fi
+                n=$((n + 1)) ;;
+        esac
+    done <<EOF
+$K_OUT
+EOF
+    if [ -n "$key" ]; then
+        while :; do case "$acc" in *"$_nl") acc="${acc%"$_nl"}" ;; *) break ;; esac; done
+        PX_K[${#PX_K[@]}]="$key"; PX_S[${#PX_S[@]}]="$acc"
+    fi
+}
+_px() { local i=0; KG_V=""; while [ "$i" -lt "${#PX_K[@]}" ]; do [ "${PX_K[$i]}" = "$1" ] && { KG_V="${PX_S[$i]}"; return 0; }; i=$((i + 1)); done; return 1; }
+_pod_probe_emit() {
+    local n="$1" label="$2" out err rc
+    if _px "$n/rc"; then
+        rc="$KG_V"; _px "$n/out"; out="$KG_V"; _px "$n/err"; err="$KG_V"
+        # what `kubectl exec` itself adds for a command that exits non-zero
+        if [ "$rc" != 0 ]; then
+            { [ -n "$err" ] && printf '%s\n' "$err"; printf 'command terminated with exit code %s\n' "$rc"; } > "$_errfile" 2>/dev/null
+            K_RC="$rc"
+        else
+            K_RC=0
+        fi
+        K_OUT="$out"
+    else
+        # the exec did not reach this probe: its reason is the exec's
+        K_OUT=""; K_RC="$PX_RC"
+        [ "$K_RC" -eq 0 ] && K_RC=1
+        printf '%s\n' "$PX_ERR" > "$_errfile" 2>/dev/null
+    fi
+    if [ "$K_RC" -eq 0 ] && [ -n "$K_OUT" ]; then _emit_labeled "$label" "$K_OUT"
+    else fact "$label: n/a ($(_k_reason))"; fi
+}
+
 # ---- discovery (run once, before the report) ---------------------------------
 NS=""; NS_SRC=""; NS_ALL=""
 k8s_ns_discover() {
@@ -901,6 +1082,55 @@ ALL_HOOKS_WHY=""     # why ALL_HOOKS is empty
 DSC_WHY="" DS_WHY="" OP_WHY="" DEP_WHY="" HS_WHY="" WH_WHY="" SP_WHY=""   # why the list behind each failed
 HELM_SECRETS=""      # sh.helm.release.v1.* secret names mentioning whatap
 
+# jsonpath templates read both on their own and inside a merged call
+T_CRD_VERSIONS='{range .spec.versions[*]}{.name}{" served="}{.served}{" storage="}{.storage}{"\n"}{end}'
+T_CR_ENV1='{.spec.features.k8sAgent.nodeAgent.envs[*].name}'
+T_CR_ENV2='{.spec.features.k8sAgent.nodeAgent.nodeAgentContainer.envs[*].name}'
+T_CR_ENV3='{.spec.features.k8sAgent.nodeAgent.nodeHelperContainer.envs[*].name}'
+T_CR_MF='{range .metadata.managedFields[*]}{.manager}{" op="}{.operation}{" subresource="}{.subresource}{" time="}{.time}{"\n"}{end}'
+T_CR_ID='{"apiVersion="}{.apiVersion}{" name="}{.metadata.name}{" k8sAgent.namespace="}{.spec.features.k8sAgent.namespace}{" k8sAgent.enabled="}{.spec.features.k8sAgent.enabled}{" apm.instrumentation.enabled="}{.spec.features.apm.instrumentation.enabled}{" targets="}{.spec.features.apm.instrumentation.targets[*].name}'
+T_CR_TG='{range .spec.features.apm.instrumentation.targets[*]}{"name="}{.name}{" lang="}{.language}{" enabled="}{.enabled}{" versions="}{.whatapApmVersions}{" mode="}{.config.mode}{" configMapRef="}{.config.configMapRef.name}{" nsSelector="}{.namespaceSelector}{" podSelector="}{.podSelector}{"\n"}{end}'
+T_CR_IMG='{range .spec.features.apm.instrumentation.targets[*]}{"name="}{.name}{" customImageFullName="}{.customImageFullName}{" customImageName="}{.customImageName}{" imagePullSecrets="}{.imagePullSecrets[*].name}{" envs="}{range .envs[*]}{.name}{"="}{.value}{";"}{end}{"\n"}{end}'
+T_CRL_SELX='{range .items[*]}{range .spec.features.apm.instrumentation.targets[*]}{range .podSelector.matchExpressions[*]}{range .values[*]}{.}{"\n"}{end}{end}{end}{end}'
+T_CRL_SELL='{range .items[*]}{range .spec.features.apm.instrumentation.targets[*]}{.podSelector.matchLabels}{"\n"}{end}{end}'
+T_CRL_JNAMES='{range .items[*]}{.metadata.name}{" apiVersion="}{.apiVersion}{" created="}{.metadata.creationTimestamp}{"\n"}{end}'
+T_CRL_JALL='{.items[*].metadata.name}'
+T_CRL_JTGT='{range .items[*]}{.metadata.name}{"="}{range .spec.features.apm.instrumentation.targets[*]}{.name}{","}{end}{"\n"}{end}'
+T_CRL_JSEL='{range .items[*]}{"cr="}{.metadata.name}{"\n"}{range .spec.features.apm.instrumentation.targets[*]}{"  target="}{.name}{" enabled="}{.enabled}{" lang="}{.language}{"\n"}{"    namespaceSelector.matchNames="}{.namespaceSelector.matchNames}{"\n"}{"    namespaceSelector.matchLabels="}{.namespaceSelector.matchLabels}{"\n"}{"    namespaceSelector.matchExpressions="}{.namespaceSelector.matchExpressions}{"\n"}{"    podSelector.matchLabels="}{.podSelector.matchLabels}{"\n"}{"    podSelector.matchExpressions="}{.podSelector.matchExpressions}{"\n"}{end}{end}'
+T_WH_HOOKS='{range .webhooks[*]}{.name}{" "}{end}'
+T_WH_LINE='{range .webhooks[*]}{.name}{" path="}{.clientConfig.service.path}{" url="}{.clientConfig.url}{" ops="}{.rules[*].operations}{" resources="}{.rules[*].resources}{" failurePolicy="}{.failurePolicy}{" matchPolicy="}{.matchPolicy}{" reinvocationPolicy="}{.reinvocationPolicy}{" nsSelector="}{.namespaceSelector}{" objectSelector="}{.objectSelector}{"\n"}{end}'
+T_WH_CAB='{range .webhooks[*]}{.name}{"="}{.clientConfig.caBundle}{"\n"}{end}'
+T_WH_SVC='{range .webhooks[*]}{.clientConfig.service.namespace}{"/"}{.clientConfig.service.name}{"\n"}{end}'
+T_WH_CABT='{range .webhooks[*]}{.name}{"\t"}{.clientConfig.caBundle}{"\n"}{end}'
+T_WH_MF='{range .metadata.managedFields[*]}{.manager}{" op="}{.operation}{" time="}{.time}{"\n"}{end}'
+T_DS_CONT='{range .spec.template.spec.containers[*]}{.name}{" "}{end}'
+T_DS_SA='{.spec.template.spec.serviceAccountName}'
+T_DS_MOUNTS='{range .spec.template.spec.containers[*]}{.name}{"="}{range .volumeMounts[*]}{.mountPath}{","}{end}{"\n"}{end}'
+T_DS_PORTS='{range .spec.template.spec.containers[*]}{.name}{"="}{.ports[0].containerPort}{"\n"}{end}'
+T_DS_HOSTPID='{.spec.template.spec.hostPID}'
+
+# _cr_merged_get -> the cluster-scoped CR list with every template read of it,
+# whole-list ones keyed by name and per-instance ones keyed <cr>/<name>
+_cr_merged_get() {
+    local k t pi=""
+    KM_T=()
+    for k in list selx sell jnames jall jtgt jsel; do
+        case "$k" in
+            list)   t='{range .items[*]}{" "}{.metadata.name}{"\n"}{end}' ;;
+            selx)   t="$T_CRL_SELX" ;;   sell) t="$T_CRL_SELL" ;;
+            jnames) t="$T_CRL_JNAMES" ;; jall) t="$T_CRL_JALL" ;;
+            jtgt)   t="$T_CRL_JTGT" ;;   jsel) t="$T_CRL_JSEL" ;;
+        esac
+        KM_T[${#KM_T[@]}]="$(_km_mark "$k")"; KM_T[${#KM_T[@]}]="$t"
+    done
+    for k in ENV1 ENV2 ENV3 MF ID TG IMG; do
+        eval "t=\$T_CR_$k"
+        pi="$pi{\"\\n$_KM_M \"}{.metadata.name}{\"/$k\\n\"}$t"
+    done
+    KM_T[${#KM_T[@]}]="{range .items[*]}$pi{end}"
+    km_get CRG get "$WA_CRD"
+}
+
 CR_STATE=""          # listed | nocrd | failed
 SCOPE_WHY=""         # why the crd scope read failed
 CR_WHY=""            # what was read, or why the list failed
@@ -924,13 +1154,21 @@ discover_workloads() {
         local where="" scopewhy=""
         # scope unknown (the read failed): list across all namespaces, which
         # also answers for a cluster-scoped kind
-        if run_k get crd "$WA_CRD" -o 'jsonpath={.spec.scope}'; then WA_SCOPE="$K_OUT"
+        # scope and served versions of the crd in one call (group CRDG)
+        KM_T=("$(_km_mark scope)" '{.spec.scope}' "$(_km_mark versions)" "$T_CRD_VERSIONS")
+        km_get CRDG get crd "$WA_CRD"
+        if kg_run CRDG scope get crd "$WA_CRD" -o 'jsonpath={.spec.scope}'; then WA_SCOPE="$K_OUT"
         else WA_SCOPE=""; scopewhy="$(_k_reason)"; SCOPE_WHY="$scopewhy"; fi
         if [ "$WA_SCOPE" = "Namespaced" ] || [ -z "$WA_SCOPE" ]; then
             where=" across all namespaces"
             run_k get "$WA_CRD" -A -o 'jsonpath={range .items[*]}{.metadata.namespace}{" "}{.metadata.name}{"\n"}{end}'
         else
-            run_k get "$WA_CRD" -o 'jsonpath={range .items[*]}{" "}{.metadata.name}{"\n"}{end}'
+            # cluster-scoped: every read of the CR list in this run, and the
+            # per-instance reads of section C, in one call (group CRG). A
+            # namespaced kind keeps its own calls: sections C and J read it
+            # per namespace and in the context's namespace.
+            _cr_merged_get
+            kg_run CRG list get "$WA_CRD" -o 'jsonpath={range .items[*]}{" "}{.metadata.name}{"\n"}{end}'
         fi
         if [ "$K_RC" -eq 0 ]; then
             out="$K_OUT"; CR_STATE=listed
@@ -961,19 +1199,31 @@ EOF
         DS_NAME="$(kval get ds -n "$NS" -o name | grep -Ei 'whatap' | head -n1)"; DS_WHY="$(_kv_why)"
         DS_NAME="${DS_NAME##*/}"
         if [ -n "$DS_NAME" ]; then
-            DS_CONTAINERS="$(kval get ds "$DS_NAME" -n "$NS" -o 'jsonpath={range .spec.template.spec.containers[*]}{.name}{" "}{end}')"; DSC_WHY="$(_kv_why)"
+            # every jsonpath read of the daemonset in this run, in one call (group DSG)
+            KM_T=("$(_km_mark cont)" "$T_DS_CONT" "$(_km_mark sa)" "$T_DS_SA" "$(_km_mark mounts)" "$T_DS_MOUNTS" \
+                  "$(_km_mark ports)" "$T_DS_PORTS" "$(_km_mark hostpid)" "$T_DS_HOSTPID")
+            km_get DSG get ds "$DS_NAME" -n "$NS"
+            DS_CONTAINERS="$(kg_kval DSG cont get ds "$DS_NAME" -n "$NS" -o "jsonpath=$T_DS_CONT")"; DSC_WHY="$(_kv_why)"
         fi
         OP_DEPLOY="$(kval get deploy -n "$NS" -o name | grep -Ei 'whatap-operator' | head -n1)"; OP_WHY="$(_kv_why)"
         OP_DEPLOY="${OP_DEPLOY##*/}"
         WHATAP_DEPLOYS="$(kval get deploy -n "$NS" 2>/dev/null | grep -Ei 'whatap|^NAME')"; DEP_WHY="$(_kv_why)"
-        HELM_SECRETS="$(kval get secrets -n "$NS" -o name | grep -E 'sh\.helm\.release\.v1\..*whatap' | sed 's#^secret/##')"; HS_WHY="$(_kv_why)"
+        # the secret name list is read again in section D: one call (group SECG)
+        run_k get secrets -n "$NS" -o name; kr_keep SECG names
+        HELM_SECRETS="$(kg_kval SECG names get secrets -n "$NS" -o name | grep -E 'sh\.helm\.release\.v1\..*whatap' | sed 's#^secret/##')"; HS_WHY="$(_kv_why)"
     fi
     WEBHOOKS="$(kval get mutatingwebhookconfigurations,validatingwebhookconfigurations -o name | grep -Ei 'whatap')"; WH_WHY="$(_kv_why)"
     # per-hook names: the API server keys its admission metrics by these, not by the
     # configuration object name, so they have to be resolved to read the counters
-    local wh
+    # every jsonpath read of each whatap webhook configuration in this run, in
+    # one call per configuration (groups WHG0, WHG1, ... in WEBHOOKS order)
+    local wh j=0
     for wh in $WEBHOOKS; do
-        WEBHOOK_HOOKS="$WEBHOOK_HOOKS $(kval get "$wh" -o 'jsonpath={range .webhooks[*]}{.name}{" "}{end}')"
+        KM_T=("$(_km_mark hooks)" "$T_WH_HOOKS" "$(_km_mark line)" "$T_WH_LINE" "$(_km_mark cab)" "$T_WH_CAB" \
+              "$(_km_mark svc)" "$T_WH_SVC" "$(_km_mark cabt)" "$T_WH_CABT" "$(_km_mark mf)" "$T_WH_MF")
+        km_get "WHG$j" get "$wh"
+        WEBHOOK_HOOKS="$WEBHOOK_HOOKS $(kg_kval "WHG$j" hooks get "$wh" -o "jsonpath=$T_WH_HOOKS")"
+        j=$((j + 1))
     done
     WHATAP_CROLES="$(kval get clusterroles -o name | grep -Ei 'whatap' | sed 's#^clusterrole\.rbac\.authorization\.k8s\.io/##' | head -n 5)"
     if run_k get mutatingwebhookconfigurations,validatingwebhookconfigurations \
@@ -995,10 +1245,10 @@ APM_SEL_VALS=""
 discover_apm_selector_values() {
     [ -n "$KCTL_BIN" ] && [ -n "$WA_CRD" ] || return
     local exprs labels
-    exprs="$(kval get "$WA_CRD" -o 'jsonpath={range .items[*]}{range .spec.features.apm.instrumentation.targets[*]}{range .podSelector.matchExpressions[*]}{range .values[*]}{.}{"\n"}{end}{end}{end}{end}')"
+    exprs="$(kg_kval CRG selx get "$WA_CRD" -o "jsonpath=$T_CRL_SELX")"
     # matchLabels is a map; jsonpath cannot range over it, so the JSON object is
     # emitted and its values are taken from the "key":"value" pairs
-    labels="$(kval get "$WA_CRD" -o 'jsonpath={range .items[*]}{range .spec.features.apm.instrumentation.targets[*]}{.podSelector.matchLabels}{"\n"}{end}{end}' \
+    labels="$(kg_kval CRG sell get "$WA_CRD" -o "jsonpath=$T_CRL_SELL" \
         | tr ',' '\n' | sed -n 's/.*":"\([^"]*\)".*/\1/p')"
     APM_SEL_VALS="$(printf '%s\n%s\n' "$exprs" "$labels" | grep -v '^$' | sort -u)"
 }
@@ -1085,14 +1335,19 @@ run_report() {
     if run_k get --raw /readyz && [ -n "$K_OUT" ]; then fact "apiserver /readyz: $K_OUT"
     elif run_k get --raw /healthz && [ -n "$K_OUT" ]; then fact "apiserver /healthz: $K_OUT"
     else fact "apiserver readiness endpoints: n/a ($(_k_reason))"; fi
-    if run_k get nodes --no-headers; then fact "node count: $(printf '%s\n' "$K_OUT" | grep -c .)"
+    # the same list feeds the status summary in section B (group NHG)
+    run_k get nodes --no-headers; kr_keep NHG nh
+    if [ "$K_RC" -eq 0 ]; then fact "node count: $(printf '%s\n' "$K_OUT" | grep -c .)"
     else fact "node count: n/a ($(_k_reason))"; fi
     if run_k get ns --no-headers; then fact "namespace count: $(printf '%s\n' "$K_OUT" | grep -c .)"
     else fact "namespace count: n/a ($(_k_reason))"; fi
     subsection "platform markers (verbatim; reader interprets)"
-    kprobe "first node providerID" get nodes -o 'jsonpath={.items[0].spec.providerID}'
+    # both first-node reads in one call (group NDG)
+    KM_T=("$(_km_mark prov)" '{.items[0].spec.providerID}' "$(_km_mark labels)" '{.items[0].metadata.labels}')
+    km_get NDG get nodes
+    kg_probe NDG prov "first node providerID" get nodes -o 'jsonpath={.items[0].spec.providerID}'
     local nlabels
-    if run_k get nodes -o 'jsonpath={.items[0].metadata.labels}'; then
+    if kg_run NDG labels get nodes -o 'jsonpath={.items[0].metadata.labels}'; then
         nlabels="$(printf '%s\n' "$K_OUT" | tr ' ,' '\n\n' | grep -Ei 'eks|gke|aks|azure|cce|openshift|cloud\.google|paas' | head -n 15)"
         if [ -n "$nlabels" ]; then _emit_labeled "first node platform-ish labels" "$nlabels"
         else fact "first node platform-ish labels: none matched (eks/gke/aks/azure/cce/openshift/paas)"; fi
@@ -1125,7 +1380,7 @@ run_report() {
     else
         fact "node table: n/a ($(_k_reason))"
     fi
-    if run_k get nodes --no-headers; then
+    if kg_run NHG nh get nodes --no-headers; then
         _emit_labeled "node status summary" "$(printf '%s\n' "$K_OUT" | awk '{print $2}' | sort | uniq -c | sed 's/^ *//')"
     else
         fact "node status summary: n/a ($(_k_reason))"
@@ -1160,7 +1415,7 @@ run_report() {
     fact "install generation markers: crd=$m_crd ds-containers=$m_dsc helm-release-secrets=$m_hs"
     if [ -n "$WA_CRD" ]; then
         fact "crd scope: ${WA_SCOPE:-n/a (${SCOPE_WHY:-not read})}"
-        kprobe "crd stored/served versions" get crd "$WA_CRD" -o 'jsonpath={range .spec.versions[*]}{.name}{" served="}{.served}{" storage="}{.storage}{"\n"}{end}'
+        kg_probe CRDG versions "crd stored/served versions" get crd "$WA_CRD" -o "jsonpath=$T_CRD_VERSIONS"
         if [ "${#CR_NAMES[@]}" -eq 0 ]; then
             if [ "$CR_STATE" = listed ]; then fact "whatapagent instances: none ($CR_WHY)"
             else fact "whatapagent instances: n/a ($CR_WHY)"; fi
@@ -1176,11 +1431,12 @@ run_report() {
             # env placement facts: the operator applies container-level envs and
             # pod-level envs through different code paths — surface both verbatim.
             # shellcheck disable=SC2086
-            kprobe "nodeAgent.envs (pod-level) names" get "$WA_CRD" "$cr" $crref -o 'jsonpath={.spec.features.k8sAgent.nodeAgent.envs[*].name}'
+            # (kg_probe: from the merged CR call when the kind is cluster-scoped)
+            kg_probe CRG "$cr/ENV1" "nodeAgent.envs (pod-level) names" get "$WA_CRD" "$cr" $crref -o "jsonpath=$T_CR_ENV1"
             # shellcheck disable=SC2086
-            kprobe "nodeAgentContainer.envs names" get "$WA_CRD" "$cr" $crref -o 'jsonpath={.spec.features.k8sAgent.nodeAgent.nodeAgentContainer.envs[*].name}'
+            kg_probe CRG "$cr/ENV2" "nodeAgentContainer.envs names" get "$WA_CRD" "$cr" $crref -o "jsonpath=$T_CR_ENV2"
             # shellcheck disable=SC2086
-            kprobe "nodeHelperContainer.envs names" get "$WA_CRD" "$cr" $crref -o 'jsonpath={.spec.features.k8sAgent.nodeAgent.nodeHelperContainer.envs[*].name}'
+            kg_probe CRG "$cr/ENV3" "nodeHelperContainer.envs names" get "$WA_CRD" "$cr" $crref -o "jsonpath=$T_CR_ENV3"
             # master switches above the per-target level: with apm.instrumentation.enabled
             # false, or no targets at all, the pod-mutating path returns before any target
             # is evaluated (whatapagent_webhook.go)
@@ -1188,15 +1444,15 @@ run_report() {
             # when each writer last touched the CR — settles "was the apm block present
             # when that pod was created", which generation alone cannot answer
             # shellcheck disable=SC2086
-            kprobe "cr write history (managedFields: manager / operation / time)" get "$WA_CRD" "$cr" $crref -o 'jsonpath={range .metadata.managedFields[*]}{.manager}{" op="}{.operation}{" subresource="}{.subresource}{" time="}{.time}{"\n"}{end}'
+            kg_probe CRG "$cr/MF" "cr write history (managedFields: manager / operation / time)" get "$WA_CRD" "$cr" $crref -o "jsonpath=$T_CR_MF"
             # shellcheck disable=SC2086
-            kprobe "cr identity + master switches" get "$WA_CRD" "$cr" $crref -o 'jsonpath={"apiVersion="}{.apiVersion}{" name="}{.metadata.name}{" k8sAgent.namespace="}{.spec.features.k8sAgent.namespace}{" k8sAgent.enabled="}{.spec.features.k8sAgent.enabled}{" apm.instrumentation.enabled="}{.spec.features.apm.instrumentation.enabled}{" targets="}{.spec.features.apm.instrumentation.targets[*].name}'
+            kg_probe CRG "$cr/ID" "cr identity + master switches" get "$WA_CRD" "$cr" $crref -o "jsonpath=$T_CR_ID"
             # shellcheck disable=SC2086
-            kprobe "apm instrumentation targets" get "$WA_CRD" "$cr" $crref -o 'jsonpath={range .spec.features.apm.instrumentation.targets[*]}{"name="}{.name}{" lang="}{.language}{" enabled="}{.enabled}{" versions="}{.whatapApmVersions}{" mode="}{.config.mode}{" configMapRef="}{.config.configMapRef.name}{" nsSelector="}{.namespaceSelector}{" podSelector="}{.podSelector}{"\n"}{end}'
+            kg_probe CRG "$cr/TG" "apm instrumentation targets" get "$WA_CRD" "$cr" $crref -o "jsonpath=$T_CR_TG"
             # the init image the operator will pull for each target: an explicit
             # customImageFullName overrides the default public.ecr.aws/whatap/apm-init-<lang>:<version>
             # shellcheck disable=SC2086
-            kprobe "apm target init image overrides + extra envs" get "$WA_CRD" "$cr" $crref -o 'jsonpath={range .spec.features.apm.instrumentation.targets[*]}{"name="}{.name}{" customImageFullName="}{.customImageFullName}{" customImageName="}{.customImageName}{" imagePullSecrets="}{.imagePullSecrets[*].name}{" envs="}{range .envs[*]}{.name}{"="}{.value}{";"}{end}{"\n"}{end}'
+            kg_probe CRG "$cr/IMG" "apm target init image overrides + extra envs" get "$WA_CRD" "$cr" $crref -o "jsonpath=$T_CR_IMG"
             i=$((i + 1))
         done
     else
@@ -1225,19 +1481,20 @@ run_report() {
     if [ -n "$WEBHOOKS" ]; then
         local wh whsvc svcns svcname
         for wh in $WEBHOOKS; do
+            _whg "$wh"
             # compact applicability line first (the full yaml below carries everything,
             # but these four fields decide whether a given pod is even sent to the webhook)
-            kprobe "webhook $wh (per-hook: name / path / rules / policies / selectors)" get "$wh" \
-                -o 'jsonpath={range .webhooks[*]}{.name}{" path="}{.clientConfig.service.path}{" url="}{.clientConfig.url}{" ops="}{.rules[*].operations}{" resources="}{.rules[*].resources}{" failurePolicy="}{.failurePolicy}{" matchPolicy="}{.matchPolicy}{" reinvocationPolicy="}{.reinvocationPolicy}{" nsSelector="}{.namespaceSelector}{" objectSelector="}{.objectSelector}{"\n"}{end}'
+            kg_probe "$_WHG" line "webhook $wh (per-hook: name / path / rules / policies / selectors)" get "$wh" \
+                -o "jsonpath=$T_WH_LINE"
             # an empty caBundle means the API server has nothing to trust the backend
             # with; the value itself is a long base64 blob, so its size is what is stated
             local cab
-            cab="$(kval get "$wh" -o 'jsonpath={range .webhooks[*]}{.name}{"="}{.clientConfig.caBundle}{"\n"}{end}' | awk -F'=' '{printf "%s caBundle=%d bytes\n", $1, length($2)}')"
+            cab="$(kg_kval "$_WHG" cab get "$wh" -o "jsonpath=$T_WH_CAB" | awk -F'=' '{printf "%s caBundle=%d bytes\n", $1, length($2)}')"
             if [ -n "$cab" ]; then _emit_labeled "webhook $wh caBundle size per hook" "$cab"
             else fact "webhook $wh caBundle size: n/a (empty output)"; fi
             kprobe "webhook $wh (yaml)" get "$wh" -o yaml
             # the webhook backend: a Service with no ready endpoint cannot mutate anything
-            whsvc="$(kval get "$wh" -o 'jsonpath={range .webhooks[*]}{.clientConfig.service.namespace}{"/"}{.clientConfig.service.name}{"\n"}{end}' | sort -u | grep -v '^/*$')"
+            whsvc="$(kg_kval "$_WHG" svc get "$wh" -o "jsonpath=$T_WH_SVC" | sort -u | grep -v '^/*$')"
             if [ -n "$whsvc" ]; then
                 for svcns in $whsvc; do
                     svcname="${svcns#*/}"; svcns="${svcns%%/*}"
@@ -1284,7 +1541,8 @@ run_report() {
     if [ -n "$WEBHOOKS" ] && have openssl; then
         local wh2 cab1 fpr
         for wh2 in $WEBHOOKS; do
-            cab1="$(kval get "$wh2" -o 'jsonpath={range .webhooks[*]}{.name}{"\t"}{.clientConfig.caBundle}{"\n"}{end}')"
+            _whg "$wh2"
+            cab1="$(kg_kval "$_WHG" cabt get "$wh2" -o "jsonpath=$T_WH_CABT")"
             [ -n "$cab1" ] || continue
             fpr="$(printf '%s\n' "$cab1" | while IFS="$(printf '\t')" read -r hn hb; do
                 [ -n "$hb" ] || { printf '%s\tcaBundle empty\n' "$hn"; continue; }
@@ -1304,7 +1562,7 @@ run_report() {
         # the Secret name is discovered, not assumed — it has differed across versions
         local certsec secfp
         local cs_why
-        certsec="$(kval get secrets -n "$NS" -o name | sed 's#^secret/##' | grep -Ei 'webhook.*cert|cert.*webhook' | head -n1)"; cs_why="$(_kv_why)"
+        certsec="$(kg_kval SECG names get secrets -n "$NS" -o name | sed 's#^secret/##' | grep -Ei 'webhook.*cert|cert.*webhook' | head -n1)"; cs_why="$(_kv_why)"
         if [ -n "$certsec" ]; then
             secfp="$(kval get secret "$certsec" -n "$NS" -o 'jsonpath={.data.cert\.pem}' \
                 | base64 -d 2>/dev/null \
@@ -1324,8 +1582,9 @@ run_report() {
     fi
     local wh3
     for wh3 in $WEBHOOKS; do
-        kprobe "$wh3 last written (managedFields times)" get "$wh3" \
-            -o 'jsonpath={range .metadata.managedFields[*]}{.manager}{" op="}{.operation}{" time="}{.time}{"\n"}{end}'
+        _whg "$wh3"
+        kg_probe "$_WHG" mf "$wh3 last written (managedFields times)" get "$wh3" \
+            -o "jsonpath=$T_WH_MF"
     done
     # Best effort: the CA the running process actually has on disk. The operator image may
     # be distroless, in which case there is no shell and this reports why instead.
@@ -1397,7 +1656,7 @@ run_report() {
     if [ -n "$NS" ]; then
         kprobe "serviceaccounts (ns)" get sa -n "$NS"
         local dssa opsa
-        [ -n "$DS_NAME" ] && dssa="$(kval get ds "$DS_NAME" -n "$NS" -o 'jsonpath={.spec.template.spec.serviceAccountName}')"
+        [ -n "$DS_NAME" ] && dssa="$(kg_kval DSG sa get ds "$DS_NAME" -n "$NS" -o "jsonpath=$T_DS_SA")"
         [ -n "$OP_DEPLOY" ] && opsa="$(kval get deploy "$OP_DEPLOY" -n "$NS" -o 'jsonpath={.spec.template.spec.serviceAccountName}')"
         fact "serviceaccount referenced by daemonset: ${dssa:-n/a}"
         fact "serviceaccount referenced by operator deploy: ${opsa:-n/a}"
@@ -1620,7 +1879,7 @@ run_report() {
     if [ -n "$NS" ] && [ -n "$DS_NAME" ] && [ "${#SP_POD[@]}" -gt 0 ]; then
         # derive exec plan from the DS spec (declared mounts / ports / hostPID)
         local mounts logcont portcont hport hostpid
-        mounts="$(kval get ds "$DS_NAME" -n "$NS" -o 'jsonpath={range .spec.template.spec.containers[*]}{.name}{"="}{range .volumeMounts[*]}{.mountPath}{","}{end}{"\n"}{end}')"
+        mounts="$(kg_kval DSG mounts get ds "$DS_NAME" -n "$NS" -o "jsonpath=$T_DS_MOUNTS")"
         logcont="$(printf '%s\n' "$mounts" | awk -F'=' '$2 ~ /\/var\/log|\/rootfs/ {print $1; exit}')"
         [ -z "$logcont" ] && logcont="$(printf '%s' "$DS_CONTAINERS" | awk '{print $1}')"
         # candidate path roots derive from the chosen container's DECLARED mounts
@@ -1643,10 +1902,10 @@ run_report() {
             sockdirs="$sockdirs $m/run/containerd/containerd.sock $m/var/run/docker.sock $m/run/crio/crio.sock"
         done
         local ports
-        ports="$(kval get ds "$DS_NAME" -n "$NS" -o 'jsonpath={range .spec.template.spec.containers[*]}{.name}{"="}{.ports[0].containerPort}{"\n"}{end}')"
+        ports="$(kg_kval DSG ports get ds "$DS_NAME" -n "$NS" -o "jsonpath=$T_DS_PORTS")"
         portcont="$(printf '%s\n' "$ports" | awk -F'=' '$2 != "" {print $1; exit}')"
         hport="$(printf '%s\n' "$ports" | awk -F'=' '$2 != "" {print $2; exit}')"
-        hostpid="$(kval get ds "$DS_NAME" -n "$NS" -o 'jsonpath={.spec.template.spec.hostPID}')"
+        hostpid="$(kg_kval DSG hostpid get ds "$DS_NAME" -n "$NS" -o "jsonpath=$T_DS_HOSTPID")"
         fact "exec container for log-path probes: ${logcont:-n/a} (first container declaring a /var/log mount, else first container)"
         fact "declared container ports: $(printf '%s' "$ports" | tr '\n' ' ')"
         fact "daemonset hostPID: ${hostpid:-not set}"
@@ -1674,26 +1933,34 @@ run_report() {
             fact "exec samples: with-restarts=${with:-none} without-restarts=${without:-none}"
         fi
         local any=0
+        # the in-pod probes of one pod run in ONE exec (_pod_probes_run), each
+        # still through its own sh -c with its own exit status
+        local pc1 pc2 pc3 pc4 pc5 pc6 pn pcs
+        pc1="for d in $logdirs; do for f in \"\$d\"/*.log; do [ -L \"\$f\" ] || [ -e \"\$f\" ] || continue; readlink \"\$f\"; break 2; done; done; :"
+        pc2="ls -d $rootdirs 2>/dev/null; :"
+        pc3="ls -l $sockdirs 2>/dev/null; :"
+        pc4='stat -fc %T /sys/fs/cgroup 2>/dev/null; ls /sys/fs/cgroup/cgroup.controllers 2>/dev/null; :'
+        pc5="wget -qO- -T 5 http://127.0.0.1:$hport/health 2>/dev/null || curl -sf -m 5 http://127.0.0.1:$hport/health"
+        pc6='for d in /proc/[0-9]*; do case "$(cat "$d/comm" 2>/dev/null)" in kubelet) tr "\0" " " < "$d/cmdline"; echo; break;; esac; done'
         for pod in $EXEC_PODS; do
             any=1
             subsection "in-pod probes: $pod"
-            pod_exec_probe "container log symlink target (first entry found under: $logdirs)" "$pod" "$logcont" \
-                "for d in $logdirs; do for f in \"\$d\"/*.log; do [ -L \"\$f\" ] || [ -e \"\$f\" ] || continue; readlink \"\$f\"; break 2; done; done; :"
-            pod_exec_probe "container-log roots present (candidates from declared mounts)" "$pod" "$logcont" \
-                "ls -d $rootdirs 2>/dev/null; :"
-            pod_exec_probe "container runtime sockets visible (candidates from declared mounts)" "$pod" "$logcont" \
-                "ls -l $sockdirs 2>/dev/null; :"
-            pod_exec_probe "cgroup filesystem type + v2 controllers file" "$pod" "$logcont" \
-                'stat -fc %T /sys/fs/cgroup 2>/dev/null; ls /sys/fs/cgroup/cgroup.controllers 2>/dev/null; :'
+            pcs=("$pc1" "$pc2" "$pc3" "$pc4")
+            [ -n "$hport" ] && [ -n "$portcont" ] && pcs[${#pcs[@]}]="$pc5"
+            [ "$hostpid" = "true" ] && pcs[${#pcs[@]}]="$pc6"
+            _pod_probes_run "$pod" "$logcont" "${pcs[@]}"
+            _pod_probe_emit 1 "container log symlink target (first entry found under: $logdirs)"
+            _pod_probe_emit 2 "container-log roots present (candidates from declared mounts)"
+            _pod_probe_emit 3 "container runtime sockets visible (candidates from declared mounts)"
+            _pod_probe_emit 4 "cgroup filesystem type + v2 controllers file"
+            pn=4
             if [ -n "$hport" ] && [ -n "$portcont" ]; then
-                pod_exec_probe "helper endpoint http://127.0.0.1:$hport/health" "$pod" "$logcont" \
-                    "wget -qO- -T 5 http://127.0.0.1:$hport/health 2>/dev/null || curl -sf -m 5 http://127.0.0.1:$hport/health"
+                pn=5; _pod_probe_emit 5 "helper endpoint http://127.0.0.1:$hport/health"
             else
                 fact "helper endpoint probe: n/a (not applicable: no containerPort declared in daemonset)"
             fi
             if [ "$hostpid" = "true" ]; then
-                pod_exec_probe "kubelet cmdline (via hostPID /proc)" "$pod" "$logcont" \
-                    'for d in /proc/[0-9]*; do case "$(cat "$d/comm" 2>/dev/null)" in kubelet) tr "\0" " " < "$d/cmdline"; echo; break;; esac; done'
+                _pod_probe_emit $((pn + 1)) "kubelet cmdline (via hostPID /proc)"
             else
                 fact "kubelet cmdline: n/a (not applicable: daemonset hostPID not set)"
             fi
@@ -1718,8 +1985,8 @@ run_report() {
     # collected together, verbatim, so each side of every match can be read off one page.
     subsection "name mapping inputs (CR name, selectors, labels)"
     if [ -n "$WA_CRD" ]; then
-        kprobe "whatapagent CR names present (cluster)" get "$WA_CRD" -o 'jsonpath={range .items[*]}{.metadata.name}{" apiVersion="}{.apiVersion}{" created="}{.metadata.creationTimestamp}{"\n"}{end}'
-        if run_k get "$WA_CRD" -o 'jsonpath={.items[*].metadata.name}'; then
+        kg_probe CRG jnames "whatapagent CR names present (cluster)" get "$WA_CRD" -o "jsonpath=$T_CRL_JNAMES"
+        if kg_run CRG jall get "$WA_CRD" -o "jsonpath=$T_CRL_JALL"; then
             case " $K_OUT " in
                 *" whatap "*) fact "a whatapagent named 'whatap' is present: yes" ;;
                 *) fact "a whatapagent named 'whatap' is present: no (names found: ${K_OUT:-none})" ;;
@@ -1730,12 +1997,12 @@ run_report() {
         # how many targets exist at all, stated separately so "no targets declared" is
         # never confused with "the selector probe returned nothing"
         local tgtnames=""
-        run_k get "$WA_CRD" -o 'jsonpath={range .items[*]}{.metadata.name}{"="}{range .spec.features.apm.instrumentation.targets[*]}{.name}{","}{end}{"\n"}{end}' && tgtnames="$K_OUT"
+        kg_run CRG jtgt get "$WA_CRD" -o "jsonpath=$T_CRL_JTGT" && tgtnames="$K_OUT"
         if [ -n "$tgtnames" ]; then _emit_labeled "apm instrumentation targets declared per cr (cr=target,target,...)" "$tgtnames"
         else fact "apm instrumentation targets declared per cr: n/a ($(_k_reason))"; fi
         # per-target selectors, one line per target, in the shape they are matched in:
         # namespaceSelector by name OR by namespace label; podSelector by pod label
-        kprobe "target selectors (matched against namespace names/labels and pod labels)" get "$WA_CRD" -o 'jsonpath={range .items[*]}{"cr="}{.metadata.name}{"\n"}{range .spec.features.apm.instrumentation.targets[*]}{"  target="}{.name}{" enabled="}{.enabled}{" lang="}{.language}{"\n"}{"    namespaceSelector.matchNames="}{.namespaceSelector.matchNames}{"\n"}{"    namespaceSelector.matchLabels="}{.namespaceSelector.matchLabels}{"\n"}{"    namespaceSelector.matchExpressions="}{.namespaceSelector.matchExpressions}{"\n"}{"    podSelector.matchLabels="}{.podSelector.matchLabels}{"\n"}{"    podSelector.matchExpressions="}{.podSelector.matchExpressions}{"\n"}{end}{end}'
+        kg_probe CRG jsel "target selectors (matched against namespace names/labels and pod labels)" get "$WA_CRD" -o "jsonpath=$T_CRL_JSEL"
     else
         fact "whatapagent CR name mapping: n/a ($CR_WHY)"
     fi

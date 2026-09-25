@@ -43,7 +43,14 @@ export LC_ALL=C
 
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-apmpython"
-VERSION="0.6.0"
+# 0.7.0  The ten lookups per interpreter in section [3] run in one interpreter
+#        start (_pyrun) instead of ten `python -c`, each still with its own
+#        stdout, stderr and exit status, so every fact and n/a reason reads as
+#        before. _env_pick and PYTHONPATH work in the shell, an interpreter
+#        path already listed is not resolved again, and the detail list reads
+#        each environ once. 12.9 s -> 7.5 s with 8 interpreters, 20.3 s ->
+#        9.9 s with 300 more python processes (2026-09-25).
+VERSION="0.7.0"
 DOMAIN="apm"
 TARGET="host/$(hostname 2>/dev/null || echo unknown)"
 
@@ -646,6 +653,147 @@ pyprobe() {
     _emit_labeled "$label" "$out"
 }
 
+# _pyrun PY CODE... -> run every CODE in ONE interpreter start instead of one
+# `PY -c CODE` each (ten starts per interpreter took 8.9 s of a 12 s run on a
+# host with 8 interpreters). _PYDRV runs each CODE on its own: fresh globals,
+# its stdout and stderr captured apart, an uncaught exception printed by
+# sys.excepthook exactly as `python -c` prints it, and its exit status. It
+# prints, per CODE, "<marker> N out", the stdout, "<marker> N err", the
+# stderr and "<marker> N rc R", flushing after each, so a CODE that finished
+# before a timeout keeps its result. Python 2.4+ and 3 syntax: no `with`, no
+# `except X as e`. The CODE importing pkg_resources (it rewires namespace
+# packages on import) runs last; the report order stays as listed.
+# _pyreport N LABEL then reports CODE N as pyprobe would have.
+_PYM='@@ggt-pyprobe@@'
+_PYDRV='
+import sys
+try:
+    from StringIO import StringIO
+except ImportError:
+    from io import StringIO
+m = sys.argv[1]
+codes = sys.argv[2:]
+order = [i for i in range(len(codes)) if "pkg_resources" not in codes[i]] + [i for i in range(len(codes)) if "pkg_resources" in codes[i]]
+out = sys.stdout
+err = sys.stderr
+for i in order:
+    o = StringIO()
+    e = StringIO()
+    rc = 0
+    sys.stdout = o
+    sys.stderr = e
+    try:
+        try:
+            exec(compile(codes[i], "<string>", "exec"), {"__name__": "__main__"})
+        except SystemExit:
+            c = sys.exc_info()[1].code
+            if c is None:
+                rc = 0
+            elif isinstance(c, int):
+                rc = c & 255
+            else:
+                e.write(str(c) + "\n")
+                rc = 1
+        except:
+            t, v, tb = sys.exc_info()
+            sys.excepthook(t, v, tb)
+            rc = 1
+    finally:
+        sys.stdout = out
+        sys.stderr = err
+    ob = o.getvalue()
+    eb = e.getvalue()
+    out.write("%s %d out\n" % (m, i + 1))
+    try:
+        out.write(ob)
+    except:
+        x = StringIO()
+        sys.stderr = x
+        sys.excepthook(*sys.exc_info())
+        sys.stderr = err
+        eb = eb + x.getvalue()
+        ob = ""
+        rc = 1
+    if not ob.endswith("\n"):
+        out.write("\n")
+    out.write("%s %d err\n" % (m, i + 1))
+    try:
+        out.write(eb)
+    except:
+        eb = repr(eb)
+        out.write(eb)
+    if not eb.endswith("\n"):
+        out.write("\n")
+    out.write("%s %d rc %d\n" % (m, i + 1, rc))
+    out.flush()
+'
+_pyrun_py="" _pyrun_rc=0 _pyrun_pre="" _pyrun_post="" _pyrun_err=""
+_pyrun() {
+    local l m k acc="" seen=0 i=1
+    _pyrun_py="$1"; shift
+    _pyrun_rc=0 _pyrun_pre="" _pyrun_post="" _pyrun_err=""
+    while [ "$i" -le "$#" ]; do eval "_pyr_$i='' _pyo_$i='' _pye_$i=''"; i=$((i + 1)); done
+    [ -x "$_pyrun_py" ] || { _pyrun_rc=noexec; return; }
+    _past_deadline && { _pyrun_rc=deadline; return; }
+    _pyrun_out="$(_bounded "$_pyrun_py" -c "$_PYDRV" "$_PYM" "$@" 2>"$(_tmp pyrun.err)")"; _pyrun_rc=$?
+    [ -s "$(_tmp pyrun.err)" ] && _pyrun_err="$(cat "$(_tmp pyrun.err)" 2>/dev/null)"
+    # Split on the marker lines. What the interpreter printed outside them
+    # (a sitecustomize at start-up, an atexit hook) is what every `python -c`
+    # would have printed around its own output, so each CODE gets it too.
+    while IFS= read -r l; do
+        case "$l" in
+            "$_PYM "*)
+                m="${l#"$_PYM "}"; k="${m#* }"; m="${m%% *}"
+                case "$m" in ''|*[!0-9]*) acc="$acc$l$_nl"; continue ;; esac
+                case "$k" in
+                    out) [ "$seen" = 0 ] && _pyrun_pre="$acc"; seen=1 ;;
+                    err) eval "_pyo_$m=\$acc" ;;
+                    "rc "*) case "${k#rc }" in ''|*[!0-9]*) ;; *) eval "_pye_$m=\$acc _pyr_$m=\${k#rc }" ;; esac ;;
+                    *) acc="$acc$l$_nl"; continue ;;
+                esac
+                acc="" ;;
+            *) acc="$acc$l$_nl" ;;
+        esac
+    done <<EOF
+$_pyrun_out
+EOF
+    if [ "$seen" = 1 ]; then _pyrun_post="$acc"; else _pyrun_pre="$acc"; fi
+}
+
+# _pyreport N LABEL CODE -> the facts pyprobe gives for CODE, from the result of
+# CODE N in the last _pyrun. A CODE with no status of its own, when the
+# interpreter was not stopped by the cap (it cannot run the driver, or a CODE
+# ended it), is run alone with pyprobe, as it was before _pyrun.
+_pyreport() {
+    local n="$1" label="$2" out rc err
+    case "$_pyrun_rc" in
+        noexec)   _pyout="" _pyrc=1; fact "$label: n/a (not executable: $_pyrun_py)"; return ;;
+        deadline) _pyout="" _pyrc=124; fact "$label: n/a (run deadline reached: ${RUN_DEADLINE}s)"; return ;;
+    esac
+    eval "rc=\$_pyr_$n out=\$_pyo_$n err=\$_pye_$n"
+    if [ -z "$rc" ]; then
+        if [ "$_pyrun_rc" != 124 ]; then pyprobe "$label" "$_pyrun_py" "$3"; return; fi
+        _pyout="" _pyrc=124
+        if _past_deadline; then fact "$label: n/a (run deadline reached: ${RUN_DEADLINE}s)"
+        else fact "$label: n/a (timed out: ${CMD_TIMEOUT}s)"; fi
+        return
+    fi
+    # $(...) drops the trailing newlines
+    out="$_pyrun_pre$out$_pyrun_post"
+    while :; do case "$out" in *"$_nl") out="${out%"$_nl"}" ;; *) break ;; esac; done
+    _pyout="$out" _pyrc="$rc"
+    if [ "$rc" -ne 0 ]; then
+        { [ -n "$_pyrun_err" ] && printf '%s\n' "$_pyrun_err"; printf '%s' "$err"; } > "$_errfile" 2>/dev/null
+        local e
+        e="$(grep -E 'Error|Exception' "$_errfile" 2>/dev/null | tail -n1 | cut -c1-140)"
+        [ -z "$e" ] && e="$(_classify_err)"
+        fact "$label: n/a ($e)"
+        return
+    fi
+    [ -z "$out" ] && { fact "$label: n/a (empty output)"; return; }
+    _emit_labeled "$label" "$out"
+}
+
 # ---- process table (internal; emits nothing) ----------------------------------
 # _proc_table -> one line per process that has a command line, fields joined by
 # the unit separator \037 (a whitespace IFS would merge empty fields):
@@ -817,6 +965,8 @@ _add_py() {
     [ -n "$p" ] || return
     [ -x "$p" ] || return
     case "$p" in *-config|*-dbg|*-coverage) return ;; esac   # not interpreters
+    # a path already listed has the same key: no readlink per process for it
+    case "$_nl$D_PY_EXES$_nl" in *"$_nl$p$_nl"*) return ;; esac
     k="${p%/*}|$(readlink -f "$p" 2>/dev/null || echo "$p")"
     case "$D_PY_KEYS" in *"$_nl$k$_nl"*) return ;; esac
     D_PY_KEYS="$D_PY_KEYS$_nl$k$_nl"
@@ -839,25 +989,33 @@ _read_proc_env() {
 }
 
 # _env_pick NAME... -> sets _ev_NAME to the value of NAME= in _env (empty if
-# none), for each NAME, in one pass with shell builtins only: a $(...) per
-# variable costs a fork per variable per process
+# none; the last line wins when a name repeats), for each NAME, in one pass
+# with shell builtins only: a $(...) per variable costs a fork per variable per
+# process. The lines are split by IFS, not by a `read` loop over a here-doc,
+# which costs a builtin call per line.
 _ev_WHATAP_HOME="" _ev_PYTHONPATH=""
 _env_pick() {
-    local l n
-    for n in "$@"; do eval "_ev_$n=''"; done
-    while IFS= read -r l; do
-        for n in "$@"; do
+    local l n _o _p=""
+    # a name absent from the whole environ is settled by one match on it,
+    # without walking the lines
+    for n in "$@"; do
+        eval "_ev_$n=''"
+        case "$_nl$_env" in *"$_nl$n="*) _p="$_p$n$_nl" ;; esac
+    done
+    [ -n "$_p" ] || return 0
+    _o="$IFS"; IFS="$_nl"; set -f
+    for l in $_env; do
+        for n in $_p; do
             case "$l" in "$n="*) eval "_ev_$n=\${l#*=}" ;; esac
         done
-    done <<EOF
-$_env
-EOF
+    done
+    set +f; IFS="$_o"
 }
 
 discover() {
     progress "discovery: interpreters, processes, agent homes"
     _cap_from APM_INTERP_CAP "${APM_INTERP_CAP:-}" 8; D_PY_CAP="$_cap" D_CAP_NOTE="$_cap_note"
-    local c p pid comm exe a0 cmd cwd envh _b _py _mk _pym="" _pyr="" _am="" _ar="" _d
+    local c p pid comm exe a0 cmd cwd envh _b _py _mk _pym="" _pyr="" _am="" _ar="" _d _o
     _env=""
 
     case "$(id -u 2>/dev/null)" in
@@ -896,12 +1054,13 @@ discover() {
             [ -n "$_ev_WHATAP_HOME" ] && _home_from_pid "$pid" "$_ev_WHATAP_HOME" "environ of python pid $pid"
             # whatap package dir derived from the process's PYTHONPATH bootstrap
             # entry — usable even when the interpreter cannot be executed
+            # split on ':' (and newline) in this shell, globbing off
             envh="$_ev_PYTHONPATH"
-            while IFS= read -r _d; do
+            _o="$IFS"; IFS=":$_nl"; set -f
+            for _d in $envh; do
                 case "$_d" in */whatap/bootstrap) _add_pkg_dir "${_d%/bootstrap}"; _mk=1 ;; esac
-            done <<EOF
-$(printf '%s' "$envh" | tr ':' '\n')
-EOF
+            done
+            set +f; IFS="$_o"
             case "$_nl$_env" in *"${_nl}WHATAP_"*) _mk=1 ;; esac
         fi
         [ "$_py" = 1 ] || continue
@@ -1240,19 +1399,11 @@ EOF
         _py_probed=$_pycount
         fact "-- interpreter: $py"
         fact "   resolves to: $(readlink -f "$py" 2>/dev/null || echo "$py")"
-        pyprobe "version" "$py" 'import sys; print(sys.version.replace(chr(10)," "))'
-        pyprobe "sys.prefix / base_prefix" "$py" 'import sys; print(sys.prefix); print(getattr(sys,"base_prefix",sys.prefix))'
-        pyprobe "whatap-python version" "$py" 'import importlib.metadata as m; print(m.version("whatap-python"))'
-        pyprobe "whatap package location" "$py" 'import importlib.util as u; s=u.find_spec("whatap"); print(s.origin if s and s.origin else "not found")'
-        case "$_pyrc" in
-            0) case "$_pyout" in /*) _py_whatap=1 ;; esac ;;
-            # an interpreter that cannot run the lookup at all (python2: no
-            # importlib.util) has answered it: there is nothing to look up with.
-            # A timeout or any other failure left the input unread.
-            *) if [ "$_pyrc" != 124 ] && grep -qE '^(ImportError|ModuleNotFoundError|SyntaxError|AttributeError)' "$_errfile" 2>/dev/null; then :
-               else _py_fail="$_py_fail $py"; fi ;;
-        esac
-        pyprobe "whatap_python-* metadata dirs next to the package" "$py" '
+        _pc1='import sys; print(sys.version.replace(chr(10)," "))'
+        _pc2='import sys; print(sys.prefix); print(getattr(sys,"base_prefix",sys.prefix))'
+        _pc3='import importlib.metadata as m; print(m.version("whatap-python"))'
+        _pc4='import importlib.util as u; s=u.find_spec("whatap"); print(s.origin if s and s.origin else "not found")'
+        _pc5='
 import importlib.util as u, os, glob
 s=u.find_spec("whatap")
 if not (s and s.origin): print("not found")
@@ -1260,10 +1411,10 @@ else:
     sp=os.path.dirname(os.path.dirname(s.origin))
     hits=glob.glob(os.path.join(sp,"whatap_python-*"))
     print("\n".join(os.path.basename(h) for h in hits) if hits else "no whatap_python-* metadata dir in "+sp)'
-        pyprobe "setuptools version" "$py" 'import importlib.metadata as m; print(m.version("setuptools"))'
-        pyprobe "import pkg_resources" "$py" 'import pkg_resources; print("ok")'
+        _pc6='import importlib.metadata as m; print(m.version("setuptools"))'
+        _pc7='import pkg_resources; print("ok")'
         # Go module binaries shipped inside the package, vs this machine arch
-        pyprobe "bundled Go module binaries" "$py" '
+        _pc8='
 import importlib.util as u, os
 s=u.find_spec("whatap")
 if not (s and s.origin): print("not found")
@@ -1275,13 +1426,13 @@ else:
             for f in files:
                 p=os.path.join(root,f)
                 print("%s  %d bytes  exec=%s" % (p, os.path.getsize(p), os.access(p,os.X_OK)))'
-        pyprobe "bootstrap/sitecustomize.py present" "$py" '
+        _pc9='
 import importlib.util as u, os
 s=u.find_spec("whatap")
 print(os.path.exists(os.path.join(os.path.dirname(s.origin),"bootstrap","sitecustomize.py")) if s and s.origin else "not found")'
         # hook surface of the INSTALLED agent version (trace/mod tree) — this
         # differs between agent versions, so it is reported per install
-        pyprobe "instrumentation modules bundled in installed agent (trace/mod)" "$py" '
+        _pc10='
 import importlib.util as u, os
 s=u.find_spec("whatap")
 if not (s and s.origin): print("not found")
@@ -1297,6 +1448,26 @@ else:
                 if f.endswith(".py") and f not in ("__init__.py","util.py"):
                     groups.setdefault(cat,[]).append(f[:-3])
         for k in sorted(groups): print(k+": "+", ".join(sorted(groups[k])))'
+        # one interpreter start for all ten lookups (see _pyrun)
+        _pyrun "$py" "$_pc1" "$_pc2" "$_pc3" "$_pc4" "$_pc5" "$_pc6" "$_pc7" "$_pc8" "$_pc9" "$_pc10"
+        _pyreport 1 "version" "$_pc1"
+        _pyreport 2 "sys.prefix / base_prefix" "$_pc2"
+        _pyreport 3 "whatap-python version" "$_pc3"
+        _pyreport 4 "whatap package location" "$_pc4"
+        case "$_pyrc" in
+            0) case "$_pyout" in /*) _py_whatap=1 ;; esac ;;
+            # an interpreter that cannot run the lookup at all (python2: no
+            # importlib.util) has answered it: there is nothing to look up with.
+            # A timeout or any other failure left the input unread.
+            *) if [ "$_pyrc" != 124 ] && grep -qE '^(ImportError|ModuleNotFoundError|SyntaxError|AttributeError)' "$_errfile" 2>/dev/null; then :
+               else _py_fail="$_py_fail $py"; fi ;;
+        esac
+        _pyreport 5 "whatap_python-* metadata dirs next to the package" "$_pc5"
+        _pyreport 6 "setuptools version" "$_pc6"
+        _pyreport 7 "import pkg_resources" "$_pc7"
+        _pyreport 8 "bundled Go module binaries" "$_pc8"
+        _pyreport 9 "bootstrap/sitecustomize.py present" "$_pc9"
+        _pyreport 10 "instrumentation modules bundled in installed agent (trace/mod)" "$_pc10"
         probe "installed packages ($py -m pip list, first 200)" _head_of 200 env PIP_DISABLE_PIP_VERSION_CHECK=1 "$py" -m pip list --format=freeze
     done 9<<EOF
 $D_PY_EXES
@@ -1378,15 +1549,15 @@ EOF
             printf '           exe: %s\n' "$(readlink -f "/proc/$pid/exe" 2>/dev/null || echo n/a)"
             printf '           cmdline: %s\n' "$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | cut -c1-300)"
             if [ -r "/proc/$pid/environ" ]; then
-                if tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | grep -q '^PYTHONPATH=.*whatap/bootstrap'; then
-                    printf '           PYTHONPATH contains whatap/bootstrap: yes\n'
-                else
-                    printf '           PYTHONPATH contains whatap/bootstrap: no\n'
-                fi
-                # which python environment this process actually runs in
-                tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | grep -E '^(VIRTUAL_ENV|PYTHONPATH|PYTHONHOME)=' | cut -c1-300 | while IFS= read -r _l; do printf '           env %s\n' "$_l"; done
-                tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | grep -E '^WHATAP_' | while IFS= read -r _l; do printf '           env %s\n' "$_l"; done
-                tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | grep -E '^OTEL_' | cut -c1-200 | while IFS= read -r _l; do printf '           env %s\n' "$_l"; done
+                # one read of the environ: the bootstrap line, then which
+                # python environment this process actually runs in, WHATAP_*
+                # and OTEL_*, each group in environ order
+                tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | awk '
+                    /^PYTHONPATH=.*whatap\/bootstrap/ { b = 1 }
+                    /^(VIRTUAL_ENV|PYTHONPATH|PYTHONHOME)=/ { v = v "           env " substr($0, 1, 300) "\n" }
+                    /^WHATAP_/ { w = w "           env " $0 "\n" }
+                    /^OTEL_/ { o = o "           env " substr($0, 1, 200) "\n" }
+                    END { printf "           PYTHONPATH contains whatap/bootstrap: %s\n%s%s%s", (b ? "yes" : "no"), v, w, o }'
             else
                 printf '           environ: n/a (permission denied: /proc/%s/environ)\n' "$pid"
             fi
