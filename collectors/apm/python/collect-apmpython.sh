@@ -50,7 +50,13 @@ COLLECTOR_NAME="whatap-apmpython"
 #        path already listed is not resolved again, and the detail list reads
 #        each environ once. 12.9 s -> 7.5 s with 8 interpreters, 20.3 s ->
 #        9.9 s with 300 more python processes (2026-09-25).
-VERSION="0.7.0"
+# 0.7.1  A lookup that hangs no longer takes the answers of the ones after it:
+#        those never started, and each now runs alone under its own cap (the
+#        one that hung says timed out, as before 0.7.0). The marker lines are
+#        random per run and taken only in the order the driver prints them,
+#        so a path or value holding marker-like text cannot replace another
+#        lookup's answer (2026-09-25).
+VERSION="0.7.1"
 DOMAIN="apm"
 TARGET="host/$(hostname 2>/dev/null || echo unknown)"
 
@@ -658,13 +664,35 @@ pyprobe() {
 # host with 8 interpreters). _PYDRV runs each CODE on its own: fresh globals,
 # its stdout and stderr captured apart, an uncaught exception printed by
 # sys.excepthook exactly as `python -c` prints it, and its exit status. It
-# prints, per CODE, "<marker> N out", the stdout, "<marker> N err", the
-# stderr and "<marker> N rc R", flushing after each, so a CODE that finished
-# before a timeout keeps its result. Python 2.4+ and 3 syntax: no `with`, no
-# `except X as e`. The CODE importing pkg_resources (it rewires namespace
-# packages on import) runs last; the report order stays as listed.
-# _pyreport N LABEL then reports CODE N as pyprobe would have.
-_PYM='@@ggt-pyprobe@@'
+# prints, per CODE, "<marker> N start" before running it, then "<marker> N
+# out", the stdout, "<marker> N err", the stderr and "<marker> N rc R",
+# flushing after each, so a CODE that finished before a timeout keeps its
+# result. Python 2.4+ and 3 syntax: no `with`, no `except X as e`. The CODE
+# importing pkg_resources (it rewires namespace packages on import) runs
+# last; the report order stays as listed.
+# _pyreport N LABEL CODE then reports CODE N as pyprobe would have.
+#
+# The marker is random per run and a marker line counts only when it is the
+# one expected next (same CODE, same order as the driver runs them): a CODE
+# that prints a path holding a newline and marker-like text cannot replace
+# another CODE's answer.
+#
+# Limits for whoever adds a CODE (each differs from a `python -c` of its own):
+#   * output of an atexit hook or of the interpreter's start-up (sitecustomize)
+#     is printed once and is added to EVERY CODE's stdout, as each `python -c`
+#     would have printed it;
+#   * os.write(1, ...) / os.write(2, ...) and child processes bypass the
+#     capture: that output is dropped, not attributed to the CODE;
+#   * sys.stdout / sys.stderr are StringIO objects while a CODE runs: no
+#     .buffer, no .fileno(), no binary writes;
+#   * sys.argv is the driver's (the marker and every CODE), not ['-c'];
+#   * a CODE that ends the process (os._exit, a crash) or hangs stops the
+#     CODEs after it: _pyreport then runs those alone with pyprobe.
+_pym_rand=""
+{ read -r _pym_rand < /proc/sys/kernel/random/uuid; } 2>/dev/null
+[ -n "$_pym_rand" ] || _pym_rand="$(od -An -N8 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')"
+[ -n "$_pym_rand" ] || _pym_rand="$$.$(date +%s 2>/dev/null)"
+_PYM="@@ggt-pyprobe-$_pym_rand@@"
 _PYDRV='
 import sys
 try:
@@ -677,6 +705,8 @@ order = [i for i in range(len(codes)) if "pkg_resources" not in codes[i]] + [i f
 out = sys.stdout
 err = sys.stderr
 for i in order:
+    out.write("%s %d start\n" % (m, i + 1))
+    out.flush()
     o = StringIO()
     e = StringIO()
     rc = 0
@@ -727,56 +757,81 @@ for i in order:
     out.write("%s %d rc %d\n" % (m, i + 1, rc))
     out.flush()
 '
-_pyrun_py="" _pyrun_rc=0 _pyrun_pre="" _pyrun_post="" _pyrun_err=""
+_pyrun_py="" _pyrun_rc=0 _pyrun_pre="" _pyrun_post="" _pyrun_err="" _pyrun_started=0
 _pyrun() {
-    local l m k acc="" seen=0 i=1
+    local l n c ord="" cur="" step="" acc="" seen=0 i=1
     _pyrun_py="$1"; shift
-    _pyrun_rc=0 _pyrun_pre="" _pyrun_post="" _pyrun_err=""
-    while [ "$i" -le "$#" ]; do eval "_pyr_$i='' _pyo_$i='' _pye_$i=''"; i=$((i + 1)); done
+    _pyrun_rc=0 _pyrun_pre="" _pyrun_post="" _pyrun_err="" _pyrun_started=0
+    while [ "$i" -le "$#" ]; do eval "_pyr_$i='' _pyo_$i='' _pye_$i='' _pys_$i=''"; i=$((i + 1)); done
     [ -x "$_pyrun_py" ] || { _pyrun_rc=noexec; return; }
     _past_deadline && { _pyrun_rc=deadline; return; }
+    # the order the driver runs them in: pkg_resources last
+    i=0; for c in "$@"; do i=$((i + 1)); case "$c" in *pkg_resources*) ;; *) ord="$ord $i" ;; esac; done
+    i=0; for c in "$@"; do i=$((i + 1)); case "$c" in *pkg_resources*) ord="$ord $i" ;; esac; done
     _pyrun_out="$(_bounded "$_pyrun_py" -c "$_PYDRV" "$_PYM" "$@" 2>"$(_tmp pyrun.err)")"; _pyrun_rc=$?
     [ -s "$(_tmp pyrun.err)" ] && _pyrun_err="$(cat "$(_tmp pyrun.err)" 2>/dev/null)"
-    # Split on the marker lines. What the interpreter printed outside them
-    # (a sitecustomize at start-up, an atexit hook) is what every `python -c`
-    # would have printed around its own output, so each CODE gets it too.
+    # Split on the marker lines, accepting only the one expected next: after
+    # "N rc R" comes "M start" for the next CODE M in $ord, then "M out",
+    # "M err", "M rc R". Any other line is content. What the interpreter
+    # printed outside the markers (a sitecustomize at start-up, an atexit
+    # hook) is what every `python -c` would have printed around its own
+    # output, so each CODE gets it too.
+    set -- $ord
+    cur="${1:-}"; step=start
     while IFS= read -r l; do
-        case "$l" in
-            "$_PYM "*)
-                m="${l#"$_PYM "}"; k="${m#* }"; m="${m%% *}"
-                case "$m" in ''|*[!0-9]*) acc="$acc$l$_nl"; continue ;; esac
-                case "$k" in
-                    out) [ "$seen" = 0 ] && _pyrun_pre="$acc"; seen=1 ;;
-                    err) eval "_pyo_$m=\$acc" ;;
-                    "rc "*) case "${k#rc }" in ''|*[!0-9]*) ;; *) eval "_pye_$m=\$acc _pyr_$m=\${k#rc }" ;; esac ;;
-                    *) acc="$acc$l$_nl"; continue ;;
-                esac
-                acc="" ;;
-            *) acc="$acc$l$_nl" ;;
+        case "$step:$l" in
+            "start:$_PYM $cur start")
+                [ "$seen" = 0 ] && _pyrun_pre="$acc"; seen=1
+                eval "_pys_$cur=1"; _pyrun_started=1; step=out; acc=""; continue ;;
+            "out:$_PYM $cur out")   step=err; acc=""; continue ;;
+            "err:$_PYM $cur err")   eval "_pyo_$cur=\$acc"; step=rc; acc=""; continue ;;
+            "rc:$_PYM $cur rc "*)
+                n="${l#"$_PYM $cur rc "}"
+                case "$n" in
+                    ''|*[!0-9]*) ;;
+                    *) eval "_pye_$cur=\$acc _pyr_$cur=\$n"
+                       shift; cur="${1:-}"; step=start; [ -n "$cur" ] || step=end
+                       acc=""; continue ;;
+                esac ;;
         esac
+        # content: dropped between "start" and "out" (nothing a CODE prints
+        # through sys.stdout arrives there)
+        [ "$step" = out ] || acc="$acc$l$_nl"
     done <<EOF
 $_pyrun_out
 EOF
-    if [ "$seen" = 1 ]; then _pyrun_post="$acc"; else _pyrun_pre="$acc"; fi
+    if [ "$seen" = 1 ]; then [ "$step" = end ] && _pyrun_post="$acc"; else _pyrun_pre="$acc"; fi
 }
 
 # _pyreport N LABEL CODE -> the facts pyprobe gives for CODE, from the result of
-# CODE N in the last _pyrun. A CODE with no status of its own, when the
-# interpreter was not stopped by the cap (it cannot run the driver, or a CODE
-# ended it), is run alone with pyprobe, as it was before _pyrun.
+# CODE N in the last _pyrun. A CODE with no status of its own:
+#   * it started and the cap stopped it: timed out (it was running);
+#   * the cap stopped the interpreter before any CODE started: timed out,
+#     as each `python -c` would have been;
+#   * it never started because a CODE before it hung or ended the process,
+#     or the interpreter cannot run the driver: run alone with pyprobe, under
+#     its own cap, as before _pyrun. Past the run deadline it is not run, and
+#     the reason says why.
 _pyreport() {
-    local n="$1" label="$2" out rc err
+    local n="$1" label="$2" out rc err started
     case "$_pyrun_rc" in
         noexec)   _pyout="" _pyrc=1; fact "$label: n/a (not executable: $_pyrun_py)"; return ;;
         deadline) _pyout="" _pyrc=124; fact "$label: n/a (run deadline reached: ${RUN_DEADLINE}s)"; return ;;
     esac
-    eval "rc=\$_pyr_$n out=\$_pyo_$n err=\$_pye_$n"
+    eval "rc=\$_pyr_$n out=\$_pyo_$n err=\$_pye_$n started=\$_pys_$n"
     if [ -z "$rc" ]; then
-        if [ "$_pyrun_rc" != 124 ]; then pyprobe "$label" "$_pyrun_py" "$3"; return; fi
-        _pyout="" _pyrc=124
-        if _past_deadline; then fact "$label: n/a (run deadline reached: ${RUN_DEADLINE}s)"
-        else fact "$label: n/a (timed out: ${CMD_TIMEOUT}s)"; fi
-        return
+        if [ "$_pyrun_rc" = 124 ] && { [ "$started" = 1 ] || [ "$_pyrun_started" = 0 ]; }; then
+            _pyout="" _pyrc=124
+            if _past_deadline; then fact "$label: n/a (run deadline reached: ${RUN_DEADLINE}s)"
+            else fact "$label: n/a (timed out: ${CMD_TIMEOUT}s)"; fi
+            return
+        fi
+        if [ "$_pyrun_rc" = 124 ] && _past_deadline; then
+            _pyout="" _pyrc=124
+            fact "$label: n/a (not run: the lookup before it did not finish within ${CMD_TIMEOUT}s, and the run deadline was reached: ${RUN_DEADLINE}s)"
+            return
+        fi
+        pyprobe "$label" "$_pyrun_py" "$3"; return
     fi
     # $(...) drops the trailing newlines
     out="$_pyrun_pre$out$_pyrun_post"

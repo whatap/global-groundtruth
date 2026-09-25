@@ -69,11 +69,15 @@ not one `python -c` each: every snippet runs with fresh globals, its own
 stdout, stderr and exit status, and an uncaught exception is printed by the
 interpreter's own `sys.excepthook`, so each line and each `n/a (...)` reads
 as a separate `python -c` would have made it. The `pkg_resources` import runs
-last, as it rewires namespace packages. When the interpreter cannot run the
-combined script at all (or a snippet ends the process), the snippets it did
-not report on are run one by one as before; when the shared call hits the
-per-call cap, those snippets say `timed out`. `pip list` stays a call of its
-own.
+last, as it rewires namespace packages. A snippet that hangs says `timed out`;
+the snippets after it, and those after one that ends the process, never
+started, so each is then run on its own under its own cap, as before (past the
+run deadline they say `not run: ...` instead). When the interpreter cannot run
+the combined script at all, every snippet is run on its own; when the cap
+stops it before any snippet started, every snippet says `timed out`, as each
+`python -c` would have. The marker lines that separate the snippets are random
+per run and read in order, so output that imitates one stays output. `pip list`
+stays a call of its own.
 
 ## How python processes are found
 

@@ -60,7 +60,13 @@ COLLECTOR_NAME="whatap-k8s"
 #        gives every read it replaced that failure; one that fails on a
 #        template is made again read by read. The report is unchanged; 105 ->
 #        75 calls and 24.6 s -> 18.0 s on a 4-node lab cluster (2026-09-25).
-VERSION="0.8.0"
+# 0.8.1  A probe that hangs inside the per-pod exec no longer takes the
+#        answers of the ones after it: those never started, and each now runs
+#        in its own exec under its own cap. The marker lines of the merged
+#        calls are random per run and taken only in the expected order, so a
+#        CR value or a probe output holding marker-like text cannot replace
+#        another read's answer (2026-09-25).
+VERSION="0.8.1"
 DOMAIN="k8s"
 TARGET="k8s-cluster/unresolved"      # refined after CLI/context/namespace discovery
 
@@ -870,18 +876,33 @@ pod_exec_probe() { pod_exec_probe_ns "$NS" "$1" "$2" "$3" "$4"; }
 #   would otherwise fail all of them), GROUP_K / GROUP_S (marker keys and the
 #   text after each, trailing newlines dropped as $(...) drops them).
 # Templates carry their marker: _km_mark KEY, or inside a range over items
-# {"\n@@ggt-seg@@ "}{.metadata.name}{"/KEY\n"}.
+# {"\n<marker> "}{.metadata.name}{"/KEY\n"} with the KEYs listed, in order,
+# in KM_IKEYS.
+# The marker is random per run, and a marker line counts only when it is the
+# one expected next (the _km_mark keys in KM_T order, then per item the
+# KM_IKEYS in order, one item name throughout): a value holding a newline and
+# marker-like text stays part of the value.
 # kg_run GROUP KEY ARGS... then stands in for `run_k ARGS` of the template it
 # replaced: K_OUT / K_RC / $_errfile as that call would have left them. A
 # failed merged call fails every template the same way; a template error or a
 # key the call did not print runs the original call instead.
-_KM_M='@@ggt-seg@@'
+_km_rand=""
+{ read -r _km_rand < /proc/sys/kernel/random/uuid; } 2>/dev/null
+[ -n "$_km_rand" ] || _km_rand="$(od -An -N8 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')"
+[ -n "$_km_rand" ] || _km_rand="$$.$(date +%s 2>/dev/null)"
+_KM_M="@@ggt-seg-$_km_rand@@"
 KM_T=()
+KM_IKEYS=""
 _km_mark() { printf '{"\\n%s %s\\n"}' "$_KM_M" "$1"; }
 km_get() {
-    local g="$1" tpl="" i=0 l key="" acc="" n=0
+    local g="$1" tpl="" i=0 l key="" acc="" n=0 t ks="" ik="" nm="" want
     shift
-    while [ "$i" -lt "${#KM_T[@]}" ]; do tpl="$tpl${KM_T[$i]}"; i=$((i + 1)); done
+    while [ "$i" -lt "${#KM_T[@]}" ]; do
+        t="${KM_T[$i]}"; tpl="$tpl$t"
+        # the keys _km_mark wrote, in order
+        case "$t" in "{\"\\n$_KM_M "*"\\n\"}") t="${t#"{\"\\n$_KM_M "}"; ks="$ks ${t%"\\n\"}"}" ;; esac
+        i=$((i + 1))
+    done
     eval "${g}_USE=1 ${g}_FB=0 ${g}_ERR='' ${g}_K=() ${g}_S=()"
     run_k "$@" -o "jsonpath=$tpl"
     eval "${g}_RC=\$K_RC"
@@ -890,19 +911,37 @@ km_get() {
         grep -qi 'jsonpath' "$_errfile" 2>/dev/null && eval "${g}_FB=1"
         return 1
     fi
+    set -- $ks
     while IFS= read -r l; do
+        want=""
         case "$l" in
             "$_KM_M "*)
-                if [ -n "$key" ]; then
-                    while :; do case "$acc" in *"$_nl") acc="${acc%"$_nl"}" ;; *) break ;; esac; done
-                    eval "${g}_K[\${#${g}_K[@]}]=\$key; ${g}_S[\${#${g}_S[@]}]=\$acc"
-                fi
-                key="${l#"$_KM_M "}"; acc=""; n=0 ;;
-            *)
-                [ -n "$key" ] || continue
-                if [ "$n" = 0 ]; then acc="$l"; else acc="$acc$_nl$l"; fi
-                n=$((n + 1)) ;;
+                t="${l#"$_KM_M "}"
+                if [ "$#" -gt 0 ]; then
+                    [ "$t" = "$1" ] && { want="$t"; shift; }
+                elif [ -n "$KM_IKEYS" ]; then
+                    # per item: the first KM_IKEYS key under any name, then
+                    # the rest in order under that same name
+                    [ -n "$ik" ] || { ik="$KM_IKEYS "; nm=""; }
+                    case "$t" in
+                        */"${ik%% *}")
+                            if [ -z "$nm" ] || [ "${t%/*}" = "$nm" ]; then
+                                nm="${t%/*}"; want="$t"; ik="${ik#* }"
+                            fi ;;
+                    esac
+                fi ;;
         esac
+        if [ -n "$want" ]; then
+            if [ -n "$key" ]; then
+                while :; do case "$acc" in *"$_nl") acc="${acc%"$_nl"}" ;; *) break ;; esac; done
+                eval "${g}_K[\${#${g}_K[@]}]=\$key; ${g}_S[\${#${g}_S[@]}]=\$acc"
+            fi
+            key="$want"; acc=""; n=0
+            continue
+        fi
+        [ -n "$key" ] || continue
+        if [ "$n" = 0 ]; then acc="$l"; else acc="$acc$_nl$l"; fi
+        n=$((n + 1))
     done <<EOF
 $K_OUT
 EOF
@@ -910,6 +949,7 @@ EOF
         while :; do case "$acc" in *"$_nl") acc="${acc%"$_nl"}" ;; *) break ;; esac; done
         eval "${g}_K[\${#${g}_K[@]}]=\$key; ${g}_S[\${#${g}_S[@]}]=\$acc"
     fi
+    KM_IKEYS=""
     return 0
 }
 
@@ -974,31 +1014,38 @@ kr_keep() {
 
 # _pod_probes_run POD CONTAINER CMD... -> every CMD in one `kubectl exec`, each
 # through its own `sh -c` (a CMD that does not parse fails alone, as it did in
-# its own exec). Per CMD the pod prints a marker, the stdout, a marker, the
-# stderr, and "rc N". Stored as group PX (keys N/out, N/err, N/rc);
-# _pod_probe_emit N "label" then reports CMD N as pod_exec_probe did.
-_PX_DRV='i=0; for c in "$@"; do i=$((i + 1)); echo "@@ggt-seg@@ $i/out"; { e=$( { sh -c "$c" 2>&1 1>&3 3>&-; } ); } 3>&1; r=$?; echo; echo "@@ggt-seg@@ $i/err"; printf "%s\n" "$e"; echo "@@ggt-seg@@ $i/rc"; echo "$r"; done'
+# its own exec). Per CMD the pod prints "<marker> N/start", then N/out, the
+# stdout, N/err, the stderr, and N/rc with the exit status on the next line;
+# the marker is the per-run random one of km_get, passed as $1, and a marker
+# line counts only when it is the one expected next. Stored as PX_K / PX_S
+# (keys N/out, N/err, N/rc; N/start with an empty text);
+# _pod_probe_emit N "label" CMD then reports CMD N as pod_exec_probe did.
+_PX_DRV='m=$1; shift; i=0; for c in "$@"; do i=$((i + 1)); echo "$m $i/start"; echo "$m $i/out"; { e=$( { sh -c "$c" 2>&1 1>&3 3>&-; } ); } 3>&1; r=$?; echo; echo "$m $i/err"; printf "%s\n" "$e"; echo "$m $i/rc"; echo "$r"; done'
+PX_POD="" PX_CONT=""
 _pod_probes_run() {
-    local pod="$1" cont="$2" l key="" acc="" n=0
+    local pod="$1" cont="$2" l key="" acc="" n=0 ni=1 st=start
     shift 2
-    PX_ERR="" PX_K=() PX_S=()
-    run_k exec -n "$NS" "$pod" -c "$cont" -- sh -c "$_PX_DRV" sh "$@"
+    PX_POD="$pod" PX_CONT="$cont" PX_ERR="" PX_K=() PX_S=()
+    run_k exec -n "$NS" "$pod" -c "$cont" -- sh -c "$_PX_DRV" sh "$_KM_M" "$@"
     PX_RC=$K_RC
     [ "$K_RC" -ne 0 ] && PX_ERR="$(cat "$_errfile" 2>/dev/null)"
     # a call cut short keeps what the probes before the cut printed
     while IFS= read -r l; do
-        case "$l" in
-            "$_KM_M "*)
-                if [ -n "$key" ]; then
-                    while :; do case "$acc" in *"$_nl") acc="${acc%"$_nl"}" ;; *) break ;; esac; done
-                    PX_K[${#PX_K[@]}]="$key"; PX_S[${#PX_S[@]}]="$acc"
-                fi
-                key="${l#"$_KM_M "}"; acc=""; n=0 ;;
-            *)
-                [ -n "$key" ] || continue
-                if [ "$n" = 0 ]; then acc="$l"; else acc="$acc$_nl$l"; fi
-                n=$((n + 1)) ;;
-        esac
+        if [ "$l" = "$_KM_M $ni/$st" ]; then
+            if [ -n "$key" ]; then
+                while :; do case "$acc" in *"$_nl") acc="${acc%"$_nl"}" ;; *) break ;; esac; done
+                PX_K[${#PX_K[@]}]="$key"; PX_S[${#PX_S[@]}]="$acc"
+            fi
+            key="$ni/$st"; acc=""; n=0
+            case "$st" in
+                start) st=out ;; out) st=err ;; err) st=rc ;;
+                rc) st=start; ni=$((ni + 1)) ;;
+            esac
+            continue
+        fi
+        [ -n "$key" ] || continue
+        if [ "$n" = 0 ]; then acc="$l"; else acc="$acc$_nl$l"; fi
+        n=$((n + 1))
     done <<EOF
 $K_OUT
 EOF
@@ -1008,8 +1055,14 @@ EOF
     fi
 }
 _px() { local i=0; KG_V=""; while [ "$i" -lt "${#PX_K[@]}" ]; do [ "${PX_K[$i]}" = "$1" ] && { KG_V="${PX_S[$i]}"; return 0; }; i=$((i + 1)); done; return 1; }
+# A probe with no status of its own: one that started and was cut off takes
+# the exec's reason (a timeout says timed out); when no probe started at all
+# the exec's reason stands for each, as each exec would have failed alike;
+# one that never started while a probe before it did (it hung, or the stream
+# broke) runs alone in its own exec under its own cap. Past the run deadline
+# it is not run, and the reason says why.
 _pod_probe_emit() {
-    local n="$1" label="$2" out err rc
+    local n="$1" label="$2" cmd="$3" out err rc
     if _px "$n/rc"; then
         rc="$KG_V"; _px "$n/out"; out="$KG_V"; _px "$n/err"; err="$KG_V"
         # what `kubectl exec` itself adds for a command that exits non-zero
@@ -1020,8 +1073,14 @@ _pod_probe_emit() {
             K_RC=0
         fi
         K_OUT="$out"
+    elif ! _px "$n/start" && _px "1/start"; then
+        if _past_deadline; then
+            fact "$label: n/a (not run: the probe before it did not finish within ${CMD_TIMEOUT}s, and the run deadline was reached: ${RUN_DEADLINE}s)"
+            return
+        fi
+        pod_exec_probe "$label" "$PX_POD" "$PX_CONT" "$cmd"
+        return
     else
-        # the exec did not reach this probe: its reason is the exec's
         K_OUT=""; K_RC="$PX_RC"
         [ "$K_RC" -eq 0 ] && K_RC=1
         printf '%s\n' "$PX_ERR" > "$_errfile" 2>/dev/null
@@ -1128,6 +1187,7 @@ _cr_merged_get() {
         pi="$pi{\"\\n$_KM_M \"}{.metadata.name}{\"/$k\\n\"}$t"
     done
     KM_T[${#KM_T[@]}]="{range .items[*]}$pi{end}"
+    KM_IKEYS="ENV1 ENV2 ENV3 MF ID TG IMG"
     km_get CRG get "$WA_CRD"
 }
 
@@ -1949,18 +2009,18 @@ run_report() {
             [ -n "$hport" ] && [ -n "$portcont" ] && pcs[${#pcs[@]}]="$pc5"
             [ "$hostpid" = "true" ] && pcs[${#pcs[@]}]="$pc6"
             _pod_probes_run "$pod" "$logcont" "${pcs[@]}"
-            _pod_probe_emit 1 "container log symlink target (first entry found under: $logdirs)"
-            _pod_probe_emit 2 "container-log roots present (candidates from declared mounts)"
-            _pod_probe_emit 3 "container runtime sockets visible (candidates from declared mounts)"
-            _pod_probe_emit 4 "cgroup filesystem type + v2 controllers file"
+            _pod_probe_emit 1 "container log symlink target (first entry found under: $logdirs)" "$pc1"
+            _pod_probe_emit 2 "container-log roots present (candidates from declared mounts)" "$pc2"
+            _pod_probe_emit 3 "container runtime sockets visible (candidates from declared mounts)" "$pc3"
+            _pod_probe_emit 4 "cgroup filesystem type + v2 controllers file" "$pc4"
             pn=4
             if [ -n "$hport" ] && [ -n "$portcont" ]; then
-                pn=5; _pod_probe_emit 5 "helper endpoint http://127.0.0.1:$hport/health"
+                pn=5; _pod_probe_emit 5 "helper endpoint http://127.0.0.1:$hport/health" "$pc5"
             else
                 fact "helper endpoint probe: n/a (not applicable: no containerPort declared in daemonset)"
             fi
             if [ "$hostpid" = "true" ]; then
-                _pod_probe_emit $((pn + 1)) "kubelet cmdline (via hostPID /proc)"
+                _pod_probe_emit $((pn + 1)) "kubelet cmdline (via hostPID /proc)" "$pc6"
             else
                 fact "kubelet cmdline: n/a (not applicable: daemonset hostPID not set)"
             fi
