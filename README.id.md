@@ -77,7 +77,7 @@ global-groundtruth/
 │   ├── nms/                      # SEEDED v0 — NMS Control Manager host collector
 │   ├── server/                   # STUB (README only)
 │   ├── apm/                      # SEEDED — java/ python/ nodejs/ php/ v0 + dotnet/ v0 (Windows)
-│   ├── db/                       # STUB (README only)
+│   ├── db/                       # SEEDED v0 — shell collector + SQL packs
 │   └── collection-server/        # SEEDED v0 — WhaTap backend (yard/proxy/...) collector
 ├── templates/
 │   └── collector-skeleton/       # copy this to start a collector
@@ -93,7 +93,7 @@ global-groundtruth/
 | `nms`               | SEEDED v0       | skrip host NMS Control Manager; lihat `collectors/nms/` |
 | `server`            | NOT IMPLEMENTED | skrip shell host; lihat `collectors/server/`          |
 | `apm`               | SEEDED v0        | keluarga per-bahasa; `java`, `python`, `nodejs`, `php`, `dotnet` v0 di-seed; lihat `collectors/apm/` |
-| `db`                | NOT IMPLEMENTED | SQL + dump konfigurasi agent; lihat `collectors/db/`         |
+| `db`                | SEEDED v0       | collector shell + SQL pack; lihat `collectors/db/`           |
 | `collection-server` | SEEDED v0       | skrip host backend; lihat `collectors/collection-server/` |
 
 Repositori ini memuat **framework**-nya (contract, format, template,

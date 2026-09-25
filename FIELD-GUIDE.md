@@ -59,6 +59,7 @@ Your WhaTap contact will name the collector to run:
 |---|---|---|
 | The **backend / collection server** (yard, proxy, gateway, ...) | `collectors/collection-server/collect-collserver.sh` | directly on the backend host |
 | **ZFS** under a backend's data path (asked for separately) | `collectors/collection-server/collect-collzfs.sh` | directly on that backend host |
+| The backend's **MySQL** (`account` / `notihub` metadata; asked for separately) | `collectors/collection-server/collect-collmysql.sh` | on the MySQL host, or any host whose `mysql` client reaches it |
 | **Kubernetes** monitoring (operator, node agent, master agent, ...) | `collectors/k8s/collect-k8s.sh` | any machine where `kubectl` (or `oc`) reaches the cluster — a bastion or your workstation, **not** on a cluster node |
 | The **NMS Control Manager** (network monitoring) | `collectors/nms/collect-nms.sh` | directly on the NMS Control Manager host |
 | **Database monitoring** (DBX/XOS/DMX agents and the monitored DB) | `collectors/db/collect-db.sh` (Windows/MSSQL: `collectors/db/windows/collect-db-mssql.ps1`) | on the DB agent host; for a split install, once on each host |
@@ -100,6 +101,11 @@ Notes:
 - When the question is specifically about **ZFS** under the backend's data
   path, WhaTap will ask for the companion collector in the same directory
   (`./collect-collzfs.sh --file`) as well. It is a separate report; send both.
+- When the question is about the backend's **MySQL**, run
+  `./collect-collmysql.sh --file` on the MySQL host. If the database needs a
+  login, give it with `--defaults-file <my.cnf>` or let the collector ask for
+  the password on the terminal. Never type a password into the command line:
+  other users of the host can read it there.
 
 ### 4.2 Kubernetes (bastion / workstation)
 
@@ -199,6 +205,16 @@ Notes:
 - A run takes seconds to a few minutes on a slow host. Let it finish — the
   report always ends with the `==== END OF COLLECTION ... ====` line.
 - `n/a (...)` lines in the report are expected. Send the file as-is.
+- The **last `>> status:` line** tells you whether the run got what it came for.
+  - `status: COMPLETE` — send the file.
+  - `status: INCOMPLETE` — the lines under it name what was blocked and how a
+    different run would obtain it, for example `run again with sudo` or
+    `rerun with --home <dir>`. Do that if your policy allows and send the new
+    file. If it does not allow it, send the file as it is: the report says
+    what it could not read, and WhaTap takes it from there.
+- The Kubernetes, NMS, database and collection-server collectors need `bash`.
+  Start them as shown (`./collect-...sh`); under `sh collect-...sh` they stop
+  at once and say so.
 
 ## 5. Send it back
 
@@ -210,14 +226,26 @@ Notes:
 
 ## 6. Security notes
 
-- All reports and bundles contain configuration **verbatim** — no masking, by
-  framework policy: a value such as a license key or a community string must
-  be readable to be verified or refuted. `secure.conf`, admin passwords and
-  access keys therefore appear as-is. Move files over a trusted channel and
-  delete your local copy when the case is closed.
-- The **k8s** collector never fetches Kubernetes Secret values — secrets
-  appear only as name/type tables — but everything else, including its bundle
-  logs, is verbatim. Handle it the same careful way.
+Reports and bundles quote what they read **verbatim** — no masking, by
+framework policy: a value such as a license key or a community string must be
+readable to be verified or refuted. So a report can carry secrets. Move files
+over a trusted channel and delete your local copy when the case is closed.
+
+Where a secret can come from, per collector (each collector's README has the
+full list):
+
+| Collector | Can carry |
+|---|---|
+| collection server | `conf/*.conf` (license, `admin.password`, access keys), `ps aux` in the bundle, heap dumps |
+| MySQL | server variables and the process list; never the password you give it |
+| ZFS | `zpool history` (the commands that were run on the pools) |
+| Kubernetes | environment values of pods and workloads, `helm get values`, the operator's environment. Of Kubernetes Secrets it reads only the public `cert.pem` of the webhook, printed as a fingerprint |
+| NMS | NMS configs (access key, SNMP communities), repository files that may carry `user:password@` |
+| database | `whatap.conf` (license, `aws_secret_key`, `connect_option`), the JDBC URL, cron lines that mention WhaTap |
+| Java / Python / Node.js / PHP / .NET | agent configs, the environment and command line of the application processes, process-manager configs (for example `ecosystem.config.js`) |
+
+The collectors never put a credential you give them on a command line, and the
+MySQL collector never writes the password into the report.
 
 ## 7. Languages
 

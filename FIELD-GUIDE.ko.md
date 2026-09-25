@@ -58,6 +58,7 @@ cd global-groundtruth && git pull
 |---|---|---|
 | **백엔드 / 수집 서버** (yard, proxy, gateway, ...) | `collectors/collection-server/collect-collserver.sh` | 백엔드 호스트에서 직접 |
 | 백엔드 데이터 경로의 **ZFS** (별도로 요청됨) | `collectors/collection-server/collect-collzfs.sh` | 해당 백엔드 호스트에서 직접 |
+| 백엔드의 **MySQL** (`account` / `notihub` 메타데이터, 별도로 요청됨) | `collectors/collection-server/collect-collmysql.sh` | MySQL 호스트, 또는 `mysql` 클라이언트가 그 DB에 닿는 호스트 |
 | **Kubernetes** 모니터링 (operator, node agent, master agent, ...) | `collectors/k8s/collect-k8s.sh` | `kubectl`(또는 `oc`)로 클러스터에 접근되는 아무 장비 — bastion 또는 워크스테이션. 클러스터 노드 위가 **아님** |
 | **NMS Control Manager** (네트워크 모니터링) | `collectors/nms/collect-nms.sh` | NMS Control Manager 호스트에서 직접 |
 | **데이터베이스 모니터링** (DBX/XOS/DMX 에이전트 및 대상 DB) | `collectors/db/collect-db.sh` (Windows/MSSQL: `collectors/db/windows/collect-db-mssql.ps1`) | DB 에이전트 호스트에서. 분리 구성이면 양쪽 호스트에서 각각 1회 |
@@ -99,6 +100,10 @@ cd global-groundtruth/collectors/collection-server
 - 백엔드 데이터 경로의 **ZFS**가 쟁점이면 같은 디렉토리의 companion collector
   (`./collect-collzfs.sh --file`)도 함께 요청됩니다. 별도 리포트이므로 둘 다
   보내주십시오.
+- 백엔드의 **MySQL**이 쟁점이면 MySQL 호스트에서 `./collect-collmysql.sh --file`을
+  실행하십시오. 로그인이 필요하면 `--defaults-file <my.cnf>`로 주거나, collector가
+  터미널에서 암호를 묻게 두십시오. 암호를 명령행에 직접 입력하지 마십시오.
+  명령행은 그 호스트의 다른 사용자도 읽을 수 있습니다.
 
 ### 4.2 Kubernetes (bastion / 워크스테이션)
 
@@ -198,6 +203,16 @@ cd global-groundtruth\collectors\apm\dotnet
 - 실행은 수 초에서, 느린 호스트에서는 몇 분까지 걸립니다. 끝까지 기다리십시오 —
   리포트는 항상 `==== END OF COLLECTION ... ====` 줄로 끝납니다.
 - 리포트의 `n/a (...)` 줄은 정상입니다. 파일을 그대로 보내십시오.
+- **마지막 `>> status:` 줄**이 이번 실행이 필요한 것을 얻었는지 알려줍니다.
+  - `status: COMPLETE` — 파일을 보내십시오.
+  - `status: INCOMPLETE` — 그 아래 줄에 막힌 항목과, 어떻게 다시 실행하면 얻을 수
+    있는지가 나옵니다. 예: `run again with sudo`, `rerun with --home <dir>`.
+    운영 정책이 허용하면 그대로 다시 실행해 새 파일을 보내십시오. 허용하지 않으면
+    파일을 그대로 보내십시오. 리포트에 무엇을 읽지 못했는지 적혀 있으므로 이후는
+    WhaTap이 이어서 진행합니다.
+- Kubernetes, NMS, 데이터베이스, collection server collector는 `bash`가 필요합니다.
+  위에 적힌 대로(`./collect-...sh`) 실행하십시오. `sh collect-...sh`로 실행하면
+  바로 멈추고 그 이유를 출력합니다.
 
 ## 5. 회신하기
 
@@ -208,14 +223,27 @@ cd global-groundtruth\collectors\apm\dotnet
 
 ## 6. 보안 주의사항
 
-- 모든 리포트와 번들에는 설정이 **원문 그대로(verbatim)** 들어갑니다 —
-  프레임워크 정책상 마스킹하지 않습니다. 라이선스 키나 community 문자열 같은
-  값은 읽을 수 있어야 검증·반박이 가능하기 때문입니다. `secure.conf`, 관리자
-  암호, 액세스 키도 그대로 나타납니다. 신뢰할 수 있는 경로로 전달하고 케이스
-  종료 후 로컬 사본을 삭제하십시오.
-- **k8s** collector는 Kubernetes Secret 값을 가져오지 않습니다(이름/타입
-  표로만 표시) — 그 외 리포트·로그·번들은 모두 원문 그대로이므로 같은
-  수준으로 주의해서 다루십시오.
+리포트와 번들은 읽은 내용을 **원문 그대로(verbatim)** 인용합니다. 프레임워크
+정책상 마스킹하지 않습니다. 라이선스 키나 community 문자열 같은 값은 읽을 수
+있어야 검증하거나 반박할 수 있기 때문입니다. 따라서 리포트에 비밀값이 들어갈 수
+있습니다. 신뢰할 수 있는 경로로 전달하고, 케이스가 끝나면 로컬 사본을
+삭제하십시오.
+
+collector별로 비밀값이 들어올 수 있는 곳은 다음과 같습니다 (전체 목록은 각
+collector의 README에 있습니다):
+
+| Collector | 들어갈 수 있는 것 |
+|---|---|
+| collection server | `conf/*.conf` (라이선스, `admin.password`, 액세스 키), 번들의 `ps aux`, heap dump |
+| MySQL | 서버 변수와 프로세스 목록. 입력한 암호는 들어가지 않습니다 |
+| ZFS | `zpool history` (풀에 실행된 명령) |
+| Kubernetes | 파드와 워크로드의 환경 변수 값, `helm get values`, operator의 환경 변수. Kubernetes Secret 중에서는 webhook의 공개 `cert.pem`만 읽고, 그것도 지문(fingerprint)으로만 출력합니다 |
+| NMS | NMS 설정 (액세스 키, SNMP community), `user:password@`가 들어 있을 수 있는 저장소 파일 |
+| 데이터베이스 | `whatap.conf` (라이선스, `aws_secret_key`, `connect_option`), JDBC URL, WhaTap을 언급하는 cron 줄 |
+| Java / Python / Node.js / PHP / .NET | 에이전트 설정, 애플리케이션 프로세스의 환경 변수와 명령행, 프로세스 관리자 설정 (예: `ecosystem.config.js`) |
+
+collector는 입력받은 자격 증명을 명령행에 올리지 않으며, MySQL collector는 암호를
+리포트에 쓰지 않습니다.
 
 ## 7. 언어
 

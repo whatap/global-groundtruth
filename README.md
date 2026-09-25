@@ -93,7 +93,7 @@ global-groundtruth/
 This repository ships the **framework** (contract, format, template, validator,
 docs), per-domain **stubs**, and the **seeded v0** collectors listed above
 (`collection-server`, `k8s`, `nms`, `db`, `apm/java`, `apm/python`, `apm/nodejs`,
-`apm/dotnet`) that the
+`apm/php`, `apm/dotnet`) that the
 Global team owns until handover.
 Collectors are authored and then owned by their domain teams.
 

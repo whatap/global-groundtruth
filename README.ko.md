@@ -70,7 +70,7 @@ global-groundtruth/
 │   ├── nms/                      # SEEDED v0 — NMS Control Manager host collector
 │   ├── server/                   # STUB (README only)
 │   ├── apm/                      # SEEDED — java/ python/ nodejs/ php/ v0 + dotnet/ v0 (Windows)
-│   ├── db/                       # STUB (README only)
+│   ├── db/                       # SEEDED v0 — shell collector + SQL packs
 │   └── collection-server/        # SEEDED v0 — WhaTap backend (yard/proxy/...) collector
 ├── templates/
 │   └── collector-skeleton/       # copy this to start a collector
@@ -86,7 +86,7 @@ global-groundtruth/
 | `nms`               | SEEDED v0       | NMS Control Manager 호스트 스크립트; `collectors/nms/` 참조 |
 | `server`            | NOT IMPLEMENTED | 호스트 셸 스크립트; `collectors/server/` 참조          |
 | `apm`               | SEEDED v0        | 언어별 패밀리; `java`·`python`·`nodejs`·`php`·`dotnet` v0 시드; `collectors/apm/` 참조 |
-| `db`                | NOT IMPLEMENTED | SQL + 에이전트 설정 덤프; `collectors/db/` 참조         |
+| `db`                | SEEDED v0       | 셸 collector + SQL pack; `collectors/db/` 참조           |
 | `collection-server` | SEEDED v0       | 백엔드 호스트 스크립트; `collectors/collection-server/` 참조 |
 
 이 저장소는 **프레임워크**(계약, 포맷, 템플릿, 검증기, 문서), 도메인별

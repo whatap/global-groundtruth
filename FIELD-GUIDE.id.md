@@ -64,6 +64,7 @@ Kontak WhaTap Anda akan menyebutkan collector yang harus dijalankan:
 |---|---|---|
 | **Backend / collection server** (yard, proxy, gateway, ...) | `collectors/collection-server/collect-collserver.sh` | langsung di host backend |
 | **ZFS** di bawah data path backend (diminta secara terpisah) | `collectors/collection-server/collect-collzfs.sh` | langsung di host backend tersebut |
+| **MySQL** milik backend (metadata `account` / `notihub`; diminta secara terpisah) | `collectors/collection-server/collect-collmysql.sh` | di host MySQL, atau host mana pun yang client `mysql`-nya dapat menjangkaunya |
 | Monitoring **Kubernetes** (operator, node agent, master agent, ...) | `collectors/k8s/collect-k8s.sh` | mesin mana pun yang dapat menjangkau cluster lewat `kubectl` (atau `oc`) — bastion atau workstation Anda, **bukan** di node cluster |
 | **NMS Control Manager** (monitoring jaringan) | `collectors/nms/collect-nms.sh` | langsung di host NMS Control Manager |
 | Monitoring **database** (agen DBX/XOS/DMX dan DB yang dimonitor) | `collectors/db/collect-db.sh` (Windows/MSSQL: `collectors/db/windows/collect-db-mssql.ps1`) | di host agen DB; untuk instalasi terpisah, satu kali di setiap host |
@@ -105,6 +106,11 @@ Catatan:
 - Bila pertanyaannya khusus tentang **ZFS** di bawah data path backend, WhaTap
   akan meminta collector pendamping di direktori yang sama
   (`./collect-collzfs.sh --file`). Itu laporan terpisah; kirim keduanya.
+- Bila pertanyaannya tentang **MySQL** milik backend, jalankan
+  `./collect-collmysql.sh --file` di host MySQL. Jika database memerlukan login,
+  berikan lewat `--defaults-file <my.cnf>` atau biarkan collector menanyakan
+  password di terminal. Jangan pernah mengetik password di baris perintah:
+  pengguna lain di host itu dapat membacanya.
 
 ### 4.2 Kubernetes (bastion / workstation)
 
@@ -208,6 +214,18 @@ Catatan:
   `==== END OF COLLECTION ... ====`.
 - Baris `n/a (...)` di dalam laporan adalah hal yang wajar. Kirim file apa
   adanya.
+- **Baris `>> status:` terakhir** memberi tahu apakah eksekusi mendapatkan apa
+  yang dicarinya.
+  - `status: COMPLETE` — kirim file-nya.
+  - `status: INCOMPLETE` — baris di bawahnya menyebut apa yang terhalang dan
+    bagaimana eksekusi lain akan mendapatkannya, misalnya `run again with sudo`
+    atau `rerun with --home <dir>`. Lakukan itu jika kebijakan Anda mengizinkan,
+    lalu kirim file yang baru. Jika tidak diizinkan, kirim file apa adanya:
+    laporan menyebutkan apa yang tidak dapat dibaca, dan WhaTap melanjutkan
+    dari sana.
+- Collector Kubernetes, NMS, database, dan collection server memerlukan `bash`.
+  Jalankan seperti yang ditunjukkan (`./collect-...sh`); dengan
+  `sh collect-...sh` collector langsung berhenti dan menyebutkan alasannya.
 
 ## 5. Mengirimkan kembali
 
@@ -220,14 +238,27 @@ Catatan:
 
 ## 6. Catatan keamanan
 
-- Semua laporan dan bundle memuat konfigurasi **apa adanya (verbatim)** —
-  tanpa masking, sesuai kebijakan framework: nilai seperti license key atau
-  community string harus terbaca agar bisa diverifikasi atau dibantah.
-  `secure.conf`, password admin, dan access key tampil apa adanya. Kirim
-  lewat jalur tepercaya dan hapus salinan lokal setelah kasus ditutup.
-- Collector **k8s** tidak pernah mengambil isi Secret Kubernetes (hanya
-  tabel nama/tipe) — tetapi selebihnya, termasuk log di dalam bundle,
-  verbatim. Perlakukan dengan kehati-hatian yang sama.
+Laporan dan bundle mengutip apa yang dibacanya **apa adanya (verbatim)** —
+tanpa masking, sesuai kebijakan framework: nilai seperti license key atau
+community string harus terbaca agar bisa diverifikasi atau dibantah. Jadi
+laporan dapat memuat rahasia. Kirim lewat jalur tepercaya dan hapus salinan
+lokal setelah kasus ditutup.
+
+Dari mana rahasia dapat masuk, per collector (daftar lengkapnya ada di README
+masing-masing collector):
+
+| Collector | Dapat memuat |
+|---|---|
+| collection server | `conf/*.conf` (license, `admin.password`, access key), `ps aux` di dalam bundle, heap dump |
+| MySQL | variabel server dan daftar proses; password yang Anda berikan tidak pernah dimuat |
+| ZFS | `zpool history` (perintah yang pernah dijalankan pada pool) |
+| Kubernetes | nilai environment pod dan workload, `helm get values`, environment operator. Dari Secret Kubernetes hanya `cert.pem` publik milik webhook yang dibaca, dan itu pun dicetak sebagai fingerprint |
+| NMS | konfigurasi NMS (access key, SNMP community), file repositori yang mungkin memuat `user:password@` |
+| database | `whatap.conf` (license, `aws_secret_key`, `connect_option`), URL JDBC, baris cron yang menyebut WhaTap |
+| Java / Python / Node.js / PHP / .NET | konfigurasi agent, environment dan baris perintah proses aplikasi, konfigurasi process manager (misalnya `ecosystem.config.js`) |
+
+Collector tidak pernah menaruh kredensial yang Anda berikan di baris perintah,
+dan collector MySQL tidak pernah menulis password ke dalam laporan.
 
 ## 7. Bahasa
 

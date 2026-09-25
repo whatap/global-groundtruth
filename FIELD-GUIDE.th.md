@@ -58,6 +58,7 @@ cd global-groundtruth && git pull
 |---|---|---|
 | **backend / collection server** (yard, proxy, gateway, ...) | `collectors/collection-server/collect-collserver.sh` | บนโฮสต์ backend โดยตรง |
 | **ZFS** ใต้ data path ของ backend (ขอแยกต่างหาก) | `collectors/collection-server/collect-collzfs.sh` | บนโฮสต์ backend นั้นโดยตรง |
+| **MySQL** ของ backend (metadata `account` / `notihub`; ขอแยกต่างหาก) | `collectors/collection-server/collect-collmysql.sh` | บนโฮสต์ MySQL หรือโฮสต์ใดก็ได้ที่ client `mysql` เข้าถึงฐานข้อมูลนั้นได้ |
 | การมอนิเตอร์ **Kubernetes** (operator, node agent, master agent, ...) | `collectors/k8s/collect-k8s.sh` | เครื่องใดก็ได้ที่เข้าถึงคลัสเตอร์ผ่าน `kubectl` (หรือ `oc`) — bastion หรือเครื่องทำงานของคุณ **ไม่ใช่** บนโหนดของคลัสเตอร์ |
 | **NMS Control Manager** (มอนิเตอร์เครือข่าย) | `collectors/nms/collect-nms.sh` | บนโฮสต์ NMS Control Manager โดยตรง |
 | การมอนิเตอร์ **ฐานข้อมูล** (เอเจนต์ DBX/XOS/DMX และ DB ที่ถูกมอนิเตอร์) | `collectors/db/collect-db.sh` (Windows/MSSQL: `collectors/db/windows/collect-db-mssql.ps1`) | บนโฮสต์ของเอเจนต์ DB; หากติดตั้งแยกโฮสต์ ให้รันโฮสต์ละหนึ่งครั้ง |
@@ -99,6 +100,10 @@ cd global-groundtruth/collectors/collection-server
 - หากคำถามเจาะจงเรื่อง **ZFS** ใต้ data path ของ backend ทาง WhaTap จะขอ
   collector คู่กันในไดเรกทอรีเดียวกัน (`./collect-collzfs.sh --file`) ด้วย
   เป็นรายงานคนละฉบับ กรุณาส่งทั้งสองไฟล์
+- หากคำถามเกี่ยวกับ **MySQL** ของ backend ให้รัน `./collect-collmysql.sh --file`
+  บนโฮสต์ MySQL หากฐานข้อมูลต้องล็อกอิน ให้ระบุผ่าน `--defaults-file <my.cnf>`
+  หรือปล่อยให้ collector ถามรหัสผ่านบนเทอร์มินัล ห้ามพิมพ์รหัสผ่านลงในบรรทัดคำสั่ง
+  เพราะผู้ใช้อื่นบนโฮสต์นั้นอ่านได้
 
 ### 4.2 Kubernetes (bastion / เครื่องทำงาน)
 
@@ -198,6 +203,15 @@ cd global-groundtruth\collectors\apm\dotnet
 - การรันใช้เวลาไม่กี่วินาทีจนถึงไม่กี่นาทีบนโฮสต์ที่ช้า รอให้จบ — รายงานจะจบด้วย
   บรรทัด `==== END OF COLLECTION ... ====` เสมอ
 - บรรทัด `n/a (...)` ในรายงานเป็นเรื่องปกติ ส่งไฟล์ตามสภาพที่ได้
+- **บรรทัด `>> status:` บรรทัดสุดท้าย** บอกว่าการรันครั้งนี้ได้สิ่งที่ต้องการหรือไม่
+  - `status: COMPLETE` — ส่งไฟล์ได้เลย
+  - `status: INCOMPLETE` — บรรทัดด้านล่างจะระบุสิ่งที่ถูกบล็อกและวิธีรันแบบอื่นที่จะได้ค่านั้น
+    เช่น `run again with sudo` หรือ `rerun with --home <dir>` หากนโยบายของคุณอนุญาต
+    ให้ทำตามแล้วส่งไฟล์ใหม่ หากไม่อนุญาต ให้ส่งไฟล์ตามสภาพที่ได้ รายงานระบุไว้แล้วว่า
+    อ่านอะไรไม่ได้ และ WhaTap จะดำเนินการต่อจากนั้น
+- collector ของ Kubernetes, NMS, ฐานข้อมูล และ collection server ต้องใช้ `bash`
+  ให้รันตามที่แสดงไว้ (`./collect-...sh`) หากรันด้วย `sh collect-...sh` จะหยุดทันที
+  และแจ้งเหตุผล
 
 ## 5. การส่งกลับ
 
@@ -208,14 +222,26 @@ cd global-groundtruth\collectors\apm\dotnet
 
 ## 6. ข้อควรระวังด้านความปลอดภัย
 
-- รายงานและ bundle ทั้งหมดมีการตั้งค่าแบบ **ตรงตามต้นฉบับ (verbatim)** —
-  ไม่มีการปิดบัง ตามนโยบายของ framework: ค่าอย่าง license key หรือ community
-  string ต้องอ่านได้จึงจะตรวจสอบยืนยันหรือหักล้างได้ ดังนั้น `secure.conf`
-  รหัสผ่านผู้ดูแลระบบ และ access key จะปรากฏตามจริง ส่งไฟล์ผ่านช่องทางที่
-  เชื่อถือได้ และลบสำเนาในเครื่องเมื่อปิดเคสแล้ว
-- collector **k8s** ไม่อ่านค่า Secret ของ Kubernetes เลย (แสดงเป็นตาราง
-  ชื่อ/ชนิดเท่านั้น) — แต่ส่วนอื่นทั้งหมดรวมถึง log ใน bundle เป็น verbatim
-  จึงต้องดูแลด้วยความระมัดระวังในระดับเดียวกัน
+รายงานและ bundle ยกสิ่งที่อ่านได้มาแบบ **ตรงตามต้นฉบับ (verbatim)** — ไม่มีการปิดบัง
+ตามนโยบายของ framework: ค่าอย่าง license key หรือ community string ต้องอ่านได้
+จึงจะตรวจสอบยืนยันหรือหักล้างได้ ดังนั้นรายงานอาจมีข้อมูลลับอยู่ ส่งไฟล์ผ่านช่องทางที่
+เชื่อถือได้ และลบสำเนาในเครื่องเมื่อปิดเคสแล้ว
+
+แหล่งที่ข้อมูลลับอาจเข้ามาได้ แยกตาม collector (รายการเต็มอยู่ใน README ของแต่ละ
+collector):
+
+| Collector | อาจมี |
+|---|---|
+| collection server | `conf/*.conf` (license, `admin.password`, access key), `ps aux` ใน bundle, heap dump |
+| MySQL | ตัวแปรของเซิร์ฟเวอร์และรายการโปรเซส ไม่มีรหัสผ่านที่คุณให้ไว้ |
+| ZFS | `zpool history` (คำสั่งที่เคยรันกับ pool) |
+| Kubernetes | ค่า environment ของ pod และ workload, `helm get values`, environment ของ operator สำหรับ Secret ของ Kubernetes จะอ่านเฉพาะ `cert.pem` สาธารณะของ webhook และแสดงเป็น fingerprint เท่านั้น |
+| NMS | การตั้งค่า NMS (access key, SNMP community), ไฟล์ repository ที่อาจมี `user:password@` |
+| ฐานข้อมูล | `whatap.conf` (license, `aws_secret_key`, `connect_option`), JDBC URL, บรรทัด cron ที่กล่าวถึง WhaTap |
+| Java / Python / Node.js / PHP / .NET | การตั้งค่า agent, environment และบรรทัดคำสั่งของโปรเซสแอปพลิเคชัน, การตั้งค่า process manager (เช่น `ecosystem.config.js`) |
+
+collector จะไม่นำข้อมูลรับรองที่คุณให้ไว้ไปใส่ในบรรทัดคำสั่ง และ collector ของ MySQL
+จะไม่เขียนรหัสผ่านลงในรายงาน
 
 ## 7. ภาษา
 

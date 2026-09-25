@@ -72,7 +72,7 @@ global-groundtruth/
 │   ├── nms/                      # SEEDED v0 — NMS Control Manager host collector
 │   ├── server/                   # STUB (README only)
 │   ├── apm/                      # SEEDED — java/ python/ nodejs/ php/ v0 + dotnet/ v0 (Windows)
-│   ├── db/                       # STUB (README only)
+│   ├── db/                       # SEEDED v0 — shell collector + SQL packs
 │   └── collection-server/        # SEEDED v0 — WhaTap backend (yard/proxy/...) collector
 ├── templates/
 │   └── collector-skeleton/       # copy this to start a collector
@@ -88,7 +88,7 @@ global-groundtruth/
 | `nms`               | SEEDED v0       | สคริปต์บนโฮสต์ NMS Control Manager; ดู `collectors/nms/` |
 | `server`            | NOT IMPLEMENTED | สคริปต์ shell บนโฮสต์; ดู `collectors/server/`          |
 | `apm`               | SEEDED v0        | แยกตามภาษา; seed v0 แล้ว: `java`, `python`, `nodejs`, `php`, `dotnet`; ดู `collectors/apm/` |
-| `db`                | NOT IMPLEMENTED | SQL + dump การตั้งค่า agent; ดู `collectors/db/`         |
+| `db`                | SEEDED v0       | collector แบบ shell + SQL pack; ดู `collectors/db/`       |
 | `collection-server` | SEEDED v0       | สคริปต์บนโฮสต์ backend; ดู `collectors/collection-server/` |
 
 รีโพซิทอรีนี้ประกอบด้วยตัว **framework** (contract, format, template,
