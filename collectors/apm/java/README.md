@@ -1,10 +1,13 @@
 # collectors/apm/java — WhaTap Java APM agent collector
 
-> **Status: SEEDED (v0).** `collect-apmjava.sh` is a working Tier-0 collector,
-> plus an opt-in library detail pack (`--library` / `--class`) and two opt-in
-> Tier-2 flags (`--threads` / `--jcmd`), seeded by the Global team (CONTRACT
-> rule 4 — interim ownership). Ongoing ownership belongs to the Java agent
-> developers once handed over.
+> **Status: SEEDED (v0; validated at `collect-apmjava.sh` 0.6.0, the third
+> live run at FIF on 2026-09-17; the script's own `VERSION` is the current
+> one, and the changes after 0.6.0 have not met a real host yet).**
+> `collect-apmjava.sh` is a working Tier-0 collector, plus an opt-in library
+> detail pack (`--library` / `--class`) and two opt-in Tier-2 flags
+> (`--threads` / `--jcmd`), seeded by the Global team (CONTRACT rule 4 —
+> interim ownership). Ongoing ownership belongs to the Java agent developers
+> once handed over.
 
 Collects the hidden facts a remote WhaTap Java-agent developer repeatedly asks
 a field engineer for. The fact list was derived from the agent source
@@ -19,7 +22,7 @@ socket gateway) and 2026-06-30 (keypro GlassFish console/JUL logging loop).
 | | Fact | Why the report is built around it |
 |---|---|---|
 | Attach | `-javaagent:` may arrive on the command line **or** through `JAVA_TOOL_OPTIONS` / `JDK_JAVA_OPTIONS` / `_JAVA_OPTIONS` | the operator injects it via `JAVA_TOOL_OPTIONS`, so it never appears in `/proc/<pid>/cmdline`; all four sources are read and **every** `-javaagent` reaching the JVM is listed with a count (a second profiler is then a visible fact) |
-| Config | env `WHATAP_CONFIG_FILE` > `-Dwhatap.config.file` > `-Dwhatap.home` (**default `"."`, the process working directory**) + `-Dwhatap.config` (default `whatap.conf`) | the home is a **per-process** fact, not a host fact; an operator-injected pod usually has no conf file at all and runs on environment values only, and the report shows exactly that |
+| Config | env `WHATAP_CONFIG_FILE` > `-Dwhatap.config.file` > `-Dwhatap.home` + `-Dwhatap.config` (default `whatap.conf`). When `-Dwhatap.home` is absent the agent sets it to the directory of its own jar before reading the file (`whatap.agent.boot.AgentBoot`, `JarUtil.getJarLocation`); `Configure`'s literal default `"."`, the process working directory, is reached only when no `-javaagent` jar location is known | the home is a **per-process** fact, not a host fact, and a relative home or config path is relative to **that JVM's** working directory, so the collector joins it to `/proc/<pid>/cwd` and reads an absolute one through `/proc/<pid>/root` when the JVM is in another mount namespace, or when it runs under a chroot (a working directory is taken off the root's path and resolved the same way); a JVM whose root this run cannot read at all (another user's, as non-root) has its paths reported as not readable, never read from the collector's own filesystem in their place; every path is resolved symlink component by component under that root (an absolute link target is re-rooted there and `..` stops at it), because the kernel resolves a link met below `/proc/<pid>/root` against the collector's own root and a container's `whatap.conf -> /etc/shadow` would otherwise read the host's file; an operator-injected pod usually has no conf file at all and runs on environment values only, and the report shows exactly that |
 | Overlay | the agent overlays environment variables and system properties onto the config file (`ConfigValueUtil.replaceSysProp`) | so the conf dump alone is not the effective setting — the whatap-related env of each process (names may contain dots: `license`, `whatap.server.host`) and every `-Dwhatap.*` argument are reported next to it |
 | Version | the agent build fixes no version into the jar filename | version is read from **`whatap/v.properties` inside the jar** (`VERSION`/`BUILD`, the file `whatap.Version` itself reads), cross-checked by jar size/mtime/sha256 and by the `WhaTap Java v<version>` banner at the head of `logs/whatap.log` |
 
@@ -210,64 +213,113 @@ Container notes:
 
 | # | Section | Answers the recurring question |
 | --- | --- | --- |
-| 1 | Collection environment | which tools were available to this collection; whether Tier 2 was requested |
+| 1 | Collection environment | which tools were available to this collection, the privilege and host boot time, the per-command cap and run deadline, and which opt-in flags were given |
 | 2 | A. Host / platform | OS, kernel, CPU/memory, **cgroup limits** (the JVM sizes heap and thread pools from them), container markers, and clock/NTP state (transaction timestamps) |
-| 3 | B. Java runtimes discovered | every java binary from running processes, PATH, `JAVA_HOME` and `/usr/lib/jvm`: the `release` file (free) plus `-version` (a separate short-lived JVM, never the target process) |
-| 4 | C. WhaTap agent artifacts on disk | every agent jar found via `-javaagent`, `WHATAP_JAVA_AGENT_PATH` and `/whatap-agent`, with size/mtime/sha256 and the in-jar `whatap/v.properties` (VERSION/BUILD); javahelper and other whatap files next to it |
-| 5 | D. JVM processes and agent attachment | the `/proc` walk itself (entries scanned, entries skipped, the four tests applied in order), then per JVM (WhaTap-attached first): **which test identified it as a JVM**, verbatim cmdline, for a JVM found by its `libjvm.so` mapping whether its options were recovered from the VM via `--jcmd` or not asked for, **count and list of every `-javaagent` reaching the JVM from all four argument sources** with per-path existence, `JAVA_TOOL_OPTIONS`/`_JAVA_OPTIONS`/`JDK_JAVA_OPTIONS`/`JAVA_OPTS`/`CATALINA_OPTS`, server markers (the same properties `ProcessTypeDetector` reads), program identity (main class / executable jar; for a JNI-created VM the `java_command` the VM recorded, never a token off the launcher's own argv), uid, thread count, RSS, start time, cwd, and **where fd 1 / fd 2 point** — the boot banner and any SIGQUIT dump land there, not in the agent log |
-| 6 | E. Agent home resolution and configuration | the resolution rule (env `WHATAP_CONFIG_FILE`, then `-Dwhatap.config.file`, then `-Dwhatap.home`; when the latter is absent the agent sets it to the directory of its own `-javaagent` jar before reading the file, `AgentBoot`, so the collector resolves the same way and falls back to the working directory only when no jar path is known), then **per process**: the config path it resolves to and whether the file exists, `whatap.conf` verbatim plus byte facts (size, CR 0x0D count — Windows-edited conf files are a recurring case), the whatap-related environment of that process (dotted names included), `whatap.env`, every `-Dwhatap.*` argument, the home listing, `security.conf`/`paramkey.txt` presence, `container.conf` |
+| 3 | B. Java runtimes discovered | every java binary from running processes, PATH, `JAVA_HOME` and the install-root globs: the `release` file (free) plus `-version` (a separate short-lived JVM, never the target process). `-version` runs **only when both the name the binary was found or invoked under (PATH name, `argv[0]`) and the file it resolves to are named `java`**: any other JVM binary (an embedding launcher such as `vshell`, `jsvc`, or a symlink named `vshell` that points at `java`) is listed with the VM library it maps and the `release` file found above that library, and is never executed, because what it does with `-version` is its own business |
+| 4 | C. WhaTap agent artifacts on disk | every agent jar found via `-javaagent`, `WHATAP_JAVA_AGENT_PATH` and `/whatap-agent`, each resolved as its own JVM resolves it (relative to that JVM's working directory, through its root when it is in another mount namespace), with size/mtime/sha256 and the in-jar `whatap/v.properties` (VERSION/BUILD); a jar that could not be read says why (`permission denied: …` / `path not found: …`); javahelper and other whatap files next to it |
+| 5 | D. JVM processes and agent attachment | the `/proc` walk itself (entries scanned, entries skipped because their cmdline was unreadable while the process still existed, the four tests applied in order, how many processes the maps test could not read, which JVMs' `environ` this run could not read), a fifth test for the processes whose maps this run cannot read (another user's, as non-root): the VM's own thread names in the world-readable `/proc/<pid>/task/*/comm` (HotSpot `VM Thread`, `Signal Dispatch`, `Reference Handl`, `VM Periodic Tas`, `C1`/`C2 CompilerThre`, `GC Thread#<n>`, verified on OpenJDK 17; OpenJ9 `JIT Compilation`, `Signal Reporter`, `Finalizer maste`, not verified on a running OpenJ9; one glob of every thread's comm file and one grep; a process is a candidate only when two distinct VM thread names match, and a scan that hits its safety cap or time cap is reported as partial and blocks the goals). Only a **confirmed** JVM — a libjvm / libj9vm mapping read in its maps — is ever attached to (`jcmd`, `jstack`) or signalled (SIGQUIT); a JVM found only by its comm, an argument or its thread names is reported and counted, never attached. A wrapper that runs java as a child (`sudo`, `timeout`, `nohup`, `env`, `setsid`, `nice`, `tini`, …) is excluded by its comm even though its argv carries the JVM options. Then per JVM (WhaTap-attached first): **which test identified it as a JVM**, whether it shares the collector's mount namespace, verbatim cmdline, whether its `environ` was readable (when it was not, `JAVA_TOOL_OPTIONS` and the other injected options were not read), for a JVM found by its `libjvm.so` mapping whether its options were recovered from the VM via `--jcmd` or not asked for, **count and list of every `-javaagent` reaching the JVM from all four argument sources** with per-path existence as that JVM resolves the path, `JAVA_TOOL_OPTIONS`/`_JAVA_OPTIONS`/`JDK_JAVA_OPTIONS`/`JAVA_OPTS`/`CATALINA_OPTS`, server markers (the same properties `ProcessTypeDetector` reads), program identity (main class / executable jar; for a JNI-created VM the `java_command` the VM recorded, never a token off the launcher's own argv), uid, thread count, RSS, start time (from `/proc/<pid>/stat` and `btime`, which busybox `ps` cannot print), cwd, and **where fd 1 / fd 2 point** — the boot banner and any SIGQUIT dump land there, not in the agent log |
+| 6 | E. Agent home resolution and configuration | the resolution this collector applies (the Config row above), then **per process** (cap 8): the config path and home it resolves to and where each came from (an assumed default file name is named as such), `whatap.conf` verbatim plus byte facts (size, CR 0x0D count — Windows-edited conf files are a recurring case), the whatap-related environment of that process (dotted names included), `whatap.env` (a properties text the agent applies over the config), every `-Dwhatap.*` argument, the home listing, `security.conf`/`paramkey.txt` presence and size (they hold the SQL-parameter encryption key, whose content is not collected), `container.conf` (the container id the k8s node agent writes). Then every home candidate with whether it was readable, and for a home no attached JVM resolves (collector-shell `WHATAP_HOME`, `/whatap-agent`) its `whatap.conf` under the assumed default name |
 | 7 | F. Application libraries visible to the target JVMs | every jar of a listed directory is recorded even though only the first 120 are printed, so `--library` reaches one that sorts past the printed part; classpath entries, executable-jar contents (`BOOT-INF/lib`, `WEB-INF/lib`), `CLASSPATH`, server `lib`/`webapps/*/WEB-INF/lib`/`deploy`/`deployments` directories (exploded `*.ear/lib` and `*.war/WEB-INF/lib` included), and open jar file descriptors — **agent jar excluded, exclusion stated** |
 | 8 | G. Agent instrumentation surface and weaving activation | **what this agent build can instrument**: the `weaving/<name>.jar` modules bundled in the installed jar and its built-in `whatap/agent/asm/*ASM` classes; the on-disk `<home>/weaving/` plugin directory (loaded whole-directory, independent of the weaving list) and the `<home>/plugin/*.x` script plugins (size, mtime); the weaving / `hook_service_*` / `hook_method_*` / `instrumentation_*` / `_enable_asm_*` settings in force, with a **per-entry check of the weaving list against that jar**; and the `Weaving` lines the running process wrote to the agent log (`Load <module>`, and the compiled-class-version `Warning`/`Error` that stops a module from applying) — bounded log window, never a whole-file grep |
 | 9 | H. Application logging stack | logging `-D` properties, the logging libraries **filtered out of section F's inventory** (so a library that is present but not yet opened is still reported), logging config files in each working directory, the console destination and the server log directories with sizes — the on-disk volume and the collected volume are both facts a reader compares |
-| 10 | I. WhaTap agent logs | `<home>/logs` inventory, `whatap.log` head (the `WhaTap Java v<version>` banner) and tail, the most recent rotated `whatap-YYYYMMDD.log`, and a `[WA*]` code frequency count — all bounded reads |
-| 11 | J. Network endpoints | the `whatap.server.host`/`port` values reaching each JVM through env or `-D`, TCP sessions toward :6600, DNS resolvers, proxy variables |
+| 10 | I. WhaTap agent logs | per attached JVM, the log directory from `log_root` and the file name from `log_name` (read from `-D`, env or the config file, and the source named); when neither is set, `<home>/logs` and `whatap`, stated as the assumed defaults; then the directory inventory, the log head (the `WhaTap Java v<version>` banner) and tail, the most recent rotated `<log_name>-*.log` by mtime, and a `[WA*]` code frequency count over the last 500 lines — all bounded reads, sizes from the inode instead of a line count |
+| 11 | J. Network endpoints | the `whatap.server.host`/`port` values reaching each JVM through `-D`, env or its config file (source named); the TCP sessions owned by the JVM processes (matched on the pid `ss -p` / `netstat -p` prints; as non-root these name the owner only of this uid's sockets, so another user's JVM is reported as `owner not visible to uid N` rather than as having no session); the TCP sessions to the configured server port(s) and to 6600 (the assumed default, which other WhaTap agents on the host use too) from any owner, where the process column is empty for a socket whose owner the uid cannot see; DNS resolvers, proxy variables |
 | 12 | K. Kubernetes / operator injection context | `/whatap-agent` listing, `WHATAP_JAVA_AGENT_PATH`, `JAVA_TOOL_OPTIONS`, `POD_NAME`/`NODE_NAME`/`NODE_IP`/`OKIND`/`WHATAP_MICRO_ENABLED`, k8s markers |
 | 13 | L. Tier 2 artifacts (opt-in) | `--threads[=N]`: N `jstack -l` dumps per attached JVM (cap 3 JVMs, 5000 lines per dump), falling back to `jcmd Thread.print -l` and then to SIGQUIT (whose output goes to the fd 1 target shown in section D), **followed by a frame-frequency count over the dumps just taken** — every `at <class>.<method>` line, counted and sorted, in three buckets defined by the package prefixes printed with them (JDK/vendor, `whatap.`, everything else). `--dump-file PATH` (repeatable) adds a dump taken elsewhere to the same counts without contacting any JVM. After the frame buckets: thread header count, thread states counted, thread name shapes (digit runs collapsed), dotted class-like names carried inside thread names with their package roots, and the frames and thread names of other APM agents on the same JVM against a fixed prefix list printed verbatim. `--jcmd`: `VM.command_line`, `VM.system_properties`, `VM.flags`, `VM.version` — for every WhaTap-attached JVM **and** every JVM whose options are absent from `/proc` (cap 3), since for the latter this is the only verbatim record of what it runs. When none of the flags is given the section states that no attach, signal or pause was applied |
 | 14 | M. Library detail pack (opt-in) | `--library PAT` / `--library-all`: for every enumerated jar that matches, a byte-identical copy being named rather than detailed twice (several deployment units of one application carry the same jar, and detailing each copy spends the 40-jar cap on identical content), and the package histogram left out for a jar whose class names section N already prints — Maven coordinates from `META-INF/maven/*/pom.properties`, manifest version attributes, **class-file major version** (the number a weaving module has to be compiled against), package map (shading shows here), class count, multi-release/module/service entries; `--class FQCN` adds `javap -p -s` member signatures, JVM descriptor included. Libraries packed inside an executable jar are extracted (bounded at 80 MB) and reported with an `origin:` entry line instead of a path; `--class` also resolves application classes out of `BOOT-INF/classes` |
-| 15 | N. Application class index (opt-in) | `--appclasses`: the classes the application itself ships, from every class root section F enumerated — directory classpath entries (a relative one resolved through the JVM's own working directory), the JVM's working directory itself when it carries `BOOT-INF/classes`, `WEB-INF/classes`, `classes` or a top-level class file, every configured Tomcat `appBase` and `docBase` rather than `<instance>/webapps` alone, a Jetty base's `webapps`, `WEB-INF/classes` of deployment units, `WEB-INF/classes` directories found under `jeus.home`/`domain.home`/`com.sun.aas.instanceRoot` (GlassFish, Payara) (depth 10, first 12), a WebLogic domain located from `-Dweblogic.Name` plus the process working directory or its `DOMAIN_HOME` (the stock start scripts set no `domain.home`): `servers/<name>/tmp/_WL_user/**/WEB-INF/classes` and the `<source-path>` entries of `config/config.xml`, and `WEB-INF/classes`/`BOOT-INF/classes` read in place inside a war/ear/executable jar (cap 12 roots, 20000 class files per root). A `BOOT-INF/classes` or `WEB-INF/classes` segment at the head of a path inside a root is a layout artifact and is not printed as part of the class name. Reported as a class count, a package histogram, a name-pattern index over a fixed pattern list printed with it, a count of the classes matching none of those patterns, and the class list (first 2000). A class root that yields no class file also reports the jar count of its sibling `lib` directory, because a deployment unit can ship the application's own code as jars rather than as class files (name those jars with `--library` to get their class lists from section M). Then the join with section L: the frames of every counted dump whose class is in this index, with a stated 0 when there is none. Libraries are section F; this section is the application's own code |
+| 15 | N. Application class index (opt-in) | `--appclasses`: the classes the application itself ships, from every class root section F enumerated — directory classpath entries (a relative one resolved through the JVM's own working directory), the JVM's working directory itself when it carries `BOOT-INF/classes`, `WEB-INF/classes`, `classes` or a top-level class file, every configured Tomcat `appBase` and `docBase` rather than `<instance>/webapps` alone, a Jetty base's `webapps`, `WEB-INF/classes` of deployment units, `WEB-INF/classes` directories found under `jeus.home`/`domain.home`/`com.sun.aas.instanceRoot` (GlassFish, Payara) (depth 10; the WebLogic staging area depth 7; each search stops descending at every `WEB-INF`, visits at most 20000 directories and runs under the per-command cap, and the report states those bounds and marks the result partial when one was hit; first 12), a WebLogic domain located from `-Dweblogic.Name` plus the process working directory or its `DOMAIN_HOME` (the stock start scripts set no `domain.home`): `servers/<name>/tmp/_WL_user/**/WEB-INF/classes` and the `<source-path>` entries of `config/config.xml`, and `WEB-INF/classes`/`BOOT-INF/classes` read in place inside a war/ear/executable jar (cap 12 roots, 20000 class files per root). A `BOOT-INF/classes` or `WEB-INF/classes` segment at the head of a path inside a root is a layout artifact and is not printed as part of the class name. Reported as a class count, a package histogram, a name-pattern index over a fixed pattern list printed with it, a count of the classes matching none of those patterns, and the class list (first 2000). A class root that yields no class file also reports the jar count of its sibling `lib` directory, because a deployment unit can ship the application's own code as jars rather than as class files (name those jars with `--library` to get their class lists from section M). Then the join with section L: the frames of every counted dump whose class is in this index, with a stated 0 when there is none. Libraries are section F; this section is the application's own code |
 
-## Security note
+## Collection status
 
-Framework policy: WhaTap configuration files (`whatap.conf`, `container.conf`)
-are dumped **verbatim, never masked** — a mistyped license or server address
-must be readable to be verified or refuted. The whatap-related environment
-variables of running processes (including `license=`) are reported verbatim
-for the same reason. Handle the report accordingly.
+The report ends with the goals it came for. Two are always declared: **agent
+artifacts on disk** and **agent configuration**. Each requested opt-in adds
+one: `--threads`, `--jcmd`, `--dump-file`.
 
-One data-scope exception (not masking): `security.conf` / `paramkey.txt` hold
-the SQL-parameter **encryption key**; the report states presence and size only,
-never content.
+- *agent artifacts* is obtained only when an agent jar opened as an archive
+  (an agent home counts only when no jar is named anywhere), and only when
+  every JVM that names an agent had it read: one JVM's corrupt or unreadable
+  jar blocks the goal whatever the other JVMs show. Any JVM whose
+  environment or VM options this run could not read blocks it, even when
+  another JVM's agent was read: a `-javaagent` could arrive there. A JVM
+  found by its VM library or thread names passed its options in memory, so it
+  blocks the goal until `--jcmd` reads them back. The same holds for *agent
+  configuration*. A jar or home that a JVM names but this run could not read is
+  blocked. With no whatap marker anywhere, it is `na` only when the argument
+  list and environment of every JVM were read; a non-root run that cannot read
+  another user's `/proc/<pid>/environ` cannot see a `-javaagent` injected
+  through `JAVA_TOOL_OPTIONS`, so it is blocked, with `run again with sudo`.
+- *agent configuration* is obtained only when every attached JVM's config
+  file was read. A config path that does not exist, or cannot be read, for
+  any attached JVM blocks it, whatever the other JVMs show; with no attached
+  JVM it is `na` when every input was read.
+- *thread dumps* and *jcmd VM data* are blocked by any dump or query that
+  failed, was refused or timed out; a failed `jstack` is reported with its
+  output and is not counted as a dump.
 
-Note that a full JVM command line is dumped verbatim, so any credential passed
-as a `-D` property by the customer's own launcher appears in the report.
+## What the report can contain
+
+Framework policy: what the report quotes is not masked — a mistyped license
+or server address must be readable to be verified or refuted. So the report
+can carry secrets from each of these places, and is handled as the
+customer's configuration is:
+
+| where | section | what it can carry |
+|---|---|---|
+| the agent config file (`whatap.conf` or the per-instance file `-Dwhatap.config` names) | E, G, J | `license`, `accesskey`, server addresses, any key the customer set |
+| `container.conf` | E | the container id written by the node agent |
+| the whatap-related environment of each JVM (`WHATAP_*`, `whatap.*`, `license=`, `accesskey=`, `whatap.env`) | E, J | license and access keys passed as environment |
+| `JAVA_TOOL_OPTIONS`, `JDK_JAVA_OPTIONS`, `_JAVA_OPTIONS`, `JAVA_OPTS`, `CATALINA_OPTS`, `JAVA_OPTIONS`, `CLASSPATH` of each JVM | D, F | whatever the launcher passes there, `-D` credentials included |
+| the full command line of each JVM, and pid 1's | A, D | `-D` passwords, keystore passwords, JDBC URLs with credentials |
+| `jcmd VM.command_line` / `VM.system_properties` (`--jcmd`) | D, L | every system property of the VM, credentials the launcher passed included |
+| thread dumps (`--threads`, `--dump-file`) | L | thread names and lock owners the application chose, which can embed user ids, SQL or URLs |
+| agent log head and tail, rotated log tail | I | URLs, SQL text and error messages the agent logged |
+| server log directory listings, deploy directories, WebLogic `<source-path>` entries | F, H | file and application names |
+| jar manifests, Maven coordinates, `javap` member signatures (`--library`, `--class`) | M | build metadata, internal class and method names |
+| the application class index (`--appclasses`) | N | the application's own class names |
+| proxy variables of the collector shell | J | `http_proxy` may carry `user:password@` |
+
+`security.conf` and `paramkey.txt` hold the SQL-parameter **encryption key**;
+the report states their presence and size only, never their content. The
+collector itself puts no credential on any command line it runs.
 
 ## Load profile
 
 Tier 0 is read-only and **never attaches to, signals, or pauses the target
-JVM**: directory listings only (no recursive walk), bounded `head`/`tail`
-reads, jar central-directory reads via `unzip`, per-probe timeout 15s. Process
-identification adds at most one `/proc/<pid>/maps` read per process, and only
-for the processes the three cheaper tests did not settle. A run
-completes in roughly 10–15s on a host with ~1000 processes. `java -version` is
-executed only against discovered java **binaries**, never against a running
+JVM**. It reads directory listings, bounded `head`/`tail` windows of logs
+(sizes come from the inode, never from counting lines), jar central
+directories via `unzip`, and searches server directories for
+`WEB-INF/classes` (depth 7 under a WebLogic staging area, 10 under `jeus.home` / `domain.home` / `com.sun.aas.instanceRoot`, stopping at each `WEB-INF`, at most 20000 directories visited). Every
+external command runs under `_bounded` (per-command cap 15s, whole run 300s,
+`RUN_DEADLINE`), with or without `timeout(1)`. Process identification forks
+a fixed handful of commands for the whole `/proc` (one `ls` of the exe links,
+one `grep -z` over every cmdline, one `awk` for comm and the verdicts, one
+`grep` over the maps of the processes the first three tests did not settle),
+not one per process: 0.11.1 took 16.7s at 704 processes on a development
+host, 0.12.0 took 4–7s at about 720 on the same host. `-version` is executed
+only against discovered binaries named `java`, never against a running
 process.
 
 The library detail pack (`--library` / `--library-all` / `--class`) is off by
 default because it is targeted, not because it is risky: it reads jar central
-directories and single entries, extracts a packed library to a temp file only
-when one is requested, and never touches the running JVM. Roughly six `unzip`
-reads per detailed jar, capped at 40 jars.
+directories and single entries, extracts a packed library to a file under the
+run's private directory only when one is requested, and never touches the
+running JVM. Capped at 40 jars.
 
 The application class index (`--appclasses`) is off by default for the same
 reason: one `find` per class root (bounded at 20000 files) or one `unzip -Z1`
 per archive root, capped at 12 roots, with no contact with the running JVM.
 
-Tier 2 is off by default. Each flag prints its impact on stderr before running:
-`--threads` pauses the target JVM at a safepoint for each dump, `--jcmd` uses
-the JVM attach mechanism — once during discovery to recover the options of a
-JVM that has none in `/proc` (cap 4 processes), and once in section L for the
-verbatim `VM.*` output (cap 3). `jmap` is not used at all — never `jmap -histo:live`
+Tier 2 is off by default. Each flag prints its impact on the terminal before
+running, also in `--file` mode: `--threads` pauses the target JVM at a
+safepoint for each dump (cap 60s per dump), `--jcmd` uses the JVM attach
+mechanism — once during discovery to recover the options of a JVM that has
+none in `/proc` (cap 4 processes), and once in section L for the verbatim
+`VM.*` output (cap 3). `jmap` is not used at all — never `jmap -histo:live`
 (it forces a full GC).
+
+Temporary files (jar listings, extracted nested jars, thread dumps, the
+class-ref scan) live in the run's private directory, removed on exit and on
+INT, TERM and HUP.
 
 No `--bundle` tier yet; copy the bundle plumbing from `collect-collserver.sh`
 if the domain team needs raw log artifacts.
