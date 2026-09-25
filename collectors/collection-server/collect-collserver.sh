@@ -24,6 +24,10 @@
 # its footer even when individual steps fail; each step guards itself.
 # -----------------------------------------------------------------------------
 
+# bash only (arrays for the discovered JVMs). Checked first, so sh or dash
+# stops with a sentence instead of a syntax error.
+[ -n "${BASH_VERSION:-}" ] || { echo "collect-collserver.sh needs bash" >&2; exit 2; }
+
 export LC_ALL=C
 
 # ---- collector metadata -----------------------------------------------------
@@ -63,7 +67,23 @@ COLLECTOR_NAME="whatap-collserver"
 #        summarized in the report's G section. Reason: a production collection
 #        server produced a 393MB bundle that the field could not move; 99.95% of
 #        it was logs (sf-whatap-web02-bsd, 2026-09-23).
-VERSION="0.8.1"
+# 0.9.0  An absence is `na` only when every input behind it was read: an
+#        unreadable conf/ or logs/ (its glob came back literally and read as
+#        "holds no *.conf", COMPLETE), hidepid, unreadable cmdlines, a failed
+#        process scan, a running JVM whose home was not found, an installed
+#        unit file or an unreadable install path now block the goal instead.
+#        WHATAP_HOME is also found from a JVM's cwd, $WHATAP_HOME and the
+#        common install paths. Every external command is bounded and a hung
+#        systemctl is asked once; discovery reads /proc with one grep through
+#        xargs (8.1s -> 2.4s on a 739-process host) and systemd with one
+#        `systemctl show`, and works with the script on stdin. The bundle
+#        journal is capped, the bundle is built in the run's private directory,
+#        numeric options are checked (exit 2), an unwritable --out or failed
+#        tar exits 1, and --file is handed back under sudo. Ports are labelled
+#        as module defaults; the cwd is never measured for an unresolved
+#        yardbase; how-to-run text moved from facts to goal reasons. Needs
+#        bash, and says so under sh.
+VERSION="0.9.0"
 DOMAIN="collection-server"
 TARGET="collection-server/$(hostname 2>/dev/null || echo unknown)"   # refined after WHATAP_HOME is resolved
 
@@ -85,6 +105,10 @@ OPT_HEAP=0           # Tier 2: full heap dump
 OPT_DU=0             # Tier 2: recursive du of yardbase
 OPT_TIMEREF=0        # Tier 2: compare clock to an external time source (network call)
 TIMEREF_SERVER="pool.ntp.org"
+# RUN_DEADLINE as the caller gave it (empty when not given), read before the run
+# helpers default it: a Tier 2 heap dump or thread dump needs more than the
+# default, and an explicit value from the caller wins over that.
+_RUN_DEADLINE_ENV="${RUN_DEADLINE:-}"
 
 usage() {
     cat <<'EOF'
@@ -187,7 +211,8 @@ have() { command -v "$1" >/dev/null 2>&1; }
 _errfile=""
 _init_errfile() { _errfile="$(_tmp probe.err)"; }
 _timeout_bin=""
-CMD_TIMEOUT=20
+CMD_TIMEOUT="${CMD_TIMEOUT:-20}"
+case "$CMD_TIMEOUT" in ''|*[!0-9]*) CMD_TIMEOUT=20 ;; esac
 
 _classify_err() {
     # reads a stderr file, prints a short classified reason
@@ -618,28 +643,26 @@ _emit_labeled() {
     fi
 }
 
-# probe "label" CMD [ARGS...] -> emits output as facts, or "label: n/a (<why>)"
+# probe "label" CMD [ARGS...] -> emits output as facts, or "label: n/a (<why>)".
+# Every call goes through _bounded (run helpers), so a hung command costs at
+# most CMD_TIMEOUT and the run still reaches its footer. A non-zero exit that
+# still printed something is reported with its output and exit code.
 probe() {
     local label="$1"; shift
-    local bin="$1"
-    if ! command -v "$bin" >/dev/null 2>&1; then
-        fact "$label: n/a (command not found: $bin)"; return
-    fi
+    [ -n "$(_cmd_kind "$1")" ] || { fact "$label: n/a (command not found: $1)"; return; }
+    _past_deadline && { fact "$label: n/a (run deadline reached: ${RUN_DEADLINE}s)"; return; }
     local out rc
-    if [ -n "$_timeout_bin" ]; then
-        out="$("$_timeout_bin" "$CMD_TIMEOUT" "$@" 2>"$_errfile")"; rc=$?
-    else
-        out="$("$@" 2>"$_errfile")"; rc=$?
-    fi
-    if [ "$rc" -eq 124 ] && [ -n "$_timeout_bin" ]; then
-        fact "$label: n/a (timed out: ${CMD_TIMEOUT}s)"; return
+    out="$(_bounded "$@" 2>"$_errfile")"; rc=$?
+    if [ "$rc" -eq 124 ]; then
+        if _past_deadline; then fact "$label: n/a (run deadline reached: ${RUN_DEADLINE}s)"
+        else fact "$label: n/a (timed out: ${CMD_TIMEOUT}s)"; fi
+        return
     fi
     if [ "$rc" -ne 0 ]; then
+        [ -n "$out" ] && { _emit_labeled "$label (exit $rc)" "$out"; return; }
         fact "$label: n/a ($(_classify_err))"; return
     fi
-    if [ -z "$out" ]; then
-        fact "$label: n/a (empty output)"; return
-    fi
+    [ -z "$out" ] && { fact "$label: n/a (empty output)"; return; }
     _emit_labeled "$label" "$out"
 }
 
@@ -647,15 +670,11 @@ probe() {
 # stderr, e.g. `java -version`).
 probe_merged() {
     local label="$1"; shift
-    local bin="$1"
-    if ! command -v "$bin" >/dev/null 2>&1; then
-        fact "$label: n/a (command not found: $bin)"; return
-    fi
+    [ -n "$(_cmd_kind "$1")" ] || { fact "$label: n/a (command not found: $1)"; return; }
     local out rc
-    if [ -n "$_timeout_bin" ]; then out="$("$_timeout_bin" "$CMD_TIMEOUT" "$@" 2>&1)"; rc=$?
-    else out="$("$@" 2>&1)"; rc=$?; fi
-    if [ "$rc" -eq 124 ] && [ -n "$_timeout_bin" ]; then fact "$label: n/a (timed out: ${CMD_TIMEOUT}s)"; return; fi
-    if [ -z "$out" ]; then fact "$label: n/a (empty output)"; return; fi
+    out="$(_bounded "$@" 2>&1)"; rc=$?
+    [ "$rc" -eq 124 ] && { fact "$label: n/a (timed out: ${CMD_TIMEOUT}s)"; return; }
+    [ -z "$out" ] && { fact "$label: n/a (empty output)"; return; }
     _emit_labeled "$label" "$out"
 }
 
@@ -686,13 +705,52 @@ dump_file() {
 progress() { [ "$OPT_QUIET" = 1 ] && return; printf '>> %s\n' "$*" >&3 2>/dev/null; }
 
 # ---- portable helpers -------------------------------------------------------
-cmdline_of() { tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null; }
+# cmdline_of PID -> sets _CL to the process's argv joined by spaces (the same
+# bytes `tr '\0' ' '` gave), with builtins only: it runs once per candidate,
+# and a fork per process made discovery linear in the process count (3.5s of
+# an 8s run on a 759-process host, 2026-09-25).
+_CL=""
+cmdline_of() {
+    local a=""
+    _CL=""
+    while IFS= read -r -d '' a; do _CL="$_CL$a "; done < "/proc/$1/cmdline" 2>/dev/null
+    _CL="$_CL$a"
+}
+
+# _whatap_cmdlines -> /proc/<pid>/cmdline paths that name a whatap module, in
+# /proc order. One bounded grep over every entry instead of a read per process,
+# fed through xargs so a host with tens of thousands of processes does not hit
+# ARG_MAX. Its exit status is kept: grep answers 0 (match) or 1 (none), and 2
+# when a process vanished mid-scan, which xargs reports as 123; anything else
+# (a cap, a failed exec) means the table was not read, and says so.
+CMDLINE_SCAN_WHY=""
+_whatap_cmdlines() {
+    # The list goes through a file and _bounded_in, not a pipe into _bounded:
+    # with the script on stdin (bash -s), _bounded gives its command /dev/null
+    # as stdin, and a piped list would arrive empty and read as "no JVM".
+    local lst; lst="$(_tmp cmdlines.lst)"
+    if have xargs && [ "$lst" != /dev/null ] && printf '%s\0' /proc/[0-9]*/cmdline > "$lst" 2>/dev/null; then
+        _bounded_in "$lst" xargs -0 grep -lsE 'whatap\.server\.|whatap\.opslake\.|\.yard\.boot'
+    else
+        # No xargs or no private directory: the paths as arguments (bounded by ARG_MAX).
+        _bounded grep -lsE 'whatap\.server\.|whatap\.opslake\.|\.yard\.boot' /proc/[0-9]*/cmdline
+    fi
+}
+_scan_cmdlines() {
+    local rc
+    _SCAN_OUT="$(_whatap_cmdlines)"; rc=$?
+    case "$rc" in
+        0|1|2|123) CMDLINE_SCAN_WHY="" ;;
+        124) CMDLINE_SCAN_WHY="the /proc/<pid>/cmdline scan did not finish within ${CMD_TIMEOUT}s" ;;
+        *)   CMDLINE_SCAN_WHY="the /proc/<pid>/cmdline scan failed (xargs/grep exit $rc)" ;;
+    esac
+}
 
 get_listen_ports() {
     if have ss; then
-        ss -ltn 2>/dev/null | awk 'NR>1{n=split($4,a,":"); print a[n]}'
+        _bounded ss -ltn 2>/dev/null | awk 'NR>1{n=split($4,a,":"); print a[n]}'
     elif have netstat; then
-        netstat -ltn 2>/dev/null | awk '/^tcp/{n=split($4,a,":"); print a[n]}'
+        _bounded netstat -ltn 2>/dev/null | awk '/^tcp/{n=split($4,a,":"); print a[n]}'
     else
         # /proc/net/tcp{,6}: state 0A == LISTEN; local port is hex after ':'
         awk '$4=="0A"{split($2,a,":"); print a[2]}' /proc/net/tcp /proc/net/tcp6 2>/dev/null \
@@ -702,30 +760,130 @@ get_listen_ports() {
 
 fstype_of() {
     local p="$1"
-    if have findmnt; then findmnt -no FSTYPE -T "$p" 2>/dev/null && return; fi
-    if have stat; then stat -f -c '%T' "$p" 2>/dev/null && return; fi
+    if have findmnt; then _bounded findmnt -no FSTYPE -T "$p" 2>/dev/null && return; fi
+    if have stat; then _bounded stat -f -c '%T' "$p" 2>/dev/null && return; fi
     echo ""
 }
 
 source_of() {
     local p="$1"
-    have findmnt && findmnt -no SOURCE -T "$p" 2>/dev/null
+    have findmnt && _bounded findmnt -no SOURCE -T "$p" 2>/dev/null
 }
 
-# systemd helpers — avoid `--value` (unsupported on systemd <230 / Ubuntu 16.04)
-sd_show() { have systemctl && systemctl show -p "$1" "$2.service" 2>/dev/null | cut -d= -f2-; }
+# systemd helpers — avoid `--value` (unsupported on systemd <230 / Ubuntu 16.04).
+# Bounded: systemctl waits on D-Bus, and a wedged systemd would hang every call.
+# Fail fast: once one systemctl call hits the cap, the rest are skipped rather
+# than each costing CMD_TIMEOUT again. The mark is a file in the run's private
+# directory because most calls run inside $(...), where a variable would not
+# survive.
+_sd() {
+    local mark="" rc
+    [ -n "$_tmp_dir" ] && mark="$_tmp_dir/systemctl.hung"
+    [ -n "$mark" ] && [ -e "$mark" ] && return 124
+    _bounded systemctl "$@" 2>/dev/null; rc=$?
+    if [ "$rc" -eq 124 ] && [ -n "$mark" ]; then
+        : > "$mark"
+        warn "systemctl did not answer within ${CMD_TIMEOUT}s; further systemctl calls are skipped"
+    fi
+    return "$rc"
+}
+
+# One `systemctl show` for every unit this run asks about, instead of one per
+# question (57 calls, about 1.4s, on a host with the whatap units; 2026-09-25).
+# The output is one block per unit, separated by blank lines, properties in
+# systemd's order rather than the order asked; each block is read whole and
+# filed under its Id. sd_show answers from here, and asks systemctl itself
+# only for a unit that was not prefetched.
+_SD_CACHE=""   # lines: <unit><TAB><Prop>=<value>
+_SD_KNOWN=" "  # units the prefetch answered for
+_sd_prefetch() {
+    have systemctl || return 0
+    local out line id="" blk=""
+    out="$(_sd show -p Id -p LoadState -p WorkingDirectory -p NRestarts "$@")"
+    [ -n "$out" ] || return 0
+    # A trailing blank line closes the last block.
+    while IFS= read -r line; do
+        if [ -n "$line" ]; then
+            case "$line" in Id=*) id="${line#Id=}" ;; esac
+            blk="$blk$line$_nl"
+            continue
+        fi
+        if [ -n "$id" ]; then
+            _SD_KNOWN="$_SD_KNOWN$id "
+            while IFS= read -r line; do
+                [ -n "$line" ] && _SD_CACHE="$_SD_CACHE$id$_tab$line$_nl"
+            done <<EOB
+$blk
+EOB
+        fi
+        id=""; blk=""
+    done <<EOF
+$out
+
+EOF
+}
+# _sd_cached PROP UNIT -> the prefetched value; false when UNIT was not prefetched
+_sd_cached() {
+    case "$_SD_KNOWN" in *" $2 "*) ;; *) return 1 ;; esac
+    local l
+    while IFS= read -r l; do
+        case "$l" in "$2$_tab$1="*) printf '%s\n' "${l#*=}"; return 0 ;; esac
+    done <<EOF
+$_SD_CACHE
+EOF
+    return 0
+}
+sd_show() {
+    have systemctl || return 0
+    _sd_cached "$1" "$2.service" && return 0
+    _sd show -p "$1" "$2.service" | cut -d= -f2-
+}
 unit_loaded() { [ "$(sd_show LoadState "$1")" = "loaded" ]; }
+sd_state() { _sd "$1" "$2.service"; }
 
 WHATAP_UNITS="yard proxy gateway keeper account notihub eureka front router billing crane flexreport"
 
+# Places a WhaTap backend is commonly unpacked to. They are only READ: a
+# candidate becomes WHATAP_HOME when it holds a module config or a server jar,
+# and an unreadable one keeps "not installed here" from being concluded.
+WHATAP_HOME_CANDIDATES="/whatap /data/whatap /opt/whatap /app/whatap /home/whatap /usr/local/whatap /whatap/server /data/whatap/server"
+
+# _dir_ok DIR -> true when this uid can list DIR (read + search)
+_dir_ok() { [ -d "$1" ] && [ -r "$1" ] && [ -x "$1" ]; }
+
+# _looks_like_home DIR -> true when DIR holds a module config or a server jar
+_looks_like_home() {
+    local d="$1" u f
+    for u in $WHATAP_UNITS; do [ -f "$d/conf/$u.conf" ] && return 0; done
+    for f in "$d"/lib/whatap.server.*.jar "$d"/lib/whatap.opslake.*.jar "$d"/*.yard.boot*; do
+        [ -e "$f" ] && return 0
+    done
+    return 1
+}
+
 # ---- discovery (run once) ---------------------------------------------------
 # PIDS[] and MODS[] are parallel indexed arrays of discovered whatap JVMs.
+PROC_SEEN=0          # /proc/<pid> entries looked at
+PROC_UNREAD=0        # of those, cmdline not readable by this uid
 discover_services() {
     PIDS=(); MODS=()
     local d pid cl mod
+    # Accounting first, with builtins only: how many entries there were, and
+    # how many this uid could not read (the absence rule needs both).
     for d in /proc/[0-9]*; do
-        [ -r "$d/cmdline" ] || continue
-        cl="$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null)"
+        [ -d "$d" ] || continue
+        PROC_SEEN=$((PROC_SEEN + 1))
+        # A process that exited during the scan is gone, not unreadable.
+        if [ ! -r "$d/cmdline" ]; then
+            if [ -d "$d" ]; then PROC_UNREAD=$((PROC_UNREAD + 1)); else PROC_SEEN=$((PROC_SEEN - 1)); fi
+        fi
+    done
+    local f
+    _scan_cmdlines
+    while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        d="${f%/cmdline}"
+        cmdline_of "${d#/proc/}"; cl="$_CL"
         case "$cl" in
             *whatap.server.*|*whatap.opslake.*|*.yard.boot*)
                 pid="${d#/proc/}"
@@ -744,7 +902,9 @@ discover_services() {
                 MODS[${#MODS[@]}]="$mod"
                 ;;
         esac
-    done
+    done <<EOF
+$_SCAN_OUT
+EOF
 }
 
 WHOME=""
@@ -755,9 +915,19 @@ resolve_home() {
     # from a running JVM's -Dwhatap.server.home=
     i=0
     while [ "$i" -lt "${#PIDS[@]}" ]; do
-        pid="${PIDS[$i]}"; cl="$(cmdline_of "$pid")"
+        pid="${PIDS[$i]}"; cmdline_of "$pid"; cl="$_CL"
         v="$(printf '%s\n' "$cl" | grep -oE '[-]Dwhatap\.server\.home=[^ ]+' | head -n1 | cut -d= -f2-)"
         if [ -n "$v" ]; then WHOME="$v"; WHOME_SRC="process $pid (-Dwhatap.server.home)"; return; fi
+        i=$((i + 1))
+    done
+    # from a running JVM's working directory (start scripts cd into the home)
+    i=0
+    while [ "$i" -lt "${#PIDS[@]}" ]; do
+        pid="${PIDS[$i]}"
+        wd="$(readlink "/proc/$pid/cwd" 2>/dev/null)"
+        if [ -n "$wd" ] && [ "$wd" != "/" ] && _looks_like_home "$wd"; then
+            WHOME="$wd"; WHOME_SRC="process $pid working directory"; return
+        fi
         i=$((i + 1))
     done
     # from a systemd unit WorkingDirectory
@@ -773,8 +943,73 @@ resolve_home() {
     if [ -n "$sd" ] && [ -d "$sd/../conf" ] && [ -d "$sd/../logs" ]; then
         WHOME="$(cd "$sd/.." && pwd)"; WHOME_SRC="script parent dir"; return
     fi
+    # from this shell's WHATAP_HOME, then the common install paths. A path that
+    # exists but cannot be listed is remembered: it may be the installation.
+    local c
+    HOME_UNREAD=""
+    for c in ${WHATAP_HOME:-} $WHATAP_HOME_CANDIDATES; do
+        [ -e "$c" ] || continue
+        if ! _dir_ok "$c"; then HOME_UNREAD="$HOME_UNREAD $c"; continue; fi
+        if [ -d "$c/conf" ] && ! _dir_ok "$c/conf"; then HOME_UNREAD="$HOME_UNREAD $c/conf"; continue; fi
+        if _looks_like_home "$c"; then
+            WHOME="$c"
+            if [ "$c" = "${WHATAP_HOME:-}" ]; then WHOME_SRC="environment WHATAP_HOME"
+            else WHOME_SRC="install path $c (holds a module conf or server jar)"; fi
+            return
+        fi
+    done
     WHOME=""; WHOME_SRC="n/a (not resolved)"
 }
+HOME_UNREAD=""
+
+# _proc_why -> empty when the process table was fully visible to this uid,
+# otherwise what hid part of it.
+_proc_why() {
+    local why="" uid; uid="$(id -u 2>/dev/null || echo '?')"
+    if [ "$uid" != 0 ] && grep -qE '^[^ ]+ /proc proc [^ ]*hidepid=([12]|invisible|noaccess)' /proc/mounts 2>/dev/null; then
+        why="/proc is mounted with hidepid, so processes of other users are not visible to uid $uid"
+    elif [ "$PROC_SEEN" -eq 0 ]; then
+        why="no /proc/<pid> entry was visible to uid $uid"
+    elif [ "$PROC_UNREAD" -gt 0 ]; then
+        why="$PROC_UNREAD of $PROC_SEEN /proc/<pid>/cmdline not readable by uid $uid"
+    fi
+    if [ -n "$CMDLINE_SCAN_WHY" ]; then printf '%s' "$CMDLINE_SCAN_WHY"; return; fi
+    [ -n "$why" ] && printf '%s%s' "$why" "$(_priv_hint)"
+}
+
+# _absence_why -> empty when every input behind "no WhaTap here" was read and
+# came back empty, otherwise what could not be read or what contradicts it. The
+# inputs: the process table, the systemd unit files, and the install paths.
+_absence_why() {
+    local why uid; uid="$(id -u 2>/dev/null || echo '?')"
+    why="$(_proc_why)"
+    # A whatap JVM is running and its home was not found: that is never "not
+    # installed here", whatever the rest of the host shows.
+    if [ "${#PIDS[@]}" -gt 0 ]; then
+        local p0="${PIDS[0]}" cwd c
+        cwd="$(readlink "/proc/$p0/cwd" 2>/dev/null)"
+        if [ -z "$cwd" ]; then c="its cwd is not readable by uid $uid$(_priv_hint)"
+        else c="its cwd $cwd holds no module conf or server jar"; fi
+        why="whatap JVM pid $p0 (${MODS[0]}) running, home not resolved: no -Dwhatap.server.home, $c${why:+; $why}"
+    fi
+    if have systemctl; then
+        local uf rc re
+        uf="$(_sd list-unit-files --no-pager)"; rc=$?
+        if [ "$rc" -ne 0 ] && [ -z "$uf" ]; then
+            why="${why:+$why; }systemctl list-unit-files failed (exit $rc)"
+        else
+            re="^($(printf '%s' "$WHATAP_UNITS" | tr ' ' '|'))\\.service"
+            if printf '%s\n' "$uf" | grep -qE "$re"; then
+                why="${why:+$why; }whatap unit file installed ($(printf '%s\n' "$uf" | grep -oE "$re" | tr '\n' ' ' | sed 's/ $//')) but WHATAP_HOME not resolved from it"
+            fi
+        fi
+    fi
+    [ -n "$HOME_UNREAD" ] && why="${why:+$why; }uid $uid cannot list${HOME_UNREAD}$(_priv_hint)"
+    printf '%s' "$why"
+}
+
+# _no_whatap_na -> the na reason, stating what was read
+NO_WHATAP_NA="no whatap home in any readable process, unit or install path (checked: -Dwhatap.server.home and cwd of whatap JVMs, systemd units, script dir, \$WHATAP_HOME, $WHATAP_HOME_CANDIDATES)"
 
 YARDBASE=""
 resolve_yardbase() {
@@ -862,7 +1097,6 @@ run_report() {
     for t in ss netstat findmnt df stat systemctl journalctl timedatectl chronyc ntpq zfs zpool jstack jmap jcmd java timeout du tar ps awk; do
         if command -v "$t" >/dev/null 2>&1; then printf '        %-12s present\n' "$t"; else printf '        %-12s absent\n' "$t"; fi
     done
-    fact "note: every 'n/a (...)' below names why a value was not obtained"
 
     # -- A. Host & platform ---------------------------------------------------
     section "A. Host & platform"
@@ -894,12 +1128,19 @@ run_report() {
     fact "local time: $(date '+%Y-%m-%d %H:%M:%S %z' 2>/dev/null || echo n/a)"
     fact "UTC time:   $(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo n/a)"
     read_proc "clocksource" /sys/devices/system/clocksource/clocksource0/current_clocksource
-    fact "virtualization: $(systemd-detect-virt 2>/dev/null || echo 'n/a (command not found or bare metal)')"
+    # Raw value: systemd-detect-virt prints "none" and exits 1 when it detects
+    # no hypervisor; that is its answer, printed as it gave it.
+    if have systemd-detect-virt; then
+        fact "systemd-detect-virt: $(_bounded systemd-detect-virt 2>/dev/null || true)"
+    else
+        fact "systemd-detect-virt: n/a (command not found: systemd-detect-virt)"
+    fi
     # WhaTap servers run with -Duser.timezone (yard forces GMT); surface it per JVM.
     local jtz="" _ti _tz
     _ti=0
     while [ "$_ti" -lt "${#PIDS[@]}" ]; do
-        _tz="$(cmdline_of "${PIDS[$_ti]}" | grep -oE '[-]Duser\.timezone=[^ ]+' | head -n1)"
+        cmdline_of "${PIDS[$_ti]}"
+        _tz="$(printf '%s\n' "$_CL" | grep -oE '[-]Duser\.timezone=[^ ]+' | head -n1)"
         [ -n "$_tz" ] && jtz="$jtz ${MODS[$_ti]}=${_tz#*=}"
         _ti=$((_ti + 1))
     done
@@ -921,7 +1162,7 @@ run_report() {
         for _sd in chrony chronyd systemd-timesyncd ntp ntpd ntpsec; do
             unit_loaded "$_sd" || continue
             _sany=1
-            fact "$_sd.service: active=$(systemctl is-active "$_sd.service" 2>/dev/null) enabled=$(systemctl is-enabled "$_sd.service" 2>/dev/null)"
+            fact "$_sd.service: active=$(sd_state is-active "$_sd") enabled=$(sd_state is-enabled "$_sd")"
         done
         [ "$_sany" = 0 ] && fact "no chrony/ntpd/timesyncd *.service loaded"
     else
@@ -934,22 +1175,35 @@ run_report() {
 
     # -- C. Storage & filesystem (infra focus) --------------------------------
     section "C. Storage & filesystem"
+    # The goal exists only on a host that runs yard; elsewhere the facts are
+    # printed and nothing is resolved.
     if [ -n "$YARDBASE" ]; then
         fact "yardbase path: $YARDBASE ($( [ -d "$YARDBASE" ] && echo present || echo 'path not found' ))"
-        if [ -d "$YARDBASE" ]; then got yardbase
-        else missed yardbase "resolved to $YARDBASE, not reachable by uid $(id -u 2>/dev/null || echo '?')$(_priv_hint)"; fi
+        if [ "$_runs_yard" = 1 ]; then
+            if _dir_ok "$YARDBASE"; then got yardbase
+            else missed yardbase "resolved to $YARDBASE, not reachable by uid $(id -u 2>/dev/null || echo '?')$(_priv_hint)"; fi
+        fi
     else
         fact "yardbase path: n/a (not resolved from yard.conf or WHATAP_HOME/yardbase)"
-        missed yardbase "not resolved from yard.conf or WHATAP_HOME/yardbase"
+        [ "$_runs_yard" = 1 ] && missed yardbase "not resolved from yard.conf or WHATAP_HOME/yardbase; pass --home DIR"
     fi
+    # The filesystem of yardbase, else of WHATAP_HOME. With neither resolved
+    # there is no path to ask about: n/a, never the filesystem of the cwd.
     local ypath fstype src
-    ypath="$YARDBASE"; [ -z "$ypath" ] && ypath="$WHOME"; [ -z "$ypath" ] && ypath="."
-    fstype="$(fstype_of "$ypath")"; [ -z "$fstype" ] && fstype="n/a (not resolved)"
-    src="$(source_of "$ypath")"; [ -z "$src" ] && src="n/a"
-    fact "yardbase filesystem type: $fstype"
-    fact "yardbase mount source: $src"
-    if have findmnt; then probe "mount (findmnt)" findmnt -no FSTYPE,SOURCE,TARGET,OPTIONS -T "$ypath"; fi
-    probe "capacity (df -h)" df -h "$ypath"
+    ypath="$YARDBASE"; [ -z "$ypath" ] && ypath="$WHOME"
+    if [ -n "$ypath" ]; then
+        fact "filesystem checked for: $ypath"
+        fstype="$(fstype_of "$ypath")"; [ -z "$fstype" ] && fstype="n/a (findmnt/stat returned nothing)"
+        src="$(source_of "$ypath")"; [ -z "$src" ] && src="n/a"
+        fact "yardbase filesystem type: $fstype"
+        fact "yardbase mount source: $src"
+        if have findmnt; then probe "mount (findmnt)" findmnt -no FSTYPE,SOURCE,TARGET,OPTIONS -T "$ypath"; fi
+        probe "capacity (df -h)" df -h "$ypath"
+    else
+        fstype="n/a (not resolved)"; src="n/a"
+        fact "yardbase filesystem type: n/a (neither yardbase nor WHATAP_HOME resolved)"
+        fact "yardbase mount source: n/a (neither yardbase nor WHATAP_HOME resolved)"
+    fi
     subsection "ZFS (only if this host runs ZFS)"
     if have zfs || have zpool; then
         probe "zfs version" zfs version
@@ -962,7 +1216,7 @@ run_report() {
         fi
         read_proc "ARC stats" /proc/spl/kstat/zfs/arcstats
     else
-        fact "n/a (not applicable: zfs/zpool commands absent — this host does not run ZFS)"
+        fact "zfs / zpool: n/a (command not found: zfs, zpool)"
     fi
     subsection "data directory markers"
     if [ -n "$YARDBASE" ] && [ -d "$YARDBASE" ]; then
@@ -982,36 +1236,38 @@ run_report() {
     section "D. Deployment layout (on-disk)"
     fact "WHATAP_HOME: ${WHOME:-n/a}"
     fact "WHATAP_HOME resolved by: $WHOME_SRC"
-    if [ -n "$WHOME" ] && [ -d "$WHOME" ]; then
+    if [ -n "$WHOME" ] && _dir_ok "$WHOME"; then
         probe "top-level (depth 1)" ls -1 "$WHOME"
-        if [ -d "$WHOME/lib" ]; then probe "lib jars" ls -1 "$WHOME/lib"; else fact "lib jars: n/a ($(home_why lib))"; fi
-        if [ -d "$WHOME/conf" ]; then probe "conf files" ls -1 "$WHOME/conf"; else fact "conf files: n/a ($(home_why conf))"; fi
+        if _dir_ok "$WHOME/lib"; then probe "lib jars" ls -1 "$WHOME/lib"; else fact "lib jars: n/a ($(home_why lib))"; fi
+        if _dir_ok "$WHOME/conf"; then probe "conf files" ls -1 "$WHOME/conf"; else fact "conf files: n/a ($(home_why conf))"; fi
         got home
     else
         fact "layout: n/a ($(home_why))"
-        if _no_whatap_here; then na home "WhaTap is not installed on this host"
-        else missed home "$(home_why)"; fi
+        if [ -z "$WHOME" ] && [ -z "$_ABSENCE_WHY" ]; then na home "$NO_WHATAP_NA"
+        elif [ -z "$WHOME" ]; then missed home "$(home_why)$(home_fix); $_ABSENCE_WHY"
+        else missed home "$(home_why)$(home_fix)"; fi
     fi
 
     # -- E. Runtime processes (current state) ---------------------------------
     section "E. Runtime processes (current state)"
     if [ "${#PIDS[@]}" -eq 0 ]; then
-        fact "no whatap.server.* / whatap.opslake.* JVM found in /proc (none running, or /proc unreadable)"
-        if [ -r /proc ]; then na services "no whatap module is running on this host"
-        else missed services "/proc is not readable by uid $(id -u 2>/dev/null || echo '?')$(_priv_hint)"; fi
+        fact "no whatap.server.* / whatap.opslake.* JVM among $((PROC_SEEN - PROC_UNREAD)) readable /proc/<pid>/cmdline ($PROC_UNREAD not readable)"
+        _pwhy="$(_proc_why)"
+        if [ -z "$_pwhy" ]; then na services "no whatap JVM in any of the $PROC_SEEN /proc/<pid>/cmdline entries"
+        else missed services "$_pwhy"; fi
     else
         got services
     fi
     local i pid mod cl jar xmx xx rss st
     i=0
     while [ "$i" -lt "${#PIDS[@]}" ]; do
-        pid="${PIDS[$i]}"; mod="${MODS[$i]}"; cl="$(cmdline_of "$pid")"
+        pid="${PIDS[$i]}"; mod="${MODS[$i]}"; cmdline_of "$pid"; cl="$_CL"
         subsection "$mod (pid $pid)"
         jar="$(printf '%s\n' "$cl" | grep -oE 'whatap\.(server|opslake)\.[A-Za-z0-9._-]+\.jar' | head -n1)"; [ -z "$jar" ] && jar="n/a"
         xmx="$(printf '%s\n' "$cl" | grep -oE '[-]Xm[sx][0-9]+[kKmMgG]?' | tr '\n' ' ')"; [ -z "$xmx" ] && xmx="n/a"
         xx="$(printf '%s\n' "$cl" | grep -oE '[-]XX:[^ ]+' | tr '\n' ' ')"; [ -z "$xx" ] && xx="n/a"
         rss="$(awk '/^VmRSS/{print $2" "$3}' "/proc/$pid/status" 2>/dev/null)"; [ -z "$rss" ] && rss="n/a"
-        st="$(ps -o lstart= -p "$pid" 2>/dev/null)"; [ -z "$st" ] && st="n/a"
+        st="$(_bounded ps -o lstart= -p "$pid" 2>/dev/null)"; [ -z "$st" ] && st="n/a"
         fact "jar(version): $jar"
         fact "heap flags: $xmx"
         fact "-XX flags: $xx"
@@ -1020,15 +1276,17 @@ run_report() {
         i=$((i + 1))
     done
     subsection "PID run-files"
-    if [ -n "$WHOME" ] && [ -d "$WHOME" ]; then probe "*.run" ls -1 "$WHOME"/*.run; else fact "*.run: n/a ($(home_why))"; fi
-    subsection "listening ports"
+    if [ -n "$WHOME" ] && _dir_ok "$WHOME"; then
+        probe "*.run" sh -c 'ls -1 "$1"/*.run' sh "$WHOME"
+    else fact "*.run: n/a ($(home_why))"; fi
+    subsection "listening ports (module default port numbers)"
     local lports p name port
     lports=" $(get_listen_ports | tr '\n' ' ') "
     for p in "yard-data 6610" "yard-data-alt 6600" "yard-web 7710" "yard-sync 6620" "yard-rpc 7770" \
              "proxy-web 7700" "eureka 6761" "keeper 6789" "gateway-http 8800" "gateway-grpc 8870" \
              "notihub 6500" "front 8080" "account 18080"; do
         name="${p% *}"; port="${p#* }"
-        case "$lports" in *" $port "*) fact "$name ($port): LISTEN" ;; *) fact "$name ($port): not listening" ;; esac
+        case "$lports" in *" $port "*) fact "port $port ($name default): LISTEN" ;; *) fact "port $port ($name default): not listening" ;; esac
     done
     if have ss; then probe "ss -ltnp (whatap procs)" sh -c 'ss -ltnp 2>/dev/null | grep -E "whatap|java" || true'
     elif have netstat; then probe "netstat -ltnp (whatap procs)" sh -c 'netstat -ltnp 2>/dev/null | grep -E "whatap|java" || true'
@@ -1039,7 +1297,7 @@ run_report() {
         for unit in $WHATAP_UNITS; do
             unit_loaded "$unit" || continue
             any=1
-            fact "$unit.service: active=$(systemctl is-active "$unit.service" 2>/dev/null) enabled=$(systemctl is-enabled "$unit.service" 2>/dev/null) restarts=$(sd_show NRestarts "$unit")"
+            fact "$unit.service: active=$(sd_state is-active "$unit") enabled=$(sd_state is-enabled "$unit") restarts=$(sd_show NRestarts "$unit")"
         done
         [ "$any" = 0 ] && fact "no whatap *.service units are installed (LoadState != loaded)"
     else
@@ -1048,25 +1306,32 @@ run_report() {
 
     # -- F. Configuration (raw) -----------------------------------------------
     section "F. Configuration"
-    if [ -n "$WHOME" ] && [ -d "$WHOME/conf" ]; then
-        local cf _cfn=0
+    # conf/ must be listable before its glob means anything: an unreadable
+    # directory hands back the literal pattern, which used to read as "holds no
+    # *.conf" and made a blind run COMPLETE.
+    if [ -n "$WHOME" ] && _dir_ok "$WHOME/conf"; then
+        local cf _cfn=0 _cfu=""
         for cf in "$WHOME"/conf/*.conf; do
             [ -e "$cf" ] || { fact "no *.conf files under $WHOME/conf"; break; }
             _cfn=$((_cfn + 1))
+            [ -r "$cf" ] || _cfu="$_cfu $(basename "$cf")"
             fact "$(basename "$cf") ($(wc -c < "$cf" 2>/dev/null | tr -d ' ') bytes, mtime $(date -u -r "$cf" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo n/a)):"
             dump_file "$cf"
         done
-        # A readable but empty conf/ is not the same as an unreadable one.
-        if [ "$_cfn" -gt 0 ]; then got conf; else na conf "conf/ is readable and holds no *.conf"; fi
+        if [ -n "$_cfu" ]; then missed conf "uid $(id -u 2>/dev/null || echo '?') cannot read$_cfu under $WHOME/conf$(_priv_hint)"
+        elif [ "$_cfn" -gt 0 ]; then got conf
+        else na conf "conf/ is readable and holds no *.conf"; fi
     else
         fact "conf/: n/a ($(home_why conf))"
-        if _no_whatap_here; then na conf "WhaTap is not installed on this host"
+        if [ -z "$WHOME" ] && [ -z "$_ABSENCE_WHY" ]; then na conf "$NO_WHATAP_NA"
+        elif [ -z "$WHOME" ]; then missed conf "$(home_why conf)$(home_fix); $_ABSENCE_WHY"
+        elif [ -d "$WHOME/conf" ] || [ ! -x "$WHOME" ]; then missed conf "$(home_why conf)$(home_fix)"
         else missed conf "$(home_why conf)"; fi
     fi
 
     # -- G. Logs & recent events ----------------------------------------------
     section "G. Logs & recent events"
-    if [ -n "$WHOME" ] && [ -d "$WHOME/logs" ]; then
+    if [ -n "$WHOME" ] && _dir_ok "$WHOME/logs"; then
         # A production yard accumulates hundreds of rotated logs (logback
         # "<base>.<yyyyMMdd>.<i>.log"). Listing each drowns the report and reading
         # the tail of every one is real disk load — so current logs are listed
@@ -1113,13 +1378,6 @@ run_report() {
             fact "copied: $LOGSEL_KEPT_N files, $LOGSEL_KEPT_BYTES bytes ($LOGSEL_TRUNC_N truncated to their newest end)"
             fact "not copied: $LOGSEL_DROP_N files, $LOGSEL_DROP_BYTES bytes"
             fact "per-file detail with the reason for each: logs/SELECTION.txt"
-            if [ "$LOGSEL_DROP_N" -gt 0 ]; then
-                if [ "$OPT_ROTATED" = 1 ]; then
-                    fact "to collect more: raise --max-total-mb / --max-log-mb, or --log-days for older rotated logs"
-                else
-                    fact "to collect more: re-run with --with-rotated, and raise --max-total-mb if needed"
-                fi
-            fi
         fi
 
         subsection "recent ERROR/WARN/Exception counts (current logs only, last 2MB each)"
@@ -1150,7 +1408,7 @@ run_report() {
             esac
             _lc=$((_lc + 1))
             if [ "$_lc" -gt "$LOG_TAIL_FILES" ]; then
-                fact "(+ more base logs not tailed — see inventory above; use --bundle for full logs)"
+                fact "(further base logs not tailed: at most $LOG_TAIL_FILES are tailed; all are in the inventory above)"
                 break
             fi
             fact "${_lf#"$WHOME"/} (mtime $(date -u -r "$_lf" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo n/a)):"
@@ -1161,29 +1419,36 @@ EOF
         [ "$_lc" -eq 0 ] && fact "no base service logs found (only _self/_api/access streams, or none)"
         subsection "self-mon / checker"
         fact "yard_self.log: $( ls "$WHOME"/logs/*_self.log >/dev/null 2>&1 && echo present || echo 'n/a (path not found)' )"
-        local chk; chk="$(find "$WHOME/logs" -maxdepth 2 -name '*checker*.log' 2>/dev/null | head -n1)"
+        local chk; chk="$(_bounded find "$WHOME/logs" -maxdepth 2 -name '*checker*.log' 2>/dev/null | head -n1)"
         if [ -n "$chk" ]; then fact "$chk (last 20 lines):"; tail -n 20 "$chk" 2>/dev/null | while IFS= read -r _l; do printf '        %s\n' "$_l"; done
         else fact "checker log: n/a (path not found)"; fi
     else
         fact "logs/: n/a ($(home_why logs))"
-        if _no_whatap_here; then na logs "WhaTap is not installed on this host"
+        if [ -z "$WHOME" ] && [ -z "$_ABSENCE_WHY" ]; then na logs "$NO_WHATAP_NA"
+        elif [ -z "$WHOME" ]; then missed logs "$(home_why logs)$(home_fix); $_ABSENCE_WHY"
+        elif [ -d "$WHOME/logs" ] || [ ! -x "$WHOME" ]; then missed logs "$(home_why logs)$(home_fix)"
         else missed logs "$(home_why logs)"; fi
     fi
     subsection "heap dumps / GC log / restart"
     if [ -n "$WHOME" ]; then
-        probe "*.hprof" sh -c "ls -la $WHOME/*.hprof $WHOME/logs/*.hprof 2>/dev/null || true"
-        fact "gc log: $( ls "$WHOME"/logs/gc*.log >/dev/null 2>&1 && echo present || echo 'n/a (not enabled by default)' )"
+        probe "*.hprof" sh -c 'ls -la "$1"/*.hprof "$1"/logs/*.hprof 2>/dev/null || true' sh "$WHOME"
+        fact "gc log: $( ls "$WHOME"/logs/gc*.log >/dev/null 2>&1 && echo present || echo 'absent (no logs/gc*.log)' )"
         if [ -f "$WHOME/restart.out" ]; then fact "restart.out (last 20 lines):"; tail -n 20 "$WHOME/restart.out" 2>/dev/null | while IFS= read -r _l; do printf '        %s\n' "$_l"; done
         else fact "restart.out: n/a (path not found)"; fi
     fi
     subsection "journal errors (last ${OPT_HOURS}h, bounded, installed units only)"
     _jwhy="$(journal_why)"
-    _jhits=0
+    _jhits=0; _jfail=""
     if have journalctl; then
         for unit in $WHATAP_UNITS; do
             unit_loaded "$unit" || continue
             local jout
-            jout="$(journalctl -u "$unit.service" -p err --since "${OPT_HOURS} hours ago" -n 20 --no-pager 2>/dev/null)"
+            jout="$(_bounded journalctl -u "$unit.service" -p err --since "${OPT_HOURS} hours ago" -n 20 --no-pager 2>/dev/null)"
+            case "$?" in
+                0|1) ;;
+                124) _jfail="$_jfail $unit (timed out: ${CMD_TIMEOUT}s)"; fact "$unit.service: n/a (timed out: ${CMD_TIMEOUT}s)"; continue ;;
+                *)   [ -z "$jout" ] && { _jfail="$_jfail $unit (journalctl failed)"; fact "$unit.service: n/a (journalctl failed)"; continue; } ;;
+            esac
             case "$jout" in
                 ''|*'-- No entries --'*) ;;
                 *) _jhits=$((_jhits + 1))
@@ -1193,9 +1458,14 @@ EOF
         done
     fi
     # An empty journal has two causes that print the same thing. Say which.
-    if [ -n "$_jwhy" ]; then
+    # Resolved only where the goal was declared (a loaded whatap unit).
+    if [ "$_has_unit" != 1 ]; then
+        fact "journal: n/a (no whatap unit is loaded, so no unit journal was read)"
+    elif [ -n "$_jwhy" ]; then
         fact "journal: n/a ($_jwhy)"
-        missed journal "$_jwhy"
+        missed journal "$_jwhy$(_priv_hint)"
+    elif [ -n "$_jfail" ]; then
+        missed journal "journalctl did not answer for:$_jfail"
     elif [ "$_jhits" -gt 0 ]; then
         got journal
     else
@@ -1222,41 +1492,38 @@ EOF
 # it could not, and the bundles carried no conf/ at all. The report blamed
 # "WHATAP_HOME not resolved" and the reader concluded the collector needed root.
 # It did not. It needed the account that owns the installation.
-# _no_whatap_here -> true when nothing on this host says WhaTap is installed.
-# Then an unresolved WHATAP_HOME is not a blocked run, it is the answer, and
-# passing --home would only point the collector at a path that is not there.
-_no_whatap_here() {
-    [ -z "$WHOME" ] || return 1
-    [ "${#PIDS[@]}" -eq 0 ] || return 1
-    if have systemctl && systemctl list-unit-files 2>/dev/null \
-        | grep -qE '^(yard|proxy|gateway|keeper|account|notihub|eureka|front|flexreport)\.service'; then
-        return 1
-    fi
-    return 0
-}
-
 home_why() {
     local sub="$1" path="$WHOME"
     [ -n "$sub" ] && path="$WHOME/$sub"
     local uid; uid="$(id -u 2>/dev/null || echo '?')"
     if [ -z "$WHOME" ]; then
-        printf 'WHATAP_HOME not resolved; pass --home DIR'
+        printf 'WHATAP_HOME not resolved'
     elif [ ! -d "$WHOME" ]; then
         # stat() on WHOME itself failed, so its parent is not searchable by us.
-        printf 'WHATAP_HOME resolved to %s (via %s) but uid %s cannot reach it; run with sudo or as the account that owns the installation' \
+        printf 'WHATAP_HOME resolved to %s (via %s) but uid %s cannot reach it' \
             "$WHOME" "$WHOME_SRC" "$uid"
     elif [ ! -x "$WHOME" ]; then
         # WHOME stats but we cannot search it, so every path under it would come
         # back "not found". Say permission, not absence — they are different bugs.
-        printf 'uid %s cannot search %s (no execute permission); run with sudo or as the account that owns the installation' \
+        printf 'uid %s cannot search %s (no execute permission)' \
             "$uid" "$WHOME"
     elif [ ! -d "$path" ]; then
         printf 'path not found: %s' "$path"
     elif [ ! -r "$path" ]; then
         printf 'uid %s cannot read %s' "$uid" "$path"
+    elif [ ! -x "$path" ]; then
+        printf 'uid %s cannot search %s (no execute permission)' "$uid" "$path"
     else
         printf 'unreadable: %s' "$path"
     fi
+}
+
+# home_fix -> how running this differently obtains what home_why says is
+# missing. It goes only into goal reasons, never into a fact line (CONTRACT 1).
+home_fix() {
+    if [ -z "$WHOME" ]; then printf '; pass --home DIR'
+    elif [ ! -d "$WHOME" ] || [ ! -x "$WHOME" ]; then printf '; run with sudo or as the account that owns the installation'
+    else _priv_hint; fi
 }
 
 # journal_why -> empty when this uid can read the SYSTEM journal, otherwise the
@@ -1277,7 +1544,7 @@ journal_why() {
         for f in "$d"/*/system.journal; do
             [ -e "$f" ] || continue
             [ -r "$f" ] && return
-            printf 'uid %s cannot read %s (groups: %s); journalctl then shows only entries from this user; run with sudo' \
+            printf 'uid %s cannot read %s (groups: %s)' \
                 "$uid" "$f" "$(id -nG 2>/dev/null | tr ' ' ',')"
             return
         done
@@ -1287,10 +1554,10 @@ journal_why() {
 
 collect_conf() {
     local dest="$1"
-    [ -n "$WHOME" ] && [ -d "$WHOME/conf" ] || { warn "conf: skipped (no WHATAP_HOME/conf)"; return; }
+    [ -n "$WHOME" ] && _dir_ok "$WHOME/conf" || { warn "conf: not copied ($(home_why conf))"; return; }
     mkdir -p "$dest" 2>/dev/null
-    cp -a "$WHOME/conf/." "$dest/" 2>/dev/null
-    progress "conf: copied $WHOME/conf"
+    if _bounded cp -a "$WHOME/conf/." "$dest/" 2>/dev/null; then progress "conf: copied $WHOME/conf"
+    else warn "conf: copy of $WHOME/conf was incomplete (a file could not be read by uid $(id -u 2>/dev/null || echo '?'))"; fi
 }
 
 # Results of the last collect_logs run, read back by the report's G section.
@@ -1299,7 +1566,7 @@ LOGSEL_TRUNC_N=0 LOGSEL_DROP_N=0 LOGSEL_DROP_BYTES=0 LOGSEL_REASON=""
 
 collect_logs() {
     local dest="$1"
-    [ -n "$WHOME" ] && [ -d "$WHOME/logs" ] || { warn "logs: skipped (no WHATAP_HOME/logs)"; return; }
+    [ -n "$WHOME" ] && _dir_ok "$WHOME/logs" || { warn "logs: not copied ($(home_why logs))"; return; }
 
     # Two caps, because one file being huge and many files being large are
     # different failures. The per-file cap alone let a production collection
@@ -1316,13 +1583,13 @@ collect_logs() {
     local total_cap=$((OPT_MAXTOTAL_MB * 1024 * 1024))
     local days="$OPT_LOG_DAYS"
     local list sel
-    list="$(mktemp 2>/dev/null || echo "/tmp/.collsel.$$.list")"
+    list="$(_tmp logsel.list)"
     sel="$dest/SELECTION.txt"
     mkdir -p "$dest" 2>/dev/null
 
     # Candidates, newest first. Current (non-rotated) logs sort ahead of rotated
     # ones so the total cap never spends itself on history before the live logs.
-    find "$WHOME/logs" -maxdepth 2 -type f \( -name '*.log' -o -name '*.log.*' \) 2>/dev/null |
+    _bounded find "$WHOME/logs" -maxdepth 2 -type f \( -name '*.log' -o -name '*.log.*' \) 2>/dev/null |
     while IFS= read -r f; do
         local kind=current
         case "$f" in
@@ -1356,7 +1623,7 @@ collect_logs() {
             printf 'dropped\t0\t%s\t%s\trotated log, --with-rotated not given\n' "$sz" "$rel" >> "$sel"
             continue
         fi
-        if [ "$kind" = rotated ] && [ -z "$(find "$f" -mtime "-$days" 2>/dev/null)" ]; then
+        if [ "$kind" = rotated ] && [ -z "$(_bounded find "$f" -mtime "-$days" 2>/dev/null)" ]; then
             LOGSEL_DROP_N=$((LOGSEL_DROP_N + 1)); LOGSEL_DROP_BYTES=$((LOGSEL_DROP_BYTES + sz))
             printf 'dropped\t0\t%s\t%s\trotated log older than %s days\n' "$sz" "$rel" "$days" >> "$sel"
             continue
@@ -1396,21 +1663,30 @@ collect_logs() {
 
     LOGSEL_REASON="$([ "$OPT_ROTATED" = 1 ] && printf 'current + rotated within %sd' "$days" || printf 'current logs only')"
     progress "logs: copied $LOGSEL_KEPT_N files ($LOGSEL_KEPT_BYTES bytes), left out $LOGSEL_DROP_N ($LOGSEL_DROP_BYTES bytes) — see logs/SELECTION.txt"
+    # How to obtain what was left out is a way to run this differently, so it
+    # goes to the operator rather than into the report's facts.
+    if [ "$LOGSEL_DROP_N" -gt 0 ]; then
+        if [ "$OPT_ROTATED" = 1 ]; then
+            warn "logs: $LOGSEL_DROP_N files not copied; --max-total-mb / --max-log-mb / --log-days copy more"
+        else
+            warn "logs: $LOGSEL_DROP_N files not copied; --with-rotated (and a larger --max-total-mb) copies more"
+        fi
+    fi
 }
 
 collect_fs() {
     local dest="$1"; mkdir -p "$dest" 2>/dev/null
-    have findmnt && findmnt > "$dest/findmnt.txt" 2>/dev/null
-    have df && df -T > "$dest/df-T.txt" 2>/dev/null
+    have findmnt && _bounded findmnt > "$dest/findmnt.txt" 2>/dev/null
+    have df && _bounded df -T > "$dest/df-T.txt" 2>/dev/null
     cat /proc/self/mountinfo > "$dest/mountinfo.txt" 2>/dev/null
     if have zpool; then
-        zpool status -v > "$dest/zpool-status.txt" 2>/dev/null
-        zpool list > "$dest/zpool-list.txt" 2>/dev/null
-        zpool history > "$dest/zpool-history.txt" 2>/dev/null
+        _bounded zpool status -v > "$dest/zpool-status.txt" 2>&1
+        _bounded zpool list > "$dest/zpool-list.txt" 2>&1
+        _bounded zpool history > "$dest/zpool-history.txt" 2>&1
     fi
     if have zfs; then
-        zfs list -o space > "$dest/zfs-list.txt" 2>/dev/null
-        [ -n "$YARDBASE" ] && zfs get all "$(source_of "$YARDBASE")" > "$dest/zfs-get.txt" 2>/dev/null
+        _bounded zfs list -o space > "$dest/zfs-list.txt" 2>&1
+        [ -n "$YARDBASE" ] && _bounded zfs get all "$(source_of "$YARDBASE")" > "$dest/zfs-get.txt" 2>&1
     fi
     cat /proc/spl/kstat/zfs/arcstats > "$dest/arcstats.txt" 2>/dev/null
     progress "fs: snapshot written"
@@ -1418,19 +1694,19 @@ collect_fs() {
 
 collect_os() {
     local dest="$1"; mkdir -p "$dest" 2>/dev/null
-    have ps && ps aux > "$dest/ps-aux.txt" 2>/dev/null
-    have ss && ss -s > "$dest/ss-summary.txt" 2>/dev/null
-    have ss && ss -ltnp > "$dest/ss-listen.txt" 2>/dev/null
-    have df && df -h > "$dest/df-h.txt" 2>/dev/null
-    have free && free -m > "$dest/free.txt" 2>/dev/null
+    have ps && _bounded ps aux > "$dest/ps-aux.txt" 2>/dev/null
+    have ss && _bounded ss -s > "$dest/ss-summary.txt" 2>/dev/null
+    have ss && _bounded ss -ltnp > "$dest/ss-listen.txt" 2>/dev/null
+    have df && _bounded df -h > "$dest/df-h.txt" 2>/dev/null
+    have free && _bounded free -m > "$dest/free.txt" 2>/dev/null
     cat /proc/loadavg > "$dest/loadavg.txt" 2>/dev/null
     # dmesg is refused for an unprivileged uid when kernel.dmesg_restrict=1, and
     # discarding stderr turned that into a 0-byte file carrying no reason. Keep
     # whatever the command said instead (all three Smartfren bundles: 0 bytes).
-    { dmesg 2>&1 || true; } | tail -n 200 > "$dest/dmesg-tail.txt" 2>/dev/null
+    { _bounded dmesg 2>&1 || true; } | tail -n 200 > "$dest/dmesg-tail.txt" 2>/dev/null
     [ -s "$dest/dmesg-tail.txt" ] || printf 'dmesg produced no output and no message (uid %s)\n' \
         "$(id -u 2>/dev/null || echo '?')" > "$dest/dmesg-tail.txt" 2>/dev/null
-    have top && top -bn1 2>/dev/null | head -n 40 > "$dest/top.txt" 2>/dev/null
+    have top && _bounded top -bn1 2>/dev/null | head -n 40 > "$dest/top.txt" 2>/dev/null
     local i pid
     i=0
     while [ "$i" -lt "${#PIDS[@]}" ]; do
@@ -1443,14 +1719,14 @@ collect_os() {
 
 collect_time() {
     local dest="$1"; mkdir -p "$dest" 2>/dev/null
-    have timedatectl && timedatectl > "$dest/timedatectl.txt" 2>&1
-    have timedatectl && timedatectl timesync-status > "$dest/timesync-status.txt" 2>&1
+    have timedatectl && _bounded timedatectl > "$dest/timedatectl.txt" 2>&1
+    have timedatectl && _bounded timedatectl timesync-status > "$dest/timesync-status.txt" 2>&1
     if have chronyc; then
-        chronyc tracking    > "$dest/chrony-tracking.txt"   2>&1
-        chronyc -n sources  > "$dest/chrony-sources.txt"    2>&1
-        chronyc sourcestats > "$dest/chrony-sourcestats.txt" 2>&1
+        _bounded chronyc tracking    > "$dest/chrony-tracking.txt"   2>&1
+        _bounded chronyc -n sources  > "$dest/chrony-sources.txt"    2>&1
+        _bounded chronyc sourcestats > "$dest/chrony-sourcestats.txt" 2>&1
     fi
-    have ntpq && ntpq -pn > "$dest/ntpq.txt" 2>&1
+    have ntpq && _bounded ntpq -pn > "$dest/ntpq.txt" 2>&1
     cat /sys/devices/system/clocksource/clocksource0/current_clocksource > "$dest/clocksource.txt" 2>/dev/null
     readlink -f /etc/localtime > "$dest/localtime.txt" 2>/dev/null
     progress "time: snapshot written"
@@ -1459,12 +1735,15 @@ collect_time() {
 collect_journal() {
     local dest="$1"; have journalctl || { warn "journal: skipped (journalctl absent)"; return; }
     mkdir -p "$dest" 2>/dev/null
-    local unit
+    # Capped twice: by time (CMD_TIMEOUT) and by size (JOURNAL_LINES per unit,
+    # newest kept), because a unit that restarts in a loop logs millions of lines.
+    local unit JOURNAL_LINES=20000
     for unit in $WHATAP_UNITS; do
         unit_loaded "$unit" || continue
-        journalctl -u "$unit.service" --since "${OPT_HOURS} hours ago" --no-pager > "$dest/$unit.journal.txt" 2>/dev/null
+        _bounded journalctl -u "$unit.service" --since "${OPT_HOURS} hours ago" -n "$JOURNAL_LINES" --no-pager > "$dest/$unit.journal.txt" 2>&1
+        [ $? -eq 124 ] && printf '\n(journalctl stopped at the %ss cap)\n' "$CMD_TIMEOUT" >> "$dest/$unit.journal.txt"
     done
-    progress "journal: last ${OPT_HOURS}h written"
+    progress "journal: last ${OPT_HOURS}h written (at most $JOURNAL_LINES lines per unit)"
 }
 
 # ---- Tier 2 (opt-in) --------------------------------------------------------
@@ -1478,8 +1757,15 @@ collect_threads() {
         warn "[Tier2] thread dump: pid $pid ($mod) x$n — may cause a JVM safepoint pause"
         k=1
         while [ "$k" -le "$n" ]; do
-            if have jstack; then jstack -l "$pid" > "$dest/$mod-$pid.jstack.$k.txt" 2>&1
-            else kill -3 "$pid" 2>/dev/null; printf 'jstack absent; sent SIGQUIT to %s (output goes to the JVM stdout/journal)\n' "$pid" > "$dest/$mod-$pid.sigquit.$k.txt"; fi
+            if have jstack; then
+                CMD_TIMEOUT=60 _bounded jstack -l "$pid" > "$dest/$mod-$pid.jstack.$k.txt" 2>&1
+                [ $? -eq 124 ] && printf '\n(jstack stopped at the 60s cap)\n' >> "$dest/$mod-$pid.jstack.$k.txt"
+            else
+                # kill is a shell builtin and returns at once; the dump itself is
+                # written by the JVM to its own stdout, not here.
+                kill -3 "$pid" 2>/dev/null
+                printf 'jstack absent; sent SIGQUIT to %s (output goes to the JVM stdout/journal)\n' "$pid" > "$dest/$mod-$pid.sigquit.$k.txt"
+            fi
             k=$((k + 1))
         done
         i=$((i + 1))
@@ -1494,7 +1780,7 @@ collect_histo() {
     while [ "$i" -lt "${#PIDS[@]}" ]; do
         pid="${PIDS[$i]}"; mod="${MODS[$i]}"
         warn "[Tier2] jmap -histo: pid $pid ($mod) — walks the live heap (no full GC)"
-        jmap -histo "$pid" 2>&1 | head -n 200 > "$dest/$mod-$pid.histo.txt" 2>/dev/null
+        CMD_TIMEOUT=120 _bounded jmap -histo "$pid" 2>&1 | head -n 200 > "$dest/$mod-$pid.histo.txt" 2>/dev/null
         i=$((i + 1))
     done
 }
@@ -1507,7 +1793,8 @@ collect_heap() {
     while [ "$i" -lt "${#PIDS[@]}" ]; do
         pid="${PIDS[$i]}"; mod="${MODS[$i]}"
         warn "[Tier2] FULL HEAP DUMP: pid $pid ($mod) — large file and a JVM pause"
-        jmap -dump:format=b,file="$dest/$mod-$pid.hprof" "$pid" > "$dest/$mod-$pid.heap.log" 2>&1
+        CMD_TIMEOUT=900 _bounded jmap -dump:format=b,file="$dest/$mod-$pid.hprof" "$pid" > "$dest/$mod-$pid.heap.log" 2>&1
+        [ $? -eq 124 ] && warn "[Tier2] heap dump of pid $pid stopped at the 900s cap; the .hprof is incomplete"
         i=$((i + 1))
     done
 }
@@ -1516,14 +1803,17 @@ collect_du() {
     local dest="$1"; mkdir -p "$dest" 2>/dev/null
     [ -n "$YARDBASE" ] && [ -d "$YARDBASE" ] || { warn "[Tier2] du: yardbase absent"; return; }
     warn "[Tier2] recursive du of $YARDBASE — reads data-disk metadata"
-    if have timeout; then timeout 120 du --max-depth=1 -h "$YARDBASE" > "$dest/yardbase-du.txt" 2>&1
-    else du --max-depth=1 -h "$YARDBASE" > "$dest/yardbase-du.txt" 2>&1; fi
+    CMD_TIMEOUT=120 _bounded du --max-depth=1 -h "$YARDBASE" > "$dest/yardbase-du.txt" 2>&1
+    [ $? -eq 124 ] && printf '\n(du stopped at the 120s cap; totals above are partial)\n' >> "$dest/yardbase-du.txt"
 }
 
 do_bundle() {
     local work tarball
-    work="$(mktemp -d 2>/dev/null || echo "$OPT_OUT/$BASENAME.tmp.$$")"
-    mkdir -p "$work" 2>/dev/null
+    # The work dir lives in the run's private directory, so an interrupted run
+    # (Ctrl-C, a lost ssh session) leaves no copy of configs or logs behind.
+    work="$(_tmp bundle)"
+    case "$work" in /dev/null) warn "the bundle was not written: no private temp directory could be created under ${TMPDIR:-/tmp}"; return 1 ;; esac
+    mkdir -p "$work" 2>/dev/null || { warn "the bundle was not written: cannot create $work"; return 1; }
     # Logs are selected BEFORE the report is written so the report can state what
     # this bundle carries and what it left out (G section, "logs copied into this
     # bundle"). The report otherwise describes the host only, and the reader
@@ -1542,25 +1832,34 @@ do_bundle() {
     [ "$OPT_DU" = 1 ] && collect_du "$work/fs"
 
     tarball="$OPT_OUT/$BASENAME.tar.gz"
-    if have tar; then
-        # Use -C instead of `cd "$work"`: with a relative --out (the default "."),
-        # a `cd` into $work would make $tarball land INSIDE $work and then be
-        # deleted with it. -C changes only where tar reads inputs; $tarball stays
-        # relative to the caller's CWD. Only remove $work if tar actually wrote it.
-        if tar -C "$work" -czf "$tarball" . 2>/dev/null && [ -f "$tarball" ]; then
-            # Under sudo the tarball is root-owned, and the operator who started
-            # the run then cannot move or delete the one file they came for.
-            if [ "$(id -u 2>/dev/null)" = 0 ] && [ -n "${SUDO_UID:-}" ]; then
-                chown "$SUDO_UID:${SUDO_GID:-$SUDO_UID}" "$tarball" 2>/dev/null
-            fi
-            progress "bundle: $tarball"
-            rm -rf "$work" 2>/dev/null
-        else
-            warn "tar failed — artifacts left under $work"
-        fi
+    have tar || { warn "the bundle was not written: tar: command not found"; return 1; }
+    # -C instead of `cd "$work"`: $tarball stays relative to the caller's cwd.
+    # Not bounded by CMD_TIMEOUT: this is a local write of what the run already
+    # collected, and a cap would leave a truncated archive behind.
+    if tar -C "$work" -czf "$tarball" . 2>/dev/null && [ -s "$tarball" ]; then
+        # Under sudo the tarball is root-owned, and the operator who started
+        # the run then cannot move or delete the one file they came for.
+        _give_back "$tarball"
+        progress "bundle: $tarball"
     else
-        warn "tar: command not found — artifacts left under $work"
+        rm -f "$tarball" 2>/dev/null
+        warn "the bundle was not written: tar could not write $tarball"
+        return 1
     fi
+}
+
+# _give_back FILE -> under sudo, hand FILE to the account that ran sudo
+_give_back() {
+    if [ "$(id -u 2>/dev/null)" = 0 ] && [ -n "${SUDO_UID:-}" ]; then
+        chown "$SUDO_UID:${SUDO_GID:-$SUDO_UID}" "$1" 2>/dev/null
+    fi
+}
+
+# _need_int NAME VALUE -> exit 2 unless VALUE is a non-negative integer
+_need_int() {
+    case "$2" in
+        ''|*[!0-9]*) warn "$1 takes a non-negative integer; got '$2'"; exit 2 ;;
+    esac
 }
 
 # =============================================================================
@@ -1581,15 +1880,48 @@ if [ "$OPT_BUNDLE" = 0 ] && [ "$OPT_STDOUT" = 0 ] && [ "$OPT_FILE" = 0 ]; then
     exit 2
 fi
 
+# Numeric options are checked before anything runs: a value the shell cannot
+# do arithmetic on used to abort the bundle half way with exit 0 and no file.
+_need_int --hours "$OPT_HOURS"
+_need_int --max-log-mb "$OPT_MAXLOG_MB"
+_need_int --max-total-mb "$OPT_MAXTOTAL_MB"
+_need_int --log-days "$OPT_LOG_DAYS"
+_need_int --threads "$OPT_THREADS"
+
+# Tier 2 JVM work is capped per call (jstack 60s, jmap -histo 120s, heap dump
+# 900s); the run deadline is raised to fit them unless the caller set one.
+if [ -z "$_RUN_DEADLINE_ENV" ]; then
+    [ "$OPT_THREADS" -ge 1 ] && RUN_DEADLINE=$((RUN_DEADLINE + 120))
+    [ "$OPT_HISTO" = 1 ] && RUN_DEADLINE=$((RUN_DEADLINE + 300))
+    [ "$OPT_HEAP" = 1 ] && RUN_DEADLINE=$((RUN_DEADLINE + 1800))
+    [ "$OPT_DU" = 1 ] && RUN_DEADLINE=$((RUN_DEADLINE + 120))
+fi
+
 _run_init
 _init_errfile
-have timeout && _timeout_bin="$(command -v timeout)"
-mkdir -p "$OPT_OUT" 2>/dev/null
+
+# The output directory is checked before collecting, so an unwritable one
+# fails at once rather than after a full run.
+if [ "$OPT_STDOUT" != 1 ] || [ "$OPT_BUNDLE" = 1 ]; then
+    mkdir -p "$OPT_OUT" 2>/dev/null
+    if [ ! -d "$OPT_OUT" ] || [ ! -w "$OPT_OUT" ] || [ ! -x "$OPT_OUT" ]; then
+        warn "the report was not written: output directory $OPT_OUT is not writable by uid $(id -u 2>/dev/null || echo '?')"
+        exit 1
+    fi
+fi
 
 progress "discovering WhaTap services / resolving WHATAP_HOME ..."
 discover_services
+# every unit sd_show will be asked about, in one call
+_pf=""; for _u in $WHATAP_UNITS chrony chronyd systemd-timesyncd ntp ntpd ntpsec; do _pf="$_pf $_u.service"; done
+# shellcheck disable=SC2086
+_sd_prefetch $_pf
 resolve_home
 resolve_yardbase
+# What kept "no WhaTap here" from being read off this host; empty when every
+# input was read. Computed once: it runs systemctl list-unit-files.
+_ABSENCE_WHY=""
+[ -z "$WHOME" ] && _ABSENCE_WHY="$(_absence_why)"
 TARGET="collection-server/$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || echo unknown)${WHOME:+@$WHOME}"
 progress "WHATAP_HOME: ${WHOME:-n/a} (via $WHOME_SRC); whatap JVMs found: ${#PIDS[@]}"
 
@@ -1599,7 +1931,7 @@ BASENAME="whatap-collserver-${HOST}-${TS}"
 
 if [ "$OPT_BUNDLE" = 1 ]; then
     progress "mode: bundle (Tier 0 report + Tier 1 artifacts) -> $OPT_OUT/$BASENAME.tar.gz"
-    do_bundle
+    do_bundle || exit 1
     progress "done."
 elif [ "$OPT_STDOUT" = 1 ]; then
     progress "mode: stdout (Tier 0 report, read-only)"
@@ -1609,8 +1941,7 @@ else
     OUTFILE="$OPT_OUT/$BASENAME.txt"
     progress "mode: file (Tier 0 report, read-only) -> writing $OUTFILE"
     _report_to_file "$OUTFILE" || exit 1
+    _give_back "$OUTFILE"
     progress "report written: $OUTFILE"
 fi
-
-[ -n "$_errfile" ] && rm -f "$_errfile" 2>/dev/null
 exit 0

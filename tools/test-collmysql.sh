@@ -5,17 +5,12 @@
 # Usage:  tools/test-collmysql.sh [path/to/collect-collmysql.sh]
 #
 # validate.sh checks the SHAPE of a collector's source. This checks what this
-# one DOES, and most of it is about one decision: whether the run reaches root.
-# Nearly every section of this report comes from SQL, a packaged MySQL lets root
-# in over the unix socket, and root is also what reads the binary log directory,
-# so the elevation carries the collector. The ways it can fall short are the
-# thing worth pinning down.
-#
-# The sudo cases run against a stub `sudo` on PATH rather than the real one, so
-# they behave the same on every machine and need no privilege. The stub answers
-# the way a host with a password-protected sudo does: `-n` cannot run, `-v` asks
-# and does not authenticate. A separate group uses real passwordless sudo and
-# says so when it cannot run, rather than passing quietly.
+# one DOES: that it never elevates or re-runs itself (a stub sudo on PATH logs
+# any call, and the log must stay empty), that no credential reaches a child's
+# command line or environment, that every wait ends within the deadline, and
+# that a goal root would have obtained says so in its reason. One group uses
+# real passwordless sudo, the way an operator runs it, and says so when it
+# cannot run, rather than passing quietly.
 #
 # Build stub PATHs with `type -P`, never `command -v`: in an interactive shell
 # `command -v grep` can answer with an alias, and a symlink built from that
@@ -23,6 +18,21 @@
 # -----------------------------------------------------------------------------
 
 set -u
+set -o noclobber
+# Stubs are written only through stub_write, and stub dirs are copied only
+# through stub_clone. A stub dir is a farm of symlinks to the real tools, and a
+# `>` onto one of them writes the real tool (as root, /usr/bin/xargs itself).
+# noclobber makes any other `>` onto an existing file an error; `>|` is used
+# only on files this suite created as regular files.
+stub_write() { rm -f "$1" && cat > "$1" && chmod +x "$1"; }   # content on stdin
+stub_clone() {                                                # SRC DST: links stay links
+    local f; mkdir -p "$2"
+    for f in "$1"/*; do
+        [ -e "$f" ] || [ -L "$f" ] || continue
+        if [ -L "$f" ]; then ln -s "$(readlink "$f")" "$2/${f##*/}"
+        else rm -f "$2/${f##*/}"; cp "$f" "$2/${f##*/}"; fi
+    done
+}
 C="${1:-$(cd "$(dirname "$0")/.." && pwd)/collectors/collection-server/collect-collmysql.sh}"
 [ -f "$C" ] || { echo "not found: $C" >&2; exit 2; }
 C="$(cd "$(dirname "$C")" && pwd)/$(basename "$C")"
@@ -37,90 +47,92 @@ hasnt(){ printf '%s' "$2" | grep -qF -- "$3" && bad "$1" "absent: $3" "present" 
 
 S="$ROOT/stub"; mkdir -p "$S"
 for c in cat ls date wc tail head sed awk grep tr id hostname find sort mktemp cp rm mkdir chmod \
-         uname stat df free ps sh bash dirname basename sleep cut uniq expr touch env timeout; do
+         uname stat df free ps sh bash dirname basename sleep cut uniq expr touch env timeout rmdir \
+         readlink kill stty; do
     p="$(type -P "$c" 2>/dev/null)" && [ -n "$p" ] && ln -sf "$p" "$S/$c"
 done
-mkstub_sudo() {
-    cat > "$S/sudo" <<'EOF'
+# A sudo that must never run: it logs, and the log must stay empty.
+export STUBLOG="$ROOT/sudo.log"; : >| "$STUBLOG"
+stub_write "$S/sudo" <<'EOF'
 #!/bin/sh
-# A sudo that refuses, in sudo's own words. SUDO_STATE picks which refusal.
-# The wording is copied from a real sudo 1.9.13 on debian bookworm, measured
-# 2026-09-24, because the collector classifies on exactly these strings.
-#
-# Note what -n answers: the same line for both states. That is the reason the
-# collector reads -v instead, and a test that stubbed only -n would not notice
-# if it went back.
 [ -n "${STUBLOG:-}" ] && echo "sudo $*" >> "$STUBLOG"
-case "$1" in
-    -n) echo "sudo: a password is required" >&2; exit 1 ;;
-    -v) case "${SUDO_STATE:-notty}" in
-            nosudoers) echo "Sorry, user tester may not run sudo on testhost." >&2 ;;
-            *)         echo "sudo: a terminal is required to read the password; either use the -S option to read from standard input or configure an askpass helper" >&2 ;;
-        esac
-        exit 1 ;;
-esac
 exit 1
 EOF
-    chmod +x "$S/sudo"
-}
-mkstub_sudo
-cat > "$S/mysql" <<'EOF'
+stub_write "$S/mysql" <<'EOF'
 #!/bin/sh
 # MYSQL_FAIL=1 -> every statement is refused. BINLOG_BASE_ANS -> the answer to
 # SELECT @@log_bin_basename. Everything else answers 1, which is all the
-# sections under test read.
+# sections under test read. STUBARGS -> each call's arguments, one per line,
+# and "pwseen" when an option file it was handed holds the pattern in STUB_PWFILE
+# (a file, so the password is in no environment of the run).
+# MYSQL_SLEEP -> the login check (SELECT 1) sleeps that long, so a test can
+# look at the process table while the collector is running.
+if [ -n "${STUBARGS:-}" ]; then
+    { echo "-- call"; for a in "$@"; do printf '%s\n' "$a"; done; } >> "$STUBARGS"
+    for a in "$@"; do
+        case "$a" in --defaults-extra-file=*|--defaults-file=*)
+            f="${a#*=}"; [ -n "${STUB_PWFILE:-}" ] && grep -qF -f "$STUB_PWFILE" "$f" 2>/dev/null && echo pwseen >> "$STUBARGS" ;;
+        esac
+    done
+fi
+# ENVSEEN: the password pattern turned up in this child's environment.
+[ -n "${STUBARGS:-}" ] && [ -n "${STUB_PWFILE:-}" ] && env | grep -qF -f "$STUB_PWFILE" && echo envseen >> "$STUBARGS"
+for a in "$@"; do q="$a"; done
+[ -n "${MYSQL_SLEEP:-}" ] && [ "$q" = "SELECT 1" ] && sleep "$MYSQL_SLEEP"
 if [ -n "${MYSQL_FAIL:-}" ]; then
     echo "ERROR 1045 (28000): Access denied for user 'x'@'localhost' (using password: YES)" >&2
     exit 1
 fi
 for a in "$@"; do q="$a"; done
 case "$q" in
+    "SHOW BINARY LOGS") if [ -n "${MYSQL_BL_DENY:-}" ]; then
+            echo "ERROR 1227 (42000) at line 1: Access denied; you need (at least one of) the SUPER, REPLICATION CLIENT privilege(s) for this operation" >&2; exit 1
+        fi; echo "mysql-bin.000001	100"; exit 0 ;;
     *log_bin_basename*) [ -n "${BINLOG_BASE_ANS:-}" ] && echo "$BINLOG_BASE_ANS"; exit 0 ;;
     *) echo 1; exit 0 ;;
 esac
 EOF
-printf '#!/bin/sh\nexit 0\n' > "$S/mysqlbinlog"
+stub_write "$S/mysqlbinlog" <<'EOF'
+#!/bin/sh
+# MYSQLBINLOG_MODE: ok (two row events), fail (mysqlbinlog's own words for a
+# file it may not open), hang (never returns).
+for a in "$@"; do f="$a"; done
+case "${MYSQLBINLOG_MODE:-ok}" in
+    fail) echo "mysqlbinlog: [ERROR] Could not open log file '$f' (Errcode: 13 - Permission denied)" >&2; exit 1 ;;
+    mixed) case "$f" in *.000002) echo "mysqlbinlog: [ERROR] Could not open log file '$f' (Errcode: 13 - Permission denied)" >&2; exit 1 ;; esac ;;
+    hang) exec sleep 600 ;;
+esac
+echo "#260925 10:00:00 server id 1  end_log_pos 100 CRC32 0x0 Query thread_id=1 exec_time=0"
+echo "BEGIN"
+echo "### INSERT INTO \`acct\`.\`lock\`"
+echo "### UPDATE \`acct\`.\`lock\`"
+EOF
 chmod +x "$S/mysql" "$S/mysqlbinlog"
 UID_NOW="$(id -u)"
+SETSID="$(type -P setsid 2>/dev/null)"
+PY="$(type -P python3 2>/dev/null)"
+PW="S3cr3t-$$-pw"; A="$ROOT/args.log"; : >| "$A"; printf '%s\n' "$PW" > "$ROOT/pw.pat"
 
-echo "== 1. the four ways a run stays unelevated, each named for what it is =="
-export STUBLOG="$ROOT/sudo.log"; : > "$STUBLOG"
-out="$(SUDO_STATE=notty PATH="$S" bash "$C" --stdout </dev/null 2>/dev/null)"
-has "no terminal to ask on: the reason names the terminal" "$out" \
-    "privilege: not root (uid $UID_NOW): sudo found no terminal to ask for a password on"
-has "and sudo was asked anyway, rather than skipped on a test of stdin" \
-    "$(cat "$STUBLOG")" "sudo -v"
-
-# The regression that made this file worth writing: 0.6.1 chose between these
-# two by testing /dev/tty, so an account sudo does not permit was reported as a
-# missing terminal on every run that had none, and the guide then sent the
-# operator to `ssh -t`, which that account cannot be helped by.
-out="$(SUDO_STATE=nosudoers PATH="$S" bash "$C" --stdout </dev/null 2>/dev/null)"
-has "not in sudoers, same absent terminal: the reason names the account" "$out" \
-    "privilege: not root (uid $UID_NOW): sudo does not permit this account"
-
-out="$(PATH="$S" bash "$C" --stdout --no-sudo </dev/null 2>/dev/null)"
-has "--no-sudo: the reason is the flag" "$out" \
-    "privilege: not root (uid $UID_NOW): --no-sudo given"
-: > "$STUBLOG"; PATH="$S" bash "$C" --stdout --no-sudo </dev/null >/dev/null 2>&1
-chk "--no-sudo: sudo is not invoked at all" "0" "$(wc -l < "$STUBLOG")"
-
-rm -f "$S/sudo"
-out="$(PATH="$S" bash "$C" --stdout </dev/null 2>/dev/null)"
-has "no sudo on the host: the reason says so" "$out" \
-    "privilege: not root (uid $UID_NOW): command not found: sudo"
-mkstub_sudo
+echo "== 1. the collector never elevates or re-runs itself =="
+out="$(PATH="$S" bash "$C" --stdout --mysql-args "-u x" </dev/null 2>/dev/null)"
+has "[1] states the privilege it was started with" "$out" "privilege: not root (uid $UID_NOW)"
+chk "sudo is never executed" "" "$(cat "$STUBLOG")"
+err="$(PATH="$S" bash "$C" --stdout --no-sudo --mysql-args "-u x" </dev/null 2>&1 >/dev/null)"
+has "--no-sudo is accepted, and warns that it is no longer needed" "$err" "--no-sudo is no longer needed: the collector never elevates"
+for o in "--mysql-pwfd 0" "--mysql-pwsrc terminal" "--mysql-pwfile /etc/hostname" "--run-marker /x/ggt.y/started" "--env CMD_TIMEOUT=5"; do
+    # shellcheck disable=SC2086
+    chk "$o is gone (unknown, exit 2)" "2" "$(PATH="$S" bash "$C" --stdout $o </dev/null >/dev/null 2>&1; echo $?)"
+done
+chk "and still no sudo" "" "$(cat "$STUBLOG")"
 
 echo "== 2. the reason reaches the operator, not only the file =="
 err="$(MYSQL_FAIL=1 PATH="$S" bash "$C" --stdout --mysql-args "-u x" </dev/null 2>&1 >/dev/null)"
-has "the blocked line carries the refusal" "$err" "mysql login"
-has "and names it" "$err" "access denied"
-has "and the privilege that would have answered it, in sudo's words" "$err" \
-    "(not elevated: sudo found no terminal to ask for a password on)"
+has "the blocked line carries the refusal" "$err" "mysql login — access denied"
+has "and the privilege that would have answered it" "$err" "(not elevated: run again with sudo)"
 has "and the run is INCOMPLETE" "$err" "status: INCOMPLETE"
 out="$(MYSQL_FAIL=1 PATH="$S" bash "$C" --stdout --mysql-args "-u x" </dev/null 2>/dev/null)"
 hasnt "the notices stay off stdout, which is the report" "$out" "status: INCOMPLETE —"
-has "the report carries the same roll-up" "$out" "status: INCOMPLETE"
+hasnt "no how-to-run text in a fact line" "$(printf '%s' "$out" | sed -n '/^\[1\]/,/Collection status/p')" "run again with sudo"
 
 echo "== 3. the roll-up adds up and the report is whole =="
 line="$(printf '%s' "$out" | grep -o 'goals: .*')"
@@ -132,33 +144,186 @@ if [ -n "$line" ]; then
     chk "obtained + not applicable + blocked = declared" "$d" "$((g + n + b))"
 else bad "a goals: line" "one" "none"; fi
 has "the report reaches its footer" "$out" "==== END OF COLLECTION"
-has "section 0 states the privilege" "$out" "privilege:"
 
-echo "== 4. the binary log reason separates the two questions =="
+echo "== 4. a fact root would read: blocked, with the uid and the owner =="
 out="$(BINLOG_BASE_ANS='' PATH="$S" bash "$C" --stdout --binlog --mysql-args "-u x" </dev/null 2>/dev/null)"
 has "no path from the server: not resolved" "$out" "binary log directory not resolved"
-D="$ROOT/binlogs"; mkdir -p "$D"; : > "$D/mysql-bin.000001"
+D="$ROOT/binlogs"; mkdir -p "$D"; : >| "$D/mysql-bin.000001"
 if [ "$UID_NOW" != 0 ]; then
     chmod 000 "$D"
     out="$(BINLOG_BASE_ANS="$D/mysql-bin" PATH="$S" bash "$C" --stdout --binlog --mysql-args "-u x" </dev/null 2>/dev/null)"
-    has "a path this uid cannot read: not readable" "$out" "not readable by uid $UID_NOW"
-    err="$(BINLOG_BASE_ANS="$D/mysql-bin" PATH="$S" bash "$C" --stdout --binlog --mysql-args "-u x" </dev/null 2>&1 >/dev/null)"
-    has "and the blocked line says why the run is not root" "$err" "(not elevated:"
+    has "the fact says what was read" "$out" "not readable by uid $UID_NOW"
+    has "the goal names the uid, the owner and the mode" "$out" "binary log content attribution — run as uid $UID_NOW; $D is $(id -un):$(id -gn) 0 and not readable by this uid (not elevated: run again with sudo)"
     chmod 755 "$D"
 else skip "the unreadable-directory case (this account is root, which reads it)"; fi
 
-echo "== 5. under real sudo: the elevation and what it leaves behind =="
+echo "== 5. run with sudo by the operator =="
 if sudo -n true 2>/dev/null; then
-    out="$(bash "$C" --stdout </dev/null 2>/dev/null)"
+    out="$(sudo -n bash "$C" --stdout </dev/null 2>/dev/null)"
     has "the run reports itself as root" "$out" "privilege: root (elevated by sudo from uid $UID_NOW)"
     W="$ROOT/w"; mkdir -p "$W"
-    ( cd "$W" && bash "$C" --file </dev/null >/dev/null 2>&1 )
+    ( cd "$W" && sudo -n bash "$C" --file </dev/null >/dev/null 2>&1 )
     f="$(ls "$W"/whatap-collmysql-*.txt 2>/dev/null | head -1)"
-    if [ -n "$f" ]; then
-        chk "the report comes back to the caller" "$(id -un)" "$(stat -c %U "$f")"
+    if [ -n "$f" ]; then chk "the report comes back to the caller" "$(id -un)" "$(stat -c %U "$f")"
     else bad "a report written under sudo" "one .txt" "none"; fi
-    sudo rm -rf "$W" 2>/dev/null
+    sudo -n rm -rf "$W" 2>/dev/null
 else skip "the real-sudo group (needs passwordless sudo)"; fi
+
+echo "== 6. the binlog decode is obtained only when every file decoded =="
+# Each assertion here fails on 0.7.1, which read awk's exit status instead of
+# mysqlbinlog's and resolved the goal as obtained before decoding anything.
+D2="$ROOT/binlogs2"; mkdir -p "$D2"; : >| "$D2/mysql-bin.000001"; : >| "$D2/mysql-bin.000002"
+out="$(MYSQLBINLOG_MODE=mixed BINLOG_BASE_ANS="$D2/mysql-bin" PATH="$S" bash "$C" --stdout --no-sudo --binlog --mysql-args "-u x" </dev/null 2>/dev/null)"
+if printf '%s' "$out" | grep -qF "row events (count): 2" \
+   && printf '%s' "$out" | grep -qF "binary log content attribution — mysql-bin.000002: mysqlbinlog exit 1, permission denied"; then
+    ok "one file decoded, one refused: the decoded one is counted and the refused one blocks the goal"
+else bad "one file decoded, one refused: counted, and blocked by the refused one" "both" "$(printf '%s' "$out" | grep -m2 'row events\|binary log content attribution —')"; fi
+out="$(MYSQLBINLOG_MODE=fail BINLOG_BASE_ANS="$D2/mysql-bin" PATH="$S" bash "$C" --stdout --no-sudo --binlog --mysql-args "-u x" </dev/null 2>/dev/null)"
+has "every file refused: INCOMPLETE" "$out" "status: INCOMPLETE"
+hasnt "and not obtained" "$out" "obtained: mysql login, host-side facts (process, sockets, disk), binary log content attribution"
+t0=$(date +%s)
+out="$(MYSQLBINLOG_MODE=hang BINLOG_TIMEOUT=2 BINLOG_BASE_ANS="$D2/mysql-bin" PATH="$S" bash "$C" --stdout --no-sudo --binlog=1 --mysql-args "-u x" </dev/null 2>/dev/null)"
+t1=$(date +%s)
+has "a decode at its cap is partial and blocked" "$out" "decode stopped at the 2s cap (partial)"
+[ $((t1 - t0)) -le 30 ] && ok "and the cap binds ($((t1 - t0))s)" || bad "the cap binds" "<= 30s" "$((t1 - t0))s"
+out="$(BINLOG_BASE_ANS=NULL PATH="$S" bash "$C" --stdout --no-sudo --binlog --mysql-args "-u x" </dev/null 2>/dev/null)"
+has "a NULL basename is unresolved, not the cwd" "$out" "binary log directory not resolved: @@log_bin_basename is NULL"
+hasnt "and nothing is decoded" "$out" "decoding the"
+out="$(MYSQL_FAIL=1 PATH="$S" bash "$C" --stdout --no-sudo --binlog --mysql-args "-u x" </dev/null 2>/dev/null)"
+has "no login: the basename was not queried, and says so" "$out" "binlog directory: n/a (not queried: access denied)"
+
+# scan_procs FIELD PATFILE -> pids of this account whose /proc/<pid>/FIELD
+# (cmdline or environ) holds the pattern. The pattern comes from a file: a grep
+# given the password as an argument would itself be a process carrying it.
+scan_procs() {
+    local f hits=""
+    for f in /proc/[0-9]*/"$1"; do
+        { tr '\0' '\n' < "$f"; } 2>/dev/null | grep -qF -f "$2" && hits="$hits ${f#/proc/}"
+    done
+    printf '%s' "$hits"
+}
+
+echo "== 7. no credential on a child's command line or in its environment =="
+for spell in "-p$PW" "-Bp$PW" "--password=$PW" "--loose_password=$PW" "--skip-loose-password=$PW" "--skip-password=$PW" "--pass=$PW"; do
+    : >| "$A"
+    err="$(STUBARGS="$A" PATH="$S" bash "$C" --stdout --mysql-args "-u x $spell" </dev/null 2>&1 >/dev/null)"; rc=$?
+    if [ "$rc" = 2 ] && printf '%s' "$err" | grep -qF "is refused: no credential goes on a command line" && [ ! -s "$A" ] \
+       && ! printf '%s' "$err" | grep -qF -f "$ROOT/pw.pat"; then
+        ok "${spell%%"$PW"*}SECRET in --mysql-args: exit 2, no child ever started, the value not repeated"
+    else bad "${spell%%"$PW"*}SECRET in --mysql-args: exit 2 before any child" "rc 2, no stub call" "rc $rc, $(wc -l < "$A") stub lines"; fi
+done
+: >| "$A"
+MYSQL_PWD="$PW" STUBARGS="$A" STUB_PWFILE="$ROOT/pw.pat" PATH="$S" bash "$C" --stdout --mysql-args "-u x" </dev/null >"$ROOT/pwe.out" 2>/dev/null
+has "MYSQL_PWD reaches the client in the option file" "$(cat "$A")" "pwseen"
+hasnt "and in no child's environment" "$(cat "$A")" "envseen"
+hasnt "and on no child's command line" "$(grep -vx 'pwseen\|envseen' "$A")" "$PW"
+has "the report names the source, not the value" "$(cat "$ROOT/pwe.out")" "password: from MYSQL_PWD, handed to the client in a mode-600 option file"
+hasnt "and never prints the value" "$(cat "$ROOT/pwe.out")" "$PW"
+err="$(MYSQL_PWD="$(printf 'a\nb')" PATH="$S" bash "$C" --stdout --mysql-args "-u x" </dev/null 2>&1 >/dev/null)"; rc=$?
+[ "$rc" = 2 ] && printf '%s' "$err" | grep -qF "MYSQL_PWD holds a newline" \
+    && ok "MYSQL_PWD with a newline is refused, saying why" || bad "MYSQL_PWD with a newline is refused" "exit 2 + reason" "exit $rc"
+DX="$ROOT/extra.cnf"; printf '[client]\nuser=x\n' > "$DX"; : >| "$A"
+MYSQL_PWD="$PW" STUBARGS="$A" STUB_PWFILE="$ROOT/pw.pat" PATH="$S" bash "$C" --stdout --defaults-extra-file "$DX" </dev/null >/dev/null 2>&1
+if grep -qx pwseen "$A" && grep -q -- '--defaults-extra-file=' "$A" && ! grep -qxF -- "--defaults-extra-file=$DX" "$A"; then
+    ok "--defaults-extra-file is included from the private option file that carries the password"
+else bad "--defaults-extra-file with MYSQL_PWD" "the private file, pwseen" "$(grep -- '--defaults' "$A" | head -2 | tr '\n' ' ')"; fi
+if [ -n "$SETSID" ]; then
+    : >| "$A"
+    out="$(STUBARGS="$A" PATH="$S" "$SETSID" bash "$C" --stdout --mysql-args "-u x -Bp" </dev/null 2>/dev/null)"
+    has "a bare -p with no terminal says so" "$out" "password: n/a (-p given and this run has no terminal to ask for the password on)"
+    if grep -qx -- '-B' "$A" && ! grep -qx -- '-Bp' "$A" && ! grep -qx -- '-p' "$A"; then ok "-Bp is -B plus a prompt, and the client never gets p"
+    else bad "-Bp is -B plus a prompt" "-B kept, p gone" "$(grep -x -- '-B.*\|-p' "$A" | head -2 | tr '\n' ' ')"; fi
+else skip "the no-terminal -p case (setsid absent)"; fi
+
+echo "== 8. read from stdin (bash -s) and under sh =="
+err="$(PATH="$S" bash -s -- --stdout --mysql-args "-u x -p$PW" < "$C" 2>&1 >/dev/null)"; rc=$?
+chk "-pSECRET under bash -s is refused" "2" "$rc"
+out="$(PATH="$S" bash -s -- --stdout < "$C" 2>/dev/null)"
+has "without a password it runs to its footer" "$out" "==== END OF COLLECTION"
+out="$(sh "$C" --stdout 2>&1)"; rc=$?
+[ "$rc" = 2 ] && printf '%s' "$out" | grep -qF "collect-collmysql.sh needs bash" \
+    && ok "under sh: exit 2, saying it needs bash" || bad "under sh: exit 2, saying it needs bash" "rc 2 + message" "rc $rc: $(printf '%s' "$out" | head -1)"
+chk "no sudo in any of it" "" "$(cat "$STUBLOG")"
+
+echo "== 9. waits, caps and deadlines =="
+err="$(CMD_TIMEOUT=abc PATH="$S" bash "$C" --stdout --mysql-args "-u x" </dev/null 2>&1 >/dev/null)"
+has "a bad CMD_TIMEOUT is warned about and the run goes on" "$err" "(not a whole number 1..999999 without leading zeros): CMD_TIMEOUT=abc"
+err="$(CMD_TIMEOUT=0030 PATH="$S" bash "$C" --stdout --mysql-args "-u x" </dev/null 2>&1 >/dev/null)"
+has "a leading zero is refused, and the warning says why" "$err" "(not a whole number 1..999999 without leading zeros): CMD_TIMEOUT=0030"
+out="$(MYSQL_SLEEP=5 RUN_DEADLINE=2 PATH="$S" bash "$C" --stdout --mysql-args "-u x" </dev/null 2>/dev/null)"
+has "a login cut by the run deadline says so, not 'timed out: 20s'" "$out" "mysql connection: run deadline reached (2s) before the login"
+out="$(PATH="$S" bash "$C" --stdout --sample=1 </dev/null 2>/dev/null)"
+has "--sample: the deadline covers both samplers" "$out" "run deadline(s): 372"
+out="$(MYSQL_BL_DENY=1 MYSQLBINLOG_MODE=ok BINLOG_BASE_ANS="$D2/mysql-bin" PATH="$S" bash "$C" --stdout --no-sudo --binlog --mysql-args "-u x" </dev/null 2>/dev/null)"
+if printf '%s' "$out" | grep -qF "binary logs: n/a (SHOW BINARY LOGS: access denied)" \
+   && printf '%s' "$out" | grep -qF "binary log content attribution — SHOW BINARY LOGS: access denied"; then
+    ok "ERROR 1227 on SHOW BINARY LOGS is n/a with the error, and blocks the binlog goal"
+else bad "ERROR 1227 on SHOW BINARY LOGS is n/a and blocks the goal" "n/a + blocked" "$(printf '%s' "$out" | grep -m2 'binary logs\|binary log content')"; fi
+if [ -n "$SETSID" ] && [ -n "$PY" ]; then
+    cat > "$ROOT/ptydrive.py" <<'EOF'
+import os, sys, subprocess, termios, time, fcntl, select
+# ptydrive LIMIT KEY CMD... : run CMD on a new pty with nobody typing; with
+# KEY=ctrlc, send ^C once the prompt is up. Prints elapsed, whether it ended,
+# whether the footer came, and whether the terminal still echoes.
+m, s = os.openpty()
+def ctty():
+    os.setsid(); fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+t0 = time.time()
+p = subprocess.Popen(sys.argv[3:], stdin=s, stdout=s, stderr=s, preexec_fn=ctty)
+limit = float(sys.argv[1]); key = sys.argv[2]; buf = b""; sent = False
+while time.time() - t0 < limit:
+    r, _, _ = select.select([m], [], [], 0.3)
+    if r:
+        try: buf += os.read(m, 65536)
+        except OSError: break
+    if key == "ctrlc" and not sent and b"MySQL password" in buf:
+        time.sleep(0.5); os.write(m, b"\x03"); sent = True
+    if p.poll() is not None:
+        time.sleep(0.3)
+        try:
+            while select.select([m], [], [], 0.2)[0]: buf += os.read(m, 65536)
+        except OSError: pass
+        break
+done = p.poll() is not None
+if not done: p.kill(); p.wait()
+echo = bool(termios.tcgetattr(s)[3] & termios.ECHO)
+print("elapsed=%d done=%s footer=%s echo=%s" % (time.time() - t0, done, b"END OF COLLECTION" in buf, echo))
+sys.stdout.write(buf.decode("utf-8", "replace"))
+EOF
+    T11="$ROOT/tmp11"; mkdir -p "$T11"
+    res="$(TMPDIR="$T11" PROMPT_TIMEOUT=3 RUN_DEADLINE=40 PATH="$S" "$PY" "$ROOT/ptydrive.py" 30 none bash "$C" --stdout --mysql-args "-u x -p" 2>&1)"
+    e="$(printf '%s' "$res" | head -1 | sed 's/elapsed=\([0-9]*\).*/\1/')"
+    if [ "${e:-99}" -le 15 ] && printf '%s' "$res" | head -1 | grep -q 'footer=True echo=True' \
+       && printf '%s' "$res" | grep -qF "password: n/a (password prompt not answered within 3s)" && ! printf '%s' "$res" | grep -qF "run deadline reached"; then
+        ok "an unanswered -p prompt waits PROMPT_TIMEOUT, echo is back, the rest is collected (${e}s)"
+    else bad "an unanswered -p prompt waits PROMPT_TIMEOUT only" "<= 15s, footer, echo, no deadline" "$(printf '%s' "$res" | head -1)"; fi
+    res="$(TMPDIR="$T11" RUN_DEADLINE=6 PATH="$S" "$PY" "$ROOT/ptydrive.py" 30 none bash "$C" --stdout --mysql-args "-u x -p" 2>&1)"
+    e="$(printf '%s' "$res" | head -1 | sed 's/elapsed=\([0-9]*\).*/\1/')"
+    [ "${e:-99}" -le 12 ] && printf '%s' "$res" | head -1 | grep -q 'done=True footer=True' \
+        && ok "and within RUN_DEADLINE=6 when that is less (${e}s)" || bad "the prompt ends within RUN_DEADLINE" "<= 12s, footer" "$(printf '%s' "$res" | head -1)"
+    res="$(TMPDIR="$T11" PATH="$S" "$PY" "$ROOT/ptydrive.py" 30 ctrlc bash "$C" --stdout --mysql-args "-u x -p" 2>&1)"
+    if printf '%s' "$res" | grep -q 'MySQL password'; then
+        chk "Ctrl-C at the password prompt leaves the terminal echoing" "echo=True" "$(printf '%s' "$res" | head -1 | grep -o 'echo=[A-Za-z]*')"
+    else skip "the Ctrl-C-at-the-prompt case (no prompt appeared on the pty)"; fi
+    chk "the prompt runs leave no ggt.* directory" "" "$(ls -A "$T11")"
+else skip "the prompt cases (setsid or python3 absent)"; fi
+chk "and no sudo was run by any case above" "" "$(cat "$STUBLOG")"
+
+echo "== 10. client arguments are words, not a string to re-split =="
+DF="$ROOT/my dir/my.cnf"; mkdir -p "$ROOT/my dir"; printf '[client]\nuser=x\n' > "$DF"
+W="$ROOT/globdir"; mkdir -p "$W"; : >| "$W/xa"; : >| "$W/xb"; : >| "$A"
+( cd "$W" && STUBARGS="$A" PATH="$S" bash "$C" --stdout --no-sudo --defaults-file "$DF" --mysql-args "-u x*" </dev/null >/dev/null 2>&1 )
+chk "a --defaults-file path with a space is one argument" "1" "$(grep -cxF -- "--defaults-file=$DF" "$A" | awk '{print ($1>0)}')"
+chk "a glob character is not expanded against the cwd" "1" "$(grep -cxF -- 'x*' "$A" | awk '{print ($1>0)}')"
+hasnt "no cwd file name arrives as an argument" "$(cat "$A")" "xa"
+
+echo "== 11. nowhere to log in is blocked, not an answer =="
+if ! ps -eo args 2>/dev/null | grep -qE '[m]ysqld|[m]ariadbd'; then
+    out="$(MYSQL_FAIL=1 PATH="$S" bash "$C" --stdout --no-sudo </dev/null 2>/dev/null)"
+    has "the reason names --mysql-args" "$out" "mysql login — no local mysqld found and no --mysql-args given"
+    has "and the run is INCOMPLETE" "$out" "status: INCOMPLETE"
+else skip "the no-local-mysqld case (a mysqld runs on this machine)"; fi
+chk "a bad --binlog count exits 2" "2" "$(PATH="$S" bash "$C" --stdout --no-sudo --binlog=two </dev/null >/dev/null 2>&1; echo $?)"
 
 echo; echo "PASS=$PASS FAIL=$FAIL SKIP=$SKIP"
 [ "$FAIL" -eq 0 ]

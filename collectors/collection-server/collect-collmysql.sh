@@ -24,9 +24,34 @@
 # NOTE: no `set -e`. A collector must always reach its footer.
 # -----------------------------------------------------------------------------
 
+# bash only: arrays hold the client's arguments. Checked before any of them is
+# parsed, so sh or dash stops here with a sentence instead of a syntax error.
+[ -n "${BASH_VERSION:-}" ] || { echo "collect-collmysql.sh needs bash" >&2; exit 2; }
+
 export LC_ALL=C
 
 # ---- collector metadata -----------------------------------------------------
+# ---- collector metadata -----------------------------------------------------
+# 0.8.0  Never elevates itself and never re-runs itself: the operator runs it
+#        with sudo when root is needed (a packaged MySQL that admits root over
+#        the unix socket, a binary log directory only root reads), and the goal
+#        that root would have obtained says so in its reason. --no-sudo is
+#        accepted and warns that it is no longer needed. No credential on a
+#        command line: a password in --mysql-args (-pX, --password=X and every
+#        spelling the client takes as one) ends the run with exit 2; the
+#        password comes from a bare -p (asked once on the terminal), MYSQL_PWD
+#        or the operator's --defaults-file / --defaults-extra-file, and reaches
+#        the client only through a mode-600 option file in the run's private
+#        directory. Every wait is bounded: the -p prompt waits PROMPT_TIMEOUT
+#        (60s) or what is left of RUN_DEADLINE, and restores the terminal on
+#        Ctrl-C. External commands run bounded; the client argv is built word
+#        by word. A refused SHOW BINARY LOGS is n/a with the error and blocks
+#        the binlog goal; the binlog decode reads mysqlbinlog's own exit status
+#        and a failed or capped decode is blocked; a NULL log_bin_basename is
+#        unresolved, never the cwd; --sample raises the deadline by both
+#        samplers. No local mysqld and no connection arguments is blocked.
+#        Caps from the environment that are not whole numbers 1..999999 are
+#        dropped with a warning. Needs bash, and says so under sh.
 # 0.6.4  The report names the account. Section 0 says what the connection was
 #        attempted with, which survives a refusal, and section A says which
 #        grant row the server matched, which a refusal never reaches. On
@@ -62,7 +87,7 @@ export LC_ALL=C
 #        given. The binlog n/a reason now separates "path not resolved" from
 #        "path not readable" — they are answered by different things.
 COLLECTOR_NAME="whatap-collmysql"
-VERSION="0.7.1"
+VERSION="0.8.0"
 DOMAIN="collection-server"
 TARGET="collection-server-mysql/$(hostname 2>/dev/null || echo unknown)"
 
@@ -70,15 +95,31 @@ TARGET="collection-server-mysql/$(hostname 2>/dev/null || echo unknown)"
 OPT_FILE=0
 OPT_STDOUT=0
 OPT_QUIET=0
-OPT_SUDO=1           # re-run under sudo when this account is not root
 OPT_BINLOG=0          # decode binary logs and attribute events per table
 BINLOG_FILES=2        # how many of the newest binary logs to decode
 OPT_SAMPLE=0          # interval iostat/vmstat sampling
 SAMPLE_SEC=5
 SAMPLE_COUNT=6
-BINLOG_TIMEOUT=300   # per-file cap for the mysqlbinlog decode
+# Caps come from the environment only, and are whole numbers 1..999999 or they
+# are dropped here, before anything reads them (the rule of _cap_or in the run
+# helpers). _CAP_BAD is warned about once fd 3 is open.
+_cap_ok() { case "$1" in ''|*[!0-9]*|0*) return 1 ;; esac; [ "${#1}" -le 6 ]; }
+_CAP_BAD=""
+for _cv in CMD_TIMEOUT RUN_DEADLINE BINLOG_TIMEOUT PROMPT_TIMEOUT; do
+    eval "_cx=\${$_cv:-}"
+    if [ -n "$_cx" ] && ! _cap_ok "$_cx"; then _CAP_BAD="$_CAP_BAD $_cv=$_cx"; unset "$_cv"; fi
+done
+# RUN_DEADLINE as the caller set it decides whether the deadline is raised to
+# fit a binlog decode and the samplers.
+_RUN_DEADLINE_ENV="${RUN_DEADLINE:-}"
+BINLOG_TIMEOUT="${BINLOG_TIMEOUT:-300}"   # per-file cap for the mysqlbinlog decode
+# The most the -p prompt may wait, so an unanswered prompt does not spend the
+# whole deadline and leave every later fact "deadline reached".
+PROMPT_TIMEOUT="${PROMPT_TIMEOUT:-60}"
 MYSQL_ARGS=""         # extra arguments handed to the mysql client
 DEFAULTS_FILE=""
+EXTRA_FILE=""
+OPT_NOSUDO=0
 
 usage() {
     cat <<EOF
@@ -90,46 +131,49 @@ explicit action flag so nothing starts by accident.
   $(basename "$0") --file              write the facts report -> ./$COLLECTOR_NAME-<host>-<UTC>.txt
   $(basename "$0") --stdout            print the facts report to stdout
 
-  --defaults-file PATH   option file handed to the mysql client (credentials)
-  --mysql-args "ARGS"    extra arguments for the mysql client, e.g. "-h 10.0.0.5 -P 3306 -u whatap -p..."
-  --binlog[=N]           decode the N newest binary logs and count events per
-                         table (default N=$BINLOG_FILES). Reads log files; off by default.
-                         Each file is streamed once and capped at ${BINLOG_TIMEOUT}s
-  --sample[=SEC]         add SEC-interval iostat/vmstat samples (default $SAMPLE_SEC s x $SAMPLE_COUNT)
-  --quiet                silence progress on stderr
-  --no-sudo              stay at the current privilege (see below)
+  --defaults-file PATH        option file handed to the mysql client (credentials)
+  --defaults-extra-file PATH  option file read in addition to the client's own
+  --mysql-args "ARGS"         extra arguments for the mysql client, e.g. "-h 10.0.0.5 -P 3306 -u whatap -p"
+                              A bare -p asks for the password once, on the terminal.
+                              A password on the command line (-pSECRET,
+                              --password=SECRET, ...) is refused (exit 2): use -p,
+                              MYSQL_PWD or an option file.
+  --binlog[=N]                decode the N newest binary logs and count events per
+                              table (default N=$BINLOG_FILES). Reads log files; off by default.
+                              Each file is streamed once and capped at ${BINLOG_TIMEOUT}s
+  --sample[=SEC]              add SEC-interval iostat/vmstat samples (default $SAMPLE_SEC s x $SAMPLE_COUNT)
+  --quiet                     silence progress on stderr
 
-Privilege: when this account is not root, the collector re-runs itself under
-sudo, because a packaged MySQL usually lets root log in over the unix socket
-with no password, and root can also read the binary log directory. Passwordless
-sudo is used as-is; otherwise sudo asks once. Anything short of an elevation
-(no sudo, no terminal to ask on, an account sudo does not authorise) leaves the
-run at the current privilege instead of ending it, and section [1] names which of
-them it was. --no-sudo skips all of this.
+Privilege: the collector runs at the privilege it was started with and never
+elevates itself. A packaged MySQL often admits root over the unix socket with
+no password, and the binary log directory is often readable by root only; run
+it with sudo for those:  sudo ./$(basename "$0") --stdout
 
-Connection: with neither --defaults-file nor --mysql-args, the mysql client is
+Connection: with neither an option file nor --mysql-args, the mysql client is
 invoked with no connection arguments, so it uses its own option files
 (~/.my.cnf, /etc/my.cnf). Every section reports "n/a (<reason>)" when the client
 cannot connect, so a run without credentials still produces the host-side facts.
+
+Environment: CMD_TIMEOUT, RUN_DEADLINE, BINLOG_TIMEOUT, PROMPT_TIMEOUT (seconds).
 EOF
 }
 
 ARGC=$#
-# Kept for the sudo re-exec: the loop below consumes $@ with shift, and the
-# elevated run has to be given exactly what this one was given.
-_ARGV=("$@")
 while [ $# -gt 0 ]; do
     case "$1" in
         --file)    OPT_FILE=1 ;;
         --stdout)  OPT_STDOUT=1 ;;
         --quiet)   OPT_QUIET=1 ;;
-        --no-sudo) OPT_SUDO=0 ;;
+        # Field scripts written for 0.6/0.7 pass it; it changes nothing now.
+        --no-sudo) OPT_NOSUDO=1 ;;
         --binlog)  OPT_BINLOG=1 ;;
         --binlog=*) OPT_BINLOG=1; BINLOG_FILES="${1#*=}" ;;
         --sample)  OPT_SAMPLE=1 ;;
         --sample=*) OPT_SAMPLE=1; SAMPLE_SEC="${1#*=}" ;;
         --defaults-file) shift; DEFAULTS_FILE="${1:-}" ;;
         --defaults-file=*) DEFAULTS_FILE="${1#*=}" ;;
+        --defaults-extra-file) shift; EXTRA_FILE="${1:-}" ;;
+        --defaults-extra-file=*) EXTRA_FILE="${1#*=}" ;;
         --mysql-args) shift; MYSQL_ARGS="${1:-}" ;;
         --mysql-args=*) MYSQL_ARGS="${1#*=}" ;;
         -h|--help) usage; exit 0 ;;
@@ -170,11 +214,9 @@ have() { command -v "$1" >/dev/null 2>&1; }
 
 _errfile=""
 _timeout_bin=""
-CMD_TIMEOUT=20
-_init_probe() {
-    _errfile="$(_tmp probe.err)"
-    have timeout && _timeout_bin="$(command -v timeout)"
-}
+CMD_TIMEOUT="${CMD_TIMEOUT:-20}"
+case "$CMD_TIMEOUT" in ''|*[!0-9]*) CMD_TIMEOUT=20 ;; esac
+_init_probe() { _errfile="$(_tmp probe.err)"; }
 
 # ---- privilege — DO NOT EDIT ------------------------------------------------
 # What a collection can read is decided by the privilege it was given. That is a
@@ -606,13 +648,19 @@ _emit_labeled() {
     fi
 }
 
+# probe "label" CMD... -> output as facts, or "label: n/a (<why>)". Bounded by
+# _bounded (run helpers) at CMD_TIMEOUT and the run deadline.
 probe() {
     local label="$1"; shift
-    command -v "$1" >/dev/null 2>&1 || { fact "$label: n/a (command not found: $1)"; return; }
+    [ -n "$(_cmd_kind "$1")" ] || { fact "$label: n/a (command not found: $1)"; return; }
+    _past_deadline && { fact "$label: n/a (run deadline reached: ${RUN_DEADLINE}s)"; return; }
     local out rc
-    if [ -n "$_timeout_bin" ]; then out="$("$_timeout_bin" "$CMD_TIMEOUT" "$@" 2>"$_errfile")"; rc=$?
-    else out="$("$@" 2>"$_errfile")"; rc=$?; fi
-    [ "$rc" -eq 124 ] && [ -n "$_timeout_bin" ] && { fact "$label: n/a (timed out: ${CMD_TIMEOUT}s)"; return; }
+    out="$(_bounded "$@" 2>"$_errfile")"; rc=$?
+    if [ "$rc" -eq 124 ]; then
+        if _past_deadline; then fact "$label: n/a (run deadline reached: ${RUN_DEADLINE}s)"
+        else fact "$label: n/a (timed out: ${CMD_TIMEOUT}s)"; fi
+        return
+    fi
     [ "$rc" -ne 0 ] && { fact "$label: n/a ($(_classify_err))"; return; }
     [ -z "$out" ] && { fact "$label: n/a (empty output)"; return; }
     _emit_labeled "$label" "$out"
@@ -635,120 +683,196 @@ MYSQL_BIN=""
 MYSQL_OK=0
 MYSQL_WHY="not attempted"
 
-# ---- sudo elevation (this collector only) -----------------------------------
-# Rule 2: discover, never assume. Whether this account may become root is a
-# property of the host, so it is tested rather than declared, and whatever the
-# test finds fills the shared PRIV_WHY and PRIV_GAP above.
-#
-# Why elevate at all, here and nowhere else in the family. Nearly every section
-# of this report comes from SQL, and on a packaged MySQL the root@localhost
-# account authenticates by unix socket rather than by password. An elevated run
-# therefore needs no credentials, and the same elevation lets section I read the
-# binary log directory. One run instead of three, which is what rule 3 asks for:
-# the field runs one thing.
-#
-# Why it never ends the run. A host that forbids sudo still produces the
-# host-side facts, and those are worth sending. So sudo is only exec'd once it
-# is known to succeed: passwordless sudo is tested with `sudo -n true`, and the
-# interactive attempt goes through `sudo -v`, which returns nonzero when it
-# cannot authenticate instead of taking the process with it.
-#
-# Why `sudo -v` is attempted unconditionally. Whether a password can be asked
-# for is sudo's question, not this script's: sudo prompts on /dev/tty, which a
-# test of stdin does not describe. 0.6.0 gated the attempt on `[ -t 0 ]` and so
-# went silently unelevated under `ssh host 'cmd'`, reporting it as an account
-# sudo had refused. Without a terminal sudo fails immediately, and the reason it
-# gives is the one worth reporting.
+# ---- credentials (this collector only) ---------------------------------------
+# No credential on a command line (a child's argv is world-readable in ps and
+# /proc/<pid>/cmdline) and none in a child's environment. The client gets the
+# password from a mode-600 option file in the run's private directory, and only
+# that file's path is on its command line. Where the password may come from:
+#   a bare -p / --password in --mysql-args: asked once, on the terminal;
+#   MYSQL_PWD: read, then unset before any child starts;
+#   the operator's --defaults-file / --defaults-extra-file.
+# A password written into --mysql-args is on this collector's own command line
+# already; the collector refuses it rather than hand it on.
+_PW=""; _PW_SRC=""; _PW_WHY=""; CNF=""
 
-# _priv_gap_is REASON -> record that this run stayed unelevated, and why, in the
-# shared vocabulary of PRIV_WHY and PRIV_GAP.
-_priv_gap_is() { PRIV_GAP="$1"; PRIV_WHY="not root (uid $(id -u 2>/dev/null || echo '?')): $1"; }
-
-# _sudo_gap TEXT -> why sudo did not elevate this run, in sudo's own terms.
-#
-# Guessing this from /dev/tty gets it wrong. An account that is not in sudoers
-# fails whether or not there is a terminal, and the remedy is a different one:
-# a missing terminal is answered by `ssh -t`, an account sudo does not permit is
-# answered by an administrator. 0.6.1 reported the first for both.
-#
-# `sudo -n true` cannot tell them apart either — it answers "a password is
-# required" in both cases (debian bookworm, sudo 1.9.13). Only `sudo -v` names
-# the account, so the text handed here is that call's output.
-_sudo_gap() {
-    case "$1" in
-        *"may not run sudo"*|*"not in the sudoers"*|*"not allowed to execute"*)
-            printf 'sudo does not permit this account' ;;
-        *"a terminal is required"*|*"no tty present"*|*"no askpass"*)
-            printf 'sudo found no terminal to ask for a password on' ;;
-        *"try again"*|*"ncorrect password"*|*"uthentication fail"*)
-            printf 'sudo asked for a password and did not accept it' ;;
-        '')
-            printf 'sudo did not elevate this run' ;;
-        *)
-            printf 'sudo: %s' "$(printf '%s' "$1" | grep -m1 -v '^[[:space:]]*$' 2>/dev/null | cut -c1-120)" ;;
+# _pw_opt NAME -> what the mysql client does with a long option NAME (without
+# =VALUE), as measured on the 5.6, 5.7.32, 8.0.46 and 8.4.10 clients
+# (2026-09-25):
+#   "pw"   the value is the password: --password, --password1..3 (8.0.27+),
+#          a unique prefix of password (--pas .. --passwor; 5.6 accepts those,
+#          5.7 and 8.x reject them), after any run of the prefixes loose-,
+#          maximum-, skip-, enable-, disable- whose last one is loose- or
+#          maximum- (8.0.46 logs in with --skip-loose-password=X and
+#          --enable-loose-password=X);
+#   "drop" the same names whose last prefix is skip-/enable-/disable-
+#          (--skip-password=X, --loose-enable-password=X: the client does not
+#          use the value), and any other name that spells password;
+#   ""     anything else.
+# "_" and "-" are the same character in an option name (--loose_password). The
+# set is the union over those clients, so a spelling one of them takes as a
+# password never stays on a command line; the price is that --pass=X logs in
+# where an 8.x client would have refused the option.
+_pw_opt() {
+    local n="${1#--}" pre last=""
+    n="$(printf '%s' "$n" | tr '_' '-')"
+    while :; do
+        pre="${n%%-*}"
+        case "$pre" in loose|maximum|skip|enable|disable) last="$pre"; n="${n#*-}" ;; *) break ;; esac
+        [ -n "$n" ] || break
+    done
+    case "$n" in
+        password|password[123]|pas|pass|passw|passwo|passwor)
+            case "$last" in skip|enable|disable) printf 'drop' ;; *) printf 'pw' ;; esac
+            return 0 ;;
     esac
+    # Not a spelling any client takes, but it names a password: it does not
+    # stay on a command line either (--PASSWORD=, --pass-word=, --loose--password=).
+    case "$(printf '%s' "$1" | tr 'A-Z' 'a-z' | tr -d '_-')" in *password*) printf 'drop'; return 0 ;; esac
+    return 1
 }
 
-_elevate() {
-    local uid; uid="$(id -u 2>/dev/null || echo 0)"
-    if [ "$uid" = 0 ]; then _note_privilege; return 0; fi
-    if [ "$OPT_SUDO" = 0 ]; then _priv_gap_is "--no-sudo given"; return 0; fi
-    if ! have sudo; then _priv_gap_is "command not found: sudo"; return 0; fi
-
-    # Absolute path: sudo keeps the working directory, but $0 may have been
-    # reached through PATH. A copy without the execute bit is run through bash.
-    local self="$0" dir
-    case "$self" in
-        /*) ;;
-        *)  dir="$(cd "$(dirname "$self")" 2>/dev/null && pwd)" || dir=""
-            [ -n "$dir" ] && self="$dir/$(basename "$self")" ;;
-    esac
-    local runner=""; [ -x "$self" ] || runner="$(command -v bash || echo sh)"
-
-    if sudo -n true 2>/dev/null; then
-        printf '>> re-running under sudo (uid %s -> root)\n' "$uid" >&2
-        # shellcheck disable=SC2086
-        exec sudo -n $runner "$self" "$@"
-    fi
-    # Capturing this call's stderr does not swallow the password prompt: sudo
-    # writes the prompt to /dev/tty, and where there is no /dev/tty there is no
-    # prompt to lose. Verified in a container with a pty (2026-09-24).
-    local _sudo_said; _sudo_said="$(sudo -v 2>&1)"
-    if [ $? = 0 ]; then
-        printf '>> re-running under sudo (uid %s -> root)\n' "$uid" >&2
-        # shellcheck disable=SC2086
-        exec sudo $runner "$self" "$@"
-    fi
-    [ -n "$_sudo_said" ] && printf '%s\n' "$_sudo_said" >&2
-    _priv_gap_is "$(_sudo_gap "$_sudo_said")"
+# _tty_restore -> the terminal settings saved before the password prompt
+_STTY_SAVED=""
+_tty_restore() {
+    if [ -n "$_STTY_SAVED" ]; then stty "$_STTY_SAVED" </dev/tty 2>/dev/null
+    else stty echo </dev/tty 2>/dev/null; fi
 }
 
-_mysql_base() {
-    local args=""
-    [ -n "$DEFAULTS_FILE" ] && args="--defaults-file=$DEFAULTS_FILE"
-    printf '%s %s' "$args" "$MYSQL_ARGS"
+# _short_pw WORD -> true when a short-option cluster holds -p. Sets _SP_KEPT
+# (the cluster without p and what follows it) and _SP_PW (the rest after p,
+# empty for "ask").
+_SP_KEPT=""; _SP_PW=""
+_short_pw() {
+    local w="${1#-}" i=0 c pre=""
+    while [ "$i" -lt "${#w}" ]; do
+        c="${w:$i:1}"
+        case "$c" in
+            p) _SP_PW="${w:$((i + 1))}"; _SP_KEPT="${pre:+-$pre}"; return 0 ;;
+            u|h|P|D|S|e|R|'#') return 1 ;;
+        esac
+        pre="$pre$c"; i=$((i + 1))
+    done
+    return 1
+}
+
+# _prompt_budget -> seconds the prompt may wait: PROMPT_TIMEOUT or what is left
+# of the run, whichever is less
+_prompt_budget() {
+    local left=$((RUN_DEADLINE - $(_elapsed)))
+    [ "$left" -gt "$PROMPT_TIMEOUT" ] && left="$PROMPT_TIMEOUT"
+    printf '%s' "$left"
+}
+
+_take_password() {
+    local w out="" prompt=0 inargs=""
+    set -f
+    for w in $MYSQL_ARGS; do
+        case "$w" in
+            --*=*) [ -n "$(_pw_opt "${w%%=*}")" ] && { inargs="${w%%=*}=..."; continue; } ;;
+            --*)   case "$(_pw_opt "$w")" in pw) prompt=1; continue ;; drop) continue ;; esac ;;
+            -?*)   # A cluster of short options (-BpX, -Np): p takes the rest of
+                   # the word as the password, unless an option that takes an
+                   # argument (-u, -h, -P, -D, -S, -e, -R, -#) came first.
+                   if _short_pw "$w"; then
+                       if [ -n "$_SP_PW" ]; then inargs="${_SP_KEPT:--}p..."; continue; fi
+                       prompt=1; [ -n "$_SP_KEPT" ] && out="$out${out:+ }$_SP_KEPT"; continue
+                   fi ;;
+        esac
+        out="$out${out:+ }$w"
+    done
+    set +f
+    if [ -n "$inargs" ]; then
+        warn "a password in --mysql-args ($inargs) is refused: no credential goes on a command line; use a bare -p (asked on the terminal), MYSQL_PWD or --defaults-file"
+        exit 2
+    fi
+    MYSQL_ARGS="$out"
+    if [ -n "${MYSQL_PWD:-}" ]; then
+        # A value with a newline cannot survive an option file (a line ends
+        # there), and would log in as access denied with nothing saying why.
+        case "$MYSQL_PWD" in
+            *"$_nl"*) warn "MYSQL_PWD holds a newline, which the mysql option file cannot carry; use --defaults-file"; exit 2 ;;
+        esac
+        [ "$prompt" = 1 ] || { _PW="$MYSQL_PWD"; _PW_SRC=MYSQL_PWD; }
+    fi
+    unset MYSQL_PWD
+    [ -z "$_PW" ] && [ "$prompt" = 1 ] || return 0
+    if ! { : </dev/tty; } 2>/dev/null; then
+        _PW_WHY="-p given and this run has no terminal to ask for the password on"; return 0
+    fi
+    # Echo off before the prompt, so a password typed ahead is not shown, and
+    # back on however the read ends: a Ctrl-C at the prompt used to leave the
+    # operator's terminal without echo.
+    local left prc=0; left="$(_prompt_budget)"
+    [ "$left" -lt 1 ] && left=1
+    _STTY_SAVED="$(stty -g </dev/tty 2>/dev/null)"
+    trap '_tty_restore; _run_cleanup; exit 129' HUP
+    trap '_tty_restore; _run_cleanup; exit 130' INT
+    trap '_tty_restore; _run_cleanup; exit 143' TERM
+    stty -echo </dev/tty 2>/dev/null
+    printf 'MySQL password (asked once, for every query of this run): ' >/dev/tty
+    IFS= read -r -t "$left" _PW </dev/tty || prc=$?
+    _tty_restore
+    # the run helpers' traps again
+    trap '_run_cleanup; exit 129' HUP
+    trap '_run_cleanup; exit 130' INT
+    trap '_run_cleanup; exit 143' TERM
+    printf '\n' >/dev/tty
+    if [ "$prc" -gt 128 ]; then
+        _PW=""; _PW_WHY="password prompt not answered within ${left}s"
+        warn "$_PW_WHY; continuing without a password"
+    elif [ -n "$_PW" ]; then _PW_SRC="terminal prompt"; fi
+}
+
+# _load_password -> write the client option file for the password this run holds
+_load_password() {
+    [ -n "$_PW" ] || return 0
+    # Option-file syntax: the value in double quotes, with \ and " escaped, so a
+    # password holding #, ; or spaces survives the parse.
+    local q inc="${DEFAULTS_FILE:-$EXTRA_FILE}"
+    q="$(printf '%s' "$_PW" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+    case "$inc" in ''|/*) ;; *) inc="$PWD/$inc" ;; esac
+    CNF="$(_tmp client.cnf)"
+    [ "$CNF" = /dev/null ] && { CNF=""; _PW_WHY="no private directory for the client option file"; return 0; }
+    ( umask 077
+      {
+          # The client reads one --defaults-file only and one extra file only,
+          # so the operator's file is included from ours rather than lost.
+          [ -n "$inc" ] && printf '!include %s\n' "$inc"
+          printf '[client]\npassword="%s"\n' "$q"
+      } > "$CNF" ) 2>/dev/null || { CNF=""; _PW_WHY="the client option file could not be written"; }
+}
+
+# MYSQL_ARGV -> the client's arguments, one word each. Built once: an unquoted
+# $(...) split a --defaults-file path with a space in two and let a glob
+# character in an argument match files in the working directory.
+MYSQL_ARGV=()
+_build_client_argv() {
+    local w
+    MYSQL_ARGV=()
+    if [ -n "$CNF" ]; then
+        if [ -n "$DEFAULTS_FILE" ]; then MYSQL_ARGV=("--defaults-file=$CNF")
+        else MYSQL_ARGV=("--defaults-extra-file=$CNF"); fi
+    elif [ -n "$DEFAULTS_FILE" ]; then
+        MYSQL_ARGV=("--defaults-file=$DEFAULTS_FILE")
+        [ -n "$EXTRA_FILE" ] && MYSQL_ARGV=("${MYSQL_ARGV[@]}" "--defaults-extra-file=$EXTRA_FILE")
+    elif [ -n "$EXTRA_FILE" ]; then
+        MYSQL_ARGV=("--defaults-extra-file=$EXTRA_FILE")
+    fi
+    set -f
+    for w in $MYSQL_ARGS; do MYSQL_ARGV[${#MYSQL_ARGV[@]}]="$w"; done
+    set +f
 }
 
 # mysql_q "SQL" -> raw tab-separated rows on stdout, nonzero on failure
 mysql_q() {
     [ -n "$MYSQL_BIN" ] || return 127
-    # shellcheck disable=SC2086
-    if [ -n "$_timeout_bin" ]; then
-        "$_timeout_bin" "$CMD_TIMEOUT" "$MYSQL_BIN" $(_mysql_base) -N -B -e "$1" 2>"$_errfile"
-    else
-        "$MYSQL_BIN" $(_mysql_base) -N -B -e "$1" 2>"$_errfile"
-    fi
+    _bounded "$MYSQL_BIN" "${MYSQL_ARGV[@]}" -N -B -e "$1" 2>"$_errfile"
 }
 
 # mysql_vertical "SQL" -> \G style output (for STATUS commands)
 mysql_vertical() {
     [ -n "$MYSQL_BIN" ] || return 127
-    # shellcheck disable=SC2086
-    if [ -n "$_timeout_bin" ]; then
-        "$_timeout_bin" "$CMD_TIMEOUT" "$MYSQL_BIN" $(_mysql_base) -e "$1\G" 2>"$_errfile"
-    else
-        "$MYSQL_BIN" $(_mysql_base) -e "$1\G" 2>"$_errfile"
-    fi
+    _bounded "$MYSQL_BIN" "${MYSQL_ARGV[@]}" -e "$1\G" 2>"$_errfile"
 }
 
 # sql "label" "SQL" -> rows as facts, or a classified reason
@@ -782,8 +906,13 @@ _resolve_mysql() {
     local c
     for c in mysql mariadb; do have "$c" && { MYSQL_BIN="$(command -v $c)"; break; }; done
     if [ -z "$MYSQL_BIN" ]; then MYSQL_WHY="command not found: mysql"; return; fi
-    if mysql_q "SELECT 1" >/dev/null 2>&1; then MYSQL_OK=1; MYSQL_WHY="ok"
-    else MYSQL_WHY="$(_classify_err)"; fi
+    mysql_q "SELECT 1" >/dev/null 2>&1
+    case "$?" in
+        0)   MYSQL_OK=1; MYSQL_WHY="ok" ;;
+        124) if _past_deadline; then MYSQL_WHY="run deadline reached (${RUN_DEADLINE}s) before the login"
+             else MYSQL_WHY="timed out: ${CMD_TIMEOUT}s"; fi ;;
+        *)   MYSQL_WHY="$(_classify_err)" ;;
+    esac
 }
 
 # ---- report body ------------------------------------------------------------
@@ -802,9 +931,12 @@ run_report() {
     section "Collection environment"
     fact "bash: ${BASH_VERSION:-unknown}"
     fact "uid: $(id -u 2>/dev/null || echo unknown)"
+    _note_privilege
     fact "privilege: $PRIV_WHY"
     # Section D's kernel counters are totals since boot.
     _note_boot
+    # The whole run is bounded by this, raised for what this run was asked to do.
+    fact "run deadline(s): $RUN_DEADLINE"
     fact "tools:"
     for t in mysql mysqlbinlog iostat vmstat ss findmnt lsblk timeout; do
         if have "$t"; then sub "$(printf '%-12s present' "$t")"
@@ -814,20 +946,28 @@ run_report() {
     # What the connection was attempted WITH. Section A reports what the server
     # matched, but only a successful login reaches section A, and a refused one
     # is exactly when the question is asked. With no arguments the client takes
-    # the account name from the OS uid and goes over the unix socket, so an
-    # elevated run attempts root@localhost without anything being passed.
-    if [ -n "$DEFAULTS_FILE" ] || [ -n "$MYSQL_ARGS" ]; then
-        fact "connection attempted with:${DEFAULTS_FILE:+ --defaults-file=$DEFAULTS_FILE}${MYSQL_ARGS:+ $(printf '%s' "$MYSQL_ARGS" | sed -E 's/(-p)[^ ]+/\1<masked>/g; s/(password=)[^ ]+/\1<masked>/gI')}"
+    # the account name from the OS uid and goes over the unix socket, so a run
+    # started with sudo attempts root@localhost without anything being passed.
+    # The password itself is never printed: it is not report content but a
+    # credential this run was handed. Where it came from is printed.
+    if [ -n "$DEFAULTS_FILE$EXTRA_FILE" ] || [ -n "$MYSQL_ARGS" ]; then
+        fact "connection attempted with:${DEFAULTS_FILE:+ --defaults-file=$DEFAULTS_FILE}${EXTRA_FILE:+ --defaults-extra-file=$EXTRA_FILE}${MYSQL_ARGS:+ $MYSQL_ARGS}"
     else
         fact "connection attempted with: no arguments (client defaults: account from uid $(id -u 2>/dev/null || echo '?') = $(id -un 2>/dev/null || echo unknown), unix socket)"
     fi
+    if [ -n "$CNF" ]; then fact "password: from $_PW_SRC, handed to the client in a mode-600 option file"
+    elif [ -n "$_PW_WHY" ]; then fact "password: n/a ($_PW_WHY)"
+    else fact "password: none given to this collector"; fi
     fact "mysql connection: $MYSQL_WHY"
     if [ "$MYSQL_OK" = 1 ]; then got login
-    elif [ -z "$MYSQL_ARGS" ] && [ -z "$DEFAULTS_FILE" ] \
-         && ! (ps -eo args 2>/dev/null | grep -qE "[m]ysqld|[m]ariadbd"); then
-        # No local server and no connection arguments: there is no database
-        # here to log in to, so this is the answer rather than a blocked run.
-        na login "no mysqld on this host and no connection arguments given"
+    elif [ -z "$MYSQL_BIN" ]; then missed login "command not found: mysql or mariadb client"
+    elif [ -n "$_PW_WHY" ]; then missed login "$MYSQL_WHY; $_PW_WHY"
+    elif [ -z "$MYSQL_ARGS" ] && [ -z "$DEFAULTS_FILE$EXTRA_FILE" ] \
+         && ! (_bounded ps -eo args 2>/dev/null | grep -qE "[m]ysqld|[m]ariadbd"); then
+        # The backend's MySQL is often on another host. No local server and no
+        # connection arguments is therefore a run that asked nowhere, not an
+        # answer: --mysql-args would obtain it.
+        missed login "no local mysqld found and no --mysql-args given (client without arguments: $MYSQL_WHY)"
     else missed login "$MYSQL_WHY$(_priv_hint)"; fi
     fact "binlog decode tier: $([ "$OPT_BINLOG" = 1 ] && echo "on (newest $BINLOG_FILES files)" || echo "off")"
     fact "sampling tier: $([ "$OPT_SAMPLE" = 1 ] && echo "on (${SAMPLE_SEC}s x ${SAMPLE_COUNT})" || echo "off")"
@@ -898,8 +1038,15 @@ run_report() {
     if [ "$MYSQL_OK" != 1 ]; then
         fact "binary logs: n/a ($MYSQL_WHY)"
     else
-        _bl_rows="$(mysql_q "SHOW BINARY LOGS")"
-        if [ -z "$_bl_rows" ]; then
+        # A refusal is not an empty list: without REPLICATION CLIENT the server
+        # answers ERROR 1227, which used to read as "binary logs: none".
+        _BL_INV_WHY=""
+        _bl_rows="$(mysql_q "SHOW BINARY LOGS")"; _bl_rc=$?
+        if [ "$_bl_rc" -ne 0 ]; then
+            if [ "$_bl_rc" -eq 124 ]; then _BL_INV_WHY="timed out: ${CMD_TIMEOUT}s"
+            else _BL_INV_WHY="$(_classify_err)"; fi
+            fact "binary logs: n/a (SHOW BINARY LOGS: $_BL_INV_WHY)"
+        elif [ -z "$_bl_rows" ]; then
             fact "binary logs: none"
         else
             fact "binary logs: $(printf '%s\n' "$_bl_rows" | wc -l | tr -d ' ') files, $(printf '%s\n' "$_bl_rows" | awk '{s+=$2} END {printf "%.0f", s+0}') bytes total (SHOW BINARY LOGS)"
@@ -913,17 +1060,26 @@ run_report() {
     sql "Binlog_bytes_written"        "SHOW GLOBAL STATUS LIKE 'Binlog%bytes%'"
 
     # Growth rate is measured from file mtimes, so it needs no second sample.
+    # NULL (log_bin off, or a server that does not report it) and a bare file
+    # name both leave no directory: dirname would answer ".", the cwd of this
+    # run, and that is not where the server writes.
     BINLOG_DIR=""
+    LOG_BIN="$(mysql_val "SELECT @@log_bin" 2>/dev/null)"
     BINLOG_BASE="$(mysql_val "SELECT @@log_bin_basename" 2>/dev/null)"
-    [ -n "$BINLOG_BASE" ] && BINLOG_DIR="$(dirname "$BINLOG_BASE" 2>/dev/null)"
+    case "$BINLOG_BASE" in
+        /*) BINLOG_DIR="$(dirname "$BINLOG_BASE" 2>/dev/null)" ;;
+    esac
     if [ -n "$BINLOG_DIR" ] && [ -d "$BINLOG_DIR" ] && [ -r "$BINLOG_DIR" ]; then
         fact "binlog directory: $BINLOG_DIR"
+        # The server-supplied path is an argument, never part of the script text.
         probe "newest binlog files (mtime, bytes)" sh -c \
-            "ls -l --time-style=+%Y-%m-%dT%H:%M:%SZ '$BINLOG_DIR' 2>/dev/null | grep -E '\\.[0-9]{6}\$' | tail -20"
-        probe "binlog total bytes" sh -c \
-            "du -sb '$BINLOG_DIR' 2>/dev/null | cut -f1"
+            'ls -l --time-style=+%Y-%m-%dT%H:%M:%SZ "$1" 2>/dev/null | grep -E "\.[0-9]{6}\$" | tail -20' sh "$BINLOG_DIR"
+        probe "binlog total bytes" sh -c 'du -sb "$1" 2>/dev/null | cut -f1' sh "$BINLOG_DIR"
+    elif [ -n "$BINLOG_DIR" ]; then
+        fact "binlog directory: $BINLOG_DIR (not readable by uid $(id -u 2>/dev/null || echo '?'))"
     else
-        fact "binlog directory: n/a (not resolved or not readable from this host)"
+        if [ "$MYSQL_OK" != 1 ]; then fact "binlog directory: n/a (not queried: $MYSQL_WHY)"
+        else fact "binlog directory: n/a (@@log_bin_basename is not an absolute path: ${BINLOG_BASE:-empty})"; fi
     fi
 
     section "D. Storage and I/O"
@@ -932,7 +1088,7 @@ run_report() {
     DATADIR="$(mysql_val "SELECT @@datadir" 2>/dev/null)"
     if [ -n "$DATADIR" ] && [ -d "$DATADIR" ]; then
         fact "datadir: $DATADIR"
-        probe "datadir filesystem" sh -c "df -hT '$DATADIR' 2>/dev/null | tail -n +2"
+        probe "datadir filesystem" sh -c 'df -hT "$1" 2>/dev/null | tail -n +2' sh "$DATADIR"
     else
         fact "datadir: ${DATADIR:-n/a (not resolved)} (not present on this host)"
     fi
@@ -988,8 +1144,17 @@ run_report() {
     sql "max_connections"        "SELECT @@max_connections"
 
     section "I. Binary log content attribution"
+    # The goal is declared only when --binlog was given, and resolved once,
+    # after every file: obtained only when every selected file was decoded to
+    # its end. A decode that failed (mysqlbinlog could not open a file, Errcode
+    # 13) or stopped at the cap is a gap, however many counters it printed.
     if [ "$OPT_BINLOG" != 1 ]; then
-        fact "n/a (not requested: pass --binlog to enable)"
+        fact "n/a (not requested: --binlog not given)"
+    elif [ "$MYSQL_OK" = 1 ] && [ "$LOG_BIN" = 0 ]; then
+        # Checked before the decoder: a server that writes no binary log has
+        # nothing to decode, whatever tools the host has.
+        fact "n/a (@@log_bin is 0 on this server)"
+        na binlog "@@log_bin is 0 on this server, so it writes no binary log"
     elif ! have mysqlbinlog; then
         fact "n/a (command not found: mysqlbinlog)"
         missed binlog "command not found: mysqlbinlog"
@@ -997,35 +1162,35 @@ run_report() {
         # Splitting these two matters: an unresolved path is answered by getting
         # a login, an unreadable one by getting a different account. The old
         # wording covered both and answered neither (Smartfren, 2026-09-23).
-        fact "n/a (binary log directory not resolved: log_bin_basename and datadir both unavailable)"
-        missed binlog "binary log directory not resolved (log_bin_basename and datadir unavailable)"
-    elif [ ! -r "$BINLOG_DIR" ]; then
+        if [ "$MYSQL_OK" != 1 ]; then fact "n/a (binary log directory not resolved: @@log_bin_basename not queried: $MYSQL_WHY)"
+        else fact "n/a (binary log directory not resolved: @@log_bin_basename is ${BINLOG_BASE:-empty})"; fi
+        missed binlog "binary log directory not resolved (@@log_bin_basename ${BINLOG_BASE:-unavailable}; mysql connection: $MYSQL_WHY)"
+    elif [ ! -r "$BINLOG_DIR" ] || [ ! -x "$BINLOG_DIR" ]; then
         fact "n/a (binary log directory $BINLOG_DIR not readable by uid $(id -u 2>/dev/null || echo '?'))"
-        missed binlog "$BINLOG_DIR not readable by uid $(id -u 2>/dev/null || echo '?')$(_priv_hint)"
+        missed binlog "run as uid $(id -u 2>/dev/null || echo '?'); $BINLOG_DIR is $(stat -c '%U:%G %a' "$BINLOG_DIR" 2>/dev/null || echo 'not readable') and not readable by this uid$(_priv_hint)"
     else
         fact "decoding the $BINLOG_FILES newest binary logs under $BINLOG_DIR"
-        _bl_list="$(ls -1t "$BINLOG_DIR" 2>/dev/null | grep -E '\.[0-9]{6}$' | head -n "$BINLOG_FILES")"
+        _bl_list="$(ls -1td -- "$BINLOG_DIR"/*.[0-9][0-9][0-9][0-9][0-9][0-9] 2>/dev/null | head -n "$BINLOG_FILES")"
         if [ -z "$_bl_list" ]; then
             fact "n/a (no binary log files matched under $BINLOG_DIR)"
-            na binlog "no binary log files under $BINLOG_DIR (log_bin off, or none written yet)"
+            na binlog "$BINLOG_DIR is readable and holds no <basename>.NNNNNN file"
         else
-            got binlog
-            for _bl in $_bl_list; do
-                _path="$BINLOG_DIR/$_bl"
+            _bl_ok=0; _bl_gap=""
+            _sum="$(_tmp binlog.sum)"
+            while IFS= read -r _bl; do
+                [ -n "$_bl" ] || continue
+                _path="$_bl"; _bl="${_bl##*/}"
                 _bytes="$(ls -l "$_path" 2>/dev/null | awk '{print $5}')"
                 fact "file: $_bl ($_bytes bytes)"
                 # A production binary log is max_binlog_size (1 GiB by default),
                 # and decoded row events run about 1.15x that. Holding it in a
                 # shell variable and walking it six times costs gigabytes of RSS
                 # on a host that is already short of I/O, so stream it once
-                # through awk and keep only the counters.
-                _sum="$(mktemp 2>/dev/null || echo "${TMPDIR:-/tmp}/.ggt.$$.bl")"
-                if [ -n "$_timeout_bin" ]; then
-                    "$_timeout_bin" "$BINLOG_TIMEOUT" mysqlbinlog --no-defaults \
-                        --base64-output=DECODE-ROWS -v "$_path" 2>"$_errfile"
-                else
-                    mysqlbinlog --no-defaults --base64-output=DECODE-ROWS -v "$_path" 2>"$_errfile"
-                fi | awk '
+                # through awk and keep only the counters. The decoder's own exit
+                # status is the one read (PIPESTATUS), not awk's: awk always
+                # succeeds and always prints its END block.
+                CMD_TIMEOUT="$BINLOG_TIMEOUT" _bounded mysqlbinlog --no-defaults \
+                    --base64-output=DECODE-ROWS -v "$_path" 2>"$_errfile" | awk '
                     /^### INSERT INTO / { c["INSERT " $4]++; rows++; next }
                     /^### UPDATE /      { c["UPDATE " $3]++; rows++; next }
                     /^### DELETE FROM / { c["DELETE " $4]++; rows++; next }
@@ -1046,16 +1211,23 @@ run_report() {
                         printf "S\tfirst\t%s\n",   first
                         printf "S\tlast\t%s\n",    last
                     }' > "$_sum" 2>/dev/null
-                _rc=$?
-                if [ ! -s "$_sum" ]; then
-                    sub "n/a ($(_classify_err))"
-                    rm -f "$_sum" 2>/dev/null
+                _rc="${PIPESTATUS[0]}"
+                if [ "$_rc" -ne 0 ] && [ "$_rc" -ne 124 ]; then
+                    _why="$(_classify_err)"
+                    sub "n/a (mysqlbinlog exit $_rc: $_why)"
+                    case "$_why" in *permission*) _why="$_why$(_priv_hint)" ;; esac
+                    _bl_gap="$_bl_gap${_bl_gap:+; }$_bl: mysqlbinlog exit $_rc, $_why"
                     continue
                 fi
-                [ "$_rc" -eq 124 ] && sub "note: decoding stopped at the ${BINLOG_TIMEOUT}s cap, counts below are partial"
+                if [ "$_rc" -eq 124 ]; then
+                    sub "decoding stopped at the ${BINLOG_TIMEOUT}s cap; the counts below cover the part decoded before it"
+                    _bl_gap="$_bl_gap${_bl_gap:+; }$_bl: decode stopped at the ${BINLOG_TIMEOUT}s cap (partial)"
+                else
+                    _bl_ok=$((_bl_ok + 1))
+                fi
                 _rows="$(awk -F'\t' '$2=="rows"{print $3}' "$_sum")"
                 if [ "${_rows:-0}" -eq 0 ]; then
-                    sub "events per table: none (no row events decoded; check binlog_format in section C)"
+                    sub "events per table: none (no row events decoded)"
                 else
                     sub "events per table (count, table):"
                     awk -F'\t' '$1=="T"{printf "%12d %s\n", $2, $3}' "$_sum" \
@@ -1067,19 +1239,24 @@ run_report() {
                 sub "statement and DDL events (Query, count): $(awk -F'\t' '$2=="queries"{print $3}' "$_sum")"
                 sub "first event timestamp: $(awk -F'\t' '$2=="first"{print $3}' "$_sum")"
                 sub "last event timestamp:  $(awk -F'\t' '$2=="last"{print $3}' "$_sum")"
-                rm -f "$_sum" 2>/dev/null
-            done
+            done <<EOF
+$_bl_list
+EOF
+            rm -f "$_sum" 2>/dev/null
+            [ -n "${_BL_INV_WHY:-}" ] && _bl_gap="$_bl_gap${_bl_gap:+; }SHOW BINARY LOGS: $_BL_INV_WHY"
+            if [ -z "$_bl_gap" ] && [ "$_bl_ok" -gt 0 ]; then got binlog
+            else missed binlog "${_bl_gap:-no file was decoded}"; fi
         fi
     fi
 
     section "J. Interval samples"
     if [ "$OPT_SAMPLE" != 1 ]; then
-        fact "n/a (not requested: pass --sample to enable)"
+        fact "n/a (not requested: --sample not given)"
     else
-        CMD_TIMEOUT=$(( SAMPLE_SEC * SAMPLE_COUNT + 30 ))
+        _ct="$CMD_TIMEOUT"; CMD_TIMEOUT=$(( SAMPLE_SEC * SAMPLE_COUNT + 30 ))
         probe "iostat -x" iostat -x "$SAMPLE_SEC" "$SAMPLE_COUNT"
         probe "vmstat" vmstat "$SAMPLE_SEC" "$SAMPLE_COUNT"
-        CMD_TIMEOUT=20
+        CMD_TIMEOUT="$_ct"
     fi
 
     section "K. MySQL error log"
@@ -1099,6 +1276,8 @@ run_report() {
 
 # ---- main -------------------------------------------------------------------
 exec 3>&2
+[ -n "$_CAP_BAD" ] && warn "ignored from the environment (not a whole number 1..999999 without leading zeros):$_CAP_BAD; the defaults are used"
+[ "$OPT_NOSUDO" = 1 ] && warn "--no-sudo is no longer needed: the collector never elevates"
 
 [ "$ARGC" -eq 0 ] && { usage; exit 0; }
 
@@ -1108,9 +1287,26 @@ if [ "$OPT_FILE" = 0 ] && [ "$OPT_STDOUT" = 0 ]; then
     exit 2
 fi
 
-_elevate "${_ARGV[@]}"
+_need_int() {
+    case "$2" in ''|*[!0-9]*) warn "$1 takes a non-negative integer; got '$2'"; exit 2 ;; esac
+}
+_need_int --binlog "$BINLOG_FILES"
+_need_int --sample "$SAMPLE_SEC"
+[ "$BINLOG_FILES" -lt 1 ] && BINLOG_FILES=1
+[ "$SAMPLE_SEC" -lt 1 ] && SAMPLE_SEC=1
+# The decode is capped per file; the run deadline is raised to fit it and the
+# samplers (iostat and vmstat run one after the other), unless the caller set one.
+if [ -z "$_RUN_DEADLINE_ENV" ]; then
+    [ "$OPT_BINLOG" = 1 ] && RUN_DEADLINE=$((RUN_DEADLINE + BINLOG_FILES * BINLOG_TIMEOUT))
+    [ "$OPT_SAMPLE" = 1 ] && RUN_DEADLINE=$((RUN_DEADLINE + 2 * (SAMPLE_SEC * SAMPLE_COUNT + 30)))
+fi
+
+# The private directory first, because the client option file goes into it.
 _run_init
+_take_password
+_load_password
 _init_probe
+_build_client_argv
 _resolve_mysql
 # An identity only. Whether the login worked is the status section's business.
 TARGET="collection-server-mysql/$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || echo unknown)"
@@ -1124,11 +1320,14 @@ else
     TS="$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null || echo unknown)"
     OUTFILE="./$COLLECTOR_NAME-$HOST-$TS.txt"
     progress "collecting facts (read-only) -> writing $OUTFILE"
-    _report_to_file "$OUTFILE" || exit 1
-    # Written by root after an elevation, so give it back to whoever asked for
-    # it; otherwise they cannot move or delete their own report.
-    [ -n "${SUDO_UID:-}" ] && [ "$(id -u 2>/dev/null || echo 0)" = 0 ] \
-        && chown "$SUDO_UID:${SUDO_GID:-$SUDO_UID}" "$OUTFILE" 2>/dev/null
-    progress "report written: $OUTFILE"
+    # Written as root when the operator ran it with sudo, so give it back to
+    # them; otherwise they cannot move or delete their own report.
+    if _report_to_file "$OUTFILE"; then
+        [ -n "${SUDO_UID:-}" ] && [ "$(id -u 2>/dev/null || echo 0)" = 0 ] \
+            && chown "$SUDO_UID:${SUDO_GID:-$SUDO_UID}" "$OUTFILE" 2>/dev/null
+        progress "report written: $OUTFILE"
+    else
+        exit 1
+    fi
 fi
 _end_probe

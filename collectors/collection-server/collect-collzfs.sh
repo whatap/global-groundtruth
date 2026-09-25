@@ -53,11 +53,30 @@
 # its footer even when individual steps fail; each step guards itself.
 # -----------------------------------------------------------------------------
 
+# bash only (arrays, local, PIPESTATUS). Checked first, so sh or dash stops with
+# a sentence instead of a syntax error.
+[ -n "${BASH_VERSION:-}" ] || { echo "collect-collzfs.sh needs bash" >&2; exit 2; }
+
 export LC_ALL=C
 
 # ---- collector metadata -----------------------------------------------------
 COLLECTOR_NAME="whatap-collzfs"
-VERSION="0.5.1"
+# 0.6.0  "No pool" is an answer only when `zpool list` ran and listed none: a
+#        list that was refused, failed or hung, and a kstat tree with no zpool,
+#        now block the pools goal instead of "none imported", COMPLETE. A third
+#        goal, dataset properties and snapshots, is blocked when zfs get or
+#        the snapshot list failed, hung or is absent, and [1] and the per-pool
+#        lines say why nothing was queried. Every zpool / zfs / zdb /
+#        journalctl / find call is bounded, a zpool or zfs that hangs during
+#        discovery is not asked again, and the run deadline is raised to fit
+#        the file-size walk, --sample, --zdb (per pool) and the bundle; [1]
+#        prints it. A walk that could not read part of the tree is PARTIAL.
+#        Discovery reads /proc with one grep through xargs (5.2s -> 0.5s) and
+#        works with the script on stdin. Temp files and the bundle live in the
+#        run's private directory; numeric options are checked (exit 2); an
+#        unwritable --out or failed tar exits 1; output is handed back under
+#        sudo. Needs bash, and says so under sh.
+VERSION="0.6.0"
 DOMAIN="collection-server"
 TARGET="collection-server-zfs/$(hostname 2>/dev/null || echo unknown)"   # refined after pool discovery
 
@@ -94,6 +113,10 @@ FILESIZES_SECS=300   # bound on the tree walk; a partial result is labelled as s
 # because what matters is when a class STARTED and when it STOPPED. So: tally
 # everything, keep the detail for this window. 0 keeps the detail for everything.
 OPT_EVENT_DAYS=30
+# RUN_DEADLINE as the caller gave it (empty when not given), read before the run
+# helpers default it: the file-size walk, --sample, --zdb and the bundle's
+# event dump each need more than the default, and a caller's value wins.
+_RUN_DEADLINE_ENV="${RUN_DEADLINE:-}"
 
 usage() {
     cat <<'EOF'
@@ -202,7 +225,8 @@ have() { command -v "$1" >/dev/null 2>&1; }
 _errfile=""
 _init_errfile() { _errfile="$(_tmp probe.err)"; }
 _timeout_bin=""
-CMD_TIMEOUT=20
+CMD_TIMEOUT="${CMD_TIMEOUT:-20}"
+case "$CMD_TIMEOUT" in ''|*[!0-9]*) CMD_TIMEOUT=20 ;; esac
 
 _classify_err() {
     # reads a stderr file, prints a short classified reason
@@ -635,43 +659,51 @@ _emit_labeled() {
     fi
 }
 
-# probe "label" CMD [ARGS...] -> emits output as facts, or "label: n/a (<why>)"
+# probe "label" CMD [ARGS...] -> emits output as facts, or "label: n/a (<why>)".
+# Every call goes through _bounded (run helpers): a pool that hangs costs at most
+# CMD_TIMEOUT per call and the run still reaches its footer.
+# Fail fast: a zpool or zfs whose discovery call hit the cap is not asked again.
+# One hung pool would otherwise cost CMD_TIMEOUT for each of forty calls.
+HUNG=""              # " zpool zfs" as discovery found them
+HUNG_ZPOOL_WHY=""    # which discovery call hung, and its cap
+HUNG_ZFS_WHY=""
+_hung() { case " $HUNG " in *" $1 "*) return 0 ;; esac; return 1; }
+# _skip_why CMD -> the reason a call to CMD was not made
+_skip_why() {
+    case "$1" in
+        zpool) printf 'skipped: zpool hung earlier (%s)' "$HUNG_ZPOOL_WHY" ;;
+        zfs)   printf 'skipped: zfs hung earlier (%s)' "$HUNG_ZFS_WHY" ;;
+    esac
+}
+
 probe() {
     local label="$1"; shift
-    local bin="$1"
-    if ! command -v "$bin" >/dev/null 2>&1; then
-        fact "$label: n/a (command not found: $bin)"; return
-    fi
+    [ -n "$(_cmd_kind "$1")" ] || { fact "$label: n/a (command not found: $1)"; return; }
+    _hung "$1" && { fact "$label: n/a ($(_skip_why "$1"))"; return; }
+    _past_deadline && { fact "$label: n/a (run deadline reached: ${RUN_DEADLINE}s)"; return; }
     local out rc
-    if [ -n "$_timeout_bin" ]; then
-        out="$("$_timeout_bin" "$CMD_TIMEOUT" "$@" 2>"$_errfile")"; rc=$?
-    else
-        out="$("$@" 2>"$_errfile")"; rc=$?
-    fi
-    if [ "$rc" -eq 124 ] && [ -n "$_timeout_bin" ]; then
-        fact "$label: n/a (timed out: ${CMD_TIMEOUT}s)"; return
+    out="$(_bounded "$@" 2>"$_errfile")"; rc=$?
+    if [ "$rc" -eq 124 ]; then
+        if _past_deadline; then fact "$label: n/a (run deadline reached: ${RUN_DEADLINE}s)"
+        else fact "$label: n/a (timed out: ${CMD_TIMEOUT}s)"; fi
+        return
     fi
     if [ "$rc" -ne 0 ]; then
+        [ -n "$out" ] && { _emit_labeled "$label (exit $rc)" "$out"; return; }
         fact "$label: n/a ($(_classify_err))"; return
     fi
-    if [ -z "$out" ]; then
-        fact "$label: n/a (empty output)"; return
-    fi
+    [ -z "$out" ] && { fact "$label: n/a (empty output)"; return; }
     _emit_labeled "$label" "$out"
 }
 
 # probe_merged: like probe but folds stderr into stdout (tools that print to stderr).
 probe_merged() {
     local label="$1"; shift
-    local bin="$1"
-    if ! command -v "$bin" >/dev/null 2>&1; then
-        fact "$label: n/a (command not found: $bin)"; return
-    fi
+    [ -n "$(_cmd_kind "$1")" ] || { fact "$label: n/a (command not found: $1)"; return; }
     local out rc
-    if [ -n "$_timeout_bin" ]; then out="$("$_timeout_bin" "$CMD_TIMEOUT" "$@" 2>&1)"; rc=$?
-    else out="$("$@" 2>&1)"; rc=$?; fi
-    if [ "$rc" -eq 124 ] && [ -n "$_timeout_bin" ]; then fact "$label: n/a (timed out: ${CMD_TIMEOUT}s)"; return; fi
-    if [ -z "$out" ]; then fact "$label: n/a (empty output)"; return; fi
+    out="$(_bounded "$@" 2>&1)"; rc=$?
+    [ "$rc" -eq 124 ] && { fact "$label: n/a (timed out: ${CMD_TIMEOUT}s)"; return; }
+    [ -z "$out" ] && { fact "$label: n/a (empty output)"; return; }
     _emit_labeled "$label" "$out"
 }
 
@@ -691,6 +723,7 @@ probe_pipe() {
     if ! command -v "$req" >/dev/null 2>&1; then
         fact "$label: n/a (command not found: $req)"; return
     fi
+    _hung "$req" && { fact "$label: n/a ($(_skip_why "$req"))"; return; }
     probe "$label" sh -c "$pipeline"
 }
 
@@ -753,30 +786,122 @@ dump_file() {
 # --quiet. Keep the text a fact about collection state (no judgment words).
 progress() { [ "$OPT_QUIET" = 1 ] && return; printf '>> %s\n' "$*" >&3 2>/dev/null; }
 
-# run_bounded SECS CMD... -> stdout only, bounded when `timeout` exists
+# run_bounded SECS CMD... -> stdout only, capped at SECS by _bounded (which also
+# honours the run deadline and works without timeout(1)). Returns 124 on a cap.
 run_bounded() {
     local s="$1"; shift
-    if [ -n "$_timeout_bin" ]; then "$_timeout_bin" "$s" "$@" 2>/dev/null
-    else "$@" 2>/dev/null; fi
+    _hung "$1" && return 124
+    CMD_TIMEOUT="$s" _bounded "$@" 2>/dev/null
 }
 
 # ---- portable helpers -------------------------------------------------------
 fstype_of() {
     local p="$1"
-    if have findmnt; then findmnt -no FSTYPE -T "$p" 2>/dev/null && return; fi
-    if have stat; then stat -f -c '%T' "$p" 2>/dev/null && return; fi
+    if have findmnt; then _bounded findmnt -no FSTYPE -T "$p" 2>/dev/null && return; fi
+    if have stat; then _bounded stat -f -c '%T' "$p" 2>/dev/null && return; fi
     echo ""
 }
 
 source_of() {
     local p="$1"
-    if have findmnt; then findmnt -no SOURCE -T "$p" 2>/dev/null && return; fi
+    if have findmnt; then _bounded findmnt -no SOURCE -T "$p" 2>/dev/null && return; fi
     echo ""
 }
 
-cmdline_of() { tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null; }
+# cmdline_of PID -> sets _CL to the process's argv joined by spaces (the same
+# bytes `tr '\0' ' '` gave), with builtins only: it runs once per candidate,
+# and a fork per process made discovery linear in the process count (3.5s of
+# an 8s run on a 759-process host, 2026-09-25).
+_CL=""
+cmdline_of() {
+    local a=""
+    _CL=""
+    while IFS= read -r -d '' a; do _CL="$_CL$a "; done < "/proc/$1/cmdline" 2>/dev/null
+    _CL="$_CL$a"
+}
 
-sd_show() { have systemctl && systemctl show -p "$1" "$2" 2>/dev/null | cut -d= -f2-; }
+# _whatap_cmdlines -> /proc/<pid>/cmdline paths that name a whatap module, in
+# /proc order. One bounded grep over every entry instead of a read per process,
+# fed through xargs so a host with tens of thousands of processes does not hit
+# ARG_MAX. Its exit status is kept: grep answers 0 (match) or 1 (none), and 2
+# when a process vanished mid-scan, which xargs reports as 123; anything else
+# (a cap, a failed exec) means the table was not read, and says so.
+CMDLINE_SCAN_WHY=""
+_whatap_cmdlines() {
+    # The list goes through a file and _bounded_in, not a pipe into _bounded:
+    # with the script on stdin (bash -s), _bounded gives its command /dev/null
+    # as stdin, and a piped list would arrive empty and read as "no JVM".
+    local lst; lst="$(_tmp cmdlines.lst)"
+    if have xargs && [ "$lst" != /dev/null ] && printf '%s\0' /proc/[0-9]*/cmdline > "$lst" 2>/dev/null; then
+        _bounded_in "$lst" xargs -0 grep -lsE 'whatap\.server\.|whatap\.opslake\.|\.yard\.boot'
+    else
+        # No xargs or no private directory: the paths as arguments (bounded by ARG_MAX).
+        _bounded grep -lsE 'whatap\.server\.|whatap\.opslake\.|\.yard\.boot' /proc/[0-9]*/cmdline
+    fi
+}
+_scan_cmdlines() {
+    local rc
+    _SCAN_OUT="$(_whatap_cmdlines)"; rc=$?
+    case "$rc" in
+        0|1|2|123) CMDLINE_SCAN_WHY="" ;;
+        124) CMDLINE_SCAN_WHY="the /proc/<pid>/cmdline scan did not finish within ${CMD_TIMEOUT}s" ;;
+        *)   CMDLINE_SCAN_WHY="the /proc/<pid>/cmdline scan failed (xargs/grep exit $rc)" ;;
+    esac
+}
+
+
+# One `systemctl show` for every unit this run asks about, instead of one per
+# question (57 calls, about 1.4s, on a host with the whatap units; 2026-09-25).
+# The output is one block per unit, separated by blank lines, properties in
+# systemd's order rather than the order asked; each block is read whole and
+# filed under its Id. sd_show answers from here, and asks systemctl itself
+# only for a unit that was not prefetched.
+_SD_CACHE=""   # lines: <unit><TAB><Prop>=<value>
+_SD_KNOWN=" "  # units the prefetch answered for
+_sd_prefetch() {
+    have systemctl || return 0
+    local out line id="" blk=""
+    out="$(_sdq show -p Id -p LoadState -p WorkingDirectory -p NRestarts "$@")"
+    [ -n "$out" ] || return 0
+    # A trailing blank line closes the last block.
+    while IFS= read -r line; do
+        if [ -n "$line" ]; then
+            case "$line" in Id=*) id="${line#Id=}" ;; esac
+            blk="$blk$line$_nl"
+            continue
+        fi
+        if [ -n "$id" ]; then
+            _SD_KNOWN="$_SD_KNOWN$id "
+            while IFS= read -r line; do
+                [ -n "$line" ] && _SD_CACHE="$_SD_CACHE$id$_tab$line$_nl"
+            done <<EOB
+$blk
+EOB
+        fi
+        id=""; blk=""
+    done <<EOF
+$out
+
+EOF
+}
+# _sd_cached PROP UNIT -> the prefetched value; false when UNIT was not prefetched
+_sd_cached() {
+    case "$_SD_KNOWN" in *" $2 "*) ;; *) return 1 ;; esac
+    local l
+    while IFS= read -r l; do
+        case "$l" in "$2$_tab$1="*) printf '%s\n' "${l#*=}"; return 0 ;; esac
+    done <<EOF
+$_SD_CACHE
+EOF
+    return 0
+}
+_sdq() { _bounded systemctl "$@" 2>/dev/null; }
+sd_show() {
+    have systemctl || return 0
+    _sd_cached "$1" "$2" && return 0
+    _bounded systemctl show -p "$1" "$2" 2>/dev/null | cut -d= -f2-
+}
+sd_state() { _bounded systemctl "$1" "$2" 2>/dev/null; }
 unit_loaded() { [ "$(sd_show LoadState "$1")" = "loaded" ]; }
 
 # param NAME -> "NAME = value" from /sys/module/zfs/parameters, with a reason.
@@ -810,29 +935,64 @@ _ZGETALL=""          # temp file: name<TAB>property<TAB>value<TAB>source (fs+vol
 _ZSNAP=""            # temp file: name<TAB>used<TAB>creation(epoch)<TAB>userrefs
 DS_COUNT=0
 SNAP_COUNT=0
-KSTAT_DIR="/proc/spl/kstat/zfs"
+# COLLZFS_KSTAT_DIR is a test hook (tools/test-collzfs.sh): a machine without
+# ZFS cannot otherwise show the "kstat tree but no zpool" case.
+KSTAT_DIR="${COLLZFS_KSTAT_DIR:-/proc/spl/kstat/zfs}"
 ZFS_ON_HOST=0        # 1 when zfs/zpool commands OR the kstat tree exist
+ZPOOL_RC=""          # exit status of the discovery `zpool list`; empty when not run
+ZPOOL_ERR=""         # its stderr, first line
+ZGET_RC=""           # the same for `zfs get all` and the snapshot list
+ZGET_ERR=""
+ZSNAP_RC=""
+ZSNAP_CAP=120
+ZSNAP_ERR=""
 
 discover_zfs() {
     if have zfs || have zpool || [ -d "$KSTAT_DIR" ]; then ZFS_ON_HOST=1; fi
     if have zpool; then
-        ZPOOLS="$(run_bounded 20 zpool list -H -o name | tr '\n' ' ')"
-        ZPOOL_COUNT="$(printf '%s' "$ZPOOLS" | wc -w | tr -d ' ')"
+        # A failed list is not an empty one: its exit status and message are
+        # kept so the pools goal can tell "none imported" from "not allowed".
+        local _zl _ze; _ze="$(_tmp zpool-list.err)"
+        _zl="$(_bounded zpool list -H -o name 2>"$_ze")"; ZPOOL_RC=$?
+        ZPOOL_ERR="$(head -n1 "$_ze" 2>/dev/null | cut -c1-160)"
+        if [ "$ZPOOL_RC" -eq 124 ]; then
+            HUNG="$HUNG zpool"; HUNG_ZPOOL_WHY="zpool list did not answer within ${CMD_TIMEOUT}s"
+            warn "$HUNG_ZPOOL_WHY; the other zpool calls are skipped"
+        fi
+        if [ "$ZPOOL_RC" -eq 0 ]; then
+            # No trailing blank: an empty list has to stay empty for [ -z ].
+            ZPOOLS="$(printf '%s' "$_zl" | tr '\n' ' ' | sed 's/ *$//')"
+            ZPOOL_COUNT="$(printf '%s' "$ZPOOLS" | wc -w | tr -d ' ')"
+        fi
     fi
     if have zfs; then
         # One pass over every filesystem/volume property, WITH its source
         # (local / inherited / default). Asking for `all` instead of a property
         # list means a version that lacks a property simply does not report it —
         # no command-wide failure, and the absence itself becomes a fact.
-        _ZGETALL="$(mktemp 2>/dev/null || echo "${TMPDIR:-/tmp}/.ggt.zget.$$")"
-        run_bounded 90 zfs get -H -o name,property,value,source -t filesystem,volume all > "$_ZGETALL" 2>/dev/null
+        _ZGETALL="$(_tmp zget.tsv)"
+        local _ge; _ge="$(_tmp zget.err)"
+        # Caps scale with CMD_TIMEOUT: 90s and 120s at the default 20s.
+        local _gcap=$(( CMD_TIMEOUT * 9 / 2 )) _scap=$(( CMD_TIMEOUT * 6 ))
+        CMD_TIMEOUT="$_gcap" _bounded zfs get -H -o name,property,value,source -t filesystem,volume all > "$_ZGETALL" 2>"$_ge"
+        ZGET_RC=$?; ZGET_ERR="$(head -n1 "$_ge" 2>/dev/null | cut -c1-160)"
+        if [ "$ZGET_RC" -eq 124 ]; then
+            HUNG="$HUNG zfs"; HUNG_ZFS_WHY="zfs get did not answer within ${_gcap}s"
+            warn "$HUNG_ZFS_WHY; the other zfs calls are skipped"
+        fi
         DS_COUNT="$(awk -F'\t' '{print $1}' "$_ZGETALL" 2>/dev/null | sort -u | grep -c . 2>/dev/null)"
         # One pass over snapshots. `clones` is a SNAPSHOT property (it never
         # appears in the filesystem/volume dump above), so it is collected here:
         # a snapshot with a clone attached cannot be destroyed to reclaim space.
         # Bounded: a yard with an aggressive snapshot policy holds tens of thousands.
-        _ZSNAP="$(mktemp 2>/dev/null || echo "${TMPDIR:-/tmp}/.ggt.zsnap.$$")"
-        run_bounded 120 zfs list -H -p -t snapshot -o name,used,creation,userrefs,clones > "$_ZSNAP" 2>/dev/null
+        _ZSNAP="$(_tmp zsnap.tsv)"
+        local _se; _se="$(_tmp zsnap.err)"
+        if _hung zfs; then ZSNAP_RC=124
+        else
+            CMD_TIMEOUT="$_scap" _bounded zfs list -H -p -t snapshot -o name,used,creation,userrefs,clones > "$_ZSNAP" 2>"$_se"
+            ZSNAP_RC=$?
+        fi
+        ZSNAP_CAP="$_scap"; ZSNAP_ERR="$(head -n1 "$_se" 2>/dev/null | cut -c1-160)"
         SNAP_COUNT="$(grep -c . "$_ZSNAP" 2>/dev/null)"
     fi
     [ -z "$DS_COUNT" ] && DS_COUNT=0
@@ -860,16 +1020,21 @@ YARDBASE=""
 resolve_home() {
     local d cl v unit wd sd
     if [ -n "$OPT_HOME" ]; then WHOME="$OPT_HOME"; WHOME_SRC="option --home"; return; fi
-    for d in /proc/[0-9]*; do
-        [ -r "$d/cmdline" ] || continue
-        cl="$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null)"
+    local f
+    _scan_cmdlines
+    while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        d="${f%/cmdline}"
+        cmdline_of "${d#/proc/}"; cl="$_CL"
         case "$cl" in
             *whatap.server.*|*whatap.opslake.*|*.yard.boot*) ;;
             *) continue ;;
         esac
         v="$(printf '%s\n' "$cl" | grep -oE '[-]Dwhatap\.server\.home=[^ ]+' | head -n1 | cut -d= -f2-)"
         if [ -n "$v" ]; then WHOME="$v"; WHOME_SRC="process ${d#/proc/} (-Dwhatap.server.home)"; return; fi
-    done
+    done <<EOF
+$_SCAN_OUT
+EOF
     if have systemctl; then
         for unit in $WHATAP_UNITS; do
             unit_loaded "$unit.service" || continue
@@ -1063,14 +1228,21 @@ objset_kstat_view() {
 # awk would hide this: awk still prints a complete-looking END block from
 # whatever it received before find was killed.
 filesize_histogram() {
-    local p="$1" tmp rc
-    tmp="$(mktemp 2>/dev/null || echo "${TMPDIR:-/tmp}/.ggt.fsz.$$")"
-    run_bounded "$FILESIZES_SECS" find "$p" -xdev -type f -printf '%s\n' 2>/dev/null > "$tmp"
+    local p="$1" tmp err rc nerr
+    tmp="$(_tmp fsz.list)"; err="$(_tmp fsz.err)"
+    CMD_TIMEOUT="$FILESIZES_SECS" _bounded find "$p" -xdev -type f -printf '%s\n' 2>"$err" > "$tmp"
     rc=$?
     if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
         printf '(PARTIAL: the walk hit the %ss bound and was stopped. The buckets below\n' "$FILESIZES_SECS"
-        printf ' cover only the files reached by then, in directory order, not the whole tree.\n'
-        printf ' Raise it with --filesizes-secs N.)\n'
+        printf ' cover only the files reached by then, in directory order, not the whole tree.)\n'
+        warn "file-size histogram is partial: the walk hit the ${FILESIZES_SECS}s bound; --filesizes-secs N raises it"
+    elif [ "$rc" -ne 0 ]; then
+        # find exits 1 when it could not descend into part of the tree. The
+        # buckets then leave those subtrees out, and must say so.
+        nerr="$(grep -c . "$err" 2>/dev/null)"
+        printf '(PARTIAL: find exited %s; %s directories or files could not be read by uid %s,\n' "$rc" "${nerr:-0}" "$(id -u 2>/dev/null || echo '?')"
+        printf ' so the buckets below leave those subtrees out. First message: %s)\n' "$(head -n1 "$err" 2>/dev/null | cut -c1-160)"
+        warn "file-size histogram is partial: ${nerr:-0} paths under $p were not readable$(_priv_hint)"
     fi
     awk '
         {
@@ -1109,6 +1281,7 @@ run_report() {
 
     goal zfs   "ZFS present on this host"
     goal pools "pool topology and properties"
+    [ "$ZFS_ON_HOST" = 1 ] && goal datasets "dataset properties and snapshots"
 
     # -- [1] Collection environment -------------------------------------------
     section "Collection environment"
@@ -1119,6 +1292,8 @@ run_report() {
     fact "privilege: $PRIV_WHY"
     # [J] zpool iostat, the kstat trees and metaslab_stats are all since-boot.
     _note_boot
+    # The whole run is bounded by this, raised for what this run was asked to do.
+    fact "run deadline(s): $RUN_DEADLINE"
     fact "tools:"
     local t
     for t in zfs zpool zdb arcstat arc_summary findmnt df stat lsblk iostat modinfo dkms \
@@ -1128,24 +1303,32 @@ run_report() {
     fact "kstat tree ($KSTAT_DIR): $( [ -d "$KSTAT_DIR" ] && echo present || echo 'absent (path not found)' )"
     fact "module parameter dir (/sys/module/zfs/parameters): $( [ -d /sys/module/zfs/parameters ] && echo present || echo 'absent (path not found)' )"
     fact "ZFS present on this host: $( [ "$ZFS_ON_HOST" = 1 ] && echo yes || echo 'no (zfs/zpool commands and kstat tree all absent)' )"
-    fact "pools discovered: ${ZPOOL_COUNT:-0} (${ZPOOLS:-none})"
-    fact "filesystems+volumes discovered: ${DS_COUNT:-0}"
-    fact "snapshots discovered: ${SNAP_COUNT:-0}"
+    if [ -z "$ZPOOL_RC" ]; then fact "pools discovered: n/a (command not found: zpool)"
+    elif [ "$ZPOOL_RC" -eq 124 ]; then fact "pools discovered: n/a ($HUNG_ZPOOL_WHY)"
+    elif [ "$ZPOOL_RC" -ne 0 ]; then fact "pools discovered: n/a (zpool list exit $ZPOOL_RC${ZPOOL_ERR:+: $ZPOOL_ERR})"
+    elif [ "${ZPOOL_COUNT:-0}" -eq 0 ]; then fact "pools discovered: 0 (zpool list ran and listed none)"
+    else fact "pools discovered: $ZPOOL_COUNT ($ZPOOLS)"; fi
+    if [ -z "$ZGET_RC" ]; then fact "filesystems+volumes discovered: n/a (command not found: zfs)"
+    elif [ "$ZGET_RC" -eq 124 ]; then fact "filesystems+volumes discovered: n/a ($HUNG_ZFS_WHY)"
+    elif [ "$ZGET_RC" -ne 0 ]; then fact "filesystems+volumes discovered: n/a (zfs get exit $ZGET_RC${ZGET_ERR:+: $ZGET_ERR})"
+    else fact "filesystems+volumes discovered: ${DS_COUNT:-0}"; fi
+    if [ -z "$ZSNAP_RC" ]; then fact "snapshots discovered: n/a (command not found: zfs)"
+    elif [ "$ZSNAP_RC" -eq 124 ]; then fact "snapshots discovered: n/a ($( _hung zfs && _skip_why zfs || echo "zfs list -t snapshot did not answer within ${ZSNAP_CAP}s"))"
+    elif [ "$ZSNAP_RC" -ne 0 ]; then fact "snapshots discovered: n/a (zfs list -t snapshot exit $ZSNAP_RC${ZSNAP_ERR:+: $ZSNAP_ERR})"
+    else fact "snapshots discovered: ${SNAP_COUNT:-0}"; fi
     fact "tiers in this run: Tier0=always sample=$( [ "$OPT_SAMPLE" = 1 ] && echo "on(${SAMPLE_SECS}s)" || echo off ) zdb=$( [ "$OPT_ZDB" = 1 ] && echo on || echo off ) filesizes=$( [ "$OPT_FILESIZES" = 1 ] && echo on || echo off )"
-    fact "note: every 'n/a (...)' below names why a value was not obtained"
-    fact "note: a tunable printed as 'not present in this zfs build' is a version fact, not a collection failure"
 
     if [ "$ZFS_ON_HOST" != 1 ]; then
         section "A. ZFS software & kernel module"
         fact "n/a (not applicable: no zfs/zpool command and no $KSTAT_DIR on this host)"
-        fact "sections B..L of this collector cover ZFS only and are omitted for the same reason"
+        fact "sections B..L: not collected (no zfs/zpool command and no $KSTAT_DIR)"
         section "M. WhaTap collection-server paths"
         report_whatap_paths
         # This early return is exactly the case the status is for: a host with no
         # ZFS produces a short, tidy-looking report that answers none of the
         # questions this collector exists for. Say so before leaving.
-        na zfs "this host does not use ZFS (no zfs/zpool command and no $KSTAT_DIR)"
-        na pools "sections B..L cover ZFS only and were omitted"
+        na zfs "no zfs or zpool command and no $KSTAT_DIR on this host"
+        na pools "no zfs or zpool command and no $KSTAT_DIR on this host"
         emit_status
         emit_footer
         return
@@ -1175,16 +1358,30 @@ run_report() {
     probe_pipe "dkms status (zfs)" dkms "dkms status 2>/dev/null | grep -i zfs || true"
     subsection "subcommand availability (asked of the installed binary, not inferred from a version string)"
     if have zfs; then
-        fact "zfs rewrite subcommand: $(zfs 2>&1 | grep -qE '(^|[[:space:]])rewrite([[:space:]]|$)' && echo present || echo absent)"
-        fact "zfs jail/unjail subcommand: $(zfs 2>&1 | grep -qE '(^|[[:space:]])jail([[:space:]]|$)' && echo present || echo absent)"
+        if _hung zfs; then
+            fact "zfs subcommands: n/a ($(_skip_why zfs))"
+        else
+            local _zu; _zu="$(_bounded zfs 2>&1)"
+            fact "zfs rewrite subcommand: $(printf '%s\n' "$_zu" | grep -qE '(^|[[:space:]])rewrite([[:space:]]|$)' && echo present || echo absent)"
+            fact "zfs jail/unjail subcommand: $(printf '%s\n' "$_zu" | grep -qE '(^|[[:space:]])jail([[:space:]]|$)' && echo present || echo absent)"
+        fi
     else
         fact "zfs subcommands: n/a (command not found: zfs)"
     fi
     if have zpool; then
-        # stdout AND stderr to /dev/null, in that order: only the exit code is wanted.
-        fact "zpool iostat -r (request-size histogram): $(zpool iostat -r >/dev/null 2>&1 && echo supported || echo 'not supported by this zpool')"
-        fact "zpool iostat -w (latency histogram): $(zpool iostat -w >/dev/null 2>&1 && echo supported || echo 'not supported by this zpool')"
-        fact "zpool status -t (trim state): $(zpool status -t >/dev/null 2>&1 && echo supported || echo 'not supported by this zpool')"
+        # stdout AND stderr to /dev/null, in that order: only the exit code is
+        # wanted. A cap (124) is its own answer, not "not supported".
+        local _o _rc
+        for _o in "iostat -r|request-size histogram" "iostat -w|latency histogram" "status -t|trim state"; do
+            if _hung zpool; then fact "zpool ${_o%%|*} (${_o#*|}): n/a ($(_skip_why zpool))"; continue; fi
+            # shellcheck disable=SC2086
+            run_bounded "$CMD_TIMEOUT" zpool ${_o%%|*} >/dev/null 2>&1; _rc=$?
+            case "$_rc" in
+                0)   fact "zpool ${_o%%|*} (${_o#*|}): supported" ;;
+                124) fact "zpool ${_o%%|*} (${_o#*|}): n/a (timed out: ${CMD_TIMEOUT}s)" ;;
+                *)   fact "zpool ${_o%%|*} (${_o#*|}): not supported by this zpool (exit $_rc)" ;;
+            esac
+        done
     fi
     subsection "ZFS systemd units & pool cache"
     if have systemctl; then
@@ -1192,7 +1389,7 @@ run_report() {
         for u in zfs.target zfs-import-cache zfs-import-scan zfs-mount zfs-share zfs-zed zfs-volume-wait zfs-load-key; do
             unit_loaded "$u.service" || [ "$u" = "zfs.target" ] || continue
             any=1
-            fact "$u: active=$(systemctl is-active "$u" 2>/dev/null) enabled=$(systemctl is-enabled "$u" 2>/dev/null)"
+            fact "$u: active=$(sd_state is-active "$u") enabled=$(sd_state is-enabled "$u")"
         done
         [ "$any" = 0 ] && fact "no zfs-* units loaded"
     else
@@ -1297,15 +1494,17 @@ run_report() {
     subsection "per-top-level-vdev usage by allocation class (derived from zpool list -v)"
     local cv; cv="$(zpool_class_view)"
     if [ -n "$cv" ]; then printf '%s\n' "$cv" | while IFS= read -r _l; do blk "$_l"; done
+    elif _hung zpool; then fact "n/a ($(_skip_why zpool))"
     else fact "n/a (empty output or layout not parsed — see the raw zpool list -v above)"; fi
     subsection "redundancy shape per allocation class (derived from zpool list -v)"
     local cs; cs="$(zpool_class_shape)"
     if [ -n "$cs" ]; then printf '%s\n' "$cs" | while IFS= read -r _l; do blk "$_l"; done
+    elif _hung zpool; then fact "n/a ($(_skip_why zpool))"
     else fact "n/a (empty output or layout not parsed)"; fi
     subsection "zpool status"
     # -v and -t combined in one call: -t only annotates the same vdev tree with
     # trim state, so two separate calls would print the tree twice.
-    if zpool status -vt >/dev/null 2>&1; then
+    if run_bounded "$CMD_TIMEOUT" zpool status -vt >/dev/null 2>&1; then
         probe "zpool status -vt (verbose + trim state per vdev)" zpool status -vt
     else
         probe "zpool status -v" zpool status -v
@@ -1320,7 +1519,7 @@ run_report() {
         probe_pipe "$p: leaf device paths (zpool status -P)" zpool \
             "zpool status -PL '$p' 2>/dev/null | awk 'NF>=2 && \$1 ~ /^\\// {print \$1\"  \"\$2}' || true"
     done
-    [ -z "$ZPOOLS" ] && fact "leaf device paths: n/a (no pool discovered)"
+    [ -z "$ZPOOLS" ] && fact "leaf device paths: n/a ($(_nopool_why))"
 
     # -- D. Pool properties, features & capacity ------------------------------
     section "D. Pool properties, features & capacity"
@@ -1329,7 +1528,7 @@ run_report() {
         subsection "$p"
         probe "zpool get all $p" zpool get all "$p"
     done
-    [ -z "$ZPOOLS" ] && fact "zpool get all: n/a (no pool discovered)"
+    [ -z "$ZPOOLS" ] && fact "zpool get all: n/a ($(_nopool_why))"
     subsection "dataset space overview (zfs list -o space)"
     probe_t 60 "zfs list -o space" zfs list -o space
 
@@ -1368,7 +1567,10 @@ run_report() {
     if [ -n "$sm_" ]; then printf '%s\n' "$sm_" | while IFS= read -r _l; do blk "$_l"; done
     else fact "n/a (no dataset property dump)"; fi
     subsection "snapshot inventory"
-    fact "snapshot count (all pools): ${SNAP_COUNT:-0}"
+    if [ -n "$ZSNAP_RC" ] && [ "$ZSNAP_RC" -eq 0 ]; then fact "snapshot count (all pools): ${SNAP_COUNT:-0}"
+    elif [ -z "$ZSNAP_RC" ]; then fact "snapshot count (all pools): n/a (command not found: zfs)"
+    elif [ "$ZSNAP_RC" -eq 124 ]; then fact "snapshot count (all pools): n/a ($( _hung zfs && _skip_why zfs || echo "zfs list -t snapshot did not answer within ${ZSNAP_CAP}s"))"
+    else fact "snapshot count (all pools): n/a (zfs list -t snapshot exit $ZSNAP_RC${ZSNAP_ERR:+: $ZSNAP_ERR})"; fi
     if [ -n "$_ZSNAP" ] && [ -s "$_ZSNAP" ]; then
         # counts are emitted as a bare numeric column so `sort -k2,2nr` orders
         # them numerically (a formatted "snapshots=N" field would sort as text)
@@ -1388,13 +1590,16 @@ run_report() {
         probe_pipe "snapshots with a clone attached (first 30)" awk \
             "awk -F'\t' '\$5!=\"-\" && \$5!=\"\" {n++; if(n<=30) printf \"%s  clones=%s\n\", \$1, \$5} END{printf \"total_snapshots_with_clones=%d\n\", n+0}' '$_ZSNAP' || true"
     else
-        fact "snapshot detail: n/a (zfs list -t snapshot returned nothing or timed out)"
+        if [ -z "$ZSNAP_RC" ]; then fact "snapshot detail: n/a (command not found: zfs)"
+        elif [ "$ZSNAP_RC" -eq 124 ] && _hung zfs; then fact "snapshot detail: n/a ($(_skip_why zfs))"
+        elif [ "$ZSNAP_RC" -eq 124 ]; then fact "snapshot detail: n/a (zfs list -t snapshot did not answer within ${ZSNAP_CAP}s)"
+        elif [ "$ZSNAP_RC" -ne 0 ]; then fact "snapshot detail: n/a (zfs list -t snapshot exit $ZSNAP_RC${ZSNAP_ERR:+: $ZSNAP_ERR})"
+        else fact "snapshot detail: none (zfs list -t snapshot ran and listed no snapshot)"; fi
     fi
     subsection "clones (the filesystem/volume side: which dataset has an origin)"
     if [ -n "$_ZGETALL" ] && [ -s "$_ZGETALL" ]; then
         probe_pipe "clone origins" awk \
             "awk -F'\t' '\$2==\"origin\" && \$3!=\"-\" {printf \"%-38s origin=%s\n\", \$1, \$3}' '$_ZGETALL' || true"
-        fact "note: the reverse mapping (which snapshot is pinned by a clone) is in the snapshot inventory above, because 'clones' is a snapshot property"
     else
         fact "clones: n/a (no dataset property dump)"
     fi
@@ -1418,7 +1623,7 @@ run_report() {
     read_proc "vdev_cache_stats" "$KSTAT_DIR/vdev_cache_stats"
     subsection "host memory context for the ARC values above"
     read_proc "meminfo" /proc/meminfo
-    fact "/proc/spl/kmem/slab: $( [ -e /proc/spl/kmem/slab ] && echo 'present (not inlined here — included in --bundle)' || echo 'absent (path not found)' )"
+    fact "/proc/spl/kmem/slab: $( [ -e /proc/spl/kmem/slab ] && echo 'present (not inlined in this report)' || echo 'absent (path not found)' )"
 
     # -- H. Write path: transaction groups & ZIL ------------------------------
     # The txgs kstat is a ring buffer of the last zfs_txg_history transaction
@@ -1442,10 +1647,10 @@ run_report() {
     subsection "global write-path kstats"
     read_proc "dmu_tx" "$KSTAT_DIR/dmu_tx"
     read_proc "zil (global)" "$KSTAT_DIR/zil"
-    fact "note: the tunables that govern the values above (zfs_txg_timeout, zfs_txg_history, zfs_dirty_data_*, zil_slog_bulk) are in section B"
     subsection "separate log (SLOG) vdev presence"
     local shp; shp="$(zpool_class_shape 2>/dev/null | grep -E '/(logs|log)/' || true)"
     if [ -n "$shp" ]; then printf '%s\n' "$shp" | while IFS= read -r _l; do blk "$_l"; done
+    elif _hung zpool; then fact "separate log vdev: n/a ($(_skip_why zpool))"
     else fact "no vdev in the logs allocation class was parsed from zpool list -v"; fi
 
     # -- I. Per-dataset I/O counters (objset kstats) --------------------------
@@ -1460,7 +1665,6 @@ run_report() {
         # and can be very large and lock-heavy on a busy host.
         probe_pipe "kstat inventory" find \
             "find '$KSTAT_DIR' -maxdepth 2 \\( -type f -o -type d \\) 2>/dev/null | sed \"s#^$KSTAT_DIR/*##\" | grep -vE '^(arcstats|dbufstats|abdstats|zfetchstats|dnodestats|vdev_cache_stats|dmu_tx|zil|dbufs|dbgmsg|metaslab_stats|zstd|brtstats|fm|)\$' | grep -vE '/(txgs|zil|state|iostats|reads|multihost|dmu_tx_assign)\$' | grep -vE '/objset-' | sort || true"
-        fact "note: $KSTAT_DIR/dbufs is present on most builds and is deliberately not read (it enumerates every ARC dbuf)"
     else
         fact "kstat inventory: n/a (path not found: $KSTAT_DIR)"
     fi
@@ -1543,7 +1747,7 @@ run_report() {
     done
     probe_pipe "device id links (/dev/disk/by-id)" ls "ls -l /dev/disk/by-id 2>/dev/null | awk 'NF>=9 {print \$9\" -> \"\$NF}' || true"
     probe_pipe "iostat -x (cumulative since boot)" iostat "iostat -x 2>/dev/null | head -n 60 || true"
-    fact "multipath: $( have multipath && echo 'multipath command present (multipath -ll is included in --bundle)' || echo 'n/a (command not found: multipath)' )"
+    fact "multipath: $( have multipath && echo 'command present (multipath -ll not run in this report)' || echo 'n/a (command not found: multipath)' )"
 
     # -- L. Pool events, errors & maintenance ---------------------------------
     section "L. Pool events, errors & maintenance"
@@ -1574,13 +1778,11 @@ run_report() {
                 for (c in n) printf \"%10d  %-10s %-10s  %s\n\", n[c], f[c], l[c], c
                 printf \"%10d  %-10s %-10s  %s\n\", t, \"\", \"\", \"(total)\"
             }' | sort -rn || true"
-    fact "note: the tally above covers the whole ring buffer, whose depth is set by zfs_zevent_len_max (section B)"
     probe_pipe_t 60 "zpool events (last 100, stderr folded in)" zpool "zpool events 2>&1 | tail -n 100 || true"
     for p in $ZPOOLS; do
         probe_pipe_t 60 "$p: zpool history (last 200, stderr folded in)" zpool "zpool history '$p' 2>&1 | tail -n 200 || true"
     done
-    [ -z "$ZPOOLS" ] && fact "zpool history: n/a (no pool discovered)"
-    fact "note: 'zpool events' and 'zpool history' read /dev/zfs; the uid of this run is in section [1]"
+    [ -z "$ZPOOLS" ] && fact "zpool history: n/a ($(_nopool_why))"
     subsection "fault management kstat"
     read_proc "fm" "$KSTAT_DIR/fm"
     subsection "kernel messages"
@@ -1593,8 +1795,9 @@ run_report() {
         for u2 in zfs-zed zfs-import-cache zfs-import-scan zfs-mount zfs-share; do
             unit_loaded "$u2.service" || continue
             local jo
-            jo="$(journalctl -u "$u2.service" -p warning --since "${OPT_HOURS} hours ago" -n 30 --no-pager 2>/dev/null)"
-            if [ -n "$jo" ]; then fact "$u2.service (last 30 at warning+):"; printf '%s\n' "$jo" | while IFS= read -r _l; do blk "$_l"; done
+            jo="$(_bounded journalctl -u "$u2.service" -p warning --since "${OPT_HOURS} hours ago" -n 30 --no-pager 2>/dev/null)"
+            if [ $? -eq 124 ]; then fact "$u2.service: n/a (timed out: ${CMD_TIMEOUT}s)"
+            elif [ -n "$jo" ]; then fact "$u2.service (last 30 at warning+):"; printf '%s\n' "$jo" | while IFS= read -r _l; do blk "$_l"; done
             else fact "$u2.service: no warning+ entry in the last ${OPT_HOURS}h"; fi
         done
     else
@@ -1647,7 +1850,7 @@ run_report() {
                 probe_pipe_t 1800 "zdb -mm $p (metaslab free-space histograms; first 500 lines)" zdb \
                     "zdb -mm '$p' 2>&1 | head -n 500 || true"
             done
-            [ -z "$ZPOOLS" ] && fact "zdb: n/a (no pool discovered)"
+            [ -z "$ZPOOLS" ] && fact "zdb: n/a ($(_nopool_why))"
         fi
     else
         fact "zdb block/metaslab statistics: n/a (not applicable: --zdb not given)"
@@ -1657,7 +1860,7 @@ run_report() {
         local fp="$FILESIZES_PATH"
         [ -z "$fp" ] && fp="$YARDBASE"
         if [ -z "$fp" ]; then
-            fact "n/a (no path given and yardbase not resolved — pass --filesizes=PATH)"
+            fact "n/a (no --filesizes=PATH given and yardbase not resolved)"
         elif [ ! -d "$fp" ]; then
             fact "n/a (path not found: $fp)"
         elif ! find /dev/null -maxdepth 0 -printf '' 2>/dev/null; then
@@ -1668,35 +1871,94 @@ run_report() {
             fact "path: $fp (single filesystem, -xdev)"
             local fh; fh="$(filesize_histogram "$fp")"
             if [ -n "$fh" ]; then printf '%s\n' "$fh" | while IFS= read -r _l; do blk "$_l"; done
-            else fact "n/a (empty output or timed out: 600s)"; fi
+            else fact "n/a (empty output or timed out: ${FILESIZES_SECS}s)"; fi
         fi
     else
-        fact "n/a (skipped: --no-filesizes was given. This histogram is on by default)"
+        fact "n/a (skipped: --no-filesizes given)"
     fi
 
-    if [ "$ZFS_ON_HOST" = 1 ]; then got zfs
-    else na zfs "this host does not use ZFS"; fi
-    if [ "$ZPOOL_COUNT" -gt 0 ] 2>/dev/null; then got pools
-    elif [ "$ZFS_ON_HOST" = 1 ]; then na pools "zpool list returned no pools (none imported on this host)"
-    else na pools "sections B..L cover ZFS only"; fi
+    got zfs
+    _resolve_pools
+    _resolve_datasets
 
     emit_status
     emit_footer
+}
+
+# _nopool_why -> why there is no pool to ask about: the list was not answered,
+# or it answered with none
+_nopool_why() {
+    if [ -z "$ZPOOL_RC" ]; then printf 'not queried: command not found: zpool'
+    elif [ "$ZPOOL_RC" -eq 124 ]; then printf 'not queried: %s' "$HUNG_ZPOOL_WHY"
+    elif [ "$ZPOOL_RC" -ne 0 ]; then printf 'not queried: zpool list exit %s%s' "$ZPOOL_RC" "${ZPOOL_ERR:+: $ZPOOL_ERR}"
+    else printf 'zpool list ran and listed no pool'; fi
+}
+
+# _module_absent_msg TEXT -> true when TEXT is zpool/zfs saying the kernel module
+# is not loaded (never a permission refusal)
+_module_absent_msg() {
+    printf '%s' "$1" | grep -qiE 'modules are not loaded|/dev/zfs.*no such file' \
+        && ! printf '%s' "$1" | grep -qiE 'permission|not permitted'
+}
+
+# _resolve_pools -> the pools goal, on a host where some ZFS was found. "No pool"
+# is an answer only when `zpool list` ran and listed none. A zpool that failed,
+# was refused or timed out has not shown that there is no pool, and a missing
+# zpool binary next to a loaded kernel module has not asked.
+_resolve_pools() {
+    local uid; uid="$(id -u 2>/dev/null || echo '?')"
+    if [ -z "$ZPOOL_RC" ]; then
+        missed pools "command not found: zpool (while $( [ -d "$KSTAT_DIR" ] && echo "$KSTAT_DIR exists" || echo "zfs is installed" ))"
+    elif [ "$ZPOOL_RC" -eq 0 ] && [ "$ZPOOL_COUNT" -gt 0 ] 2>/dev/null; then
+        got pools
+    elif [ "$ZPOOL_RC" -eq 0 ]; then
+        na pools "zpool list ran and listed no imported pool"
+    elif [ "$ZPOOL_RC" -eq 124 ]; then
+        missed pools "zpool list did not answer within ${CMD_TIMEOUT}s"
+    elif [ ! -d "$KSTAT_DIR" ] && _module_absent_msg "$ZPOOL_ERR"; then
+        # The kernel side is absent: /proc/spl was read and there is no ZFS in
+        # this kernel for a pool to be imported into.
+        na pools "zfs kernel module not loaded ($KSTAT_DIR absent; zpool: $ZPOOL_ERR)"
+    else
+        case "$ZPOOL_ERR" in
+            *[Pp]ermission*|*"not permitted"*) missed pools "zpool list failed for uid $uid (exit $ZPOOL_RC): $ZPOOL_ERR$(_priv_hint)" ;;
+            *) missed pools "zpool list failed (exit $ZPOOL_RC)${ZPOOL_ERR:+: $ZPOOL_ERR}" ;;
+        esac
+    fi
+}
+
+# _resolve_datasets -> the datasets goal: `zfs get all` and the snapshot list
+# ran and answered. A hang, a failure or a missing zfs binary is blocked; an
+# empty answer is n/a only when zpool also listed no pool.
+_resolve_datasets() {
+    if [ -z "$ZGET_RC" ]; then missed datasets "command not found: zfs"
+    elif [ "$ZGET_RC" -eq 124 ]; then missed datasets "$HUNG_ZFS_WHY"
+    elif [ "$ZGET_RC" -ne 0 ] && [ ! -d "$KSTAT_DIR" ] && _module_absent_msg "$ZGET_ERR"; then
+        na datasets "zfs kernel module not loaded ($KSTAT_DIR absent; zfs: $ZGET_ERR)"
+    elif [ "$ZGET_RC" -ne 0 ]; then
+        case "$ZGET_ERR" in
+            *[Pp]ermission*|*"not permitted"*) missed datasets "zfs get failed (exit $ZGET_RC): $ZGET_ERR$(_priv_hint)" ;;
+            *) missed datasets "zfs get failed (exit $ZGET_RC)${ZGET_ERR:+: $ZGET_ERR}" ;;
+        esac
+    elif [ "$ZSNAP_RC" -eq 124 ]; then missed datasets "zfs list -t snapshot did not answer within ${ZSNAP_CAP}s"
+    elif [ "$ZSNAP_RC" -ne 0 ]; then missed datasets "zfs list -t snapshot failed (exit $ZSNAP_RC)${ZSNAP_ERR:+: $ZSNAP_ERR}"
+    elif [ "$DS_COUNT" -gt 0 ] 2>/dev/null; then got datasets
+    elif [ "${ZPOOL_COUNT:-0}" -gt 0 ] 2>/dev/null; then missed datasets "zfs get listed no dataset while zpool listed $ZPOOL_COUNT pools"
+    else na datasets "zfs get ran and listed no filesystem or volume"; fi
 }
 
 # Section M body — also used in the "no ZFS on this host" short path.
 report_whatap_paths() {
     fact "WHATAP_HOME: ${WHOME:-n/a (not resolved)}"
     fact "WHATAP_HOME resolved by: $WHOME_SRC"
+    [ -n "$CMDLINE_SCAN_WHY" ] && fact "whatap process scan: n/a ($CMDLINE_SCAN_WHY)"
     fact "yardbase: ${YARDBASE:-n/a (not resolved from yard.conf or WHATAP_HOME/yardbase)}"
-    fact "note: WhaTap conf/*.conf, JVM flags, ports and service logs are collected by collect-collserver.sh, not here"
     subsection "path -> filesystem -> dataset"
     local paths p ex ft sr pool
     paths="$WHOME $YARDBASE"
     [ -n "$WHOME" ] && paths="$paths $WHOME/logs $WHOME/conf $WHOME/db $WHOME/keeperbase $WHOME/logsink"
     if [ -z "$WHOME" ] && [ -z "$YARDBASE" ]; then
-        fact "n/a (WHATAP_HOME and yardbase both unresolved: no running whatap JVM, no whatap systemd unit, and this script is not in \$WHATAP_HOME/bin — pass --home DIR to map paths anyway)"
-        fact "note: the ZFS sections of this report do not depend on WHATAP_HOME — only this path-to-dataset mapping does"
+        fact "n/a (WHATAP_HOME and yardbase both unresolved: no -Dwhatap.server.home in a readable whatap JVM, no WorkingDirectory in a loaded whatap unit, no conf/ + logs/ beside this script)"
         return
     fi
     local seen=""
@@ -1866,7 +2128,7 @@ bundle_kstat() {
     mkdir -p "$d" 2>/dev/null
     # dbufs is skipped on purpose (very large, lock-heavy). Everything else under
     # the kstat tree is a small text file.
-    find "$KSTAT_DIR" -maxdepth 2 -type f 2>/dev/null | while IFS= read -r f; do
+    _bounded find "$KSTAT_DIR" -maxdepth 2 -type f 2>/dev/null | while IFS= read -r f; do
         case "$(basename "$f")" in dbufs) continue ;; esac
         rel="${f#"$KSTAT_DIR"/}"
         mkdir -p "$d/$(dirname "$rel")" 2>/dev/null
@@ -1885,7 +2147,7 @@ bundle_params() {
               printf '%s = %s\n' "$k" "$(head -n1 "$k" 2>/dev/null)"
           done ) > "$d/$(printf '%s' "$f" | tr '/' '_').txt" 2>/dev/null
     done
-    have modinfo && modinfo zfs > "$d/modinfo-zfs.txt" 2>/dev/null
+    have modinfo && _bounded modinfo zfs > "$d/modinfo-zfs.txt" 2>/dev/null
     cat /etc/modprobe.d/*zfs* /etc/modprobe.d/*spl* > "$d/modprobe.d-zfs.txt" 2>/dev/null
     cat /proc/cmdline > "$d/kernel-cmdline.txt" 2>/dev/null
     progress "params: module parameters written"
@@ -1895,14 +2157,14 @@ bundle_host() {
     local d="$1"; mkdir -p "$d" 2>/dev/null
     cat /proc/meminfo > "$d/meminfo.txt" 2>/dev/null
     cat /proc/loadavg > "$d/loadavg.txt" 2>/dev/null
-    have lsblk && lsblk -O > "$d/lsblk-O.txt" 2>/dev/null
-    have lsblk && lsblk -o NAME,KNAME,TYPE,SIZE,ROTA,PHY-SEC,LOG-SEC,SCHED,MOUNTPOINT,MODEL > "$d/lsblk.txt" 2>/dev/null
-    have findmnt && findmnt > "$d/findmnt.txt" 2>/dev/null
-    have df && df -T > "$d/df-T.txt" 2>/dev/null
+    have lsblk && _bounded lsblk -O > "$d/lsblk-O.txt" 2>/dev/null
+    have lsblk && _bounded lsblk -o NAME,KNAME,TYPE,SIZE,ROTA,PHY-SEC,LOG-SEC,SCHED,MOUNTPOINT,MODEL > "$d/lsblk.txt" 2>/dev/null
+    have findmnt && _bounded findmnt > "$d/findmnt.txt" 2>/dev/null
+    have df && _bounded df -T > "$d/df-T.txt" 2>/dev/null
     cat /proc/self/mountinfo > "$d/mountinfo.txt" 2>/dev/null
-    have iostat && iostat -x > "$d/iostat-x.txt" 2>/dev/null
-    have multipath && multipath -ll > "$d/multipath.txt" 2>&1
-    dmesg 2>/dev/null | tail -n 500 > "$d/dmesg-tail.txt" 2>/dev/null
+    have iostat && _bounded iostat -x > "$d/iostat-x.txt" 2>/dev/null
+    have multipath && _bounded multipath -ll > "$d/multipath.txt" 2>&1
+    _bounded dmesg 2>&1 | tail -n 500 > "$d/dmesg-tail.txt" 2>/dev/null
     ( for b in /sys/block/*; do
           [ -d "$b/queue" ] || continue
           printf '== %s ==\n' "$(basename "$b")"
@@ -1911,10 +2173,13 @@ bundle_host() {
           done
       done ) > "$d/block-queue.txt" 2>/dev/null
     if have journalctl; then
-        local u
+        # Capped by time and by size: zed on a pool that logs a deadman per
+        # second writes millions of lines. The newest JOURNAL_LINES are kept.
+        local u JOURNAL_LINES=20000
         for u in zfs-zed zfs-import-cache zfs-import-scan zfs-mount zfs-share; do
             unit_loaded "$u.service" || continue
-            journalctl -u "$u.service" --since "${OPT_HOURS} hours ago" --no-pager > "$d/$u.journal.txt" 2>/dev/null
+            _bounded journalctl -u "$u.service" --since "${OPT_HOURS} hours ago" -n "$JOURNAL_LINES" --no-pager > "$d/$u.journal.txt" 2>&1
+            [ $? -eq 124 ] && printf '\n(journalctl stopped at the %ss cap)\n' "$CMD_TIMEOUT" >> "$d/$u.journal.txt"
         done
     fi
     progress "host: block device and kernel snapshot written"
@@ -1932,7 +2197,7 @@ bundle_whatap() {
         [ -n "$p" ] && [ -e "$p" ] || continue
         printf '%s\tfstype=%s\tdataset=%s\n' "$p" "$(fstype_of "$p")" "$(source_of "$p")" >> "$d/path-dataset-map.txt" 2>/dev/null
     done
-    have df && df -h > "$d/df-h.txt" 2>/dev/null
+    have df && _bounded df -h > "$d/df-h.txt" 2>/dev/null
     progress "whatap: path-to-dataset map written"
 }
 
@@ -1970,8 +2235,11 @@ bundle_zdb() {
 
 do_bundle() {
     local work tarball
-    work="$(mktemp -d 2>/dev/null || echo "$OPT_OUT/$BASENAME.tmp.$$")"
-    mkdir -p "$work" 2>/dev/null
+    # The work dir lives in the run's private directory, so an interrupted run
+    # leaves nothing behind in /tmp or in --out.
+    work="$(_tmp bundle)"
+    case "$work" in /dev/null) warn "the bundle was not written: no private temp directory could be created under ${TMPDIR:-/tmp}"; return 1 ;; esac
+    mkdir -p "$work" 2>/dev/null || { warn "the bundle was not written: cannot create $work"; return 1; }
     run_report > "$work/report.txt" 2>/dev/null
     progress "report: written to bundle"
     bundle_zfs    "$work/zfs"
@@ -1983,19 +2251,32 @@ do_bundle() {
     [ "$OPT_ZDB" = 1 ] && bundle_zdb "$work/zdb"
 
     tarball="$OPT_OUT/$BASENAME.tar.gz"
-    if have tar; then
-        # -C instead of `cd "$work"`: with a relative --out (default "."), a cd
-        # into $work would put $tarball inside $work and then delete it with the
-        # work dir. Only remove $work if tar actually wrote the tarball.
-        if tar -C "$work" -czf "$tarball" . 2>/dev/null && [ -f "$tarball" ]; then
-            progress "bundle: $tarball"
-            rm -rf "$work" 2>/dev/null
-        else
-            warn "tar failed — artifacts left under $work"
-        fi
+    have tar || { warn "the bundle was not written: tar: command not found"; return 1; }
+    # -C instead of `cd "$work"`: $tarball stays relative to the caller's cwd.
+    # Not capped: a local write of what the run already collected.
+    if tar -C "$work" -czf "$tarball" . 2>/dev/null && [ -s "$tarball" ]; then
+        _give_back "$tarball"
+        progress "bundle: $tarball"
     else
-        warn "tar: command not found — artifacts left under $work"
+        rm -f "$tarball" 2>/dev/null
+        warn "the bundle was not written: tar could not write $tarball"
+        return 1
     fi
+}
+
+# _give_back FILE -> under sudo, hand FILE to the account that ran sudo, so the
+# operator can move and delete the file they came for
+_give_back() {
+    if [ "$(id -u 2>/dev/null)" = 0 ] && [ -n "${SUDO_UID:-}" ]; then
+        chown "$SUDO_UID:${SUDO_GID:-$SUDO_UID}" "$1" 2>/dev/null
+    fi
+}
+
+# _need_int NAME VALUE -> exit 2 unless VALUE is a non-negative integer
+_need_int() {
+    case "$2" in
+        ''|*[!0-9]*) warn "$1 takes a non-negative integer; got '$2'"; exit 2 ;;
+    esac
 }
 
 # =============================================================================
@@ -2014,18 +2295,53 @@ if [ "$OPT_BUNDLE" = 0 ] && [ "$OPT_STDOUT" = 0 ] && [ "$OPT_FILE" = 0 ]; then
     exit 2
 fi
 
-case "$SAMPLE_SECS" in
-    ''|*[!0-9]*) warn "--sample takes seconds as an integer; got '$SAMPLE_SECS' — using 10"; SAMPLE_SECS=10 ;;
-esac
-[ "$SAMPLE_SECS" -lt 1 ] 2>/dev/null && SAMPLE_SECS=1
+# Numeric options are checked before anything runs (exit 2), so a value the
+# shell cannot do arithmetic on never aborts a run half way.
+_need_int --sample "$SAMPLE_SECS"
+_need_int --hours "$OPT_HOURS"
+_need_int --filesizes-secs "$FILESIZES_SECS"
+_need_int --event-days "$OPT_EVENT_DAYS"
+[ "$SAMPLE_SECS" -lt 1 ] && SAMPLE_SECS=1
+
+# The run deadline is raised to fit what was asked for, unless the caller set
+# one: the file-size walk (FILESIZES_SECS), --sample (about 12 x SEC), --zdb
+# (up to 1800s per zdb call in the report, 3600s in the bundle) and the
+# bundle's zpool events dump (600s).
+if [ -z "$_RUN_DEADLINE_ENV" ]; then
+    [ "$OPT_FILESIZES" = 1 ] && RUN_DEADLINE=$((RUN_DEADLINE + FILESIZES_SECS))
+    [ "$OPT_SAMPLE" = 1 ] && RUN_DEADLINE=$((RUN_DEADLINE + SAMPLE_SECS * 12 + 150))
+    [ "$OPT_ZDB" = 1 ] && RUN_DEADLINE=$((RUN_DEADLINE + 4000))
+    [ "$OPT_BUNDLE" = 1 ] && RUN_DEADLINE=$((RUN_DEADLINE + 900))
+    [ "$OPT_BUNDLE" = 1 ] && [ "$OPT_ZDB" = 1 ] && RUN_DEADLINE=$((RUN_DEADLINE + 7500))
+fi
 
 _run_init
 _init_errfile
-have timeout && _timeout_bin="$(command -v timeout)"
-mkdir -p "$OPT_OUT" 2>/dev/null
+
+# The output directory is checked before collecting, so an unwritable one
+# fails at once rather than after a full run.
+if [ "$OPT_STDOUT" != 1 ] || [ "$OPT_BUNDLE" = 1 ]; then
+    mkdir -p "$OPT_OUT" 2>/dev/null
+    if [ ! -d "$OPT_OUT" ] || [ ! -w "$OPT_OUT" ] || [ ! -x "$OPT_OUT" ]; then
+        warn "the report was not written: output directory $OPT_OUT is not writable by uid $(id -u 2>/dev/null || echo '?')"
+        exit 1
+    fi
+fi
 
 progress "discovering pools, datasets and snapshots ..."
 discover_zfs
+# --zdb runs per pool (report: 120s + 1800s + 1800s; bundle: 300s + 3600s +
+# 3600s). The fixed raise above covers one pool; each further pool adds its own
+# share, so pool 2 onward is not cut off by the deadline.
+if [ -z "$_RUN_DEADLINE_ENV" ] && [ "$OPT_ZDB" = 1 ] && [ "${ZPOOL_COUNT:-0}" -gt 1 ] 2>/dev/null; then
+    RUN_DEADLINE=$((RUN_DEADLINE + (ZPOOL_COUNT - 1) * 3720))
+    [ "$OPT_BUNDLE" = 1 ] && RUN_DEADLINE=$((RUN_DEADLINE + (ZPOOL_COUNT - 1) * 7500))
+fi
+# every unit sd_show will be asked about, in one call (the zfs units are asked
+# as <name>.service, zfs.target included, as section A always has)
+_pf=""; for _u in $WHATAP_UNITS zfs.target zfs-import-cache zfs-import-scan zfs-mount zfs-share zfs-zed zfs-volume-wait zfs-load-key; do _pf="$_pf $_u.service"; done
+# shellcheck disable=SC2086
+_sd_prefetch $_pf
 progress "resolving WHATAP_HOME / yardbase ..."
 resolve_home
 resolve_yardbase
@@ -2039,7 +2355,7 @@ BASENAME="whatap-collzfs-${HOST}-${TS}"
 
 if [ "$OPT_BUNDLE" = 1 ]; then
     progress "mode: bundle (report + raw ZFS artifacts) -> $OPT_OUT/$BASENAME.tar.gz"
-    do_bundle
+    do_bundle || exit 1
     progress "done."
 elif [ "$OPT_STDOUT" = 1 ]; then
     progress "mode: stdout (report)"
@@ -2049,10 +2365,7 @@ else
     OUTFILE="$OPT_OUT/$BASENAME.txt"
     progress "mode: file (report) -> writing $OUTFILE"
     _report_to_file "$OUTFILE" || exit 1
+    _give_back "$OUTFILE"
     progress "report written: $OUTFILE"
 fi
-
-[ -n "$_errfile" ] && rm -f "$_errfile" 2>/dev/null
-[ -n "$_ZGETALL" ] && rm -f "$_ZGETALL" 2>/dev/null
-[ -n "$_ZSNAP" ] && rm -f "$_ZSNAP" 2>/dev/null
 exit 0

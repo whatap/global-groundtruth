@@ -1,14 +1,17 @@
 # collectors/collection-server
 
-> **Status: SEEDED v0.** Two collectors live here, owned for now by the Global
+> **Status: SEEDED v0.** Three collectors live here, owned for now by the Global
 > team (framework owner). Handover transfers ongoing ownership to the
 > collection-server (backend) team (CONTRACT rule 4).
 >
-> | Entrypoint | Token | Scope | Status |
-> | ---------- | ----- | ----- | ------ |
-> | [`collect-collserver.sh`](collect-collserver.sh) 0.4.1 | `collserver` | the WhaTap backend itself | run against three live production backends (Smartfren, 2026-09-23); log selection re-measured against that bundle's own log tree. Tier 2 probes still unvalidated |
-> | [`collect-collzfs.sh`](collect-collzfs.sh) 0.4.1 | `collzfs` | ZFS under the backend's data path | validated non-root on two live hosts (zfs 2.2.2 and 2.2.6), one of them a real collection server with `yardbase` on ZFS; `--zdb` and the root-only probes still unvalidated |
-> | [`collect-collmysql.sh`](collect-collmysql.sh) 0.4.0 | `collmysql` | the MySQL that holds the backend's `account` / `notihub` metadata | run end to end on MySQL 5.6.51, 5.7.32, 8.4.10 and MariaDB 10.11.19 under a scheduler-shaped write load; a replicating pair, section I on 8.4 and real `iostat` sampling are still unverified |
+> | Entrypoint | Token | Scope | validated at | Status |
+> | ---------- | ----- | ----- | ------------ | ------ |
+> | [`collect-collserver.sh`](collect-collserver.sh) | `collserver` | the WhaTap backend itself | 0.4.1 | run against three live production backends (Smartfren, 2026-09-23); log selection re-measured against that bundle's own log tree. Tier 2 probes still unvalidated. Later versions are tested against stubs and throwaway trees only (`tools/test-collserver.sh`) |
+> | [`collect-collzfs.sh`](collect-collzfs.sh) | `collzfs` | ZFS under the backend's data path | 0.4.1 | validated non-root on two live hosts (zfs 2.2.2 and 2.2.6), one of them a real collection server with `yardbase` on ZFS; `--zdb` and the root-only probes still unvalidated. Later versions are tested against a stub `zpool` only (`tools/test-collzfs.sh`) |
+> | [`collect-collmysql.sh`](collect-collmysql.sh) | `collmysql` | the MySQL that holds the backend's `account` / `notihub` metadata | 0.4.0 | run end to end on MySQL 5.6.51, 5.7.32, 8.4.10 and MariaDB 10.11.19 under a scheduler-shaped write load; a replicating pair, section I on 8.4 and real `iostat` sampling are still unverified. Later versions (0.8.0: no self-elevation, password sources) are tested against a stub client only (`tools/test-collmysql.sh`) |
+>
+> "validated at" is the last version run on a real environment, not the current
+> `VERSION` in the script.
 >
 > Which one to run: `collect-collserver.sh` for anything about the backend
 > (services, ports, configs, logs). `collect-collzfs.sh` when the question is
@@ -31,8 +34,9 @@ ingress), plus `gateway` / `keeper` / `account` / `notihub` / `eureka` /
 
 One `.txt` report, organized into MECE domains (each fact in exactly one place):
 
-- **`[0]` Collection environment** — bash version, uid (root?), and which tools
-  are present/absent — so every `n/a` below can be traced to a cause.
+- **`[1]` Collection environment** — bash version, uid, privilege, host boot
+  time and uptime, and which tools are present/absent — so every `n/a` below can
+  be traced to a cause.
 - **A. Host & platform** — OS/kernel/arch, memory, cgroup limits, load, `java -version`.
 - **B. Time & clock synchronization** — a common root-cause axis: a skewed clock
   drops data into the wrong time buckets. Reports `timedatectl` (synchronized?
@@ -46,7 +50,11 @@ One `.txt` report, organized into MECE domains (each fact in exactly one place):
 - **D. Deployment layout** — resolved `WHATAP_HOME` (and how it was resolved),
   directory tree, jar versions, conf file list.
 - **E. Runtime processes** — per service: pid, jar/version, heap & GC flags,
-  RSS, start time; listening ports; systemd unit state.
+  RSS, start time; listening ports; systemd unit state. The port list checks
+  each module's **default** port number and is labelled that way
+  (`port 6789 (keeper default): LISTEN`); it is not read from this host's conf,
+  so a LISTEN there says a socket is open on that number, not which module owns
+  it. `ss -ltnp` below it names the owning process.
 - **F. Configuration** — every `conf/*.conf` dumped **raw** (see security note).
 - **G. Logs & recent events** — log inventory, bounded ERROR/WARN/Exception
   counts, **a short tail of every base service log** (yard/proxy/gateway/keeper/
@@ -56,6 +64,28 @@ One `.txt` report, organized into MECE domains (each fact in exactly one place):
 Values are **discovered, not assumed**; an absent value is reported as
 `n/a (<why>)` — `command not found`, `permission denied`, `path not found`,
 `timed out`, `not applicable`, or `empty output`.
+
+**How `WHATAP_HOME` is found, and when "not here" is an answer.** In order: a
+running JVM's `-Dwhatap.server.home`, a running JVM's working directory,
+`WorkingDirectory` of a loaded whatap systemd unit, the script's own parent
+(when copied into `bin/`), `$WHATAP_HOME` of the shell, and the common install
+paths `/whatap /data/whatap /opt/whatap /app/whatap /home/whatap
+/usr/local/whatap /whatap/server /data/whatap/server` (a path counts only when
+it holds a module `conf/<module>.conf` or a `lib/whatap.server.*.jar`, so a
+host-agent directory is not taken for a backend). The goals are `n/a` ("no
+whatap home in any readable process, unit or install path") only when all of
+that was read: a `/proc` mounted `hidepid`, an unreadable
+`/proc/<pid>/cmdline`, a failed `systemctl list-unit-files`, an installed
+whatap unit file, or an install path this uid cannot list makes them blocked
+instead. A `conf/` or `logs/` that exists but cannot be listed is blocked, not
+empty. `--home DIR` always wins.
+
+**Reading the report.** `journalctl` does not fail for an account that cannot
+read the system journal: it narrows to that account's own entries and prints
+`-- No entries --`, which is why the journal goal checks readability of
+`system.journal` itself. `systemd-detect-virt` is printed raw: `none` is that
+tool's answer when it detects no hypervisor. `gc log: absent` means no
+`logs/gc*.log`; whether GC logging is configured is in the JVM flags of E.
 
 ### (b) Delivery mechanism
 
@@ -101,15 +131,26 @@ so nothing starts by accident.
   (full heap dump), `--du` (recursive du of yardbase), `--time-ref` (external
   time comparison — a network call). Off by default.
 
-### (c) Security note
+**Cost on a busy host.** Discovery reads `/proc` with one bounded
+`grep -l` over every `cmdline` (fed through `xargs`, so tens of thousands of
+processes do not hit ARG_MAX) and asks `systemctl show` once for every unit.
+Measured 2026-09-25 on a 739-process host: collserver 8.1 s -> 2.4 s, collzfs
+5.2 s -> 0.5 s; with 2,000 more processes, 20.5 s -> 4.2 s and 17.2 s -> 0.8 s.
+A scan that fails or hits its cap blocks the running-modules goal instead of
+reading as "none running".
 
-`--home`/`--bundle` collect configs **verbatim, unmasked** — including
-`secure.conf` / `ksecure.conf`, `account.conf` license and `admin.password`,
-and eureka credentials. This is intended for trusted on-prem/internal transfer.
-Move the resulting `.txt` / `.tar.gz` over a trusted channel and delete it when
-the case is closed.
+**Bounds.** Every external command runs under the shared `_bounded` cap
+(`CMD_TIMEOUT`, 20 s; `systemctl` that hangs once is not asked again) and the
+whole run under `RUN_DEADLINE` (300 s, raised for Tier 2: jstack is capped at
+60 s, `jmap -histo` at 120 s, a heap dump at 900 s, `du` at 120 s). The bundle
+journal keeps the newest 20,000 lines per unit. The bundle is assembled in the
+run's private temp directory (removed on exit, Ctrl-C, hang-up), so an
+interrupted run leaves no copy behind. Numeric options that are not
+non-negative integers exit 2 before anything runs; an unwritable `--out` or a
+failed `tar` exits 1 and says so. Under sudo, both the `.txt` and the
+`.tar.gz` are handed back to the invoking user.
 
-### (d) How it was built / how to maintain
+### (c) How it was built / how to maintain
 
 Copied from [../../templates/collector-skeleton/](../../templates/collector-skeleton/),
 following [../../docs/authoring-guide.md](../../docs/authoring-guide.md) and the
@@ -163,8 +204,7 @@ and re-validate after edits:
   workstation's, not a backend's.
 - Validate the **Tier 2** probes (`--threads`, `--histo`, `--heap`, `--du`) on a
   live/staging yard. Those still have not been run against a real backend.
-- `WHATAP_HOME` auto-resolution order: running-JVM `-Dwhatap.server.home` →
-  systemd `WorkingDirectory` → script parent (if copied into `bin/`) → `n/a`.
+- `WHATAP_HOME` auto-resolution order: see "How `WHATAP_HOME` is found" in (a).
 - Portability target: bash 3.2+, `/proc`+`/sys` first, command fallback chains;
   known to run on modern Ubuntu. Re-check on the oldest OS you must support.
 
@@ -180,9 +220,9 @@ the reader (CONTRACT rule 1).
 
 ### (a) Facts it collects — ZFS
 
-One `.txt` report, MECE domains `[0]` + A..N:
+One `.txt` report, MECE domains `[1]` + A..N:
 
-- **`[0]` Collection environment** — bash, uid (root?), tool presence, whether the
+- **`[1]` Collection environment** — bash, uid, privilege, boot time, tool presence, whether the
   kstat tree and the module-parameter dir exist, pool/dataset/snapshot counts,
   which tiers this run enabled.
 - **A. ZFS software & kernel module** — `zfs version`, userland vs `zfs-kmod`
@@ -282,7 +322,33 @@ hand over one file (CONTRACT rule 3):
 Run it as **root** when possible: `zpool history`, `zpool events` and
 `/proc/spl/kstat/zfs/dbgmsg` return only a header (or `permission denied`) for an
 unprivileged uid, and `zdb` cannot open the pool at all. Everything else works
-unprivileged. The uid of the run is recorded in section `[0]`.
+unprivileged. The uid of the run is recorded in section `[1]`.
+
+**When "no pool" is an answer.** The pools goal is `n/a` only when `zpool list`
+ran, exited 0 and listed nothing, or when `zpool` says the kernel module is not
+loaded and `/proc/spl/kstat/zfs` is absent. A `zpool list` that was refused
+(`/dev/zfs: Permission denied`), failed or hit its cap is blocked, and so is a
+host with the kstat tree but no `zpool` binary. A host with neither `zfs`,
+`zpool` nor `/proc/spl/kstat/zfs` is `n/a` for both goals. A `zpool` or `zfs`
+that hangs during discovery is not asked again: every later call says
+`skipped: zpool hung earlier (...)`. A third goal, dataset properties and
+snapshots, is declared wherever ZFS is found: it is blocked when `zfs get all`
+or the snapshot list failed, was refused or hung, or when `zfs` is absent.
+
+**Reading the report** (explanations that used to be `note:` lines in it):
+
+- A tunable printed as `not present in this zfs build` is a version fact, not a
+  collection failure.
+- `clones` is a snapshot property, so which snapshot a clone pins is in F's
+  snapshot inventory; the clone-origin list shows the filesystem side.
+- The tunables that govern H (`zfs_txg_timeout`, `zfs_txg_history`,
+  `zfs_dirty_data_*`, `zil_slog_bulk`) are in B.
+- `/proc/spl/kstat/zfs/dbufs` is never read (it enumerates every ARC dbuf).
+- L's event tally covers the whole ring buffer, whose depth is set by
+  `zfs_zevent_len_max` (B). `zpool events` and `zpool history` read `/dev/zfs`,
+  so their content depends on the uid in `[1]`.
+- WhaTap `conf/*.conf`, JVM flags, ports and service logs are collected by
+  `collect-collserver.sh`, not here.
 
 #### Collection-load tiers — ZFS
 
@@ -299,17 +365,23 @@ unprivileged. The uid of the run is recorded in section `[0]`.
     compression), `zdb -mm` (metaslab free-space histograms). Traverses pool
     metadata: **minutes on a large pool, and it reads the data disks.**
   - `--filesizes[=PATH]` — power-of-two file-size histogram under `yardbase` (or
-    `PATH`), by walking the tree. Metadata-only, `-xdev`, bounded to 600 s.
+    `PATH`), by walking the tree. Metadata-only, `-xdev`, bounded to
+    `--filesizes-secs` (default 300 s). A walk that hits the bound, or that
+    could not read part of the tree (`find` exits 1 on a denied directory), is
+    labelled `PARTIAL` with the reason.
+
+**Bounds.** Every `zpool` / `zfs` / `zdb` / `journalctl` / `find` call runs
+under the shared `_bounded` cap, and the run deadline (300 s) is raised to fit
+the file-size walk, `--sample`, `--zdb` (per pool: 3,720 s in the report and
+7,500 s more in the bundle) and the bundle unless `RUN_DEADLINE` is set. `[1]`
+prints the deadline the run used. The bundle journal keeps the newest 20,000 lines per unit. The bundle
+is assembled in the run's private temp directory. Numeric options that are not
+non-negative integers exit 2; an unwritable `--out` or a failed `tar` exits 1.
+Under sudo the `.txt` and the `.tar.gz` are handed back to the invoking user.
 
 `dbufs` is never read, in any tier: it enumerates every dbuf in the ARC.
 
-### (c) Security note — ZFS
-
-The report carries no WhaTap credentials — it does not read `conf/*.conf`. It does
-carry host identity (hostname, device serials via `lsblk`, dataset and pool names)
-and, with `--bundle`, the journal for zfs units. Treat it as internal.
-
-### (d) How it was built / how to maintain — ZFS
+### (c) How it was built / how to maintain — ZFS
 
 Same harness as `collect-collserver.sh` (shared `probe` / `read_proc` / `dump_file`
 helpers, fd-3 progress, action-flag dispatch), following
@@ -369,11 +441,12 @@ path.
 
 ### (a) Facts it collects
 
-One `.txt` report, sections `[0]` and A..K:
+One `.txt` report, sections `[1]` and A..K:
 
-- **`[0]` Collection environment** — bash, uid, tool presence, which mysql client
-  was resolved, whether it could connect and why not, and which opt-in tiers this
-  run enabled.
+- **`[1]` Collection environment** — bash, uid, privilege, boot time, tool
+  presence, which mysql client was resolved, what the connection was attempted
+  with, where the password came from (never the password), whether it could
+  connect and why not, and which opt-in tiers this run enabled.
 - **A. Server identity and version** — version, hostname, `server_id`,
   `server_uuid`, uptime, `read_only` / `super_read_only`, port, socket, datadir,
   the local `mysqld` process and the listening sockets.
@@ -409,16 +482,75 @@ One `.txt` report, sections `[0]` and A..K:
 
 ```sh
 ./collect-collmysql.sh --file                       # -> whatap-collmysql-<host>-<UTC>.txt
+sudo ./collect-collmysql.sh --stdout                # root over the unix socket; root-only files
 ./collect-collmysql.sh --file --defaults-file ~/.my.cnf
 ./collect-collmysql.sh --file --mysql-args "-h 10.0.0.5 -u whatap -p"
 ./collect-collmysql.sh --file --binlog --sample     # add the two opt-in tiers
 ./collect-collmysql.sh                              # no arguments -> prints help
 ```
 
-With neither `--defaults-file` nor `--mysql-args`, the mysql client is invoked
-with no connection arguments and uses its own option files. A run without
-credentials still produces the host-side facts; every SQL-backed line then reads
-`n/a (<reason>)`.
+With no option file and no `--mysql-args`, the mysql client is invoked with no
+connection arguments and uses its own option files. A run without credentials
+still produces the host-side facts; every SQL-backed line then reads
+`n/a (<reason>)`. The login goal is then blocked, not `n/a`, even when no local
+`mysqld` is running: the backend's MySQL is often on another host, and
+`--mysql-args "-h ..."` would reach it.
+
+**Privilege.** The collector runs at the privilege it was started with and
+never elevates or re-runs itself. `[1]` states that privilege. A packaged
+MySQL often admits `root@localhost` over the unix socket with no password, and
+the binary log directory is often readable by root only; the operator runs it
+with sudo for those (`sudo ./collect-collmysql.sh --stdout`). A goal that root
+would have obtained is blocked with the uid and what refused it
+(`run as uid 1000; /var/lib/mysql is mysql:mysql 750 and not readable by this
+uid (not elevated: run again with sudo)`); that hint appears only in the status
+section and on the terminal, never in a fact line. Under sudo the `--file`
+report is handed back to the invoking user. `--no-sudo`, which 0.6/0.7 needed,
+is accepted and warns that it is no longer needed.
+
+**Passwords never go on a command line.** A command line is readable by every
+account in `ps` and `/proc/<pid>/cmdline`. So the collector hands the password
+to the `mysql` client only through a mode-600 option file inside the run's
+private temp directory (`--defaults-extra-file`, or `--defaults-file` with
+`!include` of yours when you gave one), never on a child's argv or in its
+environment. Three sources:
+
+```sh
+./collect-collmysql.sh --file --defaults-file ~/.my.cnf          # or --defaults-extra-file
+./collect-collmysql.sh --file --mysql-args "-h 10.0.0.5 -u whatap -p"    # asked once, on the terminal
+MYSQL_PWD='...' ./collect-collmysql.sh --file --mysql-args "-u whatap"   # read, then unset
+```
+
+`MYSQL_PWD` is unset before any child starts, but it stays in the collector's
+own `/proc/<pid>/environ` for the run, readable by the same uid and by root,
+and MySQL deprecates the variable; prefer an option file. A `MYSQL_PWD` holding
+a newline is refused (exit 2): an option-file value ends at a newline.
+
+A password written into `--mysql-args` ends the run with exit 2 before any
+child starts: it is already on the collector's own command line (the
+operator's choice), and the collector does not hand it on. Detection follows
+the real clients, measured against the 5.6, 5.7.32, 8.0.46 and 8.4.10 clients
+(2026-09-25): `-pX`, a short-option cluster holding `p` (`-BpX`), `--password=X`,
+`--password1..3=X`, the prefixes `--pas=` .. `--passwor=` (5.6), any run of the
+prefixes `loose-`, `maximum-`, `skip-`, `enable-`, `disable-` before them, with
+`_` and `-` interchangeable (`--loose_password=X`), and any other option name
+that spells password. A bare `-p` (or `--password`, or a cluster ending in `p`
+such as `-Bp`) asks once. `-p X` with a space is not a password: the client
+reads it as "ask", and `X` as a database name.
+
+**Every wait ends within `RUN_DEADLINE`.** The `-p` prompt waits at most
+`PROMPT_TIMEOUT` (60 s) or what is left of the run, whichever is less, so an
+unanswered prompt does not spend the whole deadline; it restores the terminal
+on every path, Ctrl-C included, and an unanswered one leaves the run without a
+password with that reason in `[1]`. A bare `-p` with no terminal (`ssh host
+'cmd'`, cron) is not passed to the client and the report says so. The caps
+come from the environment only (`CMD_TIMEOUT`, `RUN_DEADLINE`, `BINLOG_TIMEOUT`,
+`PROMPT_TIMEOUT`, whole numbers 1..999999); a bad value is dropped with a
+warning. `--sample` raises the deadline by both samplers (2 x (SEC x 6 + 30));
+`[1]` prints the deadline the run used.
+
+The script needs bash and says so, exit 2, under `sh`. It runs from stdin
+(`bash -s -- --stdout < collect-collmysql.sh`) like any other invocation.
 
 Run it **on the MySQL host** when you can. Sections A, C, D and K read files and
 the process table locally, and fall back to `n/a (...)` when run from elsewhere.
@@ -433,18 +565,17 @@ the process table locally, and fall back to `n/a (...)` when run from elsewhere.
 - **Tier 2** — `--binlog[=N]` decodes the N newest binary logs (default 2) with
   `mysqlbinlog --base64-output=DECODE-ROWS` and counts row events per table.
   This reads whole log files, so it costs I/O proportional to their size and is
-  off by default. Start with `--binlog=1` on a host under pressure.
+  off by default. Start with `--binlog=1` on a host under pressure. Each file
+  is capped at `BINLOG_TIMEOUT` (300 s, settable in the environment) and the run
+  deadline is raised to fit. The goal is obtained only when every selected file
+  was decoded to its end: a file `mysqlbinlog` could not open (Errcode 13) or a
+  decode stopped at the cap is blocked, with the file named. A
+  `@@log_bin_basename` that is NULL or not an absolute path is "not resolved",
+  never the working directory, and `@@log_bin = 0` is `n/a`. When section I
+  finds no row events, `binlog_format` in section B says whether the server
+  writes row events at all.
 
-### (c) Security note
-
-The report contains schema and table names, statement digests, the processlist
-(including the `INFO` column, truncated to 120 characters) and a binary-log
-event summary by table. It does not print row values or credentials, and it
-never writes to the database. Section I prints table names and event counts, not
-the decoded rows themselves. Move the file over a trusted channel and delete it
-when the case is closed.
-
-### (d) How it was built / how to maintain
+### (c) How it was built / how to maintain
 
 Copied from [../../templates/collector-skeleton/](../../templates/collector-skeleton/).
 Re-validate after edits:
@@ -499,3 +630,73 @@ Re-validate after edits:
   only the transaction and statement counts. Confirm the parse on a live server.
 - MariaDB is resolved as a client but the MariaDB-specific replication and
   `performance_schema` differences are unvalidated.
+
+---
+
+## What the report can contain
+
+Every place a secret or sensitive value can arrive from, per collector.
+
+### `collect-collserver.sh`
+
+Nothing is masked. What can carry a secret:
+
+- **`conf/*.conf`** (section F and the bundle's `conf/`) — verbatim, including
+  `secure.conf` / `ksecure.conf`, the `account.conf` license and
+  `admin.password`, database and eureka credentials.
+- **Process arguments** — section E prints each WhaTap JVM's `-X`/`-XX` flags;
+  the bundle's `os/ps-aux.txt` is `ps aux`, i.e. the **full command line of
+  every process on the host**, including other software that takes a password
+  as an argument.
+- **Logs** — the tails in G and the copied `logs/` carry whatever the services
+  logged (request URLs, account names, tokens a module chose to log).
+- **The journal** — unit output for the last `--hours`.
+- **Tier 2** — thread dumps carry stack locals' class names; a heap dump
+  (`--heap`) carries **everything in the JVM's memory**, credentials included.
+
+Move the resulting `.txt` / `.tar.gz` over a trusted channel and delete it when
+the case is closed.
+
+### `collect-collzfs.sh`
+
+It does not read WhaTap `conf/*.conf`. What can carry something sensitive:
+
+- **Host identity** — hostname, device serials and models (`lsblk`,
+  `/dev/disk/by-id`), dataset, pool and mount names.
+- **Process arguments** — L lists `zed` / `sanoid` / `syncoid` / `zrepl` /
+  `zfs send|recv` processes with their full command lines, which for a
+  replication job can include a remote host, a user and an ssh option.
+- **`zpool history`** — every administrative `zpool` / `zfs` command ever run on
+  the pool, with its arguments (a `zfs set` of a key location, a `zfs create`
+  with properties).
+- **Configuration files named in L** are reported as present/absent only; their
+  content is not read.
+- **`--bundle`** adds the journal of zfs units, `dmesg`, the kstat tree and
+  `zpool events -v`.
+
+Treat it as internal.
+
+### `collect-collmysql.sh`
+
+Nothing is masked, and nothing is written to the database. What can carry
+something sensitive:
+
+- **The processlist** (H) — the `INFO` column, truncated to 120 characters: a
+  running statement's literal values, which can include a password in a
+  `CREATE USER` / `SET PASSWORD` / application query.
+- **Statement digests** (G) — normalized, so literals are replaced by `?`, but
+  schema, table and column names are verbatim.
+- **Schema footprint** (F) — every schema and table name, row counts.
+- **The error log tail** (K) — whatever the server logged (failed logins with
+  account and host names).
+- **Section A/[1]** — the account name the connection was attempted with and the
+  one the server matched, and the local `mysqld` command line from `ps`.
+- **Section I** prints table names and event counts, not the decoded rows.
+
+- **The password** this collector was given is never printed; `[1]` says only
+  where it came from. It exists, for the run, in the mode-600 option file of the
+  run's private temp directory, and, when it came from `MYSQL_PWD`, in the
+  collector's own `/proc/<pid>/environ`.
+
+Move the file over a trusted channel and delete it when the case
+is closed.

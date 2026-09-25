@@ -29,6 +29,21 @@
 # -----------------------------------------------------------------------------
 
 set -u
+set -o noclobber
+# Stubs are written only through stub_write, and stub dirs are copied only
+# through stub_clone. A stub dir is a farm of symlinks to the real tools, and a
+# `>` onto one of them writes the real tool (as root, /usr/bin/xargs itself).
+# noclobber makes any other `>` onto an existing file an error; `>|` is used
+# only on files this suite created as regular files.
+stub_write() { rm -f "$1" && cat > "$1" && chmod +x "$1"; }   # content on stdin
+stub_clone() {                                                # SRC DST: links stay links
+    local f; mkdir -p "$2"
+    for f in "$1"/*; do
+        [ -e "$f" ] || [ -L "$f" ] || continue
+        if [ -L "$f" ]; then ln -s "$(readlink "$f")" "$2/${f##*/}"
+        else rm -f "$2/${f##*/}"; cp "$f" "$2/${f##*/}"; fi
+    done
+}
 # Default to the collector beside this checkout. Resolve whatever we end up
 # with to an absolute path: the tests cd into throwaway directories, so a
 # relative path would stop resolving after the first one.
@@ -41,8 +56,8 @@ ok()   { PASS=$((PASS+1)); printf '  PASS  %s\n' "$1"; }
 bad()  { FAIL=$((FAIL+1)); printf '  FAIL  %s\n        expected: %s\n        actual:   %s\n' "$1" "$2" "$3"; }
 skip() { SKIP=$((SKIP+1)); printf '  ~ not checked: %s\n' "$1"; }
 chk()  { [ "$2" = "$3" ] && ok "$1" || bad "$1" "$2" "$3"; }
-has()  { printf '%s' "$2" | grep -qF "$3" && ok "$1" || bad "$1" "contains: $3" "absent"; }
-hasnt(){ printf '%s' "$2" | grep -qF "$3" && bad "$1" "absent: $3" "present" || ok "$1"; }
+has()  { printf '%s' "$2" | grep -qF -- "$3" && ok "$1" || bad "$1" "contains: $3" "absent"; }
+hasnt(){ printf '%s' "$2" | grep -qF -- "$3" && bad "$1" "absent: $3" "present" || ok "$1"; }
 mkhome() {
   local h="$1"; mkdir -p "$h/conf" "$h/logs" "$h/lib"
   printf 'yard_v4_start=20240101\n' > "$h/conf/yard.conf"; printf 'x=1\n' > "$h/conf/proxy.conf"
@@ -58,7 +73,7 @@ mkstub() {
            uniq xargs expr touch env tee timeout du; do
     p="$(type -P "$c" 2>/dev/null)" && [ -n "$p" ] && ln -sf "$p" "$s/$c"
   done
-  cat > "$s/systemctl" <<'EOF'
+  stub_write "$s/systemctl" <<'EOF'
 #!/bin/sh
 case "$*" in *list-unit-files*) echo "yard.service enabled enabled"; exit 0 ;; esac
 case "$*" in *"-p LoadState"*yard*) echo "LoadState=loaded"; exit 0 ;; esac
@@ -148,7 +163,7 @@ if sudo -n true 2>/dev/null && type -P journalctl >/dev/null 2>&1; then
   out="$(sudo -u nobody env PATH="$S" HOME=/tmp TMPDIR=/tmp bash "$ROOT/c.sh" --stdout 2>/dev/null)"
   if printf '%s' "$out" | grep -q 'cannot read /.*system.journal'; then
     ok "the reason names the file and the groups"
-    has "and says how to obtain it" "$out" "run with sudo"
+    has "and the gap says how to obtain it" "$out" "(not elevated: run again with sudo)"
     has "and the run is INCOMPLETE" "$out" "status: INCOMPLETE"
   else skip "the unreadable-journal case (this account can read the journal)"; fi
   rm -f "$S/journalctl"
@@ -163,5 +178,163 @@ if sudo -n true 2>/dev/null; then
   else bad "bundle written under sudo" "a .tar.gz" "none"; fi
   sudo rm -rf "$B5" 2>/dev/null
 else skip "the sudo group (needs passwordless sudo)"; fi
+echo "== 10. conf/ and logs/ that exist but cannot be listed =="
+# An unreadable directory hands its glob back literally, and 0.8.x read that as
+# "conf/ is readable and holds no *.conf": COMPLETE for a run that saw nothing.
+if [ "$(id -u)" != 0 ]; then
+  H3="$ROOT/home3"; mkhome "$H3"; chmod 000 "$H3/conf" "$H3/logs"
+  out="$("$C" --home "$H3" --stdout 2>/dev/null)"
+  has "INCOMPLETE" "$out" "status: INCOMPLETE"
+  has "configs are blocked, not absent" "$out" "module configs — uid $(id -u) cannot read $H3/conf"
+  has "logs are blocked, not absent" "$out" "log inventory — uid $(id -u) cannot read $H3/logs"
+  hasnt "no 'holds no *.conf'" "$out" "holds no *.conf"
+  has "and the gap names sudo" "$out" "(not elevated: run again with sudo)"
+  status_adds_up "$out" "status adds up"
+  chmod 755 "$H3/conf" "$H3/logs"
+  chmod 000 "$H3/conf/proxy.conf"
+  out="$("$C" --home "$H3" --stdout 2>/dev/null)"
+  has "one unreadable conf file blocks the goal" "$out" "module configs — uid $(id -u) cannot read proxy.conf"
+  chmod 644 "$H3/conf/proxy.conf"
+else skip "the unreadable-directory cases (this account is root, which reads them)"; fi
+echo "== 11. numeric options are checked before the run =="
+for o in "--max-log-mb 0.5" "--max-total-mb x" "--hours -1" "--log-days 1e3" "--threads=two"; do
+  B6="$ROOT/b6"; T6="$ROOT/t6"; rm -rf "$B6" "$T6"; mkdir -p "$B6" "$T6"
+  # shellcheck disable=SC2086
+  err="$( cd "$B6" && TMPDIR="$T6" "$C" --home "$H" --bundle $o --out . 2>&1 >/dev/null )"; rc=$?
+  chk "$o exits 2" "2" "$rc"
+  has "$o names the option" "$err" "${o%%[ =]*} takes a non-negative integer"
+  # 0.8.1 left its mktemp work dir behind in TMPDIR when the arithmetic aborted.
+  chk "$o leaves nothing behind, in --out or in TMPDIR" "" "$(find "$B6" "$T6" -mindepth 1 2>/dev/null | head -3)"
+done
+echo "== 12. an output directory that cannot be written =="
+if [ "$(id -u)" != 0 ]; then
+  RO="$ROOT/ro"; mkdir -p "$RO"; chmod 555 "$RO"
+  T12="$ROOT/t12"; mkdir -p "$T12"
+  err="$(TMPDIR="$T12" "$C" --home "$H" --bundle --out "$RO" 2>&1 >/dev/null)"; rc=$?
+  chk "bundle into an unwritable --out fails with exit 1" "1" "$rc"
+  has "and says so" "$err" "is not writable by uid"
+  # 0.8.1 exited 0 and left "artifacts left under" a work dir in TMPDIR.
+  chk "and leaves no work dir with the configs in TMPDIR" "" "$(ls -A "$T12")"
+  err="$("$C" --home "$H" --file --out "$RO" 2>&1 >/dev/null)"; rc=$?
+  # Fail fast: checked before the host is walked, not after.
+  if [ "$rc" = 1 ] && ! printf '%s' "$err" | grep -qF ">> discovering"; then
+    ok "--file into an unwritable --out fails before any collection"
+  else bad "--file into an unwritable --out fails before any collection" "exit 1, no discovery" "exit $rc: $(printf '%s' "$err" | head -1)"; fi
+  chmod 755 "$RO"
+else skip "the unwritable --out case (root writes anywhere)"; fi
+echo "== 13. discovery and labels =="
+out="$(WHATAP_HOME="$H" "$C" --stdout 2>/dev/null)"
+has "WHATAP_HOME from the environment is a source" "$out" "WHATAP_HOME resolved by: environment WHATAP_HOME"
+has "and the configs come back" "$out" "obtained: WHATAP_HOME contents, module configs, log inventory"
+out="$("$C" --stdout 2>/dev/null)"
+has "ports are labelled as module defaults" "$out" "port 6789 (keeper default):"
+hasnt "no module-named port line" "$out" "keeper (6789):"
+has "no yardbase and no home: the filesystem is n/a" "$out" "yardbase filesystem type: n/a (neither yardbase nor WHATAP_HOME resolved)"
+hasnt "and nothing resolved that was never declared" "$out" "resolved but never declared"
+echo "== 14. a hung systemctl is asked once, not once per unit =="
+# The stub counts its calls. Without the fail-fast every unit_loaded, is-active
+# and show would each wait CMD_TIMEOUT; with it, the first cap stops the rest.
+S2="$ROOT/stub2"; stub_clone "$S" "$S2"
+stub_write "$S2/systemctl" <<'EOF'
+#!/bin/sh
+echo x >> "$SDCALLS"
+exec sleep 600
+EOF
+chmod +x "$S2/systemctl"; export SDCALLS="$ROOT/sdcalls"; : >| "$SDCALLS"
+t0=$(date +%s); out="$(PATH="$S2" CMD_TIMEOUT=2 RUN_DEADLINE=120 "$C" --stdout 2>/dev/null)"; t1=$(date +%s)
+has "the footer is reached" "$out" "==== END OF COLLECTION"
+n="$(wc -l < "$SDCALLS" | tr -d ' ')"
+[ "$n" -le 2 ] && ok "systemctl was called $n time(s)" || bad "systemctl called at most twice" "<= 2" "$n"
+[ $((t1 - t0)) -le 30 ] && ok "and the run took $((t1 - t0))s, not RUN_DEADLINE" || bad "the run is not stretched to the deadline" "<= 30s" "$((t1 - t0))s"
+unset SDCALLS
+
+echo "== 15. a whatap JVM whose home was not found is blocked, never n/a =="
+# A process whose cmdline names a whatap module, started in a directory that
+# holds no conf, and without -Dwhatap.server.home.
+N="$ROOT/nothome"; mkdir -p "$N"
+# One process (exec -a names it), so killing it leaves no orphan holding this
+# suite's stdout open, and its own output goes nowhere.
+( cd "$N" && exec -a "java -jar whatap.server.yard.boot" sleep 60 ) >/dev/null 2>&1 </dev/null &
+jvm=$!
+sleep 1
+out="$("$C" --stdout 2>/dev/null)"
+kill "$jvm" 2>/dev/null; wait "$jvm" 2>/dev/null
+has "the module is seen" "$out" "obtained: running whatap modules"
+has "home is blocked, naming the JVM" "$out" "WHATAP_HOME contents — WHATAP_HOME not resolved; pass --home DIR; whatap JVM pid"
+has "configs are blocked too" "$out" "module configs — WHATAP_HOME not resolved; pass --home DIR; whatap JVM pid"
+hasnt "and nothing reads 'no whatap home'" "$out" "no whatap home in any readable process"
+
+echo "== 16. a /proc mounted hidepid: the empty process table is not an answer =="
+if sudo -n true 2>/dev/null && type -P unshare >/dev/null 2>&1 && type -P setpriv >/dev/null 2>&1; then
+  # nobody must reach the copy, and $ROOT may sit under a mode-700 TMPDIR, so
+  # the copy lives in a directory of its own directly under /tmp.
+  HP="$(mktemp -d /tmp/ggt-test16.XXXXXX)"; chmod 711 "$HP"
+  cp "$C" "$HP/c16.sh"; chmod 755 "$HP/c16.sh"
+  out="$(sudo -n unshare -pfm --propagation private sh -c \
+      'mount -t proc -o hidepid=2 proc /proc && grep -q hidepid /proc/mounts && echo NS_HIDEPID_OK && exec setpriv --reuid=65534 --regid=65534 --clear-groups env PATH=/usr/bin:/bin HOME=/tmp TMPDIR=/tmp bash "$1" --stdout' \
+      sh "$HP/c16.sh" 2>/dev/null)"
+  case "$HP" in /tmp/ggt-test16.*) rm -rf "$HP" ;; esac
+  if printf '%s' "$out" | grep -qx 'NS_HIDEPID_OK'; then
+    has "running modules are blocked, naming hidepid" "$out" "running whatap modules — /proc is mounted with hidepid"
+    hasnt "and not n/a" "$out" "no whatap JVM in any of the"
+  else skip "the hidepid case (the namespace could not be set up: $(printf '%s' "$out" | head -c 80))"; fi
+else skip "the hidepid case (needs passwordless sudo, unshare and setpriv)"; fi
+echo "== 17. under sh: a sentence, not a syntax error =="
+o="$(sh "$C" --stdout 2>&1)"; rc=$?
+[ "$rc" = 2 ] && printf '%s' "$o" | grep -qF "collect-collserver.sh needs bash" \
+  && ok "exit 2, saying it needs bash" || bad "exit 2, saying it needs bash" "rc 2 + message" "rc $rc: $(printf '%s' "$o" | head -1)"
+echo "== 18. round 4: one systemctl show for every unit; a failed process scan is not 'no JVM' =="
+# A systemctl that answers multi-unit show the way systemd does (blocks, the
+# properties in its own order) and counts its calls. yard is loaded, with a
+# WorkingDirectory that is a home.
+S3="$ROOT/stub3"; stub_clone "$S" "$S3"
+stub_write "$S3/systemctl" <<EOF
+#!/bin/sh
+echo x >> "$ROOT/sd3.calls"
+case "\$1" in
+  show) shift; first=1; props=" "; units=""
+        while [ \$# -gt 0 ]; do
+          if [ "\$1" = -p ]; then props="\$props\$2 "; shift 2; else units="\$units \$1"; shift; fi
+        done
+        for a in \$units; do
+          [ "\$first" = 1 ] || echo; first=0
+          if [ "\$a" = yard.service ]; then wd="$H"; ls=loaded; else wd=""; ls=not-found; fi
+          for p in NRestarts WorkingDirectory Id LoadState; do
+            case "\$props" in *" \$p "*) ;; *) continue ;; esac
+            case "\$p" in NRestarts) echo "NRestarts=0" ;; WorkingDirectory) echo "WorkingDirectory=\$wd" ;;
+                           Id) echo "Id=\$a" ;; LoadState) echo "LoadState=\$ls" ;; esac
+          done
+        done ;;
+  is-active) echo active ;;
+  is-enabled) echo enabled ;;
+  list-unit-files) echo "yard.service enabled enabled" ;;
+esac
+exit 0
+EOF
+chmod +x "$S3/systemctl"; : >| "$ROOT/sd3.calls"
+out="$(PATH="$S3" "$C" --stdout 2>/dev/null)"
+has "the home comes from the prefetched WorkingDirectory" "$out" "WHATAP_HOME resolved by: systemd yard.service WorkingDirectory"
+has "and the unit state line is there" "$out" "yard.service: active=active enabled=enabled restarts=0"
+n="$(wc -l < "$ROOT/sd3.calls" | tr -d ' ')"
+[ "$n" -le 8 ] && ok "systemctl was called $n times, not once per unit and property" || bad "systemctl called at most 8 times" "<= 8" "$n"
+# An xargs that cannot run grep: the scan failed, so no JVM is not an answer.
+S4="$ROOT/stub4"; stub_clone "$S" "$S4"
+rm -f "$S4/xargs"   # a symlink to the real one: never write through it
+printf '#!/bin/sh\necho "xargs: grep: Argument list too long" >&2\nexit 126\n' | stub_write "$S4/xargs"
+rm -f "$S4/systemctl"
+out="$(PATH="$S4" "$C" --stdout 2>/dev/null)"
+has "a failed /proc scan blocks the modules goal" "$out" "running whatap modules — the /proc/<pid>/cmdline scan failed (xargs/grep exit 126)"
+hasnt "and is not read as none running" "$out" "no whatap JVM in any of the"
+
+echo "== 19. read from stdin (bash -s): the /proc scan still sees a JVM =="
+N19="$ROOT/nothome19"; mkdir -p "$N19"
+( cd "$N19" && exec -a "java -jar whatap.server.yard.boot" sleep 60 ) >/dev/null 2>&1 </dev/null &
+jvm=$!
+sleep 1
+out="$(bash -s -- --stdout < "$C" 2>/dev/null)"
+kill "$jvm" 2>/dev/null; wait "$jvm" 2>/dev/null
+has "bash -s: the module is seen" "$out" "obtained: running whatap modules"
+hasnt "and not read as none running" "$out" "no whatap JVM in any of the"
+
 echo; echo "PASS=$PASS FAIL=$FAIL SKIP=$SKIP"
 [ "$FAIL" -eq 0 ]
