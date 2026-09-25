@@ -43,7 +43,7 @@ export LC_ALL=C
 
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-apmpython"
-VERSION="0.5.1"
+VERSION="0.6.0"
 DOMAIN="apm"
 TARGET="host/$(hostname 2>/dev/null || echo unknown)"
 
@@ -491,13 +491,10 @@ progress() { [ "$OPT_QUIET" = 1 ] && return; printf '>> %s\n' "$*" >&3 2>/dev/nu
 have() { command -v "$1" >/dev/null 2>&1; }
 
 _errfile=""
-_timeout_bin=""
-CMD_TIMEOUT=15
-_init_probe() {
-    _errfile="$(_tmp probe.err)"
-    have timeout && _timeout_bin="$(command -v timeout)"
-}
-_end_probe() { [ -n "$_errfile" ] && rm -f "$_errfile" 2>/dev/null; }
+CMD_TIMEOUT="${CMD_TIMEOUT:-15}"
+# Call after _run_init: the error file lives in the run's private directory.
+_init_probe() { _errfile="$(_tmp probe.err)"; }
+_end_probe() { :; }   # _run_cleanup removes the directory
 
 _classify_err() {
     local txt=""
@@ -522,17 +519,40 @@ _emit_labeled() {
 }
 
 # probe "label" CMD [ARGS...] -> output as facts, or "label: n/a (<why>)".
+# CMD may be a file, a shell function or a builtin; _bounded caps all three. A
+# non-zero exit that still printed something is reported with its output.
 probe() {
     local label="$1"; shift
-    command -v "$1" >/dev/null 2>&1 || { fact "$label: n/a (command not found: $1)"; return; }
+    [ -n "$(_cmd_kind "$1")" ] || { fact "$label: n/a (command not found: $1)"; return; }
+    _past_deadline && { fact "$label: n/a (run deadline reached: ${RUN_DEADLINE}s)"; return; }
     local out rc
-    if [ -n "$_timeout_bin" ]; then out="$("$_timeout_bin" "$CMD_TIMEOUT" "$@" 2>"$_errfile")"; rc=$?
-    else out="$("$@" 2>"$_errfile")"; rc=$?; fi
-    [ "$rc" -eq 124 ] && [ -n "$_timeout_bin" ] && { fact "$label: n/a (timed out: ${CMD_TIMEOUT}s)"; return; }
-    [ "$rc" -ne 0 ] && { fact "$label: n/a ($(_classify_err))"; return; }
+    out="$(_bounded "$@" 2>"$_errfile")"; rc=$?
+    if [ "$rc" -eq 124 ]; then
+        if _past_deadline; then fact "$label: n/a (run deadline reached: ${RUN_DEADLINE}s)"
+        else fact "$label: n/a (timed out: ${CMD_TIMEOUT}s)"; fi
+        return
+    fi
+    if [ "$rc" -ne 0 ]; then
+        [ -n "$out" ] && { _emit_labeled "$label (exit $rc)" "$out"; return; }
+        fact "$label: n/a ($(_classify_err))"; return
+    fi
     [ -z "$out" ] && { fact "$label: n/a (empty output)"; return; }
     _emit_labeled "$label" "$out"
 }
+
+# _head_of N CMD... -> the first N lines of CMD's stdout, with CMD's own exit
+# status (a `CMD | head` pipeline reports head's, and hides a failed CMD as
+# empty output).
+_head_of() {
+    local n="$1" rc; shift
+    "$@" > "$(_tmp head.out)"; rc=$?
+    head -n "$n" "$(_tmp head.out)" 2>/dev/null
+    return "$rc"
+}
+
+# _ls_head DIR N -> `ls -la DIR`, first N lines, failing when ls fails. Takes the
+# path as an argument, so a quote or a space in it cannot break a `sh -c` string.
+_ls_head() { _head_of "$2" ls -la -- "$1"; }
 
 # read_proc "label" PATH -> content of a /proc or /sys file, or a reason.
 read_proc() {
@@ -546,7 +566,7 @@ read_proc() {
 
 # dump_file "label" PATH [CAP] -> the file's content verbatim (line-capped),
 # or a classified reason. Framework policy: configuration is dumped verbatim,
-# never masked (see collectors/apm/python/README.md security note).
+# never masked (see collectors/apm/python/README.md, "What the report can contain").
 dump_file() {
     local label="$1" path="$2" cap="${3:-400}" total
     [ -e "$path" ] || { fact "$label: n/a (path not found: $path)"; return; }
@@ -579,15 +599,19 @@ head_file() {
     head -n "$cap" "$path" 2>/dev/null | while IFS= read -r _l || [ -n "$_l" ]; do printf '        %s\n' "$_l"; done
 }
 
-# pyprobe "label" PY_EXE CODE -> run a short python -c snippet under timeout.
+# pyprobe "label" PY_EXE CODE -> run a short python -c snippet under _bounded.
 # Never imports the `whatap` package itself (importing it has side effects);
-# only importlib/pkg metadata lookups are used.
+# only importlib/pkg metadata lookups are used. Leaves the output in _pyout and
+# the exit status in _pyrc, so a caller can resolve a goal from it.
+_pyout="" _pyrc=0
 pyprobe() {
     local label="$1" py="$2" code="$3" out rc
+    _pyout="" _pyrc=1
     [ -x "$py" ] || { fact "$label: n/a (not executable: $py)"; return; }
-    if [ -n "$_timeout_bin" ]; then out="$("$_timeout_bin" "$CMD_TIMEOUT" "$py" -c "$code" 2>"$_errfile")"; rc=$?
-    else out="$("$py" -c "$code" 2>"$_errfile")"; rc=$?; fi
-    [ "$rc" -eq 124 ] && [ -n "$_timeout_bin" ] && { fact "$label: n/a (timed out: ${CMD_TIMEOUT}s)"; return; }
+    _past_deadline && { _pyrc=124; fact "$label: n/a (run deadline reached: ${RUN_DEADLINE}s)"; return; }
+    out="$(_bounded "$py" -c "$code" 2>"$_errfile")"; rc=$?
+    _pyout="$out" _pyrc="$rc"
+    [ "$rc" -eq 124 ] && { fact "$label: n/a (timed out: ${CMD_TIMEOUT}s)"; return; }
     if [ "$rc" -ne 0 ]; then
         local err
         err="$(grep -E 'Error|Exception' "$_errfile" 2>/dev/null | tail -n1 | cut -c1-140)"
@@ -599,18 +623,59 @@ pyprobe() {
     _emit_labeled "$label" "$out"
 }
 
+# ---- process table (internal; emits nothing) ----------------------------------
+# _proc_table -> one line per process that has a command line, fields joined by
+# the unit separator \037 (a whitespace IFS would merge empty fields):
+#   pid comm exe argv0 cmdline
+# Read in one pass over /proc: three readers for every pid instead of several
+# forks per pid (readlink + basename per pid took 20 s on a 687-process host).
+# exe is empty where /proc/<pid>/exe is not readable by this uid. cmdline has
+# its NULs turned into spaces and is cut at 300 characters.
+_us="$(printf '\037')"
+_proc_table() {
+    {
+        ls -l /proc/[0-9]*/exe 2>/dev/null | awk '{
+            i = index($0, " -> "); if (!i) next
+            for (f = 1; f <= NF; f++) if ($f ~ /^\/proc\/[0-9]+\/exe$/) {
+                split($f, a, "/"); t = substr($0, i + 4); sub(/ \(deleted\)$/, "", t)
+                print "E\037" a[3] "\037" t; break } }'
+        head -n 1 /proc/[0-9]*/comm /dev/null 2>/dev/null | awk '
+            /^==> \/proc\/[0-9]+\/comm <==$/ { split($2, a, "/"); p = a[3]; next }
+            p != "" { print "C\037" p "\037" $0; p = "" }'
+        head -n 1 /proc/[0-9]*/cmdline /dev/null 2>/dev/null | tr '\000\037' '\001 ' | awk '
+            /^==> \/proc\/[0-9]+\/cmdline <==$/ { split($2, a, "/"); p = a[3]; next }
+            p != "" { split($0, v, "\001"); c = $0; gsub(/\001/, " ", c); sub(/ +$/, "", c)
+                      if (v[1] != "") print "A\037" p "\037" v[1] "\037" substr(c, 1, 300)
+                      p = "" }'
+    } | awk -F'\037' '
+        $1 == "E" { e[$2] = $3; next }
+        $1 == "C" { c[$2] = $3; next }
+        $1 == "A" { o[++n] = $2; a0[$2] = $3; cl[$2] = $4 }
+        END { for (i = 1; i <= n; i++) { p = o[i]; print p "\037" c[p] "\037" e[p] "\037" a0[p] "\037" cl[p] } }'
+}
+
 # ---- discovery (internal; emits nothing) --------------------------------------
 # Populates:
-#   D_PY_EXES   distinct python interpreter paths (PATH + running processes)
+#   D_PY_EXES   distinct python interpreter paths, newline-joined; those of
+#               whatap-marked processes first (PATH + running processes)
 #   D_GO_PIDS   pids of the Go common module (comm: whatap_python)
-#   D_APP_PIDS  pids of python processes (excluding this collector's children)
+#   D_APP_PIDS  pids of python processes, whatap-marked first
 #   D_HOMES     distinct WHATAP_HOME candidates with their discovery source
+#   D_UNREAD    pids of candidate processes whose environ or cwd this uid could
+#               not read (their WHATAP_HOME is unknown, not absent)
+#   D_HIDEPID   non-empty when /proc hides other users' processes from this uid
 D_PY_EXES=""
 D_GO_PIDS=""
 D_APP_PIDS=""
 D_ODOO_PIDS=""      # odoo processes (setproctitle may rename comm to odoo*)
 D_HOMES=""          # newline-joined "path|source" records
 D_PKG_DIRS=""       # newline-joined whatap package dirs seen in process environ
+D_UNREAD=""
+D_HIDEPID=""
+D_PY_LIVE=""        # interpreter paths of running processes, newline-joined
+# Interpreters detailed and probed per run (set in discover). APM_INTERP_CAP
+# in the environment raises it (the CLI flags are a shared block).
+D_PY_CAP=8 D_CAP_NOTE=""
 D_LOCK_FILE="${WHATAP_LOCK_FILE:-/tmp/whatap-python.lock}"
 D_LLM_LOCK_FILE="/tmp/whatap-python-llm.lock"
 
@@ -621,6 +686,8 @@ D_LLM_LOCK_FILE="/tmp/whatap-python-llm.lock"
 # (or any different mount namespace) and still read the target's files.
 resolve_fs() {
     local p="$1" pid
+    # a relative path is never read against the collector's own cwd
+    case "$p" in /*) ;; *) return 1 ;; esac
     [ -e "$p" ] && { printf '%s\n' "$p"; return; }
     for pid in $D_GO_PIDS $D_APP_PIDS $D_ODOO_PIDS; do
         [ -e "/proc/$pid/root$p" ] && { printf '%s\n' "/proc/$pid/root$p"; return; }
@@ -628,20 +695,91 @@ resolve_fs() {
     return 1
 }
 
+# _absent_why PATH [SOURCE] -> why resolve_fs found nothing: "permission denied:
+# <dir>" when an existing ancestor cannot be searched by this uid, or when the
+# process named in SOURCE ("... pid N") has a root this uid cannot enter;
+# otherwise "path not found: PATH".
+_absent_why() {
+    local p="$1" s="${2:-}" d pid i=0
+    # a relative path has no ancestor to walk; the ${d%/*} walk below only
+    # shrinks an absolute one (and is capped anyway)
+    case "$p" in /*) ;; *) printf 'relative path, not resolved: %s' "$p"; return ;; esac
+    d="${p%/*}"
+    while [ -n "$d" ] && [ ! -e "$d" ] && [ "$i" -lt 256 ]; do d="${d%/*}"; i=$((i + 1)); done
+    if [ -n "$d" ] && [ ! -e "$d" ]; then printf 'not resolved (path depth over 256): %s' "$p"; return; fi
+    if [ -n "$d" ] && [ -e "$d" ] && [ ! -x "$d" ]; then printf 'permission denied: %s' "$d"; return; fi
+    case "$s" in
+        *" pid "*)
+            pid="${s##* pid }"; pid="${pid%% *}"
+            if [ -d "/proc/$pid" ] && [ ! -e "/proc/$pid/root/" ]; then
+                printf 'permission denied: /proc/%s/root' "$pid"; return
+            fi ;;
+    esac
+    printf 'path not found: %s' "$p"
+}
+
+# _abs_for_pid PID PATH -> PATH, made absolute against the cwd of PID when it
+# is relative (a relative WHATAP_HOME in a process environ is relative to that
+# process). Fails when PATH is relative and that cwd cannot be read: the path
+# is then never tested against the collector's own cwd.
+_abs_for_pid() {
+    local c
+    case "$2" in
+        /*) printf '%s' "$2" ;;
+        *)  c="$(readlink -f "/proc/$1/cwd" 2>/dev/null)"
+            [ -n "$c" ] || return 1
+            printf '%s/%s' "$c" "${2#./}" ;;
+    esac
+}
+
+# _home_from_pid PID PATH SOURCE -> add PATH (from the environ of PID) as a home
+# candidate. A relative PATH whose process cwd cannot be read is an unread
+# input while the process lives (D_UNREAD), and a fact once it has exited
+# (D_GONE).
+D_GONE=""
+_home_from_pid() {
+    local v
+    if v="$(_abs_for_pid "$1" "$2")"; then _add_home "$v" "$3"
+    elif [ -e "/proc/$1" ]; then D_UNREAD="$D_UNREAD $1"
+    else D_GONE="${D_GONE}pid $1: $2$_nl"; fi
+}
+
+# _home_from_self VALUE NAME -> add a home candidate from the collector's own
+# environment. It belongs to this process, so a relative VALUE is taken
+# against the collector's physical cwd (the operator set it and ran the
+# collector from there); values from other processes use their cwd instead.
+_home_from_self() {
+    local c
+    case "$1" in
+        /*) _add_home "$1" "env $2 (collector shell)" ;;
+        *)  c="$(pwd -P 2>/dev/null)"
+            if [ -n "$c" ]; then _add_home "$c/${1#./}" "collector environment $2, relative to the collector's cwd $(_quote_nl "$c")"
+            else _add_home "$1" "env $2 (collector shell)"; fi ;;
+    esac
+}
+
+# _quote_nl TEXT -> TEXT with each newline written as \n
+_quote_nl() { printf '%s' "$1" | awk 'NR > 1 { printf "\\n" } { printf "%s", $0 }'; }
+
+# D_ODD: candidate paths holding a newline or '|', the record delimiters. They
+# are reported and counted as unread, never split into two records.
+D_ODD="" D_ODD_HOME=""
+
+# Membership tests bound by the record delimiter, so /opt/whatap is not taken
+# for already listed when /data/opt/whatap is.
 _add_pkg_dir() {
     local d="$1"
     [ -n "$d" ] || return
-    case "$D_PKG_DIRS" in *"$d"*) return ;; esac
-    if [ -n "$D_PKG_DIRS" ]; then D_PKG_DIRS="$D_PKG_DIRS
-$d"; else D_PKG_DIRS="$d"; fi
+    case "$_nl$D_PKG_DIRS$_nl" in *"$_nl$d$_nl"*) return ;; esac
+    if [ -n "$D_PKG_DIRS" ]; then D_PKG_DIRS="$D_PKG_DIRS$_nl$d"; else D_PKG_DIRS="$d"; fi
 }
 
 _add_home() {  # _add_home PATH SOURCE
     local p="$1" s="$2"
     [ -n "$p" ] || return
-    case "$D_HOMES" in *"$p|"*) return ;; esac
-    if [ -n "$D_HOMES" ]; then D_HOMES="$D_HOMES
-$p|$s"; else D_HOMES="$p|$s"; fi
+    case "$p" in *"$_nl"*|*"|"*) D_ODD="$D_ODD \"$(_quote_nl "$p")\"" D_ODD_HOME=1; return ;; esac
+    case "$_nl$D_HOMES" in *"$_nl$p|"*) return ;; esac
+    if [ -n "$D_HOMES" ]; then D_HOMES="$D_HOMES$_nl$p|$s"; else D_HOMES="$p|$s"; fi
 }
 
 # Identity is the INVOCATION path, not its readlink target: a virtualenv's
@@ -656,48 +794,117 @@ _add_py() {
     [ -n "$p" ] || return
     [ -x "$p" ] || return
     case "$p" in *-config|*-dbg|*-coverage) return ;; esac   # not interpreters
-    k="$(dirname "$p" 2>/dev/null)|$(readlink -f "$p" 2>/dev/null || echo "$p")"
-    case "$D_PY_KEYS" in *"|$k|"*) return ;; esac
-    D_PY_KEYS="$D_PY_KEYS|$k|"
-    D_PY_EXES="$D_PY_EXES $p"
+    k="${p%/*}|$(readlink -f "$p" 2>/dev/null || echo "$p")"
+    case "$D_PY_KEYS" in *"$_nl$k$_nl"*) return ;; esac
+    D_PY_KEYS="$D_PY_KEYS$_nl$k$_nl"
+    if [ -n "$D_PY_EXES" ]; then D_PY_EXES="$D_PY_EXES$_nl$p"; else D_PY_EXES="$p"; fi
+}
+
+# _is_py NAME -> success when NAME is a python interpreter's file name
+_is_py() { case "$1" in python|python[0-9]*|pypy|pypy[0-9]*) return 0 ;; esac; return 1; }
+
+# _read_proc_env PID -> sets _env to the process environ, one variable per line;
+# returns 1 (and adds PID to D_UNREAD) when this uid cannot read it
+_read_proc_env() {
+    _env=""
+    if [ ! -r "/proc/$1/environ" ]; then
+        [ -e "/proc/$1/environ" ] && D_UNREAD="$D_UNREAD $1"
+        return 1
+    fi
+    _env="$( { tr '\0' '\n' < "/proc/$1/environ"; } 2>/dev/null )"
+    return 0
+}
+
+# _env_pick NAME... -> sets _ev_NAME to the value of NAME= in _env (empty if
+# none), for each NAME, in one pass with shell builtins only: a $(...) per
+# variable costs a fork per variable per process
+_ev_WHATAP_HOME="" _ev_PYTHONPATH=""
+_env_pick() {
+    local l n
+    for n in "$@"; do eval "_ev_$n=''"; done
+    while IFS= read -r l; do
+        for n in "$@"; do
+            case "$l" in "$n="*) eval "_ev_$n=\${l#*=}" ;; esac
+        done
+    done <<EOF
+$_env
+EOF
 }
 
 discover() {
     progress "discovery: interpreters, processes, agent homes"
-    local c p pid comm exe cwd envh
+    _cap_from APM_INTERP_CAP "${APM_INTERP_CAP:-}" 8; D_PY_CAP="$_cap" D_CAP_NOTE="$_cap_note"
+    local c p pid comm exe a0 cmd cwd envh _b _py _mk _pym="" _pyr="" _am="" _ar="" _d
+    _env=""
 
-    # process scan (reads only comm/exe per pid; environ/cwd only for matches).
-    # Runs FIRST so the interpreters of live application processes take the
-    # detail slots before PATH/system interpreters when the cap applies.
-    for pid in $(ls /proc 2>/dev/null | grep -E '^[0-9]+$'); do
+    case "$(id -u 2>/dev/null)" in
+        0) ;;
+        *) grep -qE '^[^ ]+ /proc proc [^ ]*hidepid=([12]|invisible|noaccess)' /proc/mounts 2>/dev/null \
+               && D_HIDEPID="hidepid is set on /proc: other users' processes are not listed to uid $(id -u 2>/dev/null)" ;;
+    esac
+
+    # Process scan. A python process is matched by its comm, by argv0, or by
+    # /proc/<pid>/exe. comm alone misses every app started from a shebang
+    # script (gunicorn, uvicorn, celery, odoo-bin, whatap-start-agent): the
+    # kernel names the process after the script, and puts the interpreter from
+    # the #! line into argv0. exe covers argv0 rewritten by setproctitle, for
+    # the processes this uid may resolve. Runs FIRST so the interpreters of
+    # live application processes take the detail slots before PATH/system
+    # interpreters when the cap applies.
+    while IFS="$_us" read -r pid comm exe a0 cmd; do
+        [ -n "$pid" ] || continue
         [ "$pid" = "$$" ] && continue
-        comm="$(cat "/proc/$pid/comm" 2>/dev/null)"
+        case "$comm" in whatap_python*) D_GO_PIDS="$D_GO_PIDS $pid"; continue ;; esac
+        _py=0
+        case "$comm" in python*) _py=1 ;; esac
+        _is_py "${a0##*/}" && _py=1
+        _is_py "${exe##*/}" && _py=1
         case "$comm" in
-            whatap_python*) D_GO_PIDS="$D_GO_PIDS $pid" ;;
             odoo*) D_ODOO_PIDS="$D_ODOO_PIDS $pid" ;;
-            python*)
-                case "$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)" in
-                    *odoo*) D_ODOO_PIDS="$D_ODOO_PIDS $pid" ;;
-                esac
-                D_APP_PIDS="$D_APP_PIDS $pid"
-                # argv0 keeps the venv invocation path; /proc/<pid>/exe is
-                # already symlink-resolved by the kernel and would lose it.
-                # A relative argv0 is resolved against the process's cwd.
-                exe="$(tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null | head -n1)"
-                case "$exe" in
-                    /*python*) : ;;
-                    *python*)
-                        cwd="$(readlink -f "/proc/$pid/cwd" 2>/dev/null)"
-                        exe="${exe#./}"
-                        if [ -n "$cwd" ] && [ -x "$cwd/$exe" ]; then exe="$cwd/$exe"
-                        else exe="$(readlink -f "/proc/$pid/exe" 2>/dev/null)"; fi
-                        ;;
-                    *) exe="$(readlink -f "/proc/$pid/exe" 2>/dev/null)" ;;
-                esac
-                [ -n "$exe" ] && _add_py "$exe"
-                ;;
+            *) [ "$_py" = 1 ] || continue
+               case "$cmd" in *odoo*) D_ODOO_PIDS="$D_ODOO_PIDS $pid" ;; esac ;;
         esac
-    done
+        # whatap markers: the command line names whatap, or the environ
+        # carries WHATAP_* or the bootstrap on PYTHONPATH
+        _mk=0
+        case "$cmd" in *whatap*) _mk=1 ;; esac
+        if _read_proc_env "$pid"; then
+            _env_pick WHATAP_HOME PYTHONPATH
+            [ -n "$_ev_WHATAP_HOME" ] && _home_from_pid "$pid" "$_ev_WHATAP_HOME" "environ of python pid $pid"
+            # whatap package dir derived from the process's PYTHONPATH bootstrap
+            # entry — usable even when the interpreter cannot be executed
+            envh="$_ev_PYTHONPATH"
+            while IFS= read -r _d; do
+                case "$_d" in */whatap/bootstrap) _add_pkg_dir "${_d%/bootstrap}"; _mk=1 ;; esac
+            done <<EOF
+$(printf '%s' "$envh" | tr ':' '\n')
+EOF
+            case "$_nl$_env" in *"${_nl}WHATAP_"*) _mk=1 ;; esac
+        fi
+        [ "$_py" = 1 ] || continue
+        if [ "$_mk" = 1 ]; then _am="$_am $pid"; else _ar="$_ar $pid"; fi
+        # argv0 keeps the venv invocation path; /proc/<pid>/exe is already
+        # symlink-resolved by the kernel and would lose it. A relative argv0
+        # with a directory part is resolved against the process's cwd.
+        p=""
+        if _is_py "${a0##*/}"; then
+            case "$a0" in
+                /*) p="$a0" ;;
+                */*) cwd="$(readlink -f "/proc/$pid/cwd" 2>/dev/null)"
+                     [ -n "$cwd" ] && [ -x "$cwd/${a0#./}" ] && p="$cwd/${a0#./}" ;;
+            esac
+        fi
+        [ -n "$p" ] || p="$exe"
+        [ -n "$p" ] || continue
+        if [ "$_mk" = 1 ]; then _pym="$_pym$p$_nl"; else _pyr="$_pyr$p$_nl"; fi
+    done <<EOF
+$(_proc_table)
+EOF
+    D_APP_PIDS="$(echo $_am $_ar)"
+    D_PY_LIVE="$_pym$_pyr"
+    while IFS= read -r p; do [ -n "$p" ] && _add_py "$p"; done <<EOF
+$_pym$_pyr
+EOF
 
     # interpreters on PATH
     for c in python3 python; do
@@ -712,8 +919,8 @@ discover() {
     done
 
     # agent home candidates
-    [ -n "${WHATAP_HOME:-}" ] && _add_home "$WHATAP_HOME" "env WHATAP_HOME (collector shell)"
-    [ -n "${WHATAP_HOME_BATCH:-}" ] && _add_home "$WHATAP_HOME_BATCH" "env WHATAP_HOME_BATCH (collector shell)"
+    [ -n "${WHATAP_HOME:-}" ] && _home_from_self "$WHATAP_HOME" WHATAP_HOME
+    [ -n "${WHATAP_HOME_BATCH:-}" ] && _home_from_self "$WHATAP_HOME_BATCH" WHATAP_HOME_BATCH
     if [ -r "$D_LOCK_FILE" ]; then
         # lock file records "port<TAB>home" per agent home
         while IFS= read -r _l || [ -n "$_l" ]; do
@@ -723,20 +930,203 @@ discover() {
     fi
     for pid in $D_GO_PIDS; do
         cwd="$(readlink -f "/proc/$pid/cwd" 2>/dev/null)"
-        [ -n "$cwd" ] && _add_home "$cwd" "cwd of whatap_python pid $pid"
-        envh="$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | grep '^WHATAP_HOME=' | head -n1 | cut -d= -f2-)"
-        [ -n "$envh" ] && _add_home "$envh" "environ of whatap_python pid $pid"
+        if [ -n "$cwd" ]; then _add_home "$cwd" "cwd of whatap_python pid $pid"
+        elif [ -e "/proc/$pid" ]; then D_UNREAD="$D_UNREAD $pid"; fi
+        if _read_proc_env "$pid"; then
+            _env_pick WHATAP_HOME
+            [ -n "$_ev_WHATAP_HOME" ] && _home_from_pid "$pid" "$_ev_WHATAP_HOME" "environ of whatap_python pid $pid"
+        fi
     done
-    for pid in $D_APP_PIDS; do
-        envh="$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | grep '^WHATAP_HOME=' | head -n1 | cut -d= -f2-)"
-        [ -n "$envh" ] && _add_home "$envh" "environ of python pid $pid"
-        # whatap package dir derived from the process's PYTHONPATH bootstrap
-        # entry — usable even when the interpreter cannot be executed
-        envh="$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | grep '^PYTHONPATH=' | head -n1 | cut -d= -f2- | tr ':' '\n' | grep '/whatap/bootstrap$' | head -n1)"
-        [ -n "$envh" ] && _add_pkg_dir "$(dirname "$envh")"
-    done
+    D_UNREAD="$(printf '%s\n' $D_UNREAD | sort -un | tr '\n' ' ' | sed 's/ $//')"
     # operator auto-injection default mount
     [ -d /whatap-agent ] && _add_home "/whatap-agent" "operator injection volume /whatap-agent"
+}
+
+# _scan_gaps -> the inputs of the agent-home search this run could not read,
+# as one phrase; empty when every one was read
+_scan_gaps() {
+    local n g=""
+    if [ -n "$D_UNREAD" ]; then
+        n="$(echo $D_UNREAD | wc -w | tr -d ' ')"
+        g="environ/cwd of $n candidate process(es) not readable by uid $(id -u 2>/dev/null || echo '?') (pids: $(echo $D_UNREAD | cut -d' ' -f1-10))"
+    fi
+    [ -n "$D_HIDEPID" ] && g="${g:+$g; }$D_HIDEPID"
+    printf '%s' "$g"
+}
+
+
+# ---- numbers read from outside -------------------------------------------------
+# A value from a config, a lock file or the environment is checked before any
+# arithmetic or comparison: dash aborts the run on `$((x + 100))` with a
+# 20-digit x, and `[ x -lt n ]` on "abc" prints "Illegal number" and is false.
+# A value that fails is reported as a fact and not used.
+
+# _num_norm V MAXDIGITS -> V without leading zeros when it is 1..MAXDIGITS
+# digits (a leading zero would read as octal in $((...))); fails otherwise
+_num_norm() {
+    local v="$1"
+    case "$v" in ''|*[!0-9]*) return 1 ;; esac
+    [ "${#v}" -le "$2" ] || return 1
+    while :; do case "$v" in 0?*) v="${v#0}" ;; *) break ;; esac; done
+    printf '%s' "$v"
+}
+
+# _port_norm V -> V as a port (1..65535), or fails
+_port_norm() {
+    local v
+    v="$(_num_norm "$1" 5)" || return 1
+    [ "$v" -ge 1 ] && [ "$v" -le 65535 ] || return 1
+    printf '%s' "$v"
+}
+
+# _cap_from NAME VALUE DEFAULT -> sets _cap to VALUE when it is 1..999999, else
+# to DEFAULT, and _cap_note to why VALUE was ignored (empty when unset or used)
+_cap_from() {
+    local v
+    _cap="$3" _cap_note=""
+    [ -n "$2" ] || return 0
+    if v="$(_num_norm "$2" 6)" && [ "$v" -ge 1 ]; then _cap="$v"; return 0; fi
+    _cap_note="$1=$(_quote_nl "$2") ignored (not a number 1..999999), using $3"
+}
+
+# _conf_vals KEY FILE... -> the raw values of KEY= in FILEs, one per line
+_conf_vals() {
+    local k="$1"; shift
+    [ "$#" -gt 0 ] || return 0
+    awk -F= -v k="$k" '{ gsub(/[ \t\r]/, "") } $1 == k && $2 != "" { print $2 }' "$@" 2>/dev/null
+}
+
+# _registry_vals FILE -> the raw first field of each port registry line
+_registry_vals() { [ -r "$1" ] && awk 'NF { print $1 }' "$1" 2>/dev/null; return 0; }
+
+# _ports_add LABEL <<VALUES -> the valid ports among VALUES (one per line) join
+# _pl, and "; PORTS (LABEL)" joins _plab; refused values join _pbad
+_ports_add() {
+    local v n got=""
+    while IFS= read -r v; do
+        [ -n "$v" ] || continue
+        if n="$(_port_norm "$v")"; then
+            case " $got " in *" $n "*) ;; *) got="${got:+$got }$n" ;; esac
+        else _pbad="${_pbad:+$_pbad; }$(_quote_nl "$v") ($1)"; fi
+    done
+    [ -n "$got" ] && { _pl="$_pl $got"; _plab="$_plab; $got ($1)"; }
+    return 0
+}
+
+# _uniq_ports PORT... -> the distinct ports, space-joined (validated numbers only)
+_uniq_ports() { [ "$#" -gt 0 ] || return 0; printf '%s\n' "$@" | sort -un | tr '\n' ' ' | sed 's/ $//'; }
+
+# _home_confs -> the readable whatap.conf of every visible agent home, one per
+# line
+_home_confs() {
+    local h src f
+    while IFS='|' read -r h src; do
+        [ -n "$h" ] || continue
+        f="$(resolve_fs "$h")" || continue
+        [ -r "$f/whatap.conf" ] && [ -f "$f/whatap.conf" ] && printf '%s\n' "$f/whatap.conf"
+    done <<EOF
+$D_HOMES
+EOF
+}
+
+# _net_ports -> sets _udp_ports / _tcp_ports to the ports the readable agent
+# configs name, or 6600 when none names one, and states which it used
+_net_ports() {
+    local f
+    set --
+    while IFS= read -r f; do [ -n "$f" ] && set -- "$@" "$f"; done <<EOF
+$(_home_confs)
+EOF
+    # the 66xx range is always matched: an agent on a port no readable conf
+    # or registry names (a non-root run, a non-default port) still shows
+    _pl="" _plab="" _pbad=""
+    _ports_add "net_udp_port in $# readable whatap.conf" <<EOF
+$(_conf_vals net_udp_port "$@")
+EOF
+    _ports_add "port registry $(_quote_nl "$D_LOCK_FILE")" <<EOF
+$(_registry_vals "$D_LOCK_FILE")
+EOF
+    _ports_add "port registry $D_LLM_LOCK_FILE" <<EOF
+$(_registry_vals "$D_LLM_LOCK_FILE")
+EOF
+    # shellcheck disable=SC2086  # validated port numbers only
+    _pl="$(_uniq_ports $_pl)"
+    _udp_ports="66[0-9][0-9] $_pl" _udp_label="66xx${_pl:+ $_pl}"
+    fact "udp port filter: 66xx (range)$_plab"
+    [ -n "$_pbad" ] && fact "udp port values ignored (not a port 1..65535): $_pbad"
+    _pl="" _plab="" _pbad=""
+    _ports_add "whatap.server.port / whatap_server_port in $# readable whatap.conf" <<EOF
+$(_conf_vals whatap.server.port "$@"; _conf_vals whatap_server_port "$@")
+EOF
+    # shellcheck disable=SC2086
+    _pl="$(_uniq_ports 6600 $_pl)"
+    _tcp_ports="$_pl" _tcp_label="$_pl"
+    fact "tcp port filter: 6600$_plab"
+    [ -n "$_pbad" ] && fact "tcp port values ignored (not a port 1..65535): $_pbad"
+}
+
+# _sock_list TOOL FLAGS PORTS -> the socket table lines naming whatap or one of
+# PORTS (space-separated), header kept, first 50; exits with TOOL's status
+_sock_list() {
+    local pat rc
+    pat=":($(printf '%s' "$3" | tr -s ' ' '|' | sed 's/^|//; s/|$//'))([^0-9]|\$)"
+    "$1" "$2" > "$(_tmp sock.out)"; rc=$?
+    awk -v p="$pat" '(NR <= 2 && /State|Proto|Recv-Q/) || /whatap/ || $0 ~ p' "$(_tmp sock.out)" 2>/dev/null | head -n 50
+    return "$rc"
+}
+
+# _resolve_goals -> resolve `agent` and `conf` once, from what discovery and
+# the interpreter probes read. An absence is `na` only when every input behind
+# it was read: an unreadable environ/cwd, hidepid, a blocked home path or a
+# failed interpreter probe makes it `missed`.
+_resolve_goals() {
+    local h src fs why seen=0 homes_seen=0 blocked="" absent="" unres="" gaps agaps pr n ph
+    while IFS='|' read -r h src; do
+        [ -n "$h" ] || continue
+        if ! fs="$(resolve_fs "$h")"; then
+            why="$(_absent_why "$h" "$src")"
+            case "$why" in
+                permission*) blocked="$blocked; $h ($why)" ;;
+                relative*|"not resolved"*) unres="$unres; $h ($why)" ;;
+                *)           absent="$absent; $h ($why)" ;;
+            esac
+            continue
+        fi
+        homes_seen=1
+        if [ -d "$fs" ] && [ ! -x "$fs" ]; then blocked="$blocked; $h (permission denied: $fs)"
+        elif [ -r "$fs/whatap.conf" ] && [ -f "$fs/whatap.conf" ]; then seen=1
+        elif [ -e "$fs/whatap.conf" ]; then blocked="$blocked; $fs/whatap.conf (permission denied)"
+        else absent="$absent; $fs/whatap.conf (path not found)"; fi
+    done <<EOF
+$D_HOMES
+EOF
+    blocked="${blocked#; }" absent="${absent#; }"
+    gaps="$(_scan_gaps)"
+    unres="${unres#; }"
+    [ -n "$unres" ] && gaps="${gaps:+$gaps; }home candidate(s) not resolved: $unres"
+    [ -n "$D_ODD" ] && gaps="${gaps:+$gaps; }path(s) with a newline or '|', not followed:$D_ODD"
+    ph=""; [ -n "$blocked$D_UNREAD$D_HIDEPID" ] && ph="$(_priv_hint)"
+    # agent-only inputs: the interpreter lookups
+    agaps="$gaps"
+    [ -n "$_py_fail" ] && agaps="${agaps:+$agaps; }whatap package lookup failed for interpreter(s):$_py_fail"
+    [ -n "$_py_unprobed_live" ] && agaps="${agaps:+$agaps; }$(printf '%s' "$_py_unprobed_live" | grep -c .) interpreter(s) of running processes not probed (cap $D_PY_CAP; set APM_INTERP_CAP=<n> in the environment to raise it): $(printf '%s' "$_py_unprobed_live" | tr '\n' ' ')"
+    if [ "$_py_probed" -lt "$_py_total" ]; then pr="$_py_probed of $_py_total interpreter(s) probed (cap $D_PY_CAP; the others serve no running process)"
+    else pr="all $_py_total interpreter(s) probed"; fi
+
+    if [ "$homes_seen" = 1 ] || [ -n "$D_PKG_DIRS" ] || [ "$_py_whatap" = 1 ] || [ -n "$D_GO_PIDS" ]; then
+        got agent
+    elif [ -n "$blocked" ] || [ -n "$agaps" ]; then
+        missed agent "no whatap home or package found in what this uid could read: ${blocked:+$blocked; }$agaps$ph"
+    else
+        n="$(echo $D_APP_PIDS | wc -w | tr -d ' ')"
+        na agent "no whatap home or package in the collector env, port registry $D_LOCK_FILE, /whatap-agent, the environ of $n python process(es) (all readable); $pr${absent:+; home candidate(s): $absent}"
+    fi
+
+    if [ "$seen" = 1 ]; then got conf
+    elif [ -n "$blocked" ]; then missed conf "whatap.conf not readable: $blocked$ph"
+    elif [ -n "$D_ODD$unres" ] || { [ -z "$D_HOMES" ] && [ -n "$gaps" ]; }; then missed conf "no agent home found in what this uid could read: $gaps$ph"
+    elif [ -z "$D_HOMES" ]; then na conf "no agent home found to hold a whatap.conf (every source read)"
+    else na conf "no whatap.conf in any agent home: $absent"; fi
 }
 
 # ---- report body ---------------------------------------------------------------
@@ -749,7 +1139,8 @@ run_report() {
     # [1] capability preamble: every downstream "command not found" is
     # pre-explained here.
     section "Collection environment"
-    fact "bash: ${BASH_VERSION:-unknown}"
+    if [ -n "${BASH_VERSION:-}" ]; then fact "shell: bash $BASH_VERSION"
+    else fact "shell: POSIX sh (non-bash)"; fi
     fact "uid: $(id -u 2>/dev/null || echo unknown) ($(id -un 2>/dev/null || echo unknown))"
     _note_privilege
     fact "privilege: $PRIV_WHY"
@@ -804,19 +1195,41 @@ run_report() {
         fact "python interpreters: n/a (none found on PATH or among running processes)"
     fi
     local _pycount=0 py
-    for py in $D_PY_EXES; do
+    _py_whatap=0 _py_fail="" _py_probed=0 _py_unprobed_live=""
+    _py_total="$(printf '%s\n' "$D_PY_EXES" | grep -c .)"
+    [ -n "$D_CAP_NOTE" ] && fact "$D_CAP_NOTE"
+    # newline-split, no globbing: fd 9 carries the list, so a probe that
+    # reads stdin cannot eat it
+    while IFS= read -r py <&9; do
+        [ -n "$py" ] || continue
         _pycount=$((_pycount + 1))
-        if [ "$_pycount" -gt 8 ]; then
-            fact "-- more interpreters found but not detailed (cap: 8): $(echo $D_PY_EXES | tr ' ' '\n' | tail -n +9 | tr '\n' ' ')"
+        if [ "$_pycount" -gt "$D_PY_CAP" ]; then
+            fact "-- more interpreters found but not detailed (cap: $D_PY_CAP): $(printf '%s\n' "$D_PY_EXES" | tail -n +"$_pycount" | tr '\n' ' ')"
+            # one that serves a running process is an input this run did not read
+            while IFS= read -r _l; do
+                [ -n "$_l" ] || continue
+                case "$_nl$D_PY_LIVE" in *"$_nl$_l$_nl"*) _py_unprobed_live="$_py_unprobed_live$_l$_nl" ;; esac
+            done <<EOF
+$(printf '%s\n' "$D_PY_EXES" | tail -n +"$_pycount")
+EOF
             break
         fi
+        _py_probed=$_pycount
         fact "-- interpreter: $py"
         fact "   resolves to: $(readlink -f "$py" 2>/dev/null || echo "$py")"
         pyprobe "version" "$py" 'import sys; print(sys.version.replace(chr(10)," "))'
-        pyprobe "sys.prefix / base_prefix (differ = virtualenv)" "$py" 'import sys; print(sys.prefix); print(getattr(sys,"base_prefix",sys.prefix))'
+        pyprobe "sys.prefix / base_prefix" "$py" 'import sys; print(sys.prefix); print(getattr(sys,"base_prefix",sys.prefix))'
         pyprobe "whatap-python version" "$py" 'import importlib.metadata as m; print(m.version("whatap-python"))'
         pyprobe "whatap package location" "$py" 'import importlib.util as u; s=u.find_spec("whatap"); print(s.origin if s and s.origin else "not found")'
-        pyprobe "install format (dist-info=wheel, egg=setup.py era)" "$py" '
+        case "$_pyrc" in
+            0) case "$_pyout" in /*) _py_whatap=1 ;; esac ;;
+            # an interpreter that cannot run the lookup at all (python2: no
+            # importlib.util) has answered it: there is nothing to look up with.
+            # A timeout or any other failure left the input unread.
+            *) if [ "$_pyrc" != 124 ] && grep -qE '^(ImportError|ModuleNotFoundError|SyntaxError|AttributeError)' "$_errfile" 2>/dev/null; then :
+               else _py_fail="$_py_fail $py"; fi ;;
+        esac
+        pyprobe "whatap_python-* metadata dirs next to the package" "$py" '
 import importlib.util as u, os, glob
 s=u.find_spec("whatap")
 if not (s and s.origin): print("not found")
@@ -861,8 +1274,10 @@ else:
                 if f.endswith(".py") and f not in ("__init__.py","util.py"):
                     groups.setdefault(cat,[]).append(f[:-3])
         for k in sorted(groups): print(k+": "+", ".join(sorted(groups[k])))'
-        probe "installed packages ($py -m pip list, first 200)" sh -c "PIP_DISABLE_PIP_VERSION_CHECK=1 '$py' -m pip list --format=freeze 2>/dev/null | head -n 200"
-    done
+        probe "installed packages ($py -m pip list, first 200)" _head_of 200 env PIP_DISABLE_PIP_VERSION_CHECK=1 "$py" -m pip list --format=freeze
+    done 9<<EOF
+$D_PY_EXES
+EOF
     fact "console scripts on PATH:"
     for c in whatap-start-agent whatap-stop-agent whatap-setting-config whatap-llm-setting-config whatap-start-batch-agent; do
         p="$(command -v "$c" 2>/dev/null)"
@@ -877,7 +1292,7 @@ else:
         printf '%s\n' "$D_PKG_DIRS" | while IFS= read -r d; do
             [ -n "$d" ] || continue
             fsd="$(resolve_fs "$d")"
-            if [ -z "$fsd" ]; then printf '        -- %s: n/a (path not visible from this mount namespace)\n' "$d"; continue; fi
+            if [ -z "$fsd" ]; then printf '        -- %s: n/a (%s)\n' "$d" "$(_absent_why "$d")"; continue; fi
             if [ "$fsd" != "$d" ]; then printf '        -- %s (read via %s)\n' "$d" "$fsd"
             else printf '        -- %s\n' "$d"; fi
             sp="$(dirname "$fsd")"
@@ -914,6 +1329,7 @@ else:
     else
         fact "Go common module (whatap_python) processes:"
         for pid in $D_GO_PIDS; do
+            [ -d "/proc/$pid" ] || { printf '        -- pid %s: n/a (process exited)\n' "$pid"; continue; }
             printf '        -- pid %s\n' "$pid"
             printf '           cmdline: %s\n' "$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | cut -c1-300)"
             printf '           cwd: %s\n' "$(readlink -f "/proc/$pid/cwd" 2>/dev/null || echo "n/a (permission denied or gone)")"
@@ -929,11 +1345,12 @@ else:
     if [ "${n:-0}" -eq 0 ]; then
         fact "python processes: none found in /proc"
     else
-        fact "python processes found: $n (detailing first 20)"
+        fact "python processes found: $n (whatap-marked processes listed first; detailing first 20)"
         local shown=0
         for pid in $D_APP_PIDS; do
             shown=$((shown + 1))
             [ "$shown" -gt 20 ] && { fact "-- remaining $((n - 20)) python processes not detailed (cap: 20)"; break; }
+            [ -d "/proc/$pid" ] || { printf '        -- pid %s: n/a (process exited)\n' "$pid"; continue; }
             printf '        -- pid %s (ppid %s)\n' "$pid" "$(awk '/^PPid:/{print $2}' "/proc/$pid/status" 2>/dev/null)"
             printf '           exe: %s\n' "$(readlink -f "/proc/$pid/exe" 2>/dev/null || echo n/a)"
             printf '           cmdline: %s\n' "$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | cut -c1-300)"
@@ -959,10 +1376,10 @@ else:
                 if [ -n "$_so" ]; then
                     printf '           site-packages in use (from loaded C extensions):\n'
                     printf '%s\n' "$_so" | sed 's#\(.*/site-packages\)/.*#\1#' | sort -u | while IFS= read -r _l; do printf '             %s\n' "$_l"; done
-                    printf '           loaded C-extension packages (pure-Python imports do not appear in maps):\n'
+                    printf '           loaded C-extension packages:\n'
                     printf '%s\n' "$_so" | sed 's#.*/site-packages/##' | sed 's#/.*##' | sed 's#\.cpython.*##; s#\.so.*##' | sort -u | head -n 40 | while IFS= read -r _l; do printf '             %s\n' "$_l"; done
                 else
-                    printf '           loaded C-extension packages: none in maps (pure-Python imports do not appear in maps)\n'
+                    printf '           loaded C-extension packages: none in maps\n'
                 fi
             else
                 printf '           maps: n/a (permission denied: /proc/%s/maps)\n' "$pid"
@@ -972,19 +1389,23 @@ else:
 
     # [4] agent homes and configuration
     section "Agent homes and configuration"
-    fact "env WHATAP_HOME (collector shell): ${WHATAP_HOME:-not set}"
-    fact "env WHATAP_HOME_BATCH (collector shell): ${WHATAP_HOME_BATCH:-not set}"
-    fact "env WHATAP_LOCK_FILE (collector shell): ${WHATAP_LOCK_FILE:-not set}"
+    fact "env WHATAP_HOME (collector shell): $(_quote_nl "${WHATAP_HOME:-not set}")"
+    fact "env WHATAP_HOME_BATCH (collector shell): $(_quote_nl "${WHATAP_HOME_BATCH:-not set}")"
+    fact "env WHATAP_LOCK_FILE (collector shell): $(_quote_nl "${WHATAP_LOCK_FILE:-not set}")"
     if [ -z "$D_HOMES" ]; then
-        fact "agent home candidates: none discovered (env, port registry, process scan all empty)"
-    else
+        if [ -n "$D_ODD_HOME" ]; then fact "agent home candidates: none followed (the refused ones are listed above)"
+        else fact "agent home candidates: none discovered (env, port registry, process scan all empty)"; fi
+    fi
+    [ -n "$D_ODD" ] && fact "path(s) with a newline or '|', not followed:$D_ODD"
+    [ -n "$D_GONE" ] && printf '%s' "$D_GONE" | while IFS= read -r _l; do [ -n "$_l" ] && fact "relative WHATAP_HOME of a process that exited, not resolved: $_l"; done
+    if [ -n "$D_HOMES" ]; then
         fact "agent home candidates discovered:"
         printf '%s\n' "$D_HOMES" | while IFS='|' read -r _p _s; do printf '        %s   <- %s\n' "$_p" "$_s"; done
-        printf '%s\n' "$D_HOMES" | cut -d'|' -f1 | sort -u | while IFS= read -r home; do
+        printf '%s\n' "$D_HOMES" | while IFS='|' read -r home _src; do
             [ -n "$home" ] || continue
             fact "-- home: $home"
             fshome="$(resolve_fs "$home")"
-            if [ -z "$fshome" ]; then fact "   n/a (path not visible from this mount namespace: $home)"; continue; fi
+            if [ -z "$fshome" ]; then fact "   n/a ($(_absent_why "$home" "$_src"))"; continue; fi
             [ "$fshome" != "$home" ] && fact "   filesystem view: $fshome (read through a process root)"
             dump_file "   whatap.conf" "$fshome/whatap.conf" 400
             dump_file "   container.conf" "$fshome/container.conf" 200
@@ -1004,8 +1425,12 @@ else:
                     fi
                 fi
             done
+            for sf in security.conf paramkey.txt; do
+                if [ -e "$fshome/$sf" ]; then fact "   $sf: present, $(wc -c < "$fshome/$sf" 2>/dev/null | tr -d ' ') bytes (content not collected: key material)"
+                else fact "   $sf: absent"; fi
+            done
             if [ -d "$fshome/logs" ]; then
-                probe "   logs dir listing" sh -c "ls -la '$fshome/logs' 2>/dev/null | head -n 100"
+                probe "   logs dir listing" _ls_head "$fshome/logs" 100
             else
                 fact "   logs dir: n/a (path not found: $fshome/logs)"
             fi
@@ -1016,16 +1441,17 @@ else:
 
     # [5] network endpoints + port registry
     section "Network endpoints and port registry"
+    _net_ports
     if have ss; then
-        probe "udp sockets (whatap_python or ports 66xx)" sh -c "ss -ulnp 2>/dev/null | awk 'NR==1 || /whatap/ || /:66[0-9][0-9] /' | head -n 50"
-        probe "tcp sessions (whatap_python or port 6600)" sh -c "ss -tnp 2>/dev/null | awk 'NR==1 || /whatap/ || /:6600/' | head -n 50"
+        probe "udp sockets (whatap-named or port $_udp_label)" _sock_list ss -uanp "$_udp_ports"
+        probe "tcp sessions (whatap-named or port $_tcp_label)" _sock_list ss -tnp "$_tcp_ports"
     elif have netstat; then
-        probe "udp sockets (whatap_python or ports 66xx)" sh -c "netstat -ulnp 2>/dev/null | awk 'NR<=2 || /whatap/ || /:66[0-9][0-9] /' | head -n 50"
-        probe "tcp sessions (whatap_python or port 6600)" sh -c "netstat -tnp 2>/dev/null | awk 'NR<=2 || /whatap/ || /:6600/' | head -n 50"
+        probe "udp sockets (whatap-named or port $_udp_label)" _sock_list netstat -uanp "$_udp_ports"
+        probe "tcp sessions (whatap-named or port $_tcp_label)" _sock_list netstat -tnp "$_tcp_ports"
     else
         fact "socket listing: n/a (command not found: ss, netstat); raw tables follow"
-        probe "raw /proc/net/udp (first 30 lines, ports in hex)" sh -c "head -n 30 /proc/net/udp"
-        probe "raw /proc/net/tcp (first 30 lines, ports in hex)" sh -c "head -n 30 /proc/net/tcp"
+        probe "raw /proc/net/udp (first 30 lines)" sh -c "head -n 30 /proc/net/udp"
+        probe "raw /proc/net/tcp (first 30 lines)" sh -c "head -n 30 /proc/net/tcp"
     fi
     dump_file "port registry (format: port<TAB>home)" "$D_LOCK_FILE" 50
     dump_file "LLM port registry" "$D_LLM_LOCK_FILE" 50
@@ -1035,16 +1461,16 @@ else:
     if [ -z "$D_HOMES" ]; then
         fact "no agent home discovered; no log locations to read"
     else
-        printf '%s\n' "$D_HOMES" | cut -d'|' -f1 | sort -u | while IFS= read -r home; do
+        printf '%s\n' "$D_HOMES" | while IFS='|' read -r home _src; do
             [ -n "$home" ] || continue
             fact "-- home: $home"
             fshome="$(resolve_fs "$home")"
-            if [ -z "$fshome" ]; then fact "   n/a (path not visible from this mount namespace: $home)"; continue; fi
+            if [ -z "$fshome" ]; then fact "   n/a ($(_absent_why "$home" "$_src"))"; continue; fi
             # hook log: the banner and the "successfully injected <module>"
             # lines (= which libraries the agent hooked in THIS process) are at
             # the START of the file, so read its head as well as its tail
             _hook="$fshome/logs/whatap-hook.log"
-            head_file "   whatap-hook.log (first lines: banner + injected modules)" "$_hook" 120
+            head_file "   whatap-hook.log (first lines)" "$_hook" 120
             tail_file "   whatap-hook.log (recent lines)" "$_hook" 80
             if [ -r "$_hook" ]; then
                 fact "   'successfully injected' lines in whatap-hook.log (first 400 lines): $(head -n 400 "$_hook" 2>/dev/null | grep -c 'successfully injected' 2>/dev/null)"
@@ -1071,6 +1497,7 @@ else:
     else
         fact "odoo processes:"
         for opid in $D_ODOO_PIDS; do
+            [ -d "/proc/$opid" ] || { printf '        -- pid %s: n/a (process exited)\n' "$opid"; continue; }
             printf '        -- pid %s (ppid %s)\n' "$opid" "$(awk '/^PPid:/{print $2}' "/proc/$opid/status" 2>/dev/null)"
             printf '           comm: %s\n' "$(cat "/proc/$opid/comm" 2>/dev/null)"
             printf '           cmdline: %s\n' "$(tr '\0' ' ' < "/proc/$opid/cmdline" 2>/dev/null | cut -c1-300)"
@@ -1081,8 +1508,12 @@ else:
 
     # odoo package version — read release.py as text; the odoo module is never
     # imported and no odoo code runs
-    for py in $D_PY_EXES; do
-        _c="$("$py" -c '
+    _pycount=0
+    while IFS= read -r py <&9; do
+        [ -n "$py" ] || continue
+        _pycount=$((_pycount + 1))
+        [ "$_pycount" -gt "$D_PY_CAP" ] && break
+        _c="$(_bounded "$py" -c '
 import importlib.util as u, os
 s = u.find_spec("odoo")
 loc = ""
@@ -1091,27 +1522,34 @@ if s:
     elif s.submodule_search_locations:
         for _p in s.submodule_search_locations: loc = _p; break
 print(os.path.join(loc, "release.py") if loc else "")' 2>/dev/null)"
-        [ -n "$_c" ] && _rcands="$_rcands $_c"
-    done
-    _rcands="$_rcands /usr/lib/python3/dist-packages/odoo/release.py"
+        [ -n "$_c" ] && _rcands="$_rcands$_c$_nl"
+    done 9<<EOF
+$D_PY_EXES
+EOF
+    _rcands="$_rcands/usr/lib/python3/dist-packages/odoo/release.py$_nl"
     for opid in $D_ODOO_PIDS; do
         _c="$(readlink -f "/proc/$opid/cwd" 2>/dev/null)"
-        [ -n "$_c" ] && _rcands="$_rcands $_c/odoo/release.py"
+        [ -n "$_c" ] && _rcands="$_rcands$_c/odoo/release.py$_nl"
     done
-    for _d in $(printf '%s\n' "$D_PKG_DIRS"); do
-        _rcands="$_rcands $(dirname "$_d")/odoo/release.py"
-    done
+    while IFS= read -r _d; do
+        [ -n "$_d" ] && _rcands="$_rcands${_d%/*}/odoo/release.py$_nl"
+    done <<EOF
+$D_PKG_DIRS
+EOF
     _found_rel=0
     _seen_rel=""
-    for _c in $_rcands; do
-        case "$_seen_rel" in *"|$_c|"*) continue ;; esac
-        _seen_rel="$_seen_rel|$_c|"
+    while IFS= read -r _c <&9; do
+        [ -n "$_c" ] || continue
+        case "$_seen_rel" in *"$_nl$_c$_nl"*) continue ;; esac
+        _seen_rel="$_seen_rel$_nl$_c$_nl"
         _fs="$(resolve_fs "$_c")" || continue
         [ -f "$_fs" ] || continue
         _found_rel=1
         fact "odoo release file: $_fs"
         grep -E '^(version|version_info|serie|product_name)' "$_fs" 2>/dev/null | head -n 6 | while IFS= read -r _l; do printf '        %s\n' "$_l"; done
-    done
+    done 9<<EOF
+$_rcands
+EOF
     [ "$_found_rel" = 0 ] && fact "odoo release file: n/a (no odoo/release.py found via interpreters, process cwd, dist-packages, or site-packages)"
 
     # odoo configuration — path from cmdline -c/--config, env ODOO_RC, then
@@ -1146,7 +1584,7 @@ print(os.path.join(loc, "release.py") if loc else "")' 2>/dev/null)"
                 fact "   odoo logfile key: $_lf"
                 _lfs="$(resolve_fs "$_lf")" && tail_file "   odoo logfile (worker log)" "$_lfs" 120 || fact "   odoo logfile: n/a (path not visible: $_lf)"
             else
-                fact "   odoo logfile key: not set (odoo log output goes to process stdout/stderr, e.g. the container log)"
+                fact "   odoo logfile key: not set"
             fi
         done
     fi
@@ -1155,15 +1593,19 @@ print(os.path.join(loc, "release.py") if loc else "")' 2>/dev/null)"
     probe "odoo listening tcp sockets (odoo or ports 8069/8072)" sh -c "ss -ltnp 2>/dev/null | awk 'NR==1 || /odoo/ || /:8069 / || /:8072 /' | head -n 30"
 
     # systemd unit facts (VM installs; absent inside containers)
-    probe "systemd odoo units" sh -c "systemctl list-units --all 'odoo*' 2>/dev/null | head -n 20"
-    probe "systemd odoo unit file(s)" sh -c "systemctl cat 'odoo*' 2>/dev/null | head -n 80"
+    if have systemctl; then
+        probe "systemd odoo units" _head_of 20 systemctl list-units --all 'odoo*'
+        probe "systemd odoo unit file(s)" _head_of 80 systemctl cat 'odoo*'
+    else
+        fact "systemd odoo units: n/a (command not found: systemctl)"
+    fi
 
     # agent hook evidence for odoo, per agent home (count only; the raw lines
     # are in the log section's whatap-hook.log head)
     if [ -n "$D_HOMES" ]; then
         printf '%s\n' "$D_HOMES" | cut -d'|' -f1 | sort -u | while IFS= read -r home; do
             [ -n "$home" ] || continue
-            _fh="$(resolve_fs "$home")" || continue
+            _fh="$(resolve_fs "$home")" || { fact "hook.log 'injected odoo' lines (home $home): n/a ($(_absent_why "$home"))"; continue; }
             _hk="$_fh/logs/whatap-hook.log"
             [ -r "$_hk" ] && fact "hook.log 'injected odoo' lines (first 400 lines, home $home): $(head -n 400 "$_hk" 2>/dev/null | grep -c 'injected odoo' 2>/dev/null)"
         done
@@ -1172,9 +1614,9 @@ print(os.path.join(loc, "release.py") if loc else "")' 2>/dev/null)"
     # [9] kubernetes / operator injection artifacts
     section "Kubernetes / operator injection context"
     if [ -d /whatap-agent ]; then
-        probe "/whatap-agent listing (operator injection volume)" sh -c "ls -la /whatap-agent 2>/dev/null | head -n 50"
+        probe "/whatap-agent listing" _ls_head /whatap-agent 50
     else
-        fact "/whatap-agent: n/a (path not found — operator injection volume absent)"
+        fact "/whatap-agent: n/a (path not found: /whatap-agent)"
     fi
     if [ -n "${WHATAP_PYTHON_AGENT_PATH:-}" ]; then
         fact "env WHATAP_PYTHON_AGENT_PATH: $WHATAP_PYTHON_AGENT_PATH"
@@ -1197,18 +1639,7 @@ print(os.path.join(loc, "release.py") if loc else "")' 2>/dev/null)"
 
     # Resolved here, not at the point of use: the config dumps above run inside
     # `| while` pipelines, and an assignment made in a subshell does not survive.
-    if [ -n "$D_HOMES" ]; then got agent
-    else na agent "whatap-python is not installed on this host (env, port registry, process scan all empty)"; fi
-    _cseen=0
-    for _h in $(printf '%s\n' "$D_HOMES" | cut -d'|' -f1 | sort -u); do
-        [ -n "$_h" ] || continue
-        _fh="$(resolve_fs "$_h")"; [ -n "$_fh" ] || continue
-        [ -r "$_fh/whatap.conf" ] && _cseen=1
-    done
-    if [ "$_cseen" = 1 ]; then got conf
-    elif [ -z "$D_HOMES" ]; then na conf "no agent home exists to hold a whatap.conf"
-    else missed conf "agent home discovered but no whatap.conf under it is readable by uid $(id -u 2>/dev/null || echo '?')$(_priv_hint)"; fi
-
+    _resolve_goals
     emit_status
     emit_footer
 }

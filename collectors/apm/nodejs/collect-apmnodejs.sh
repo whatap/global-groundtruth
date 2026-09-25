@@ -54,7 +54,7 @@ export LC_ALL=C
 
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-apmnodejs"
-VERSION="0.4.1"
+VERSION="0.5.0"
 DOMAIN="apm"
 TARGET="host/$(hostname 2>/dev/null || echo unknown)"
 
@@ -502,13 +502,10 @@ progress() { [ "$OPT_QUIET" = 1 ] && return; printf '>> %s\n' "$*" >&3 2>/dev/nu
 have() { command -v "$1" >/dev/null 2>&1; }
 
 _errfile=""
-_timeout_bin=""
-CMD_TIMEOUT=15
-_init_probe() {
-    _errfile="$(_tmp probe.err)"
-    have timeout && _timeout_bin="$(command -v timeout)"
-}
-_end_probe() { [ -n "$_errfile" ] && rm -f "$_errfile" 2>/dev/null; }
+CMD_TIMEOUT="${CMD_TIMEOUT:-15}"
+# Call after _run_init: the error file lives in the run's private directory.
+_init_probe() { _errfile="$(_tmp probe.err)"; }
+_end_probe() { :; }   # _run_cleanup removes the directory
 
 _classify_err() {
     local txt=""
@@ -533,17 +530,40 @@ _emit_labeled() {
 }
 
 # probe "label" CMD [ARGS...] -> output as facts, or "label: n/a (<why>)".
+# CMD may be a file, a shell function or a builtin; _bounded caps all three. A
+# non-zero exit that still printed something is reported with its output.
 probe() {
     local label="$1"; shift
-    command -v "$1" >/dev/null 2>&1 || { fact "$label: n/a (command not found: $1)"; return; }
+    [ -n "$(_cmd_kind "$1")" ] || { fact "$label: n/a (command not found: $1)"; return; }
+    _past_deadline && { fact "$label: n/a (run deadline reached: ${RUN_DEADLINE}s)"; return; }
     local out rc
-    if [ -n "$_timeout_bin" ]; then out="$("$_timeout_bin" "$CMD_TIMEOUT" "$@" 2>"$_errfile")"; rc=$?
-    else out="$("$@" 2>"$_errfile")"; rc=$?; fi
-    [ "$rc" -eq 124 ] && [ -n "$_timeout_bin" ] && { fact "$label: n/a (timed out: ${CMD_TIMEOUT}s)"; return; }
-    [ "$rc" -ne 0 ] && { fact "$label: n/a ($(_classify_err))"; return; }
+    out="$(_bounded "$@" 2>"$_errfile")"; rc=$?
+    if [ "$rc" -eq 124 ]; then
+        if _past_deadline; then fact "$label: n/a (run deadline reached: ${RUN_DEADLINE}s)"
+        else fact "$label: n/a (timed out: ${CMD_TIMEOUT}s)"; fi
+        return
+    fi
+    if [ "$rc" -ne 0 ]; then
+        [ -n "$out" ] && { _emit_labeled "$label (exit $rc)" "$out"; return; }
+        fact "$label: n/a ($(_classify_err))"; return
+    fi
     [ -z "$out" ] && { fact "$label: n/a (empty output)"; return; }
     _emit_labeled "$label" "$out"
 }
+
+# _head_of N CMD... -> the first N lines of CMD's stdout, with CMD's own exit
+# status (a `CMD | head` pipeline reports head's, and hides a failed CMD as
+# empty output).
+_head_of() {
+    local n="$1" rc; shift
+    "$@" > "$(_tmp head.out)"; rc=$?
+    head -n "$n" "$(_tmp head.out)" 2>/dev/null
+    return "$rc"
+}
+
+# _ls_head DIR N -> `ls -la DIR`, first N lines, failing when ls fails. Takes the
+# path as an argument, so a quote or a space in it cannot break a `sh -c` string.
+_ls_head() { _head_of "$2" ls -la -- "$1"; }
 
 # read_proc "label" PATH -> content of a /proc or /sys file, or a reason.
 read_proc() {
@@ -557,7 +577,7 @@ read_proc() {
 
 # dump_file "label" PATH [CAP] -> the file's content verbatim (line-capped),
 # or a classified reason. Framework policy: configuration is dumped verbatim,
-# never masked (see collectors/apm/nodejs/README.md security note).
+# never masked (see collectors/apm/nodejs/README.md, "What the report can contain").
 dump_file() {
     local label="$1" path="$2" cap="${3:-400}" total
     [ -e "$path" ] || { fact "$label: n/a (path not found: $path)"; return; }
@@ -603,19 +623,13 @@ conf_bytes() {
     fact "$label: size ${sz:-?} bytes, CR (0x0D) bytes: ${cr:-?}"
 }
 
-# ndprobe "label" NODE_EXE [ARGS...] -> run the node binary under timeout.
+# ndprobe "label" NODE_EXE [ARGS...] -> run the node binary under _bounded.
 # Only ever used with --version; the whatap module is never loaded (a
 # require('whatap') starts an agent — the opposite of read-only collection).
 ndprobe() {
     local label="$1" nd="$2"; shift 2
     [ -x "$nd" ] || { fact "$label: n/a (not executable: $nd)"; return; }
-    local out rc
-    if [ -n "$_timeout_bin" ]; then out="$("$_timeout_bin" "$CMD_TIMEOUT" "$nd" "$@" 2>"$_errfile")"; rc=$?
-    else out="$("$nd" "$@" 2>"$_errfile")"; rc=$?; fi
-    [ "$rc" -eq 124 ] && [ -n "$_timeout_bin" ] && { fact "$label: n/a (timed out: ${CMD_TIMEOUT}s)"; return; }
-    [ "$rc" -ne 0 ] && { fact "$label: n/a ($(_classify_err))"; return; }
-    [ -z "$out" ] && { fact "$label: n/a (empty output)"; return; }
-    _emit_labeled "$label" "$out"
+    probe "$label" "$nd" "$@"
 }
 
 # pkg_json_field "FIELD" PATH -> first "FIELD": "value" from a package.json,
@@ -625,20 +639,59 @@ pkg_json_field() {
     grep -m1 "\"$field\"" "$path" 2>/dev/null | sed 's/^[[:space:]]*//; s/,[[:space:]]*$//'
 }
 
+# ---- process table (internal; emits nothing) ----------------------------------
+# _proc_table -> one line per process that has a command line, fields joined by
+# the unit separator \037 (a whitespace IFS would merge empty fields):
+#   pid comm exe argv0 cmdline
+# Read in one pass over /proc: three readers for every pid instead of several
+# forks per pid (readlink + basename per pid took 20 s on a 687-process host).
+# exe is empty where /proc/<pid>/exe is not readable by this uid. cmdline has
+# its NULs turned into spaces and is cut at 300 characters.
+_us="$(printf '\037')"
+_proc_table() {
+    {
+        ls -l /proc/[0-9]*/exe 2>/dev/null | awk '{
+            i = index($0, " -> "); if (!i) next
+            for (f = 1; f <= NF; f++) if ($f ~ /^\/proc\/[0-9]+\/exe$/) {
+                split($f, a, "/"); t = substr($0, i + 4); sub(/ \(deleted\)$/, "", t)
+                print "E\037" a[3] "\037" t; break } }'
+        head -n 1 /proc/[0-9]*/comm /dev/null 2>/dev/null | awk '
+            /^==> \/proc\/[0-9]+\/comm <==$/ { split($2, a, "/"); p = a[3]; next }
+            p != "" { print "C\037" p "\037" $0; p = "" }'
+        head -n 1 /proc/[0-9]*/cmdline /dev/null 2>/dev/null | tr '\000\037' '\001 ' | awk '
+            /^==> \/proc\/[0-9]+\/cmdline <==$/ { split($2, a, "/"); p = a[3]; next }
+            p != "" { split($0, v, "\001"); c = $0; gsub(/\001/, " ", c); sub(/ +$/, "", c)
+                      if (v[1] != "") print "A\037" p "\037" v[1] "\037" substr(c, 1, 300)
+                      p = "" }'
+    } | awk -F'\037' '
+        $1 == "E" { e[$2] = $3; next }
+        $1 == "C" { c[$2] = $3; next }
+        $1 == "A" { o[++n] = $2; a0[$2] = $3; cl[$2] = $4 }
+        END { for (i = 1; i <= n; i++) { p = o[i]; print p "\037" c[p] "\037" e[p] "\037" a0[p] "\037" cl[p] } }'
+}
+
 # ---- discovery (internal; emits nothing) --------------------------------------
 # Populates:
-#   D_NODE_EXES  distinct node binary paths (running processes + PATH)
+#   D_NODE_EXES  distinct node binary paths, newline-joined (running processes + PATH)
 #   D_GO_PIDS    pids of the master agent (comm: whatap_nodejs)
-#   D_APP_PIDS   pids of node processes (node/next-server/pm2, by comm or exe)
+#   D_APP_PIDS   pids of node processes (by comm, argv0 or exe), whatap-marked first
+#   D_PM2_PIDS   pids of pm2 daemons (by command line)
 #   D_HOMES      distinct WHATAP_HOME candidates with their discovery source
 #   D_PKG_DIRS   distinct node_modules/whatap package dirs (symlink-resolved)
 #   D_CONF_NAMES distinct conf file names ("whatap.conf" + WHATAP_CONF values)
+#   D_UNREAD     pids of candidate processes whose environ or cwd this uid could
+#                not read (their WHATAP_HOME is unknown, not absent)
+#   D_HIDEPID    non-empty when /proc hides other users' processes from this uid
 D_NODE_EXES=""
 D_GO_PIDS=""
 D_APP_PIDS=""
+D_PM2_PIDS=""
 D_HOMES=""          # newline-joined "path|source" records
 D_PKG_DIRS=""       # newline-joined "dir|source" records
 D_CONF_NAMES="whatap.conf"
+D_UNREAD=""
+D_HIDEPID=""
+D_NPM_ROOT=""       # `npm root -g`, run once
 D_LOCK_FILE="${WHATAP_LOCK_FILE:-/tmp/whatap-nodejs.lock}"
 
 # resolve_fs PATH -> prints a readable filesystem view of PATH: the path itself
@@ -648,6 +701,8 @@ D_LOCK_FILE="${WHATAP_LOCK_FILE:-/tmp/whatap-nodejs.lock}"
 # (or any different mount namespace) and still read the target's files.
 resolve_fs() {
     local p="$1" pid
+    # a relative path is never read against the collector's own cwd
+    case "$p" in /*) ;; *) return 1 ;; esac
     [ -e "$p" ] && { printf '%s\n' "$p"; return; }
     for pid in $D_GO_PIDS $D_APP_PIDS; do
         [ -e "/proc/$pid/root$p" ] && { printf '%s\n' "/proc/$pid/root$p"; return; }
@@ -655,29 +710,100 @@ resolve_fs() {
     return 1
 }
 
+# _absent_why PATH [SOURCE] -> why resolve_fs found nothing: "permission denied:
+# <dir>" when an existing ancestor cannot be searched by this uid, or when the
+# process named in SOURCE ("... pid N") has a root this uid cannot enter;
+# otherwise "path not found: PATH".
+_absent_why() {
+    local p="$1" s="${2:-}" d pid i=0
+    # a relative path has no ancestor to walk; the ${d%/*} walk below only
+    # shrinks an absolute one (and is capped anyway)
+    case "$p" in /*) ;; *) printf 'relative path, not resolved: %s' "$p"; return ;; esac
+    d="${p%/*}"
+    while [ -n "$d" ] && [ ! -e "$d" ] && [ "$i" -lt 256 ]; do d="${d%/*}"; i=$((i + 1)); done
+    if [ -n "$d" ] && [ ! -e "$d" ]; then printf 'not resolved (path depth over 256): %s' "$p"; return; fi
+    if [ -n "$d" ] && [ -e "$d" ] && [ ! -x "$d" ]; then printf 'permission denied: %s' "$d"; return; fi
+    case "$s" in
+        *" pid "*)
+            pid="${s##* pid }"; pid="${pid%% *}"
+            if [ -d "/proc/$pid" ] && [ ! -e "/proc/$pid/root/" ]; then
+                printf 'permission denied: /proc/%s/root' "$pid"; return
+            fi ;;
+    esac
+    printf 'path not found: %s' "$p"
+}
+
+# _abs_for_pid PID PATH -> PATH, made absolute against the cwd of PID when it
+# is relative (a relative WHATAP_HOME in a process environ is relative to that
+# process). Fails when PATH is relative and that cwd cannot be read: the path
+# is then never tested against the collector's own cwd.
+_abs_for_pid() {
+    local c
+    case "$2" in
+        /*) printf '%s' "$2" ;;
+        *)  c="$(readlink -f "/proc/$1/cwd" 2>/dev/null)"
+            [ -n "$c" ] || return 1
+            printf '%s/%s' "$c" "${2#./}" ;;
+    esac
+}
+
+# _home_from_pid PID PATH SOURCE -> add PATH (from the environ of PID) as a home
+# candidate. A relative PATH whose process cwd cannot be read is an unread
+# input while the process lives (D_UNREAD), and a fact once it has exited
+# (D_GONE).
+D_GONE=""
+_home_from_pid() {
+    local v
+    if v="$(_abs_for_pid "$1" "$2")"; then _add_home "$v" "$3"
+    elif [ -e "/proc/$1" ]; then D_UNREAD="$D_UNREAD $1"
+    else D_GONE="${D_GONE}pid $1: $2$_nl"; fi
+}
+
+# _home_from_self VALUE NAME -> add a home candidate from the collector's own
+# environment. It belongs to this process, so a relative VALUE is taken
+# against the collector's physical cwd (the operator set it and ran the
+# collector from there); values from other processes use their cwd instead.
+_home_from_self() {
+    local c
+    case "$1" in
+        /*) _add_home "$1" "env $2 (collector shell)" ;;
+        *)  c="$(pwd -P 2>/dev/null)"
+            if [ -n "$c" ]; then _add_home "$c/${1#./}" "collector environment $2, relative to the collector's cwd $(_quote_nl "$c")"
+            else _add_home "$1" "env $2 (collector shell)"; fi ;;
+    esac
+}
+
+# _quote_nl TEXT -> TEXT with each newline written as \n
+_quote_nl() { printf '%s' "$1" | awk 'NR > 1 { printf "\\n" } { printf "%s", $0 }'; }
+
+# D_ODD: candidate paths holding a newline or '|', the record delimiters. They
+# are reported and counted as unread, never split into two records.
+D_ODD="" D_ODD_HOME=""
+
+# Membership tests bound by the record delimiter, so /opt/whatap is not taken
+# for already listed when /data/opt/whatap is.
 _add_home() {  # _add_home PATH SOURCE
     local p="$1" s="$2"
     [ -n "$p" ] || return
-    case "$D_HOMES" in *"$p|"*) return ;; esac
-    if [ -n "$D_HOMES" ]; then D_HOMES="$D_HOMES
-$p|$s"; else D_HOMES="$p|$s"; fi
+    case "$p" in *"$_nl"*|*"|"*) D_ODD="$D_ODD \"$(_quote_nl "$p")\"" D_ODD_HOME=1; return ;; esac
+    case "$_nl$D_HOMES" in *"$_nl$p|"*) return ;; esac
+    if [ -n "$D_HOMES" ]; then D_HOMES="$D_HOMES$_nl$p|$s"; else D_HOMES="$p|$s"; fi
 }
 
 _add_pkg_dir() {  # _add_pkg_dir DIR SOURCE  (dedup on the resolved dir)
     local d="$1" s="$2" r
     [ -n "$d" ] || return
     r="$(readlink -f "$d" 2>/dev/null || echo "$d")"
-    case "$D_PKG_DIRS" in *"$r|"*) return ;; esac
-    if [ -n "$D_PKG_DIRS" ]; then D_PKG_DIRS="$D_PKG_DIRS
-$r|$s"; else D_PKG_DIRS="$r|$s"; fi
+    case "$r" in *"$_nl"*|*"|"*) D_ODD="$D_ODD \"$(_quote_nl "$r")\""; return ;; esac
+    case "$_nl$D_PKG_DIRS" in *"$_nl$r|"*) return ;; esac
+    if [ -n "$D_PKG_DIRS" ]; then D_PKG_DIRS="$D_PKG_DIRS$_nl$r|$s"; else D_PKG_DIRS="$r|$s"; fi
 }
 
 _add_conf_name() {
     local n="$1"
     [ -n "$n" ] || return
-    case "$D_CONF_NAMES" in *"$n"*) return ;; esac
-    D_CONF_NAMES="$D_CONF_NAMES
-$n"
+    case "$_nl$D_CONF_NAMES$_nl" in *"$_nl$n$_nl"*) return ;; esac
+    D_CONF_NAMES="$D_CONF_NAMES$_nl$n"
 }
 
 # Dedup key for node binaries: the resolved target (nvm/asdf install one
@@ -688,15 +814,48 @@ _add_node() {
     local p="$1" k
     [ -n "$p" ] || return
     [ -x "$p" ] || return
+    # /proc/<pid>/exe targets are already resolved: skip the readlink for them
+    case "$D_NODE_KEYS" in *"$_nl$p$_nl"*) return ;; esac
     k="$(readlink -f "$p" 2>/dev/null || echo "$p")"
-    case "$D_NODE_KEYS" in *"|$k|"*) return ;; esac
-    D_NODE_KEYS="$D_NODE_KEYS|$k|"
-    D_NODE_EXES="$D_NODE_EXES $p"
+    case "$D_NODE_KEYS" in *"$_nl$k$_nl"*) return ;; esac
+    D_NODE_KEYS="$D_NODE_KEYS$_nl$k$_nl"
+    if [ -n "$D_NODE_EXES" ]; then D_NODE_EXES="$D_NODE_EXES$_nl$p"; else D_NODE_EXES="$p"; fi
+}
+
+# _is_node NAME -> success when NAME is a node binary's file name
+_is_node() { case "$1" in node|nodejs|node[0-9]*) return 0 ;; esac; return 1; }
+
+# _read_proc_env PID -> sets _env to the process environ, one variable per line;
+# returns 1 (and adds PID to D_UNREAD) when this uid cannot read it
+_read_proc_env() {
+    _env=""
+    if [ ! -r "/proc/$1/environ" ]; then
+        [ -e "/proc/$1/environ" ] && D_UNREAD="$D_UNREAD $1"
+        return 1
+    fi
+    _env="$( { tr '\0' '\n' < "/proc/$1/environ"; } 2>/dev/null )"
+    return 0
+}
+
+# _env_pick NAME... -> sets _ev_NAME to the value of NAME= in _env (empty if
+# none), for each NAME, in one pass with shell builtins only: a $(...) per
+# variable costs a fork per variable per process
+_ev_WHATAP_HOME="" _ev_WHATAP_CONF_DIR="" _ev_WHATAP_CONF="" _ev_NODE_OPTIONS="" _ev_NODE_PATH=""
+_env_pick() {
+    local l n
+    for n in "$@"; do eval "_ev_$n=''"; done
+    while IFS= read -r l; do
+        for n in "$@"; do
+            case "$l" in "$n="*) eval "_ev_$n=\${l#*=}" ;; esac
+        done
+    done <<EOF
+$_env
+EOF
 }
 
 # _proc_env PID NAME -> value of NAME= in the process environ (empty if none)
 _proc_env() {
-    tr '\0' '\n' < "/proc/$1/environ" 2>/dev/null | grep "^$2=" | head -n1 | cut -d= -f2-
+    { tr '\0' '\n' < "/proc/$1/environ" | grep "^$2=" | head -n1 | cut -d= -f2- ; } 2>/dev/null
 }
 
 # _app_root_markers DIR -> success if DIR looks like an app root that carries
@@ -712,31 +871,68 @@ _app_root_markers() {
 
 discover() {
     progress "discovery: node processes, master agents, homes, package dirs"
-    local pid comm exe cwd v
+    local pid comm exe a0 cmd cwd v _nd _mk _am="" _ar="" _ndm="" _ndr="" _d
+    _env=""
 
-    # process scan (reads only comm/exe per pid; environ/cwd only for matches)
-    for pid in $(ls /proc 2>/dev/null | grep -E '^[0-9]+$'); do
+    case "$(id -u 2>/dev/null)" in
+        0) ;;
+        *) grep -qE '^[^ ]+ /proc proc [^ ]*hidepid=([12]|invisible|noaccess)' /proc/mounts 2>/dev/null \
+               && D_HIDEPID="hidepid is set on /proc: other users' processes are not listed to uid $(id -u 2>/dev/null)" ;;
+    esac
+
+    # Process scan. node processes may not be named "node": pm2 and
+    # next-server rename the process title, so comm, argv0 and the resolved
+    # binary each decide. The table is read once for every pid; environ and
+    # cwd are read only for the matches.
+    while IFS="$_us" read -r pid comm exe a0 cmd; do
+        [ -n "$pid" ] || continue
         [ "$pid" = "$$" ] && continue
-        comm="$(cat "/proc/$pid/comm" 2>/dev/null)"
-        case "$comm" in
-            whatap_nodejs*)
-                D_GO_PIDS="$D_GO_PIDS $pid"
-                continue
-                ;;
-        esac
-        # node processes may not be named "node": pm2 and next-server rename
-        # the process title, so the resolved binary decides
-        exe="$(readlink -f "/proc/$pid/exe" 2>/dev/null)"
-        case "$comm" in
-            node*|nodejs*) : ;;
-            *) case "$(basename "$exe" 2>/dev/null)" in
-                   node|nodejs|node[0-9]*) : ;;
-                   *) continue ;;
-               esac ;;
-        esac
-        D_APP_PIDS="$D_APP_PIDS $pid"
-        [ -n "$exe" ] && _add_node "$exe"
-    done
+        case "$comm" in whatap_nodejs*) D_GO_PIDS="$D_GO_PIDS $pid"; continue ;; esac
+        case "$cmd" in *"PM2"*"God Daemon"*|*"pm2"*[Dd]"aemon"*) D_PM2_PIDS="$D_PM2_PIDS $pid" ;; esac
+        _nd=0
+        case "$comm" in node*|next-server*|PM2*) _nd=1 ;; esac
+        _is_node "${a0##*/}" && _nd=1
+        _is_node "${exe##*/}" && _nd=1
+        [ "$_nd" = 1 ] || continue
+        # whatap markers (cmdline, env, cwd install) put a process ahead of
+        # unrelated node processes (IDE helpers, build daemons) in the detail cap
+        _mk=0
+        case "$cmd" in *whatap*) _mk=1 ;; esac
+        if _read_proc_env "$pid"; then
+            _env_pick WHATAP_HOME WHATAP_CONF_DIR WHATAP_CONF NODE_OPTIONS NODE_PATH
+            [ -n "$_ev_WHATAP_HOME" ] && _home_from_pid "$pid" "$_ev_WHATAP_HOME" "environ of node pid $pid"
+            [ -n "$_ev_WHATAP_CONF_DIR" ] && _home_from_pid "$pid" "$_ev_WHATAP_CONF_DIR" "environ WHATAP_CONF_DIR of node pid $pid"
+            [ -n "$_ev_WHATAP_CONF" ] && _add_conf_name "$_ev_WHATAP_CONF"
+            case "$_nl$_env" in *"${_nl}WHATAP_"*) _mk=1 ;; esac
+            case "$_ev_NODE_OPTIONS" in *whatap*) _mk=1 ;; esac
+            # package dirs referenced by NODE_PATH
+            v="$_ev_NODE_PATH"
+            while IFS= read -r _d; do
+                case "$_d" in /*) [ -e "$_d/whatap/package.json" ] && _add_pkg_dir "$_d/whatap" "NODE_PATH of node pid $pid" ;; esac
+            done <<EOF
+$(printf '%s' "$v" | tr ':' '\n')
+EOF
+        fi
+        # the agent's fallback home is the app root / process cwd — count the
+        # cwd as a candidate only when whatap artifacts are visible in it
+        cwd="$(readlink -f "/proc/$pid/cwd" 2>/dev/null)"
+        if [ -z "$cwd" ]; then
+            [ -e "/proc/$pid" ] && D_UNREAD="$D_UNREAD $pid"
+        elif _app_root_markers "$cwd"; then
+            _add_home "$cwd" "cwd of node pid $pid (whatap artifacts present)"
+            _mk=1
+        fi
+        [ -n "$cwd" ] && [ -e "$cwd/node_modules/whatap/package.json" ] && _add_pkg_dir "$cwd/node_modules/whatap" "cwd of node pid $pid"
+        if [ "$_mk" = 1 ]; then _am="$_am $pid"; [ -n "$exe" ] && _ndm="$_ndm$exe$_nl"
+        else _ar="$_ar $pid"; [ -n "$exe" ] && _ndr="$_ndr$exe$_nl"; fi
+    done <<EOF
+$(_proc_table)
+EOF
+    D_APP_PIDS="$(echo $_am $_ar)"
+    # binaries of whatap-marked processes take the detail slots first
+    while IFS= read -r exe; do [ -n "$exe" ] && _add_node "$exe"; done <<EOF
+$_ndm$_ndr
+EOF
 
     # node binaries on PATH and common install locations (shallow globs only)
     for v in node nodejs; do
@@ -748,8 +944,8 @@ discover() {
     done
 
     # agent home candidates
-    [ -n "${WHATAP_HOME:-}" ] && _add_home "$WHATAP_HOME" "env WHATAP_HOME (collector shell)"
-    [ -n "${WHATAP_CONF_DIR:-}" ] && _add_home "$WHATAP_CONF_DIR" "env WHATAP_CONF_DIR (collector shell)"
+    [ -n "${WHATAP_HOME:-}" ] && _home_from_self "$WHATAP_HOME" WHATAP_HOME
+    [ -n "${WHATAP_CONF_DIR:-}" ] && _home_from_self "$WHATAP_CONF_DIR" WHATAP_CONF_DIR
     [ -n "${WHATAP_CONF:-}" ] && _add_conf_name "$WHATAP_CONF"
     # port registry: one line per app group, "<udp-port>\t<home>:<id8>"
     if [ -r "$D_LOCK_FILE" ]; then
@@ -761,59 +957,221 @@ discover() {
     fi
     for pid in $D_GO_PIDS; do
         cwd="$(readlink -f "/proc/$pid/cwd" 2>/dev/null)"
-        [ -n "$cwd" ] && _add_home "$cwd" "cwd of whatap_nodejs pid $pid"
-        v="$(_proc_env "$pid" WHATAP_HOME)"
-        [ -n "$v" ] && _add_home "$v" "environ of whatap_nodejs pid $pid"
-    done
-    for pid in $D_APP_PIDS; do
-        v="$(_proc_env "$pid" WHATAP_HOME)"
-        [ -n "$v" ] && _add_home "$v" "environ of node pid $pid"
-        v="$(_proc_env "$pid" WHATAP_CONF_DIR)"
-        [ -n "$v" ] && _add_home "$v" "environ WHATAP_CONF_DIR of node pid $pid"
-        v="$(_proc_env "$pid" WHATAP_CONF)"
-        [ -n "$v" ] && _add_conf_name "$v"
-        # the agent's fallback home is the app root / process cwd — count the
-        # cwd as a candidate only when whatap artifacts are visible in it
-        cwd="$(readlink -f "/proc/$pid/cwd" 2>/dev/null)"
-        if _app_root_markers "$cwd"; then
-            _add_home "$cwd" "cwd of node pid $pid (whatap artifacts present)"
+        if [ -n "$cwd" ]; then _add_home "$cwd" "cwd of whatap_nodejs pid $pid"
+        elif [ -e "/proc/$pid" ]; then D_UNREAD="$D_UNREAD $pid"; fi
+        if _read_proc_env "$pid"; then
+            _env_pick WHATAP_HOME
+            [ -n "$_ev_WHATAP_HOME" ] && _home_from_pid "$pid" "$_ev_WHATAP_HOME" "environ of whatap_nodejs pid $pid"
         fi
-        [ -e "$cwd/node_modules/whatap/package.json" ] && _add_pkg_dir "$cwd/node_modules/whatap" "cwd of node pid $pid"
     done
+    D_UNREAD="$(printf '%s\n' $D_UNREAD | sort -un | tr '\n' ' ' | sed 's/ $//')"
     # operator auto-injection default mount (apm-init-nodejs seeds it)
     [ -d /whatap-agent ] && _add_home "/whatap-agent" "operator injection volume /whatap-agent"
     [ -e /whatap-agent/node_modules/whatap/package.json ] && _add_pkg_dir "/whatap-agent/node_modules/whatap" "operator injection volume"
-    # package dirs referenced by NODE_PATH of app processes
-    for pid in $D_APP_PIDS; do
-        v="$(_proc_env "$pid" NODE_PATH)"
-        [ -n "$v" ] || continue
-        printf '%s\n' "$v" | tr ':' '\n' | while IFS= read -r _d; do
-            [ -e "$_d/whatap/package.json" ] && printf '%s\n' "$_d/whatap"
-        done | head -n 5 > "${_errfile}.np" 2>/dev/null
-        while IFS= read -r _d; do
-            _add_pkg_dir "$_d" "NODE_PATH of node pid $pid"
-        done < "${_errfile}.np"
-        rm -f "${_errfile}.np" 2>/dev/null
-    done
 
-    # reorder node pids so processes carrying whatap markers (cmdline, env,
-    # cwd install) take the per-process detail slots before unrelated node
-    # processes (IDE helpers, build daemons) when the cap applies
-    local _marked="" _rest=""
-    for pid in $D_APP_PIDS; do
-        if cat "/proc/$pid/cmdline" 2>/dev/null | tr '\0' ' ' | grep -q 'whatap'; then
-            _marked="$_marked $pid"; continue
-        fi
-        if tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | grep -qE '^(WHATAP_|NODE_OPTIONS=.*whatap)'; then
-            _marked="$_marked $pid"; continue
-        fi
-        cwd="$(readlink -f "/proc/$pid/cwd" 2>/dev/null)"
-        if [ -n "$cwd" ] && [ -e "$cwd/node_modules/whatap" ]; then
-            _marked="$_marked $pid"; continue
-        fi
-        _rest="$_rest $pid"
+    # global installs: `npm root -g` once, and <prefix>/lib/node_modules of
+    # every node binary found, which is where npm puts them without npm
+    # having to run
+    if have npm; then
+        D_NPM_ROOT="$(_bounded npm root -g 2>/dev/null)" || D_NPM_ROOT=""
+        [ -e "$D_NPM_ROOT/whatap/package.json" ] && _add_pkg_dir "$D_NPM_ROOT/whatap" "npm root -g"
+    fi
+    while IFS= read -r exe; do
+        [ -n "$exe" ] || continue
+        v="$(readlink -f "$exe" 2>/dev/null || echo "$exe")"
+        v="${v%/*}"; v="${v%/*}"
+        [ -e "$v/lib/node_modules/whatap/package.json" ] && _add_pkg_dir "$v/lib/node_modules/whatap" "global prefix of $exe"
+    done <<EOF
+$D_NODE_EXES
+EOF
+}
+
+# _scan_gaps -> the inputs of the agent-home search this run could not read,
+# as one phrase; empty when every one was read
+_scan_gaps() {
+    local n g=""
+    if [ -n "$D_UNREAD" ]; then
+        n="$(echo $D_UNREAD | wc -w | tr -d ' ')"
+        g="environ/cwd of $n candidate process(es) not readable by uid $(id -u 2>/dev/null || echo '?') (pids: $(echo $D_UNREAD | cut -d' ' -f1-10))"
+    fi
+    [ -n "$D_HIDEPID" ] && g="${g:+$g; }$D_HIDEPID"
+    printf '%s' "$g"
+}
+
+
+# ---- numbers read from outside -------------------------------------------------
+# A value from a config, a lock file or the environment is checked before any
+# arithmetic or comparison: dash aborts the run on `$((x + 100))` with a
+# 20-digit x, and `[ x -lt n ]` on "abc" prints "Illegal number" and is false.
+# A value that fails is reported as a fact and not used.
+
+# _num_norm V MAXDIGITS -> V without leading zeros when it is 1..MAXDIGITS
+# digits (a leading zero would read as octal in $((...))); fails otherwise
+_num_norm() {
+    local v="$1"
+    case "$v" in ''|*[!0-9]*) return 1 ;; esac
+    [ "${#v}" -le "$2" ] || return 1
+    while :; do case "$v" in 0?*) v="${v#0}" ;; *) break ;; esac; done
+    printf '%s' "$v"
+}
+
+# _port_norm V -> V as a port (1..65535), or fails
+_port_norm() {
+    local v
+    v="$(_num_norm "$1" 5)" || return 1
+    [ "$v" -ge 1 ] && [ "$v" -le 65535 ] || return 1
+    printf '%s' "$v"
+}
+
+# _conf_vals KEY FILE... -> the raw values of KEY= in FILEs, one per line
+_conf_vals() {
+    local k="$1"; shift
+    [ "$#" -gt 0 ] || return 0
+    awk -F= -v k="$k" '{ gsub(/[ \t\r]/, "") } $1 == k && $2 != "" { print $2 }' "$@" 2>/dev/null
+}
+
+# _registry_vals FILE -> the raw first field of each port registry line
+_registry_vals() { [ -r "$1" ] && awk 'NF { print $1 }' "$1" 2>/dev/null; return 0; }
+
+# _ports_add LABEL <<VALUES -> the valid ports among VALUES (one per line) join
+# _pl, and "; PORTS (LABEL)" joins _plab; refused values join _pbad
+_ports_add() {
+    local v n got=""
+    while IFS= read -r v; do
+        [ -n "$v" ] || continue
+        if n="$(_port_norm "$v")"; then
+            case " $got " in *" $n "*) ;; *) got="${got:+$got }$n" ;; esac
+        else _pbad="${_pbad:+$_pbad; }$(_quote_nl "$v") ($1)"; fi
     done
-    D_APP_PIDS="$_marked $_rest"
+    [ -n "$got" ] && { _pl="$_pl $got"; _plab="$_plab; $got ($1)"; }
+    return 0
+}
+
+# _uniq_ports PORT... -> the distinct ports, space-joined (validated numbers only)
+_uniq_ports() { [ "$#" -gt 0 ] || return 0; printf '%s\n' "$@" | sort -un | tr '\n' ' ' | sed 's/ $//'; }
+
+# _home_confs -> every readable conf file (whatap.conf and the WHATAP_CONF
+# names) of every visible agent home, one per line
+_home_confs() {
+    local h src f cn
+    while IFS='|' read -r h src; do
+        [ -n "$h" ] || continue
+        f="$(resolve_fs "$h")" || continue
+        while IFS= read -r cn; do
+            [ -n "$cn" ] || continue
+            [ -r "$f/$cn" ] && [ -f "$f/$cn" ] && printf '%s\n' "$f/$cn"
+        done <<EOF2
+$D_CONF_NAMES
+EOF2
+    done <<EOF
+$D_HOMES
+EOF
+}
+
+# _net_ports -> sets _udp_ports / _tcp_ports to the ports the readable agent
+# configs name (udp: net_udp_port and net_udp_port+100, the LLM channel), or
+# 6600 when none names one, and states which it used
+_net_ports() {
+    local f p q lp=""
+    set --
+    while IFS= read -r f; do [ -n "$f" ] && set -- "$@" "$f"; done <<EOF
+$(_home_confs)
+EOF
+    # the 66xx/67xx range is always matched: an agent on a port no readable
+    # conf or registry names (a non-root run, a non-default port) still shows
+    _pl="" _plab="" _pbad=""
+    _ports_add "net_udp_port in $# readable conf file(s)" <<EOF
+$(_conf_vals net_udp_port "$@")
+EOF
+    # the LLM channel is net_udp_port + 100; only validated ports reach here
+    for p in $_pl; do
+        q=$((p + 100))
+        [ "$q" -le 65535 ] && lp="${lp:+$lp }$q"
+    done
+    [ -n "$lp" ] && { _pl="$_pl $lp"; _plab="$_plab; $lp (net_udp_port + 100)"; }
+    _ports_add "port registry $(_quote_nl "$D_LOCK_FILE")" <<EOF
+$(_registry_vals "$D_LOCK_FILE")
+EOF
+    # shellcheck disable=SC2086  # validated port numbers only
+    _pl="$(_uniq_ports $_pl)"
+    _udp_ports="6[67][0-9][0-9] $_pl" _udp_label="66xx 67xx${_pl:+ $_pl}"
+    fact "udp port filter: 66xx 67xx (range)$_plab"
+    [ -n "$_pbad" ] && fact "udp port values ignored (not a port 1..65535): $_pbad"
+    _pl="" _plab="" _pbad=""
+    _ports_add "whatap.server.port / whatap_server_port in $# readable conf file(s)" <<EOF
+$(_conf_vals whatap.server.port "$@"; _conf_vals whatap_server_port "$@")
+EOF
+    # shellcheck disable=SC2086
+    _pl="$(_uniq_ports 6600 $_pl)"
+    _tcp_ports="$_pl" _tcp_label="$_pl"
+    fact "tcp port filter: 6600$_plab"
+    [ -n "$_pbad" ] && fact "tcp port values ignored (not a port 1..65535): $_pbad"
+}
+
+# _sock_list TOOL FLAGS PORTS -> the socket table lines naming whatap or node,
+# or one of PORTS (space-separated), header kept, first 50; exits with TOOL's
+# status
+_sock_list() {
+    local pat rc
+    pat=":($(printf '%s' "$3" | tr -s ' ' '|' | sed 's/^|//; s/|$//'))([^0-9]|\$)"
+    "$1" "$2" > "$(_tmp sock.out)"; rc=$?
+    awk -v p="$pat" '(NR <= 2 && /State|Proto|Recv-Q/) || /whatap/ || /node/ || $0 ~ p' "$(_tmp sock.out)" 2>/dev/null | head -n 50
+    return "$rc"
+}
+
+# _resolve_goals -> resolve `agent` and `conf` once, from what discovery read.
+# An absence is `na` only when every input behind it was read: an unreadable
+# environ/cwd, hidepid, a blocked home path or a failed `npm root -g` makes it
+# `missed`. conf looks at every name section 5 dumps (whatap.conf and the
+# WHATAP_CONF values).
+_resolve_goals() {
+    local h src fs why cn seen=0 homes_seen=0 blocked="" absent="" unres="" gaps n ph
+    while IFS='|' read -r h src; do
+        [ -n "$h" ] || continue
+        if ! fs="$(resolve_fs "$h")"; then
+            why="$(_absent_why "$h" "$src")"
+            case "$why" in
+                permission*) blocked="$blocked; $h ($why)" ;;
+                relative*|"not resolved"*) unres="$unres; $h ($why)" ;;
+                *)           absent="$absent; $h ($why)" ;;
+            esac
+            continue
+        fi
+        homes_seen=1
+        if [ -d "$fs" ] && [ ! -x "$fs" ]; then blocked="$blocked; $h (permission denied: $fs)"; continue; fi
+        while IFS= read -r cn; do
+            [ -n "$cn" ] || continue
+            if [ -r "$fs/$cn" ] && [ -f "$fs/$cn" ]; then seen=1
+            elif [ -e "$fs/$cn" ]; then blocked="$blocked; $fs/$cn (permission denied)"
+            else absent="$absent; $fs/$cn (path not found)"; fi
+        done <<EOF2
+$D_CONF_NAMES
+EOF2
+    done <<EOF
+$D_HOMES
+EOF
+    blocked="${blocked#; }" absent="${absent#; }"
+    gaps="$(_scan_gaps)"
+    unres="${unres#; }"
+    [ -n "$unres" ] && gaps="${gaps:+$gaps; }home candidate(s) not resolved: $unres"
+    [ -n "$D_ODD" ] && gaps="${gaps:+$gaps; }path(s) with a newline or '|', not followed:$D_ODD"
+    ph=""; [ -n "$blocked$D_UNREAD$D_HIDEPID" ] && ph="$(_priv_hint)"
+    if have npm && [ -z "$D_NPM_ROOT" ]; then gaps="${gaps:+$gaps; }npm root -g returned nothing (failed or timed out)"; fi
+
+    if [ "$homes_seen" = 1 ] || [ -n "$D_PKG_DIRS" ] || [ -n "$D_GO_PIDS" ]; then
+        got agent
+    elif [ -n "$blocked" ] || [ -n "$gaps" ]; then
+        missed agent "no whatap home or package found in what this uid could read: ${blocked:+$blocked; }$gaps$ph"
+    else
+        n="$(echo $D_APP_PIDS | wc -w | tr -d ' ')"
+        na agent "no whatap home or package in the collector env, port registry $D_LOCK_FILE, /whatap-agent, the global node_modules, or the environ/cwd/NODE_PATH of $n node process(es) (all readable)${absent:+; home candidate(s): $absent}"
+    fi
+
+    if [ "$seen" = 1 ]; then got conf
+    elif [ -n "$blocked" ]; then missed conf "conf file not readable: $blocked$ph"
+    elif [ -n "$D_ODD$unres" ] || { [ -z "$D_HOMES" ] && [ -n "$gaps" ]; }; then missed conf "no agent home found in what this uid could read: $gaps$ph"
+    elif [ -z "$D_HOMES" ]; then na conf "no agent home found to hold a conf file (every source read)"
+    else na conf "no conf file in any agent home: $absent"; fi
 }
 
 # ---- report body ---------------------------------------------------------------
@@ -863,7 +1221,7 @@ run_report() {
     else
         fact "cgroup: n/a (path not found: /sys/fs/cgroup)"
     fi
-    fact "container markers (the agent daemonizes on a VM, runs foreground in a container):"
+    fact "container markers:"
     for m in /.dockerenv /run/.containerenv; do
         if [ -e "$m" ]; then printf '        %-22s present\n' "$m"; else printf '        %-22s absent\n' "$m"; fi
     done
@@ -882,36 +1240,34 @@ run_report() {
         fact "node binaries: n/a (none found on PATH or among running processes)"
     fi
     local _ndcount=0 nd
-    for nd in $D_NODE_EXES; do
+    # newline-split, no globbing; fd 9 so a probe reading stdin cannot eat it
+    while IFS= read -r nd <&9; do
+        [ -n "$nd" ] || continue
         _ndcount=$((_ndcount + 1))
         if [ "$_ndcount" -gt 8 ]; then
-            fact "-- more node binaries found but not detailed (cap: 8): $(echo $D_NODE_EXES | tr ' ' '\n' | tail -n +9 | tr '\n' ' ')"
+            fact "-- more node binaries found but not detailed (cap: 8): $(printf '%s\n' "$D_NODE_EXES" | tail -n +9 | tr '\n' ' ')"
             break
         fi
         fact "-- node binary: $nd"
         fact "   resolves to: $(readlink -f "$nd" 2>/dev/null || echo "$nd")"
         ndprobe "   version" "$nd" --version
-    done
+    done 9<<EOF
+$D_NODE_EXES
+EOF
     probe "npm version" npm --version
-    probe "global node_modules (npm root -g)" npm root -g
-    _g="$(npm root -g 2>/dev/null)"
-    if [ -n "$_g" ]; then
-        if [ -e "$_g/whatap/package.json" ]; then
-            fact "global whatap install: $_g/whatap"
-            _add_pkg_dir "$_g/whatap" "npm root -g"
-        else
-            fact "global whatap install: none in $_g"
-        fi
-    fi
+    if ! have npm; then fact "global node_modules (npm root -g): n/a (command not found: npm)"
+    elif [ -z "$D_NPM_ROOT" ]; then fact "global node_modules (npm root -g): n/a (no output: failed or timed out after ${CMD_TIMEOUT}s)"
+    elif [ -e "$D_NPM_ROOT/whatap/package.json" ]; then fact "global node_modules (npm root -g): $D_NPM_ROOT (whatap present)"
+    else fact "global node_modules (npm root -g): $D_NPM_ROOT (no whatap in it)"; fi
     if [ -z "$D_PKG_DIRS" ]; then
-        fact "whatap package dirs: none discovered (process cwd, NODE_PATH, npm -g, /whatap-agent)"
+        fact "whatap package dirs: none discovered (process cwd, NODE_PATH, npm root -g, <prefix>/lib/node_modules of each node binary, /whatap-agent)"
     else
         fact "whatap package installs discovered (read as text; the module is never loaded):"
         printf '%s\n' "$D_PKG_DIRS" | while IFS='|' read -r d src; do
             [ -n "$d" ] || continue
             printf '        -- %s   <- %s\n' "$d" "$src"
             fsd="$(resolve_fs "$d")"
-            if [ -z "$fsd" ]; then printf '           n/a (path not visible from this mount namespace)\n'; continue; fi
+            if [ -z "$fsd" ]; then printf '           n/a (%s)\n' "$(_absent_why "$d" "$src")"; continue; fi
             [ "$fsd" != "$d" ] && printf '           filesystem view: %s (read through a process root)\n' "$fsd"
             pj="$fsd/package.json"
             if [ -r "$pj" ]; then
@@ -932,7 +1288,7 @@ run_report() {
                     [ -f "$b" ] && printf '             %s  %s bytes\n' "$b" "$(wc -c < "$b" 2>/dev/null | tr -d ' ')"
                 done
             else
-                printf '           bundled master agent binaries: none (agent/ absent — 0.5.x line has no master agent)\n'
+                printf '           bundled master agent binaries: none (agent/ absent)\n'
             fi
             if [ -d "$fsd/lib/observers" ]; then
                 printf '           instrumentation modules bundled in installed agent (lib/observers): %s\n' \
@@ -942,7 +1298,7 @@ run_report() {
             fi
             [ -f "$fsd/whatap.conf" ] && printf '           whatap.conf template in package dir: present\n'
             if [ -f "$fsd/paramkey.txt" ]; then
-                printf '           paramkey.txt in package dir: present, %s bytes (content not collected — SQL-parameter encryption key)\n' "$(wc -c < "$fsd/paramkey.txt" 2>/dev/null | tr -d ' ')"
+                printf '           paramkey.txt in package dir: present, %s bytes (content not collected: key material)\n' "$(wc -c < "$fsd/paramkey.txt" 2>/dev/null | tr -d ' ')"
             fi
         done
     fi
@@ -951,10 +1307,11 @@ run_report() {
     section "Runtime processes"
     local pid n
     if [ -z "$D_GO_PIDS" ]; then
-        fact "master agent (whatap_nodejs) processes: none found in /proc (0.5.x line runs none; 1.x/2.x spawn one per agent home)"
+        fact "master agent (whatap_nodejs) processes: none found in /proc"
     else
         fact "master agent (whatap_nodejs) processes:"
         for pid in $D_GO_PIDS; do
+            [ -d "/proc/$pid" ] || { printf '        -- pid %s: n/a (process exited)\n' "$pid"; continue; }
             printf '        -- pid %s (ppid %s)\n' "$pid" "$(awk '/^PPid:/{print $2}' "/proc/$pid/status" 2>/dev/null)"
             printf '           cmdline: %s\n' "$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | cut -c1-300)"
             printf '           cwd: %s\n' "$(readlink -f "/proc/$pid/cwd" 2>/dev/null || echo "n/a (permission denied or gone)")"
@@ -975,6 +1332,7 @@ run_report() {
         for pid in $D_APP_PIDS; do
             shown=$((shown + 1))
             [ "$shown" -gt 20 ] && { fact "-- remaining $((n - 20)) node processes not detailed (cap: 20)"; break; }
+            [ -d "/proc/$pid" ] || { printf '        -- pid %s: n/a (process exited)\n' "$pid"; continue; }
             printf '        -- pid %s (ppid %s)\n' "$pid" "$(awk '/^PPid:/{print $2}' "/proc/$pid/status" 2>/dev/null)"
             printf '           comm: %s\n' "$(cat "/proc/$pid/comm" 2>/dev/null)"
             printf '           exe: %s\n' "$(readlink -f "/proc/$pid/exe" 2>/dev/null || echo n/a)"
@@ -1005,27 +1363,30 @@ run_report() {
 
     # [5] agent homes and configuration
     section "Agent homes and configuration"
-    fact "env WHATAP_HOME (collector shell): ${WHATAP_HOME:-not set}"
-    fact "env WHATAP_CONF (collector shell): ${WHATAP_CONF:-not set}"
-    fact "env WHATAP_CONF_DIR (collector shell): ${WHATAP_CONF_DIR:-not set}"
-    fact "env WHATAP_LOCK_FILE (collector shell): ${WHATAP_LOCK_FILE:-not set}"
+    fact "env WHATAP_HOME (collector shell): $(_quote_nl "${WHATAP_HOME:-not set}")"
+    fact "env WHATAP_CONF (collector shell): $(_quote_nl "${WHATAP_CONF:-not set}")"
+    fact "env WHATAP_CONF_DIR (collector shell): $(_quote_nl "${WHATAP_CONF_DIR:-not set}")"
+    fact "env WHATAP_LOCK_FILE (collector shell): $(_quote_nl "${WHATAP_LOCK_FILE:-not set}")"
+    [ -n "$D_ODD" ] && fact "path(s) with a newline or '|', not followed:$D_ODD"
+    [ -n "$D_GONE" ] && printf '%s' "$D_GONE" | while IFS= read -r _l; do [ -n "$_l" ] && fact "relative WHATAP_HOME of a process that exited, not resolved: $_l"; done
     if [ -z "$D_HOMES" ]; then
-        fact "agent home candidates: none discovered (env, port registry, process scan all empty)"
+        if [ -n "$D_ODD_HOME" ]; then fact "agent home candidates: none followed (the refused ones are listed above)"
+        else fact "agent home candidates: none discovered (env, port registry, process scan all empty)"; fi
     else
         fact "agent home candidates discovered:"
         printf '%s\n' "$D_HOMES" | while IFS='|' read -r _p _s; do printf '        %s   <- %s\n' "$_p" "$_s"; done
-        printf '%s\n' "$D_HOMES" | cut -d'|' -f1 | sort -u | while IFS= read -r home; do
+        printf '%s\n' "$D_HOMES" | while IFS='|' read -r home _src; do
             [ -n "$home" ] || continue
             fact "-- home: $home"
             fshome="$(resolve_fs "$home")"
-            if [ -z "$fshome" ]; then fact "   n/a (path not visible from this mount namespace: $home)"; continue; fi
+            if [ -z "$fshome" ]; then fact "   n/a ($(_absent_why "$home" "$_src"))"; continue; fi
             [ "$fshome" != "$home" ] && fact "   filesystem view: $fshome (read through a process root)"
             printf '%s\n' "$D_CONF_NAMES" | sort -u | while IFS= read -r cn; do
                 [ -n "$cn" ] || continue
                 dump_file "   $cn" "$fshome/$cn" 400
                 conf_bytes "   $cn byte facts" "$fshome/$cn"
             done
-            dump_file "   container.conf (written by the k8s node agent)" "$fshome/container.conf" 200
+            dump_file "   container.conf" "$fshome/container.conf" 200
             # master agent binary placed into the home by the 2.x agent
             if [ -e "$fshome/whatap_nodejs" ]; then
                 fact "   whatap_nodejs entry: $(ls -l "$fshome/whatap_nodejs" 2>/dev/null | head -n1)"
@@ -1063,12 +1424,11 @@ run_report() {
             [ "$_pp" = 0 ] && fact "   whatap_port_<pid> files: none present"
             [ -d "$fshome/run" ] && fact "   run dir: present" || fact "   run dir: absent"
             for sf in security.conf paramkey.txt; do
-                if [ -f "$fshome/$sf" ]; then
-                    fact "   $sf: present, $(wc -c < "$fshome/$sf" 2>/dev/null | tr -d ' ') bytes (content not collected — SQL-parameter encryption key)"
-                fi
+                if [ -e "$fshome/$sf" ]; then fact "   $sf: present, $(wc -c < "$fshome/$sf" 2>/dev/null | tr -d ' ') bytes (content not collected: key material)"
+                else fact "   $sf: absent"; fi
             done
             if [ -d "$fshome/logs" ]; then
-                probe "   logs dir listing" sh -c "ls -la '$fshome/logs' 2>/dev/null | head -n 100"
+                probe "   logs dir listing" _ls_head "$fshome/logs" 100
             else
                 fact "   logs dir: n/a (path not found: $fshome/logs)"
             fi
@@ -1080,16 +1440,17 @@ run_report() {
     # 2.x: app -> master agent is connected UDP to 127.0.0.1:<net_udp_port>
     # (default 6600, LLM default base+100); master agent -> collection server
     # is outbound TCP 6600. 0.5.x: the app itself holds the TCP session.
+    _net_ports
     if have ss; then
-        probe "udp sockets incl. connected peers (whatap or ports 66xx/67xx)" sh -c "ss -uapn 2>/dev/null | awk 'NR==1 || /whatap/ || /node/ || /:66[0-9][0-9]/ || /:67[0-9][0-9]/' | head -n 50"
-        probe "tcp sessions (whatap, node, or port 6600)" sh -c "ss -tnp 2>/dev/null | awk 'NR==1 || /whatap/ || /node/ || /:6600/' | head -n 50"
+        probe "udp sockets (whatap- or node-named, or port $_udp_label)" _sock_list ss -uanp "$_udp_ports"
+        probe "tcp sessions (whatap- or node-named, or port $_tcp_label)" _sock_list ss -tnp "$_tcp_ports"
     elif have netstat; then
-        probe "udp sockets incl. connected peers (whatap or ports 66xx/67xx)" sh -c "netstat -uapn 2>/dev/null | awk 'NR<=2 || /whatap/ || /node/ || /:66[0-9][0-9]/ || /:67[0-9][0-9]/' | head -n 50"
-        probe "tcp sessions (whatap, node, or port 6600)" sh -c "netstat -tnp 2>/dev/null | awk 'NR<=2 || /whatap/ || /node/ || /:6600/' | head -n 50"
+        probe "udp sockets (whatap- or node-named, or port $_udp_label)" _sock_list netstat -uanp "$_udp_ports"
+        probe "tcp sessions (whatap- or node-named, or port $_tcp_label)" _sock_list netstat -tnp "$_tcp_ports"
     else
         fact "socket listing: n/a (command not found: ss, netstat); raw tables follow"
-        probe "raw /proc/net/udp (first 30 lines, ports in hex; 0x19C8=6600)" sh -c "head -n 30 /proc/net/udp"
-        probe "raw /proc/net/tcp (first 30 lines, ports in hex; 0x19C8=6600)" sh -c "head -n 30 /proc/net/tcp"
+        probe "raw /proc/net/udp (first 30 lines)" sh -c "head -n 30 /proc/net/udp"
+        probe "raw /proc/net/tcp (first 30 lines)" sh -c "head -n 30 /proc/net/tcp"
     fi
     dump_file "port registry $D_LOCK_FILE (format: udp-port<TAB>home:app-identifier)" "$D_LOCK_FILE" 50
     [ -e "$D_LOCK_FILE.lock" ] && fact "$D_LOCK_FILE.lock (registry write lock): present" || fact "$D_LOCK_FILE.lock (registry write lock): absent"
@@ -1102,11 +1463,11 @@ run_report() {
     if [ -z "$D_HOMES" ]; then
         fact "no agent home discovered; no log locations to read"
     else
-        printf '%s\n' "$D_HOMES" | cut -d'|' -f1 | sort -u | while IFS= read -r home; do
+        printf '%s\n' "$D_HOMES" | while IFS='|' read -r home _src; do
             [ -n "$home" ] || continue
             fact "-- home: $home"
             fshome="$(resolve_fs "$home")"
-            if [ -z "$fshome" ]; then fact "   n/a (path not visible from this mount namespace: $home)"; continue; fi
+            if [ -z "$fshome" ]; then fact "   n/a ($(_absent_why "$home" "$_src"))"; continue; fi
             if [ ! -d "$fshome/logs" ]; then fact "   logs dir: n/a (path not found: $fshome/logs)"; continue; fi
             _hook="$(ls -t "$fshome"/logs/*-hook-*.log 2>/dev/null | head -n 1)"
             if [ -n "$_hook" ]; then
@@ -1146,9 +1507,7 @@ run_report() {
     # so support cases need these facts. Cheap no-op when not applicable.
     section "Application and launcher facts (pm2 / Next.js / package manifests)"
     probe "pm2 version" pm2 --version
-    _pm2d="$(ls /proc 2>/dev/null | grep -E '^[0-9]+$' | while read -r p; do
-        case "$(cat "/proc/$p/cmdline" 2>/dev/null | tr '\0' ' ')" in *"PM2"*"God Daemon"*|*"pm2"*[Dd]"aemon"*) echo "$p" ;; esac
-    done | head -n 5 | tr '\n' ' ')"
+    _pm2d="$(echo $D_PM2_PIDS | cut -d' ' -f1-5)"
     if [ -n "$_pm2d" ]; then
         fact "pm2 daemon process(es): $_pm2d"
         for p in $_pm2d; do
@@ -1194,7 +1553,7 @@ run_report() {
             fact "   node_modules: n/a (path not found: $cwd/node_modules)"
         fi
         for e in ecosystem.config.js ecosystem.config.cjs ecosystem.config.json ecosystem.json; do
-            [ -f "$cwd/$e" ] && dump_file "   $e (pm2 launcher config; customer-owned file)" "$cwd/$e" 120
+            [ -f "$cwd/$e" ] && dump_file "   $e" "$cwd/$e" 120
         done
         for ncf in next.config.js next.config.mjs next.config.ts; do
             if [ -f "$cwd/$ncf" ]; then
@@ -1218,7 +1577,7 @@ run_report() {
     # [9] kubernetes / operator injection context
     section "Kubernetes / operator injection context"
     if [ -d /whatap-agent ]; then
-        probe "/whatap-agent listing (operator injection volume)" sh -c "ls -la /whatap-agent 2>/dev/null | head -n 50"
+        probe "/whatap-agent listing" _ls_head /whatap-agent 50
         # apm-init-nodejs contract: seeds node_modules/whatap and copies the
         # arch-matched master agent binary to a stable path agent/whatap_nodejs
         if [ -e /whatap-agent/node_modules/whatap/agent/whatap_nodejs ]; then
@@ -1227,7 +1586,7 @@ run_report() {
             fact "/whatap-agent/node_modules/whatap/agent/whatap_nodejs (arch-resolved stable path): absent"
         fi
     else
-        fact "/whatap-agent: n/a (path not found — operator injection volume absent)"
+        fact "/whatap-agent: n/a (path not found: /whatap-agent)"
     fi
     if [ -n "${WHATAP_NODEJS_AGENT_PATH:-}" ]; then
         fact "env WHATAP_NODEJS_AGENT_PATH: $WHATAP_NODEJS_AGENT_PATH"
@@ -1250,18 +1609,7 @@ run_report() {
 
     # Resolved here, not at the point of use: the config dumps above run inside
     # `| while` pipelines, and an assignment made in a subshell does not survive.
-    if [ -n "$D_HOMES" ] || [ -n "$D_PKG_DIRS" ]; then got agent
-    else na agent "the whatap node package is not installed on this host (env, port registry, process scan all empty)"; fi
-    _cseen=0
-    for _h in $(printf '%s\n' "$D_HOMES" | cut -d'|' -f1 | sort -u); do
-        [ -n "$_h" ] || continue
-        _fh="$(resolve_fs "$_h")"; [ -n "$_fh" ] || continue
-        [ -r "$_fh/whatap.conf" ] && _cseen=1
-    done
-    if [ "$_cseen" = 1 ]; then got conf
-    elif [ -z "$D_HOMES" ]; then na conf "no agent home exists to hold a whatap.conf"
-    else missed conf "agent home discovered but no whatap.conf under it is readable by uid $(id -u 2>/dev/null || echo '?')$(_priv_hint)"; fi
-
+    _resolve_goals
     emit_status
     emit_footer
 }

@@ -55,7 +55,7 @@
 # Tier-0 load-safe defaults (bounded reads, no whole-log grep, no deep find),
 # bash 3.2+, reasoned absence for every missing value.
 #
-# The PHP binaries found are executed read-only, with -v / -m / -i / --ini only
+# The PHP binaries found are executed read-only, with -v / -m / -i only
 # — the same calls the vendor installer makes. No application code is run. The
 # agent binary is only ever executed with its `version` argument (running it
 # bare would start an agent).
@@ -68,7 +68,7 @@ export LC_ALL=C
 
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-apmphp"
-VERSION="0.4.1"
+VERSION="0.5.0"
 DOMAIN="apm"
 TARGET="host/$(hostname 2>/dev/null || echo unknown)"
 
@@ -517,14 +517,10 @@ have() { command -v "$1" >/dev/null 2>&1; }
 
 _errfile=""
 _infofile=""
-_timeout_bin=""
-CMD_TIMEOUT=15
-_init_probe() {
-    _errfile="$(_tmp probe.err)"
-    _infofile="$(_tmp probe.info)"
-    have timeout && _timeout_bin="$(command -v timeout)"
-}
-_end_probe() { [ -n "$_errfile" ] && rm -f "$_errfile" 2>/dev/null; [ -n "$_infofile" ] && rm -f "$_infofile" 2>/dev/null; }
+CMD_TIMEOUT="${CMD_TIMEOUT:-15}"
+# Call after _run_init: the error and php -i files live in the run's private directory.
+_init_probe() { _errfile="$(_tmp probe.err)"; _infofile="$(_tmp probe.info)"; }
+_end_probe() { :; }   # _run_cleanup removes the directory
 
 _classify_err() {
     local txt=""
@@ -549,17 +545,40 @@ _emit_labeled() {
 }
 
 # probe "label" CMD [ARGS...] -> output as facts, or "label: n/a (<why>)".
+# CMD may be a file, a shell function or a builtin; _bounded caps all three. A
+# non-zero exit that still printed something is reported with its output.
 probe() {
     local label="$1"; shift
-    command -v "$1" >/dev/null 2>&1 || { fact "$label: n/a (command not found: $1)"; return; }
+    [ -n "$(_cmd_kind "$1")" ] || { fact "$label: n/a (command not found: $1)"; return; }
+    _past_deadline && { fact "$label: n/a (run deadline reached: ${RUN_DEADLINE}s)"; return; }
     local out rc
-    if [ -n "$_timeout_bin" ]; then out="$("$_timeout_bin" "$CMD_TIMEOUT" "$@" 2>"$_errfile")"; rc=$?
-    else out="$("$@" 2>"$_errfile")"; rc=$?; fi
-    [ "$rc" -eq 124 ] && [ -n "$_timeout_bin" ] && { fact "$label: n/a (timed out: ${CMD_TIMEOUT}s)"; return; }
-    [ "$rc" -ne 0 ] && { fact "$label: n/a ($(_classify_err))"; return; }
+    out="$(_bounded "$@" 2>"$_errfile")"; rc=$?
+    if [ "$rc" -eq 124 ]; then
+        if _past_deadline; then fact "$label: n/a (run deadline reached: ${RUN_DEADLINE}s)"
+        else fact "$label: n/a (timed out: ${CMD_TIMEOUT}s)"; fi
+        return
+    fi
+    if [ "$rc" -ne 0 ]; then
+        [ -n "$out" ] && { _emit_labeled "$label (exit $rc)" "$out"; return; }
+        fact "$label: n/a ($(_classify_err))"; return
+    fi
     [ -z "$out" ] && { fact "$label: n/a (empty output)"; return; }
     _emit_labeled "$label" "$out"
 }
+
+# _head_of N CMD... -> the first N lines of CMD's stdout, with CMD's own exit
+# status (a `CMD | head` pipeline reports head's, and hides a failed CMD as
+# empty output).
+_head_of() {
+    local n="$1" rc; shift
+    "$@" > "$(_tmp head.out)"; rc=$?
+    head -n "$n" "$(_tmp head.out)" 2>/dev/null
+    return "$rc"
+}
+
+# _ls_head DIR N -> `ls -la DIR`, first N lines, failing when ls fails. Takes the
+# path as an argument, so a quote or a space in it cannot break a `sh -c` string.
+_ls_head() { _head_of "$2" ls -la -- "$1"; }
 
 # read_proc "label" PATH -> content of a /proc or /sys file, or a reason.
 read_proc() {
@@ -573,7 +592,7 @@ read_proc() {
 
 # dump_file "label" PATH [CAP] -> the file's content verbatim (line-capped),
 # or a classified reason. Framework policy: configuration is dumped verbatim,
-# never masked (see collectors/apm/php/README.md security note).
+# never masked (see collectors/apm/php/README.md, "What the report can contain").
 dump_file() {
     local label="$1" path="$2" cap="${3:-400}" total
     [ -e "$path" ] || { fact "$label: n/a (path not found: $path)"; return; }
@@ -638,16 +657,20 @@ file_facts() {
 }
 
 # php_run "label" PHP_BIN [ARGS...] -> run a PHP binary with read-only flags
-# under timeout; stdout becomes facts and any stderr is emitted as its own
-# labeled block (a PHP startup warning about the extension lands there).
+# under _bounded; stdout becomes facts and any stderr is emitted as its own
+# labeled block (a PHP startup warning about the extension lands there). The
+# output stays in _php_out for the caller.
+_php_out=""
 php_run() {
     local label="$1" php="$2"; shift 2
+    _php_out=""
     [ -x "$php" ] || { fact "$label: n/a (not executable: $php)"; return; }
+    _past_deadline && { fact "$label: n/a (run deadline reached: ${RUN_DEADLINE}s)"; return; }
     local out rc err
-    if [ -n "$_timeout_bin" ]; then out="$("$_timeout_bin" "$CMD_TIMEOUT" "$php" "$@" 2>"$_errfile")"; rc=$?
-    else out="$("$php" "$@" 2>"$_errfile")"; rc=$?; fi
+    out="$(_bounded "$php" "$@" 2>"$_errfile")"; rc=$?
+    _php_out="$out"
     err="$(head -c 2000 "$_errfile" 2>/dev/null)"
-    if [ "$rc" -eq 124 ] && [ -n "$_timeout_bin" ]; then fact "$label: n/a (timed out: ${CMD_TIMEOUT}s)"; return; fi
+    if [ "$rc" -eq 124 ]; then fact "$label: n/a (timed out: ${CMD_TIMEOUT}s)"; return; fi
     if [ -n "$out" ]; then _emit_labeled "$label" "$out"
     elif [ "$rc" -ne 0 ]; then fact "$label: n/a ($(_classify_err))"
     else fact "$label: n/a (empty output)"; fi
@@ -658,11 +681,10 @@ php_run() {
 # php_info PHP_BIN -> capture `php -i` into $_infofile (0 on success). Used by
 # php_info_grep so one execution serves every extracted field.
 php_info() {
-    local php="$1" rc
+    local php="$1"
     : > "$_infofile" 2>/dev/null
     [ -x "$php" ] || return 1
-    if [ -n "$_timeout_bin" ]; then "$_timeout_bin" "$CMD_TIMEOUT" "$php" -i > "$_infofile" 2>"$_errfile"; rc=$?
-    else "$php" -i > "$_infofile" 2>"$_errfile"; rc=$?; fi
+    _bounded "$php" -i > "$_infofile" 2>"$_errfile"
     [ -s "$_infofile" ] || return 1
     return 0
 }
@@ -689,17 +711,57 @@ php_info_block() {
     _emit_labeled "$label" "$out"
 }
 
+# ---- process table (internal; emits nothing) ----------------------------------
+# _proc_table -> one line per process that has a command line, fields joined by
+# the unit separator \037 (a whitespace IFS would merge empty fields):
+#   pid comm exe argv0 cmdline
+# Read in one pass over /proc: three readers for every pid instead of several
+# forks per pid (readlink + basename per pid took 20 s on a 687-process host).
+# exe is empty where /proc/<pid>/exe is not readable by this uid. cmdline has
+# its NULs turned into spaces and is cut at 300 characters.
+_us="$(printf '\037')"
+_proc_table() {
+    {
+        ls -l /proc/[0-9]*/exe 2>/dev/null | awk '{
+            i = index($0, " -> "); if (!i) next
+            for (f = 1; f <= NF; f++) if ($f ~ /^\/proc\/[0-9]+\/exe$/) {
+                split($f, a, "/"); t = substr($0, i + 4); sub(/ \(deleted\)$/, "", t)
+                print "E\037" a[3] "\037" t; break } }'
+        head -n 1 /proc/[0-9]*/comm /dev/null 2>/dev/null | awk '
+            /^==> \/proc\/[0-9]+\/comm <==$/ { split($2, a, "/"); p = a[3]; next }
+            p != "" { print "C\037" p "\037" $0; p = "" }'
+        head -n 1 /proc/[0-9]*/cmdline /dev/null 2>/dev/null | tr '\000\037' '\001 ' | awk '
+            /^==> \/proc\/[0-9]+\/cmdline <==$/ { split($2, a, "/"); p = a[3]; next }
+            p != "" { split($0, v, "\001"); c = $0; gsub(/\001/, " ", c); sub(/ +$/, "", c)
+                      if (v[1] != "") print "A\037" p "\037" v[1] "\037" substr(c, 1, 300)
+                      p = "" }'
+    } | awk -F'\037' '
+        $1 == "E" { e[$2] = $3; next }
+        $1 == "C" { c[$2] = $3; next }
+        $1 == "A" { o[++n] = $2; a0[$2] = $3; cl[$2] = $4 }
+        END { for (i = 1; i <= n; i++) { p = o[i]; print p "\037" c[p] "\037" e[p] "\037" a0[p] "\037" cl[p] } }'
+}
+
 # ---- discovery (internal; emits nothing) --------------------------------------
 # Populates:
-#   D_PHP_BINS    distinct php / php-fpm / php-cgi binaries (PATH, globs, procs)
+#   D_PHP_BINS    distinct php / php-fpm / php-cgi binaries (PATH, globs, procs),
+#                 newline-joined
 #   D_PHP_FACTS   one record per detailed runtime, filled in by section 3
 #   D_AGENT_PIDS  pids of the Go agent (comm: whatap_php / whatap_php_stat*)
-#   D_WEB_PIDS    pids of httpd / apache2 / php-fpm / php-cgi / php processes
+#   D_WEB_PIDS    pids of httpd / apache2 / php-fpm / php-cgi / php / lsphp
+#                 processes (by comm, argv0 or exe)
 #   D_ALT_PIDS    pids of persistent-worker PHP runtimes (swoole/octane/rr/...)
 #   D_HOMES       agent home candidates with their discovery source
 #   D_SERVICE_FILES  service/unit/init files that carry the resolved install env
 #   D_EXT_DIRS    extension_dir values seen (php -i, service files)
 #   D_INI_FILES   whatap ini files found on disk
+#   D_UNREAD      pids of whatap_php processes whose environ, cwd or exe this uid
+#                 could not read (their home is unknown, not absent)
+#   D_HIDEPID     non-empty when /proc hides other users' processes from this uid
+#   D_PHPI_FAIL   php binaries whose `php -i` did not run (their ini scan dir and
+#                 extension_dir are unknown), filled in by section 3
+#   D_MAPS_UNREAD pids whose /proc/<pid>/maps this uid could not read, filled
+#                 in by section 6
 D_PHP_BINS=""
 D_PHP_KEYS=""
 D_PHP_FACTS=""      # newline-joined "bin|version|sapi|api|threadsafety|extdir|scandir|loaded|loadmsg"
@@ -710,6 +772,17 @@ D_HOMES=""
 D_SERVICE_FILES=""
 D_EXT_DIRS=""
 D_INI_FILES=""
+D_UNREAD=""
+D_HIDEPID=""
+D_PHPI_FAIL=""
+D_MAPS_UNREAD=""
+D_DIR_UNREAD=""     # ini scan dirs / extension_dirs that exist but cannot be listed
+D_PHP_LIVE=""       # "exe|pid" of running php processes, newline-joined
+D_SCAN_UNRES=""     # relative ini scan dir entries no process cwd resolved
+# PHP binaries detailed per run. APM_INTERP_CAP in the environment raises it
+# (the CLI flags are a shared block).
+D_PHP_CAP=10 D_CAP_NOTE=""   # set in discover
+D_PHPINI_WHATAP=""  # php.ini files carrying whatap lines, filled in by section 6
 D_DEFAULT_HOME="/usr/whatap/php"
 
 # resolve_fs PATH -> a readable filesystem view of PATH: the path itself if it
@@ -719,6 +792,8 @@ D_DEFAULT_HOME="/usr/whatap/php"
 # target's files.
 resolve_fs() {
     local p="$1" pid
+    # a relative path is never read against the collector's own cwd
+    case "$p" in /*) ;; *) return 1 ;; esac
     [ -e "$p" ] && { printf '%s\n' "$p"; return; }
     for pid in $D_AGENT_PIDS $D_WEB_PIDS $D_ALT_PIDS; do
         [ -e "/proc/$pid/root$p" ] && { printf '%s\n' "/proc/$pid/root$p"; return; }
@@ -726,12 +801,84 @@ resolve_fs() {
     return 1
 }
 
+# _absent_why PATH [SOURCE] -> why resolve_fs found nothing: "permission denied:
+# <dir>" when an existing ancestor cannot be searched by this uid, or when the
+# process named in SOURCE ("... pid N") has a root this uid cannot enter;
+# otherwise "path not found: PATH".
+_absent_why() {
+    local p="$1" s="${2:-}" d pid i=0
+    # a relative path has no ancestor to walk; the ${d%/*} walk below only
+    # shrinks an absolute one (and is capped anyway)
+    case "$p" in /*) ;; *) printf 'relative path, not resolved: %s' "$p"; return ;; esac
+    d="${p%/*}"
+    while [ -n "$d" ] && [ ! -e "$d" ] && [ "$i" -lt 256 ]; do d="${d%/*}"; i=$((i + 1)); done
+    if [ -n "$d" ] && [ ! -e "$d" ]; then printf 'not resolved (path depth over 256): %s' "$p"; return; fi
+    if [ -n "$d" ] && [ -e "$d" ] && [ ! -x "$d" ]; then printf 'permission denied: %s' "$d"; return; fi
+    case "$s" in
+        *" pid "*)
+            pid="${s##* pid }"; pid="${pid%% *}"
+            if [ -d "/proc/$pid" ] && [ ! -e "/proc/$pid/root/" ]; then
+                printf 'permission denied: /proc/%s/root' "$pid"; return
+            fi ;;
+    esac
+    printf 'path not found: %s' "$p"
+}
+
+# _abs_for_pid PID PATH -> PATH, made absolute against the cwd of PID when it
+# is relative (a relative WHATAP_HOME in a process environ is relative to that
+# process). Fails when PATH is relative and that cwd cannot be read: the path
+# is then never tested against the collector's own cwd.
+_abs_for_pid() {
+    local c
+    case "$2" in
+        /*) printf '%s' "$2" ;;
+        *)  c="$(readlink -f "/proc/$1/cwd" 2>/dev/null)"
+            [ -n "$c" ] || return 1
+            printf '%s/%s' "$c" "${2#./}" ;;
+    esac
+}
+
+# _home_from_pid PID PATH SOURCE -> add PATH (from the environ of PID) as a home
+# candidate. A relative PATH whose process cwd cannot be read is an unread
+# input while the process lives (D_UNREAD), and a fact once it has exited
+# (D_GONE).
+D_GONE=""
+_home_from_pid() {
+    local v
+    if v="$(_abs_for_pid "$1" "$2")"; then _add_home "$v" "$3"
+    elif [ -e "/proc/$1" ]; then D_UNREAD="$D_UNREAD $1"
+    else D_GONE="${D_GONE}pid $1: $2$_nl"; fi
+}
+
+# _home_from_self VALUE NAME -> add a home candidate from the collector's own
+# environment. It belongs to this process, so a relative VALUE is taken
+# against the collector's physical cwd (the operator set it and ran the
+# collector from there); values from other processes use their cwd instead.
+_home_from_self() {
+    local c
+    case "$1" in
+        /*) _add_home "$1" "env $2 (collector shell)" ;;
+        *)  c="$(pwd -P 2>/dev/null)"
+            if [ -n "$c" ]; then _add_home "$c/${1#./}" "collector environment $2, relative to the collector's cwd $(_quote_nl "$c")"
+            else _add_home "$1" "env $2 (collector shell)"; fi ;;
+    esac
+}
+
+# _quote_nl TEXT -> TEXT with each newline written as \n
+_quote_nl() { printf '%s' "$1" | awk 'NR > 1 { printf "\\n" } { printf "%s", $0 }'; }
+
+# D_ODD: candidate paths holding a newline or '|', the record delimiters. They
+# are reported and counted as unread, never split into two records.
+D_ODD="" D_ODD_HOME=""
+
+# Membership tests bound by the record delimiter, so /opt/whatap is not taken
+# for already listed when /data/opt/whatap is.
 _add_home() {  # _add_home PATH SOURCE
     local p="$1" s="$2"
     [ -n "$p" ] || return
-    case "$D_HOMES" in *"$p|"*) return ;; esac
-    if [ -n "$D_HOMES" ]; then D_HOMES="$D_HOMES
-$p|$s"; else D_HOMES="$p|$s"; fi
+    case "$p" in *"$_nl"*|*"|"*) D_ODD="$D_ODD \"$(_quote_nl "$p")\"" D_ODD_HOME=1; return ;; esac
+    case "$_nl$D_HOMES" in *"$_nl$p|"*) return ;; esac
+    if [ -n "$D_HOMES" ]; then D_HOMES="$D_HOMES$_nl$p|$s"; else D_HOMES="$p|$s"; fi
 }
 
 _add_svc() {  # _add_svc PATH
@@ -745,13 +892,17 @@ _add_ext_dir() {  # _add_ext_dir DIR SOURCE
     local d="$1" s="$2"
     [ -n "$d" ] || return
     case "$d" in /*) ;; *) return ;; esac
-    case "$D_EXT_DIRS" in *"$d|"*) return ;; esac
-    if [ -n "$D_EXT_DIRS" ]; then D_EXT_DIRS="$D_EXT_DIRS
-$d|$s"; else D_EXT_DIRS="$d|$s"; fi
+    case "$d" in *"|"*|*"$_nl"*) D_ODD="$D_ODD \"$(_quote_nl "$d")\""; return ;; esac
+    case "$_nl$D_EXT_DIRS" in *"$_nl$d|"*) return ;; esac
+    if [ -n "$D_EXT_DIRS" ]; then D_EXT_DIRS="$D_EXT_DIRS$_nl$d|$s"; else D_EXT_DIRS="$d|$s"; fi
 }
 
-_add_ini() {  # _add_ini PATH
-    local p="$1"
+# _add_ini PATH -> record a whatap ini file. PATH may be seen through a process
+# root; the file that exists is the one recorded.
+_add_ini() {
+    local p
+    case "$1" in *"|"*|*"$_nl"*) D_ODD="$D_ODD \"$(_quote_nl "$1")\""; return ;; esac
+    p="$(resolve_fs "$1")" || return
     [ -f "$p" ] || return
     case "$D_INI_FILES" in *"|$p|"*) return ;; esac
     D_INI_FILES="$D_INI_FILES|$p|"
@@ -763,13 +914,17 @@ _add_ini() {  # _add_ini PATH
 _add_php() {
     local p="$1" k
     [ -n "$p" ] || return
+    case "$p" in *"|"*|*"$_nl"*) D_ODD="$D_ODD \"$(_quote_nl "$p")\""; return ;; esac
     [ -x "$p" ] || return
     case "$p" in *-config|*.ini|*.conf) return ;; esac
     k="$(readlink -f "$p" 2>/dev/null || echo "$p")"
     case "$D_PHP_KEYS" in *"|$k|"*) return ;; esac
     D_PHP_KEYS="$D_PHP_KEYS|$k|"
-    D_PHP_BINS="$D_PHP_BINS $p"
+    if [ -n "$D_PHP_BINS" ]; then D_PHP_BINS="$D_PHP_BINS$_nl$p"; else D_PHP_BINS="$p"; fi
 }
+
+# _is_php NAME -> success when NAME is a PHP binary's file name
+_is_php() { case "$1" in php|php[0-9]*|php-*|php5-*|lsphp*) return 0 ;; esac; return 1; }
 
 # _proc_env PID NAME -> value of NAME= in the process environ (empty if none).
 # The braces put the input redirection inside the silenced subshell: a process
@@ -808,41 +963,54 @@ _proc_start() {
 
 discover() {
     progress "discovery: php binaries, web/app processes, agent home, ini files"
-    local c p pid comm cmd exe cwd envh d
+    _cap_from APM_INTERP_CAP "${APM_INTERP_CAP:-}" 10; D_PHP_CAP="$_cap" D_CAP_NOTE="$_cap_note"
+    local c p pid comm exe a0 cmd cwd envh d _php _alt
 
-    # process scan (reads comm per pid; cmdline/environ only for matches)
-    for pid in $(ls /proc 2>/dev/null | grep -E '^[0-9]+$'); do
+    case "$(id -u 2>/dev/null)" in
+        0) ;;
+        *) grep -qE '^[^ ]+ /proc proc [^ ]*hidepid=([12]|invisible|noaccess)' /proc/mounts 2>/dev/null \
+               && D_HIDEPID="hidepid is set on /proc: other users' processes are not listed to uid $(id -u 2>/dev/null)" ;;
+    esac
+
+    # Process scan over a table read once for every pid. A PHP process is
+    # matched by comm, argv0 or exe: a script started from `#!/usr/bin/php`
+    # carries the script's name as comm and the interpreter as argv0.
+    while IFS="$_us" read -r pid comm exe a0 cmd; do
+        [ -n "$pid" ] || continue
         [ "$pid" = "$$" ] && continue
-        comm="$(cat "/proc/$pid/comm" 2>/dev/null)"
-        case "$comm" in
-            # /proc/<pid>/comm is capped at 15 characters, so the musl build
-            # whatap_php_static appears as whatap_php_stat
-            whatap_php*) D_AGENT_PIDS="$D_AGENT_PIDS $pid"; continue ;;
-            httpd*|apache2*|php-fpm*|php5-fpm*|php-cgi*|php|php[0-9]*|lighttpd*)
-                D_WEB_PIDS="$D_WEB_PIDS $pid"
-                # only PHP binaries join the runtime list — an httpd/apache2
-                # binary carries PHP as a module and cannot be run with -i
-                case "$comm" in
-                    php*)
-                        exe="$(_link_target "/proc/$pid/exe")"
-                        [ -n "$exe" ] && _add_php "$exe"
-                        ;;
-                esac
-                ;;
-            frankenphp*|rr|roadrunner*) D_ALT_PIDS="$D_ALT_PIDS $pid"; continue ;;
+        # /proc/<pid>/comm is capped at 15 characters, so the musl build
+        # whatap_php_static appears as whatap_php_stat
+        case "$comm" in whatap_php*) D_AGENT_PIDS="$D_AGENT_PIDS $pid"; continue ;; esac
+        # persistent-worker runtimes are matched on the executable (comm,
+        # argv0 or exe), and their markers only on the command line of a PHP
+        # executable, so an editor or `tail` naming swoole is not one
+        _alt=0
+        case "$comm|${a0##*/}|${exe##*/}" in
+            frankenphp*|*"|frankenphp"*|rr\|*|*\|rr\|*|*\|rr|roadrunner*|*"|roadrunner"*) _alt=1 ;;
         esac
-        # persistent-worker runtimes rename their process title, so the
-        # command line is the identifying fact, not comm
-        cmd="$( { tr '\0' ' ' < "/proc/$pid/cmdline" ; } 2>/dev/null )"
+        [ "$_alt" = 1 ] && { D_ALT_PIDS="$D_ALT_PIDS $pid"; continue; }
+        _php=0
+        _is_php "$comm" && _php=1
+        _is_php "${a0##*/}" && _php=1
+        _is_php "${exe##*/}" && _php=1
+        case "$comm" in httpd*|apache2*|lighttpd*) _php=2 ;; esac
+        [ "$_php" = 0 ] && continue
+        D_WEB_PIDS="$D_WEB_PIDS $pid"
+        # only PHP binaries join the runtime list — an httpd/apache2 binary
+        # carries PHP as a module and cannot be run with -i
+        _is_php "${exe##*/}" && { _add_php "$exe"; D_PHP_LIVE="$D_PHP_LIVE$exe|$pid$_nl"; }
+        [ "$_php" = 1 ] || continue
         case "$cmd" in
-            *octane*|*swoole*|*roadrunner*|*frankenphp*|*workerman*|*"php-pm"*|*"artisan queue"*|*"artisan horizon"*)
+            *octane*|*swoole*|*roadrunner*|*workerman*|*"php-pm"*|*"artisan queue"*|*"artisan horizon"*)
                 D_ALT_PIDS="$D_ALT_PIDS $pid" ;;
         esac
-    done
+    done <<EOF
+$(_proc_table)
+EOF
 
     # php binaries on PATH and in the usual install locations (shallow globs
     # only — no directory walk)
-    for c in php php-fpm php-cgi php5 php5-fpm php-zts zts-php; do
+    for c in php php-fpm php-cgi php5 php5-fpm php-zts zts-php lsphp; do
         p="$(command -v "$c" 2>/dev/null)"
         [ -n "$p" ] && _add_php "$p"
     done
@@ -864,16 +1032,19 @@ discover() {
     done
 
     # agent home candidates
-    [ -n "${WHATAP_HOME:-}" ] && _add_home "$WHATAP_HOME" "env WHATAP_HOME (collector shell)"
+    [ -n "${WHATAP_HOME:-}" ] && _home_from_self "$WHATAP_HOME" WHATAP_HOME
     [ -d "$D_DEFAULT_HOME" ] && _add_home "$D_DEFAULT_HOME" "package install path (present on disk)"
     for pid in $D_AGENT_PIDS; do
         cwd="$(_link_target "/proc/$pid/cwd")"
         [ -n "$cwd" ] && [ -d "$cwd" ] && _add_home "$cwd" "cwd of whatap_php pid $pid"
+        [ -r "/proc/$pid/environ" ] || { [ -e "/proc/$pid/environ" ] && D_UNREAD="$D_UNREAD $pid"; }
         envh="$(_proc_env "$pid" WHATAP_HOME)"
-        [ -n "$envh" ] && _add_home "$envh" "environ of whatap_php pid $pid"
+        [ -n "$envh" ] && _home_from_pid "$pid" "$envh" "environ of whatap_php pid $pid"
         exe="$(_link_target "/proc/$pid/exe")"
-        [ -n "$exe" ] && [ -f "$exe" ] && _add_home "$(dirname "$exe")" "exe path of whatap_php pid $pid"
+        if [ -n "$exe" ] && [ -f "$exe" ]; then _add_home "${exe%/*}" "exe path of whatap_php pid $pid"
+        elif [ -z "$cwd" ] && [ -e "/proc/$pid" ]; then D_UNREAD="$D_UNREAD $pid"; fi
     done
+    D_UNREAD="$(printf '%s\n' $D_UNREAD | sort -un | tr '\n' ' ' | sed 's/ $//')"
 
     # service / unit / init files: install.sh writes the resolved php
     # environment into every one of them that exists
@@ -883,21 +1054,21 @@ discover() {
     _add_svc "/lib/systemd/system/whatap-php.service"
     _add_svc "/etc/systemd/system/whatap-php.service"
     _add_svc "/etc/rc.d/whatap_php"
-    printf '%s\n' "$D_HOMES" | cut -d'|' -f1 | sort -u | while IFS= read -r d; do
-        [ -n "$d" ] && [ -f "$d/whatap-php" ] && printf '%s\n' "$d/whatap-php"
-    done > /dev/null 2>&1
+    while IFS='|' read -r d _s; do
+        [ -n "$d" ] || continue
+        p="$(resolve_fs "$d/whatap-php")" && _add_svc "$p"
+    done <<EOF
+$D_HOMES
+EOF
 
-    # extension dirs and ini files declared by the service files
-    printf '%s\n' "$D_SERVICE_FILES" | tr '|' '\n' | grep -v '^$' | while IFS= read -r p; do
-        [ -f "$p" ] || continue
-        grep -h 'WHATAP_PHP_EXT_HOME=' "$p" 2>/dev/null | sed 's/.*WHATAP_PHP_EXT_HOME=//; s/"$//'
-    done > "$_errfile.extdirs" 2>/dev/null
-    if [ -f "$_errfile.extdirs" ]; then
-        while IFS= read -r d; do
-            [ -n "$d" ] && _add_ext_dir "$d" "WHATAP_PHP_EXT_HOME in a service file"
-        done < "$_errfile.extdirs"
-        rm -f "$_errfile.extdirs" 2>/dev/null
-    fi
+    # extension dirs declared by the service files
+    while IFS= read -r d; do
+        [ -n "$d" ] && _add_ext_dir "$d" "WHATAP_PHP_EXT_HOME in a service file"
+    done <<EOF
+$(printf '%s\n' "$D_SERVICE_FILES" | tr '|' '\n' | grep -v '^$' | while IFS= read -r p; do
+    grep -h 'WHATAP_PHP_EXT_HOME=' "$p" 2>/dev/null | sed 's/.*WHATAP_PHP_EXT_HOME=//; s/"$//'
+done)
+EOF
 
     # whatap ini files: the installer copies template.ini to
     # <ini scan dir>/whatap.ini, and falls back to the agent home when PHP
@@ -918,13 +1089,225 @@ discover() {
              "$D_DEFAULT_HOME"/whatap.ini; do
         _add_ini "$p"
     done
-    printf '%s\n' "$D_HOMES" | cut -d'|' -f1 | sort -u > "$_errfile.homes" 2>/dev/null
-    if [ -f "$_errfile.homes" ]; then
-        while IFS= read -r d; do
-            [ -n "$d" ] && _add_ini "$d/whatap.ini"
-        done < "$_errfile.homes"
-        rm -f "$_errfile.homes" 2>/dev/null
+    while IFS='|' read -r d _s; do
+        [ -n "$d" ] && _add_ini "$d/whatap.ini"
+    done <<EOF
+$D_HOMES
+EOF
+}
+
+# _scan_gaps -> the inputs of the installation search this run could not read,
+# as one phrase; empty when every one was read
+# _scan_gaps [maps] -> as above; with "maps", also the web/php processes whose
+# maps a non-root run could not read. maps answer whether the module is loaded,
+# not where an ini is, and a root run that still cannot read them has no other
+# way to run, so they never block conf and never block a root run.
+_scan_gaps() {
+    local n g=""
+    if [ -n "$D_UNREAD" ]; then
+        n="$(echo $D_UNREAD | wc -w | tr -d ' ')"
+        g="environ/cwd/exe of $n whatap_php process(es) not readable by uid $(id -u 2>/dev/null || echo '?') (pids: $(echo $D_UNREAD | cut -d' ' -f1-10))"
     fi
+    if [ "${1:-}" = maps ] && [ -n "$D_MAPS_UNREAD" ] && [ -n "$PRIV_GAP" ]; then
+        n="$(echo $D_MAPS_UNREAD | wc -w | tr -d ' ')"
+        g="${g:+$g; }/proc/<pid>/maps of $n web/php process(es) not readable by uid $(id -u 2>/dev/null || echo '?') (pids: $(echo $D_MAPS_UNREAD | cut -d' ' -f1-10))"
+    fi
+    [ -n "$D_HIDEPID" ] && g="${g:+$g; }$D_HIDEPID"
+    [ -n "$D_DIR_UNREAD" ] && g="${g:+$g; }directory not readable by uid $(id -u 2>/dev/null || echo '?'):$D_DIR_UNREAD"
+    printf '%s' "$g"
+}
+
+
+# ---- numbers read from outside -------------------------------------------------
+# A value from a config, a lock file or the environment is checked before any
+# arithmetic or comparison: dash aborts the run on `$((x + 100))` with a
+# 20-digit x, and `[ x -lt n ]` on "abc" prints "Illegal number" and is false.
+# A value that fails is reported as a fact and not used.
+
+# _num_norm V MAXDIGITS -> V without leading zeros when it is 1..MAXDIGITS
+# digits (a leading zero would read as octal in $((...))); fails otherwise
+_num_norm() {
+    local v="$1"
+    case "$v" in ''|*[!0-9]*) return 1 ;; esac
+    [ "${#v}" -le "$2" ] || return 1
+    while :; do case "$v" in 0?*) v="${v#0}" ;; *) break ;; esac; done
+    printf '%s' "$v"
+}
+
+# _port_norm V -> V as a port (1..65535), or fails
+_port_norm() {
+    local v
+    v="$(_num_norm "$1" 5)" || return 1
+    [ "$v" -ge 1 ] && [ "$v" -le 65535 ] || return 1
+    printf '%s' "$v"
+}
+
+# _cap_from NAME VALUE DEFAULT -> sets _cap to VALUE when it is 1..999999, else
+# to DEFAULT, and _cap_note to why VALUE was ignored (empty when unset or used)
+_cap_from() {
+    local v
+    _cap="$3" _cap_note=""
+    [ -n "$2" ] || return 0
+    if v="$(_num_norm "$2" 6)" && [ "$v" -ge 1 ]; then _cap="$v"; return 0; fi
+    _cap_note="$1=$(_quote_nl "$2") ignored (not a number 1..999999), using $3"
+}
+
+# _conf_vals KEY FILE... -> the raw values of KEY= in FILEs, one per line
+_conf_vals() {
+    local k="$1"; shift
+    [ "$#" -gt 0 ] || return 0
+    awk -F= -v k="$k" '{ gsub(/[ \t\r]/, "") } $1 == k && $2 != "" { print $2 }' "$@" 2>/dev/null
+}
+
+# _registry_vals FILE -> the raw first field of each port registry line
+_registry_vals() { [ -r "$1" ] && awk 'NF { print $1 }' "$1" 2>/dev/null; return 0; }
+
+# _ports_add LABEL <<VALUES -> the valid ports among VALUES (one per line) join
+# _pl, and "; PORTS (LABEL)" joins _plab; refused values join _pbad
+_ports_add() {
+    local v n got=""
+    while IFS= read -r v; do
+        [ -n "$v" ] || continue
+        if n="$(_port_norm "$v")"; then
+            case " $got " in *" $n "*) ;; *) got="${got:+$got }$n" ;; esac
+        else _pbad="${_pbad:+$_pbad; }$(_quote_nl "$v") ($1)"; fi
+    done
+    [ -n "$got" ] && { _pl="$_pl $got"; _plab="$_plab; $got ($1)"; }
+    return 0
+}
+
+# _uniq_ports PORT... -> the distinct ports, space-joined (validated numbers only)
+_uniq_ports() { [ "$#" -gt 0 ] || return 0; printf '%s\n' "$@" | sort -un | tr '\n' ' ' | sed 's/ $//'; }
+
+# _net_ports -> sets _udp_ports / _tcp_ports to the ports the readable whatap
+# ini files name, or 6600 when none names one, and states which it used
+_net_ports() {
+    local f
+    set --
+    while IFS= read -r f; do [ -n "$f" ] && [ -r "$f" ] && set -- "$@" "$f"; done <<EOF
+$(printf '%s\n' "$D_INI_FILES" | tr '|' '\n' | grep -v '^$' | sort -u)
+EOF
+    # the 66xx range is always matched: an agent on a port no readable ini
+    # names (a non-root run, a non-default port) still shows
+    _pl="" _plab="" _pbad=""
+    _ports_add "whatap.net_udp_port in $# readable whatap ini file(s)" <<EOF
+$(_conf_vals whatap.net_udp_port "$@")
+EOF
+    # shellcheck disable=SC2086  # validated port numbers only
+    _pl="$(_uniq_ports $_pl)"
+    _udp_ports="66[0-9][0-9] $_pl" _udp_label="66xx${_pl:+ $_pl}"
+    fact "udp port filter: 66xx (range)$_plab"
+    [ -n "$_pbad" ] && fact "udp port values ignored (not a port 1..65535): $_pbad"
+    _pl="" _plab="" _pbad=""
+    _ports_add "whatap.server.port in $# readable whatap ini file(s)" <<EOF
+$(_conf_vals whatap.server.port "$@")
+EOF
+    # shellcheck disable=SC2086
+    _pl="$(_uniq_ports 6600 $_pl)"
+    _tcp_ports="$_pl" _tcp_label="$_pl"
+    fact "tcp port filter: 6600$_plab"
+    [ -n "$_pbad" ] && fact "tcp port values ignored (not a port 1..65535): $_pbad"
+}
+# _sock_list TOOL FLAGS PORTS -> the socket table lines naming whatap or one of
+# PORTS (space-separated), header kept, first 50; exits with TOOL's status
+_sock_list() {
+    local pat rc
+    pat=":($(printf '%s' "$3" | tr -s ' ' '|' | sed 's/^|//; s/|$//'))([^0-9]|\$)"
+    "$1" "$2" > "$(_tmp sock.out)"; rc=$?
+    awk -v p="$pat" '(NR <= 2 && /State|Proto|Recv-Q/) || /whatap/ || $0 ~ p' "$(_tmp sock.out)" 2>/dev/null | head -n 50
+    return "$rc"
+}
+
+# _nonblank_head FILE N -> FILE without blank and ;-comment lines, first N;
+# no such line is an empty answer, not a failure
+_nonblank_head() {
+    grep -vE '^[[:space:]]*(;|$)' "$1" > "$(_tmp nb.out)"
+    [ $? -le 1 ] || return 2
+    head -n "$2" "$(_tmp nb.out)"
+}
+
+# _mods_count HOME / _mods_names HOME -> the shipped tracer modules per arch
+_mods_count() {
+    local d
+    for d in "$1"/modules/*; do
+        [ -d "$d" ] && printf '%s: %s files\n' "${d##*/}" "$(ls "$d" 2>/dev/null | wc -l | tr -d ' ')"
+    done
+}
+_mods_names() { ls "$1"/modules/*/ 2>/dev/null | tr '\n' ' ' | cut -c1-1200; }
+
+# _resolve_goals -> resolve `agent` and `conf` once. An absence is `na` only
+# when every input behind it was read: an unreadable environ/cwd/exe or maps,
+# hidepid, a blocked home path or a php -i that did not run makes it `missed`.
+# conf is the whatap ini the tracer and the agent both read (section 7), not a
+# whatap.conf.
+_resolve_goals() {
+    local h src fs why homes_seen=0 so=0 blocked="" absent="" unres="" gaps agaps ph aph pr _t edu="" d p inis=0 iniread=0 iniblk=""
+    while IFS='|' read -r h src; do
+        [ -n "$h" ] || continue
+        if ! fs="$(resolve_fs "$h")"; then
+            why="$(_absent_why "$h" "$src")"
+            case "$why" in
+                permission*) blocked="$blocked; $h ($why)" ;;
+                relative*|"not resolved"*) unres="$unres; $h ($why)" ;;
+                *)           absent="$absent; $h ($why)" ;;
+            esac
+            continue
+        fi
+        homes_seen=1
+    done <<EOF
+$D_HOMES
+EOF
+    while IFS='|' read -r d src; do
+        [ -n "$d" ] || continue
+        fs="$(resolve_fs "$d")" || continue
+        if [ ! -x "$fs" ]; then
+            case " $edu " in *" $fs "*) ;; *) edu="$edu $fs" ;; esac
+            continue
+        fi
+        [ -e "$fs/whatap.so" ] && so=1
+    done <<EOF
+$D_EXT_DIRS
+EOF
+    while IFS= read -r p; do
+        [ -n "$p" ] || continue
+        inis=$((inis + 1))
+        if [ -r "$p" ]; then iniread=1; else iniblk="$iniblk; $p (permission denied)"; fi
+    done <<EOF
+$(printf '%s\n' "$D_INI_FILES" | tr '|' '\n' | grep -v '^$' | sort -u)
+EOF
+    blocked="${blocked#; }" absent="${absent#; }" iniblk="${iniblk#; }"
+    gaps="$(_scan_gaps)" agaps="$(_scan_gaps maps)"
+    unres="${unres#; }"
+    [ -n "$unres" ] && gaps="${gaps:+$gaps; }home candidate(s) not resolved: $unres"
+    [ -n "$unres" ] && agaps="${agaps:+$agaps; }home candidate(s) not resolved: $unres"
+    ph=""; [ -n "$blocked$iniblk$D_UNREAD$D_HIDEPID$D_DIR_UNREAD" ] && ph="$(_priv_hint)"
+    [ -n "$edu" ] && agaps="${agaps:+$agaps; }extension_dir not readable by uid $(id -u 2>/dev/null || echo '?'):$edu"
+    aph="$ph"; [ -n "$D_MAPS_UNREAD$edu" ] && aph="$(_priv_hint)"
+    [ -n "$D_PHPI_FAIL" ] && gaps="${gaps:+$gaps; }php -i did not run for:$D_PHPI_FAIL" \
+        && agaps="${agaps:+$agaps; }php -i did not run for:$D_PHPI_FAIL"
+    [ -n "$D_SCAN_UNRES" ] && gaps="${gaps:+$gaps; }relative ini scan dir or parsed ini, not resolved (no readable cwd of a process of that binary):$D_SCAN_UNRES"
+    if [ -n "$_php_unprobed_live" ]; then
+        _t="$(printf '%s' "$_php_unprobed_live" | grep -c .) php binary(ies) of running processes not probed (cap $D_PHP_CAP; set APM_INTERP_CAP=<n> in the environment to raise it): $(printf '%s' "$_php_unprobed_live" | tr '\n' ' ')"
+        gaps="${gaps:+$gaps; }$_t" agaps="${agaps:+$agaps; }$_t"
+    fi
+    [ -n "$D_ODD" ] && gaps="${gaps:+$gaps; }path(s) with a newline or '|', not followed:$D_ODD" \
+        && agaps="${agaps:+$agaps; }path(s) with a newline or '|', not followed:$D_ODD"
+    if [ "${_php_probed:-0}" -lt "${_php_total:-0}" ]; then pr="${_php_probed:-0} of $_php_total php runtime(s) probed with php -i (cap $D_PHP_CAP; the others run no live process)"
+    else pr="all ${_php_total:-0} php runtime(s) probed with php -i"; fi
+
+    if [ "$homes_seen" = 1 ] || [ "$so" = 1 ] || [ "$inis" -gt 0 ] || [ -n "$D_PHPINI_WHATAP" ] \
+       || [ -n "$D_SERVICE_FILES" ] || [ -n "$D_AGENT_PIDS" ]; then
+        got agent
+    elif [ -n "$blocked" ] || [ -n "$agaps" ]; then
+        missed agent "no whatap home, whatap.so, whatap ini or service file found in what this uid could read: ${blocked:+$blocked; }$agaps$aph"
+    else
+        na agent "no whatap home, whatap.so, whatap ini, service file or whatap_php process in the collector env, $D_DEFAULT_HOME, the known ini and unit paths, $pr, or the maps of $(echo $D_WEB_PIDS $D_ALT_PIDS | wc -w | tr -d ' ') web/php process(es)${D_MAPS_UNREAD:+ ($(echo $D_MAPS_UNREAD | wc -w | tr -d ' ') of them with maps not readable by uid $(id -u 2>/dev/null || echo '?'))}${absent:+; home candidate(s): $absent}"
+    fi
+
+    if [ "$iniread" = 1 ] || [ -n "$D_PHPINI_WHATAP" ]; then got conf
+    elif [ -n "$iniblk" ]; then missed conf "whatap ini not readable: $iniblk$ph"
+    elif [ -n "$gaps" ]; then missed conf "no whatap ini found in what this uid could read: $gaps$ph"
+    else na conf "no whatap ini in the known ini locations, the ini scan dirs ($pr), the agent home(s), or a php.ini carrying whatap lines"; fi
 }
 
 # ---- report body ---------------------------------------------------------------
@@ -937,7 +1320,8 @@ run_report() {
     # [1] capability preamble: every downstream "command not found" is
     # pre-explained here.
     section "Collection environment"
-    fact "bash: ${BASH_VERSION:-unknown}"
+    if [ -n "${BASH_VERSION:-}" ]; then fact "shell: bash $BASH_VERSION"
+    else fact "shell: POSIX sh (non-bash)"; fi
     fact "uid: $(id -u 2>/dev/null || echo unknown) ($(id -un 2>/dev/null || echo unknown))"
     _note_privilege
     fact "privilege: $PRIV_WHY"
@@ -956,7 +1340,8 @@ run_report() {
     probe "kernel" uname -srm
     probe "machine arch" uname -m
     read_proc "os-release" /etc/os-release
-    probe "libc" sh -c "ldd --version 2>&1 | head -n 1"
+    if have ldd; then probe "libc" sh -c "ldd --version 2>&1 | head -n 1"
+    else fact "libc: n/a (command not found: ldd)"; fi
     probe "cpu count (nproc)" nproc
     fact "memory:"
     grep -E '^(MemTotal|MemAvailable)' /proc/meminfo 2>/dev/null | while IFS= read -r _l; do printf '        %s\n' "$_l"; done
@@ -979,17 +1364,30 @@ run_report() {
     # [3] PHP runtimes: one block per distinct binary. `php -i` is executed
     # once per binary and every field below is extracted from that capture.
     section "PHP runtimes and SAPIs"
-    fact "php binaries discovered: $(echo $D_PHP_BINS | wc -w | tr -d ' ')"
+    fact "php binaries discovered: $(printf '%s\n' "$D_PHP_BINS" | grep -c .)"
     if [ -z "$D_PHP_BINS" ]; then
         fact "   none on PATH, in the known per-version install paths (distro, Sury, Remi, SCL, cPanel EA, Plesk, alt-php, LiteSpeed, source builds), or among running processes"
     fi
-    local _n=0 php
-    for php in $D_PHP_BINS; do
+    local _n=0 php _mods=""
+    _php_probed=0 _php_unprobed_live=""
+    _php_total="$(printf '%s\n' "$D_PHP_BINS" | grep -c .)"
+    [ -n "$D_CAP_NOTE" ] && fact "$D_CAP_NOTE"
+    # newline-split, no globbing; fd 9 so a probe reading stdin cannot eat it
+    while IFS= read -r php <&9; do
+        [ -n "$php" ] || continue
         _n=$((_n + 1))
-        if [ "$_n" -gt 10 ]; then
-            fact "-- more php binaries found but not detailed (cap: 10): $(echo $D_PHP_BINS | tr ' ' '\n' | tail -n +11 | tr '\n' ' ')"
+        if [ "$_n" -gt "$D_PHP_CAP" ]; then
+            fact "-- more php binaries found but not detailed (cap: $D_PHP_CAP): $(printf '%s\n' "$D_PHP_BINS" | tail -n +"$_n" | tr '\n' ' ')"
+            # one that runs a live process is an input this run did not read
+            while IFS= read -r _l; do
+                [ -n "$_l" ] || continue
+                case "$_nl$D_PHP_LIVE" in *"$_nl$_l|"*) _php_unprobed_live="$_php_unprobed_live$_l$_nl" ;; esac
+            done <<EOF
+$(printf '%s\n' "$D_PHP_BINS" | tail -n +"$_n")
+EOF
             break
         fi
+        _php_probed=$_n
         fact "-- php binary: $php"
         fact "   resolves to: $(readlink -f "$php" 2>/dev/null || echo "$php")"
         php_run "   version" "$php" -v
@@ -1010,43 +1408,86 @@ run_report() {
             _f_ts="$(grep '^Thread Safety =>' "$_infofile" 2>/dev/null | head -n1 | sed 's/.*=> *//')"
             _f_ed="$(grep '^extension_dir =>' "$_infofile" 2>/dev/null | head -n1 | sed 's/.*=> *//; s/ *=>.*//')"
             _f_sd="$(grep '^Scan this dir for additional' "$_infofile" 2>/dev/null | head -n1 | sed 's/.*=> *//')"
+            # PHP built without a scan dir prints "(none)": no scan dir is configured
+            case "$_f_sd" in "(none)"|"no value") _f_sd="" ;; esac
+            case "$_f_ed" in "(none)"|"no value") _f_ed="" ;; esac
+            case "$_f_ed" in *"|"*) D_ODD="$D_ODD \"$_f_ed\""; _f_ed="" ;; esac
             if grep -q '^whatap\.' "$_infofile" 2>/dev/null; then _f_ld="yes"; else _f_ld="no"; fi
             _f_wn="$( { grep -h 'Unable to load dynamic library' "$_infofile" "$_errfile" | head -n1 | cut -c1-200 ; } 2>/dev/null )"
             [ -n "$_f_wn" ] || _f_wn="none in the php -i output"
+            # a relative scan dir entry is relative to the cwd of the PHP
+            # process; resolved through a live process of this binary, else
+            # recorded as not resolved
+            _f_sdr="" _ppid=""
+            case "$_nl$D_PHP_LIVE" in *"$_nl$php|"*) _ppid="${D_PHP_LIVE#*"$php|"}"; _ppid="${_ppid%%"$_nl"*}" ;; esac
+            # split on ':' only, never globbed: each entry is read as a line.
+            # An entry holding '|' (the record delimiter) is refused.
+            while IFS= read -r _d; do
+                [ -n "$_d" ] || continue
+                case "$_d" in *"|"*) D_ODD="$D_ODD \"$_d\""; continue ;; esac
+                case "$_d" in
+                    /*) ;;
+                    *) if [ -n "$_ppid" ] && _a="$(_abs_for_pid "$_ppid" "$_d")"; then _d="$_a"
+                       else D_SCAN_UNRES="$D_SCAN_UNRES $php: $_d;"; fi ;;
+                esac
+                _f_sdr="${_f_sdr:+$_f_sdr:}$_d"
+            done <<EOF
+$(printf '%s' "$_f_sd" | tr ':' '\n')
+EOF
+            # the record is '|'-separated; the shown scan dir keeps its '|' as \001
             D_PHP_FACTS="$D_PHP_FACTS
-$php|$_f_ver|$_f_sapi|$_f_api|$_f_ts|$_f_ed|$_f_sd|$_f_ld|$_f_wn"
+$php|$_f_ver|$_f_sapi|$_f_api|$_f_ts|$_f_ed|$(printf '%s' "$_f_sd" | tr '|' '\001')|$_f_sdr|$_f_ld|$_f_wn"
             _add_ext_dir "$_f_ed" "php -i of $php"
             # ini files this binary parses, and the whatap ini its own scan dir
             # would hold — discovered per runtime, not guessed from a path list
             grep -E '^(Loaded Configuration File|Additional \.ini files parsed) =>' "$_infofile" 2>/dev/null \
                 | sed 's/^[^=]*=> *//' | tr ',' '\n' | sed 's/^ *//; s/ *$//' \
-                | grep -i whatap > "$_errfile.ini" 2>/dev/null
-            if [ -s "$_errfile.ini" ]; then
-                while IFS= read -r _p; do _add_ini "$_p"; done < "$_errfile.ini"
+                | grep -i whatap > "$(_tmp ini.list)" 2>/dev/null
+            # _tmp gives /dev/null when there is no private dir: nothing to read back
+            # a relative entry follows the scan-dir rule: resolved through a
+            # live process of this binary, never against the collector's cwd
+            if [ "$(_tmp ini.list)" != /dev/null ] && [ -s "$(_tmp ini.list)" ]; then
+                while IFS= read -r _p; do
+                    case "$_p" in
+                        /*) _add_ini "$_p" ;;
+                        *) if [ -n "$_ppid" ] && _a="$(_abs_for_pid "$_ppid" "$_p")"; then _add_ini "$_a"
+                           else D_SCAN_UNRES="$D_SCAN_UNRES $php: parsed ini $_p;"; fi ;;
+                    esac
+                done < "$(_tmp ini.list)"
             fi
-            rm -f "$_errfile.ini" 2>/dev/null
-            case "$_f_sd" in
-                /*) for _p in "$_f_sd"/whatap.ini "$_f_sd"/*whatap*.ini; do _add_ini "$_p"; done ;;
-            esac
+            # the scan dir may list several directories, colon-separated
+            # (PHP_INI_SCAN_DIR), and may be seen through a process root
+            while IFS= read -r _d; do
+                case "$_d" in /*) ;; *) continue ;; esac   # recorded in D_SCAN_UNRES
+                # a scan dir this uid cannot list hides its ini files: a gap,
+                # not an empty dir
+                _fd="$(resolve_fs "$_d")" || continue
+                if [ ! -r "$_fd" ] || [ ! -x "$_fd" ]; then
+                    case " $D_DIR_UNREAD " in *" $_fd "*) ;; *) D_DIR_UNREAD="$D_DIR_UNREAD $_fd" ;; esac
+                    continue
+                fi
+                for _p in "$_d"/whatap.ini "$_d"/*whatap*.ini; do _add_ini "$_p"; done
+            done <<EOF
+$(printf '%s' "$_f_sdr" | tr ':' '\n')
+EOF
         else
             fact "   php -i: n/a ($(_classify_err))"
+            D_PHPI_FAIL="$D_PHPI_FAIL $php"
             D_PHP_FACTS="$D_PHP_FACTS
-$php|||||||no|php -i did not run"
+$php||||||||no|php -i did not run"
         fi
         php_run "   extensions loaded (php -m)" "$php" -m
-    done
-    # co-resident tracers and profilers: they occupy the same hook surface
+        # co-resident tracers and profilers, from the module list just taken
+        _o="$(printf '%s\n' "$_php_out" | grep -iE 'newrelic|datadog|ddtrace|elastic|opentelemetry|otel|tideways|blackfire|xdebug|xhprof|pinpoint|scoutapm|instana' | tr '\n' ' ')"
+        [ -n "$_o" ] && _mods="$_mods$(printf '        %-40s %s' "$php" "$_o")$_nl"
+    done 9<<EOF
+$D_PHP_BINS
+EOF
+    # they occupy the same hook surface
     fact "other APM / profiler extensions among the loaded module lists above:"
-    _other=""
-    for php in $D_PHP_BINS; do
-        [ -x "$php" ] || continue
-        _o="$( { "$php" -m | grep -iE 'newrelic|datadog|ddtrace|elastic|opentelemetry|otel|tideways|blackfire|xdebug|xhprof|pinpoint|scoutapm|instana' | tr '\n' ' ' ; } 2>/dev/null )"
-        [ -n "$_o" ] && printf '        %-40s %s\n' "$php" "$_o" && _other="y"
-    done
-    [ -z "$_other" ] && fact "   none found (searched: newrelic, datadog/ddtrace, elastic, opentelemetry, tideways, blackfire, xdebug, xhprof, pinpoint, scoutapm, instana)"
-    # on a multi-version host, `php` on PATH is usually a managed symlink —
-    # install.sh resolved whichever version it pointed to at install time
-    fact "what the php commands on PATH resolve to (usually a managed symlink):"
+    if [ -n "$_mods" ]; then printf '%s' "$_mods"
+    else fact "   none found (searched: newrelic, datadog/ddtrace, elastic, opentelemetry, tideways, blackfire, xdebug, xhprof, pinpoint, scoutapm, instana)"; fi
+    fact "what the php commands on PATH resolve to:"
     for c in php php-fpm php-cgi; do
         p="$(command -v "$c" 2>/dev/null)"
         if [ -n "$p" ]; then printf '        %-10s %s -> %s\n' "$c" "$p" "$(readlink -f "$p" 2>/dev/null || echo 'n/a (unresolvable)')"
@@ -1088,17 +1529,19 @@ $php|||||||no|php -i did not run"
     [ "$_found" = 0 ] && fact "   none found in the known php-fpm config locations"
     for p in /etc/php-fpm.d/www.conf /etc/php/*/fpm/pool.d/www.conf /usr/local/etc/php-fpm.d/www.conf /etc/php[0-9]*/php-fpm.d/www.conf; do
         [ -f "$p" ] || continue
-        probe "   pool settings in $p" sh -c "grep -vE '^[[:space:]]*(;|$)' '$p' | head -n 60"
+        probe "   pool settings in $p" _nonblank_head "$p" 60
     done
     if have nginx; then probe "nginx version" sh -c "nginx -v 2>&1 | head -n 2"
     else fact "nginx version: n/a (command not found: nginx)"; fi
     # one FPM service per PHP version is the usual multi-version layout
-    probe "systemd php-fpm units" sh -c "systemctl list-units --all --type=service --no-pager --no-legend 'php*' 2>/dev/null | head -n 20"
+    if have systemctl; then probe "systemd php-fpm units" _head_of 20 systemctl list-units --all --type=service --no-pager --no-legend 'php*'
+    else fact "systemd php-fpm units: n/a (command not found: systemctl)"; fi
     fact "web / php processes found: $(echo $D_WEB_PIDS | wc -w | tr -d ' ')"
     _shown=0
     for pid in $D_WEB_PIDS; do
         _shown=$((_shown + 1))
         [ "$_shown" -gt 20 ] && { fact "-- remaining processes not detailed (cap: 20)"; break; }
+        [ -d "/proc/$pid" ] || { printf '        -- pid %s: n/a (process exited)\n' "$pid"; continue; }
         printf '        -- pid %s (ppid %s) comm=%s uid=%s\n' "$pid" \
             "$(awk '/^PPid:/{print $2}' "/proc/$pid/status" 2>/dev/null)" \
             "$(cat "/proc/$pid/comm" 2>/dev/null)" \
@@ -1107,10 +1550,11 @@ $php|||||||no|php -i did not run"
         printf '           exe: %s\n' "$(_link_target "/proc/$pid/exe" || echo 'n/a (unresolvable: exited, zombie, or permission denied)')"
     done
     if [ -z "$D_ALT_PIDS" ]; then
-        fact "persistent-worker PHP runtimes (swoole/octane/roadrunner/frankenphp/workerman/php-pm): none found by comm or cmdline"
+        fact "persistent-worker PHP runtimes (swoole/octane/roadrunner/frankenphp/workerman/php-pm): none found by executable, or by command line of a PHP executable"
     else
-        fact "persistent-worker PHP runtimes found (per-request extension hooks do not bound their request cycle the same way):"
+        fact "persistent-worker PHP runtimes found:"
         for pid in $D_ALT_PIDS; do
+            [ -d "/proc/$pid" ] || { printf '        -- pid %s: n/a (process exited)\n' "$pid"; continue; }
             printf '        -- pid %s comm=%s\n' "$pid" "$(cat "/proc/$pid/comm" 2>/dev/null)"
             printf '           cmdline: %s\n' "$(_proc_cmd "$pid")"
             printf '           cwd: %s\n' "$(_link_target "/proc/$pid/cwd" || echo 'n/a (unresolvable: exited, zombie, or permission denied)')"
@@ -1119,20 +1563,23 @@ $php|||||||no|php -i did not run"
 
     # [5] the agent package as it sits on disk
     section "WhaTap PHP agent installation on disk"
-    fact "env WHATAP_HOME (collector shell): ${WHATAP_HOME:-not set}"
+    fact "env WHATAP_HOME (collector shell): $(_quote_nl "${WHATAP_HOME:-not set}")"
+    [ -n "$D_ODD" ] && fact "path(s) with a newline or '|', not followed:$D_ODD"
+    [ -n "$D_GONE" ] && printf '%s' "$D_GONE" | while IFS= read -r _l; do [ -n "$_l" ] && fact "relative WHATAP_HOME of a process that exited, not resolved: $_l"; done
     if [ -z "$D_HOMES" ]; then
-        fact "agent home candidates: none discovered (env, $D_DEFAULT_HOME, process scan all empty)"
+        if [ -n "$D_ODD_HOME" ]; then fact "agent home candidates: none followed (the refused paths are listed above)"
+        else fact "agent home candidates: none discovered (env, $D_DEFAULT_HOME, process scan all empty)"; fi
     else
         fact "agent home candidates discovered:"
         printf '%s\n' "$D_HOMES" | while IFS='|' read -r _p _s; do printf '        %s   <- %s\n' "$_p" "$_s"; done
     fi
-    printf '%s\n' "$D_HOMES" | cut -d'|' -f1 | sort -u | while IFS= read -r home; do
+    printf '%s\n' "$D_HOMES" | while IFS='|' read -r home _src; do
         [ -n "$home" ] || continue
         fshome="$(resolve_fs "$home")"
-        if [ -z "$fshome" ]; then fact "-- home $home: n/a (path not visible from this mount namespace)"; continue; fi
+        if [ -z "$fshome" ]; then fact "-- home $home: n/a ($(_absent_why "$home" "$_src"))"; continue; fi
         fact "-- home: $home"
         [ "$fshome" != "$home" ] && fact "   filesystem view: $fshome (read through a process root)"
-        probe "   listing" sh -c "ls -la '$fshome' 2>/dev/null | head -n 40"
+        probe "   listing" _ls_head "$fshome" 40
         for b in whatap_php whatap_php_static; do
             file_facts "   agent binary $b" "$fshome/$b"
         done
@@ -1156,15 +1603,15 @@ $php|||||||no|php -i did not run"
             else fact "   php version -> PHP API map: n/a (no get_php_api_version block in $fshome/install.sh)"; fi
         fi
         if [ -d "$fshome/modules" ]; then
-            probe "   shipped tracer modules per arch (count)" sh -c "for d in '$fshome'/modules/*; do [ -d \"\$d\" ] && echo \"\$(basename \$d): \$(ls \$d 2>/dev/null | wc -l | tr -d ' ') files\"; done"
-            probe "   shipped tracer modules (names)" sh -c "ls '$fshome'/modules/*/ 2>/dev/null | tr '\n' ' ' | cut -c1-1200"
+            probe "   shipped tracer modules per arch (count)" _mods_count "$fshome"
+            probe "   shipped tracer modules (names)" _mods_names "$fshome"
         else
             fact "   modules dir: n/a (path not found: $fshome/modules)"
         fi
-        [ -d "$fshome/lib/Whatap" ] && probe "   bundled PHP API helpers" sh -c "ls '$fshome/lib/Whatap' 2>/dev/null" \
+        [ -d "$fshome/lib/Whatap" ] && probe "   bundled PHP API helpers" ls -- "$fshome/lib/Whatap" \
             || fact "   bundled PHP API helpers (lib/Whatap): absent"
     done
-    fact "package manager records (the Alpine tarball install leaves none by design):"
+    fact "package manager records:"
     if have rpm; then probe "   rpm -q whatap-php" sh -c "rpm -q whatap-php 2>&1 | head -n 3"
     else fact "   rpm: n/a (command not found: rpm)"; fi
     if have dpkg; then probe "   dpkg -l whatap-php" sh -c "dpkg -l whatap-php 2>&1 | tail -n 3"
@@ -1179,7 +1626,7 @@ $php|||||||no|php -i did not run"
     if [ -z "$D_PHP_FACTS" ]; then
         fact "no PHP runtime was detailed in section 3; only the extension_dir view below applies"
     else
-        printf '%s\n' "$D_PHP_FACTS" | grep -v '^$' | while IFS='|' read -r _p _v _sapi _api _ts _ed _sd _ld _wn; do
+        printf '%s\n' "$D_PHP_FACTS" | grep -v '^$' | while IFS='|' read -r _p _v _sapi _api _ts _ed _sd _sdr _ld _wn; do
             [ -n "$_p" ] || continue
             fact "-- runtime: $_p"
             fact "   PHP ${_v:-n/a}, SAPI ${_sapi:-n/a}, PHP API ${_api:-n/a}, Thread Safety ${_ts:-n/a}"
@@ -1187,7 +1634,9 @@ $php|||||||no|php -i did not run"
                 fact "   extension_dir: $_ed"
                 fsd="$(resolve_fs "$_ed")"
                 if [ -z "$fsd" ]; then
-                    fact "   whatap.so there: n/a (extension_dir not visible from this mount namespace)"
+                    fact "   whatap.so there: n/a ($(_absent_why "$_ed"))"
+                elif [ ! -x "$fsd" ]; then
+                    fact "   whatap.so there: n/a (permission denied: $fsd)"
                 elif [ -e "$fsd/whatap.so" ]; then
                     fact "   whatap.so there: $(ls -l "$fsd/whatap.so" 2>/dev/null)"
                     _t="$(readlink -f "$fsd/whatap.so" 2>/dev/null)"
@@ -1202,14 +1651,26 @@ $php|||||||no|php -i did not run"
                 fact "   extension_dir: n/a (php -i reported none)"
             fi
             if [ -n "$_sd" ]; then
-                fact "   ini scan dir: $_sd"
-                _i="$(ls "$_sd"/*whatap*.ini 2>/dev/null | tr '\n' ' ')"
-                if [ -n "$_i" ]; then fact "   whatap ini in that scan dir: $_i"
-                else fact "   whatap ini in that scan dir: n/a (no *whatap*.ini in $_sd)"; fi
+                fact "   ini scan dir: $(printf '%s' "$_sd" | tr '\001' '|')"
+                # one line per entry, absolute or not (refused entries are
+                # listed with the other refused paths)
+                while IFS= read -r _d; do
+                    [ -n "$_d" ] || continue
+                    case "$_d" in /*) ;; *) fact "   -- $_d: n/a (relative scan dir, not resolved)"; continue ;; esac
+                    _fd="$(resolve_fs "$_d")" || { fact "   -- $_d: n/a ($(_absent_why "$_d"))"; continue; }
+                    if [ ! -r "$_fd" ] || [ ! -x "$_fd" ]; then fact "   -- $_d: n/a (permission denied: $_fd)"; continue; fi
+                    _i=""
+                    for _q in "$_fd"/*whatap*.ini; do [ -f "$_q" ] && _i="$_i $_q"; done
+                    if [ -n "$_i" ]; then fact "   -- $_d: whatap ini:$_i"
+                    else fact "   -- $_d: no *whatap*.ini"; fi
+                done <<EOF
+$(printf '%s' "$_sdr" | tr ':' '\n')
+EOF
+
             else
-                fact "   ini scan dir: n/a (php -i reported none — the installer then writes into php.ini itself)"
+                fact "   ini scan dir: none configured (php -i reports none)"
             fi
-            fact "   whatap.* directives registered in this runtime (module loaded at startup): $_ld"
+            fact "   whatap.* directives registered in this runtime: $_ld"
             fact "   dynamic-library load message: $_wn"
         done
     fi
@@ -1229,7 +1690,7 @@ $php|||||||no|php -i did not run"
             [ -n "$_d" ] || continue
             case "$D_PHP_FACTS" in *"|$_d|"*) continue ;; esac
             fsd="$(resolve_fs "$_d")"
-            if [ -z "$fsd" ]; then fact "-- extension_dir $_d (no runtime reported it): n/a (path not visible from this mount namespace)"; continue; fi
+            if [ -z "$fsd" ]; then fact "-- extension_dir $_d (no runtime reported it): n/a ($(_absent_why "$_d"))"; continue; fi
             fact "-- extension_dir $_d (no runtime reported it):"
             if [ -e "$fsd/whatap.so" ]; then
                 file_facts "   whatap.so" "$fsd/whatap.so"
@@ -1246,18 +1707,19 @@ $php|||||||no|php -i did not run"
             printf '        %s\n' "$(ls -l "$p" 2>/dev/null)"
         done
     fi
-    fact "php.ini files carrying whatap lines (the installer's fallback when PHP reports no ini scan dir):"
+    fact "php.ini files carrying whatap lines:"
     _hit=0
     for p in /etc/php.ini /etc/php/*/*/php.ini /etc/php[0-9]*/php.ini /usr/local/etc/php/php.ini /usr/local/lib/php.ini /opt/remi/php*/root/etc/php.ini; do
         [ -f "$p" ] || continue
         _c="$(grep -c -i whatap "$p" 2>/dev/null)"
         [ "${_c:-0}" -gt 0 ] || continue
         _hit=1
+        D_PHPINI_WHATAP="$D_PHPINI_WHATAP $p"
         fact "   -- $p (${_c} whatap line(s)):"
         grep -n -i whatap "$p" 2>/dev/null | head -n 30 | while IFS= read -r _l; do printf '           %s\n' "$_l"; done
     done
     [ "$_hit" = 0 ] && fact "   none found"
-    fact "ini directory trees present (per-version and per-SAPI trees are separate: a file in one tree is not read by another):"
+    fact "ini directory trees present:"
     _hit=0
     for d in /etc/php.d /etc/php/*/cli/conf.d /etc/php/*/fpm/conf.d /etc/php/*/apache2/conf.d /etc/php/*/mods-available \
              /etc/php[0-9]*/conf.d /usr/local/etc/php/conf.d \
@@ -1272,20 +1734,29 @@ $php|||||||no|php -i did not run"
     [ "$_hit" = 0 ] && fact "   none of the known ini tree paths exist on this host"
     fact "live load status — whatap module mapped into running processes (from /proc/<pid>/maps):"
     _any=0
+    _nread=0
     for pid in $D_WEB_PIDS $D_ALT_PIDS; do
-        if cat "/proc/$pid/maps" >/dev/null 2>&1; then
-            _m="$(awk '$NF ~ /whatap/ {print $NF}' "/proc/$pid/maps" 2>/dev/null | sort -u | tr '\n' ' ')"
-            if [ -n "$_m" ]; then
+        # access(2) says maps is readable even when opening it is refused
+        # (ptrace access check), so the read itself is the test
+        if _m="$(awk '$NF ~ /whatap/ {print $NF}' "/proc/$pid/maps" 2>/dev/null)"; then
+            _nread=$((_nread + 1))
+            _m="$(printf '%s\n' "$_m" | sort -u | tr '\n' ' ')"
+            if [ -n "$_m" ] && [ "$_m" != " " ]; then
                 _any=1
                 printf '        pid %-7s comm=%-12s maps: %s\n' "$pid" "$(cat "/proc/$pid/comm" 2>/dev/null)" "$_m"
             fi
+        elif [ -e "/proc/$pid" ]; then
+            D_MAPS_UNREAD="$D_MAPS_UNREAD $pid"
         fi
     done
+    if [ -n "$D_MAPS_UNREAD" ]; then
+        fact "   maps: n/a (not readable by uid $(id -u 2>/dev/null || echo '?') for $(echo $D_MAPS_UNREAD | wc -w | tr -d ' ') process(es): $(echo $D_MAPS_UNREAD | cut -d' ' -f1-20))"
+    fi
     if [ "$_any" = 0 ]; then
         if [ -z "$D_WEB_PIDS$D_ALT_PIDS" ]; then
             fact "   no web/php processes found to inspect"
         else
-            fact "   no whatap module path present in the memory maps of the processes listed above (maps unreadable for other users' processes when not root)"
+            fact "   no whatap module path in the memory maps of the $_nread process(es) whose maps were read"
         fi
     fi
 
@@ -1299,7 +1770,7 @@ $php|||||||no|php -i did not run"
             dump_file "   content" "$p" 300
         done
     fi
-    fact "service / unit / init files written by install.sh (they carry the environment the agent starts with):"
+    fact "service / unit / init files written by install.sh:"
     if [ -z "$D_SERVICE_FILES" ]; then
         fact "   none found (searched agent home, /etc/init.d, systemd unit dirs, /etc/rc.d)"
     else
@@ -1323,30 +1794,31 @@ $php|||||||no|php -i did not run"
     _apn="$(printf '%s\n' "$D_INI_FILES" | tr '|' '\n' | grep -v '^$' | sort -u | while IFS= read -r p; do grep -h '^[[:space:]]*whatap\.app_process_name' "$p" 2>/dev/null; done | head -n1 | sed 's/.*= *//')"
     if [ -n "$_apn" ]; then
         fact "whatap.app_process_name configured value: $_apn"
-        fact "processes whose comm matches that value right now: $(ls /proc 2>/dev/null | grep -E '^[0-9]+$' | while read -r p; do cat "/proc/$p/comm" 2>/dev/null; done | grep -c "^${_apn}$")"
+        fact "processes whose comm matches that value right now: $(_proc_table | awk -F'\037' -v n="$_apn" '$2 == n' | wc -l | tr -d ' ')"
     else
         fact "whatap.app_process_name: not set in any ini file found"
     fi
     # key material: presence only, by data scope (this is not masking of a
     # dumped file — the file is not collected at all)
-    fact "agent key material files (content not collected — data scope: encryption key material):"
+    fact "agent key material files (content not collected: key material):"
     [ -z "$D_HOMES" ] && fact "   n/a (no agent home discovered)"
-    printf '%s\n' "$D_HOMES" | cut -d'|' -f1 | sort -u | while IFS= read -r home; do
+    printf '%s\n' "$D_HOMES" | while IFS='|' read -r home _src; do
         [ -n "$home" ] || continue
-        fshome="$(resolve_fs "$home")" || continue
+        fshome="$(resolve_fs "$home")" || { fact "   -- home $home: n/a ($(_absent_why "$home" "$_src"))"; continue; }
         for f in security.conf paramkey.txt; do
-            if [ -e "$fshome/$f" ]; then printf '        %s\n' "$(ls -l "$fshome/$f" 2>/dev/null)"
-            else printf '        %-46s absent\n' "$fshome/$f"; fi
+            if [ -e "$fshome/$f" ]; then printf '        %s: present, %s bytes\n' "$fshome/$f" "$(wc -c < "$fshome/$f" 2>/dev/null | tr -d ' ')"
+            else printf '        %s: absent\n' "$fshome/$f"; fi
         done
     done
 
     # [8] the agent process and its channels
     section "Agent process, service state and channels"
     if [ -z "$D_AGENT_PIDS" ]; then
-        fact "whatap_php processes: none found in /proc (comm is capped at 15 chars, so the musl build appears as whatap_php_stat)"
+        fact "whatap_php processes: none found in /proc (matched by comm whatap_php*)"
     else
         fact "whatap_php processes:"
         for pid in $D_AGENT_PIDS; do
+            [ -d "/proc/$pid" ] || { printf '        -- pid %s: n/a (process exited)\n' "$pid"; continue; }
             printf '        -- pid %s (ppid %s)\n' "$pid" "$(awk '/^PPid:/{print $2}' "/proc/$pid/status" 2>/dev/null)"
             printf '           comm: %s\n' "$(cat "/proc/$pid/comm" 2>/dev/null)"
             printf '           cmdline: %s\n' "$(_proc_cmd "$pid")"
@@ -1358,9 +1830,9 @@ $php|||||||no|php -i did not run"
             printf '           start time: %s\n' "$(_proc_start "$pid")"
         done
     fi
-    printf '%s\n' "$D_HOMES" | cut -d'|' -f1 | sort -u | while IFS= read -r home; do
+    printf '%s\n' "$D_HOMES" | while IFS='|' read -r home _src; do
         [ -n "$home" ] || continue
-        fshome="$(resolve_fs "$home")" || continue
+        fshome="$(resolve_fs "$home")" || { fact "pid file $home/whatap_php.pid: n/a ($(_absent_why "$home" "$_src"))"; continue; }
         if [ -f "$fshome/whatap_php.pid" ]; then
             _pid="$(cat "$fshome/whatap_php.pid" 2>/dev/null | tr -d ' \n')"
             if [ -n "$_pid" ] && [ -d "/proc/$_pid" ]; then
@@ -1372,19 +1844,25 @@ $php|||||||no|php -i did not run"
             fact "pid file $home/whatap_php.pid: n/a (path not found)"
         fi
     done
-    probe "systemd unit state (whatap-php)" sh -c "systemctl is-enabled whatap-php 2>&1; systemctl is-active whatap-php 2>&1"
-    probe "systemd unit status (first 20 lines)" sh -c "systemctl status whatap-php --no-pager 2>&1 | head -n 20"
+    if have systemctl; then
+        probe "systemd unit enabled (whatap-php)" systemctl is-enabled whatap-php
+        probe "systemd unit active (whatap-php)" systemctl is-active whatap-php
+        probe "systemd unit status (first 20 lines)" _head_of 20 systemctl status whatap-php --no-pager
+    else
+        fact "systemd unit state (whatap-php): n/a (command not found: systemctl)"
+    fi
     probe "sysv service status" sh -c "[ -x /etc/init.d/whatap-php ] && /etc/init.d/whatap-php status 2>&1 | head -n 5 || echo 'n/a (path not found: /etc/init.d/whatap-php)'"
+    _net_ports
     if have ss; then
-        probe "udp sockets (whatap or ports 66xx)" sh -c "ss -ulnp 2>/dev/null | awk 'NR==1 || /whatap/ || /:66[0-9][0-9] /' | head -n 40"
-        probe "tcp sessions (whatap or port 6600)" sh -c "ss -tnp 2>/dev/null | awk 'NR==1 || /whatap/ || /:6600/' | head -n 40"
+        probe "udp sockets (whatap-named or port $_udp_label)" _sock_list ss -uanp "$_udp_ports"
+        probe "tcp sessions (whatap-named or port $_tcp_label)" _sock_list ss -tnp "$_tcp_ports"
     elif have netstat; then
-        probe "udp sockets (whatap or ports 66xx)" sh -c "netstat -ulnp 2>/dev/null | awk 'NR<=2 || /whatap/ || /:66[0-9][0-9] /' | head -n 40"
-        probe "tcp sessions (whatap or port 6600)" sh -c "netstat -tnp 2>/dev/null | awk 'NR<=2 || /whatap/ || /:6600/' | head -n 40"
+        probe "udp sockets (whatap-named or port $_udp_label)" _sock_list netstat -uanp "$_udp_ports"
+        probe "tcp sessions (whatap-named or port $_tcp_label)" _sock_list netstat -tnp "$_tcp_ports"
     else
         fact "socket listing: n/a (command not found: ss, netstat); raw tables follow"
-        probe "raw /proc/net/udp (first 30 lines, ports in hex)" sh -c "head -n 30 /proc/net/udp"
-        probe "raw /proc/net/tcp (first 30 lines, ports in hex)" sh -c "head -n 30 /proc/net/tcp"
+        probe "raw /proc/net/udp (first 30 lines)" sh -c "head -n 30 /proc/net/udp"
+        probe "raw /proc/net/tcp (first 30 lines)" sh -c "head -n 30 /proc/net/tcp"
     fi
     # the tracer and the agent also share SysV shared memory + a semaphore;
     # install.sh removes key 6600 (0x19c8) on uninstall
@@ -1396,12 +1874,12 @@ $php|||||||no|php -i did not run"
     if [ -z "$D_HOMES" ]; then
         fact "no agent home discovered; no agent log locations to read"
     else
-        printf '%s\n' "$D_HOMES" | cut -d'|' -f1 | sort -u | while IFS= read -r home; do
+        printf '%s\n' "$D_HOMES" | while IFS='|' read -r home _src; do
             [ -n "$home" ] || continue
-            fshome="$(resolve_fs "$home")" || continue
             fact "-- home: $home"
+            fshome="$(resolve_fs "$home")" || { fact "   n/a ($(_absent_why "$home" "$_src"))"; continue; }
             if [ -d "$fshome/logs" ]; then
-                probe "   logs dir listing" sh -c "ls -la '$fshome/logs' 2>/dev/null | head -n 60"
+                probe "   logs dir listing" _ls_head "$fshome/logs" 60
                 _boot="$(ls -t "$fshome"/logs/whatap-boot-*.log 2>/dev/null | head -n 1)"
                 if [ -n "$_boot" ]; then
                     head_file "   $(basename "$_boot") (first lines: startup banner and configuration)" "$_boot" 80
@@ -1456,9 +1934,9 @@ $php|||||||no|php -i did not run"
         printf '        %-22s not set\n' "KUBERNETES_SERVICE_HOST"
     fi
     probe "self cgroup (first 5 lines)" sh -c "head -n 5 /proc/self/cgroup"
-    printf '%s\n' "$D_HOMES" | cut -d'|' -f1 | sort -u | while IFS= read -r home; do
+    printf '%s\n' "$D_HOMES" | while IFS='|' read -r home _src; do
         [ -n "$home" ] || continue
-        fshome="$(resolve_fs "$home")" || continue
+        fshome="$(resolve_fs "$home")" || { fact "container.conf in $home: n/a ($(_absent_why "$home" "$_src"))"; continue; }
         dump_file "container.conf in $home" "$fshome/container.conf" 60
     done
     for v in POD_NAME NODE_NAME POD_NAMESPACE OKIND ONAME ONODE; do
@@ -1470,18 +1948,7 @@ $php|||||||no|php -i did not run"
 
     # Resolved here, not at the point of use: the config dumps above run inside
     # `| while` pipelines, and an assignment made in a subshell does not survive.
-    if [ -n "$D_HOMES" ]; then got agent
-    else na agent "the whatap php agent is not installed on this host (ini scan, package scan, process scan all empty)"; fi
-    _cseen=0
-    for _h in $(printf '%s\n' "$D_HOMES" | cut -d'|' -f1 | sort -u); do
-        [ -n "$_h" ] || continue
-        _fh="$(resolve_fs "$_h")"; [ -n "$_fh" ] || continue
-        [ -r "$_fh/whatap.conf" ] && _cseen=1
-    done
-    if [ "$_cseen" = 1 ]; then got conf
-    elif [ -z "$D_HOMES" ]; then na conf "no agent home exists to hold a whatap.conf"
-    else missed conf "agent home discovered but no whatap.conf under it is readable by uid $(id -u 2>/dev/null || echo '?')$(_priv_hint)"; fi
-
+    _resolve_goals
     emit_status
     emit_footer
 }

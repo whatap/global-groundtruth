@@ -52,31 +52,72 @@ Container notes (all verified against real images):
 | --- | --- | --- |
 | 1 | Collection environment | which tools were available to this collection |
 | 2 | Host / platform | OS, arch (amd64/arm64), container markers, cgroup CPU/memory limits (container-vs-host metric questions) |
-| 3 | Python runtimes and whatap-python package | every interpreter (multiple versions and **virtualenvs are kept distinct** — identity is the invocation path, not the resolved binary), whatap-python version/location per interpreter, wheel(dist-info) vs legacy egg install, setuptools / `pkg_resources` import facts (Python 3.12 install issues), bundled Go module binaries per arch, `bootstrap/sitecustomize.py`, console scripts on PATH, **application library inventory** — `pip list` per interpreter, plus a no-pip/no-exec fallback (dist-info/egg-info dir names per environment), plus the **instrumentation surface of the installed agent** (`trace/mod` tree, grouped: application/database/httpc/amqp/...) which differs across agent versions |
-| 4 | Runtime processes | Go common module (`whatap_python`) processes with cwd/env; python app processes with argv0, `PYTHONPATH contains whatap/bootstrap`, `VIRTUAL_ENV`, `WHATAP_*`, `OTEL_*` (co-instrumentation); **libraries the process actually loaded** — C-extension packages and the real `site-packages` path from `/proc/<pid>/maps` (pure-Python imports do not appear there) |
-| 5 | Agent homes and configuration | every `WHATAP_HOME` candidate (env, port registry `/tmp/whatap-python.lock`, process cwd/environ, `/whatap-agent`), and per home: `whatap.conf` / `container.conf` verbatim, `whatap_python` symlink resolution, pid-file liveness, `logs/` inventory, `run/`, LLM module dir |
-| 6 | Network endpoints and port registry | UDP sockets (net_udp_port), TCP sessions toward :6600, port registry contents |
+| 3 | Python runtimes and whatap-python package | every interpreter (those of whatap-marked processes first, so the detail cap of 8 does not fill with unrelated ones) (multiple versions and **virtualenvs are kept distinct** — identity is the invocation path, not the resolved binary), whatap-python version/location per interpreter, the `whatap_python-*` metadata dirs next to the package (`.dist-info` = wheel install, `.egg-info`/`.egg` = setup.py-era install), `sys.prefix` / `base_prefix` (they differ inside a virtualenv), setuptools / `pkg_resources` import facts (Python 3.12 install issues), bundled Go module binaries per arch, `bootstrap/sitecustomize.py`, console scripts on PATH, **application library inventory** — `pip list` per interpreter (a missing pip module or a failing pip is reported with its error, not as empty output), plus a no-pip/no-exec fallback (dist-info/egg-info dir names per environment), plus the **instrumentation surface of the installed agent** (`trace/mod` tree, grouped: application/database/httpc/amqp/...) which differs across agent versions |
+| 4 | Runtime processes | Go common module (`whatap_python`) processes with cwd/env; python app processes (matched by comm, argv0 or `/proc/<pid>/exe`, see below; whatap-marked ones first) with argv0, `PYTHONPATH contains whatap/bootstrap`, `VIRTUAL_ENV`, `WHATAP_*`, `OTEL_*` (co-instrumentation); **libraries the process actually loaded** — C-extension packages and the real `site-packages` path from `/proc/<pid>/maps` (pure-Python imports do not appear there) |
+| 5 | Agent homes and configuration | every `WHATAP_HOME` candidate (env, port registry `/tmp/whatap-python.lock`, process cwd/environ, `/whatap-agent`), and per home: `whatap.conf` / `container.conf` verbatim, `whatap_python` symlink resolution, pid-file liveness, `security.conf` / `paramkey.txt` presence and size, `logs/` inventory, `run/`, LLM module dir. A home that cannot be read says `path not found` or `permission denied` |
+| 6 | Network endpoints and port registry | UDP sockets on 66xx plus the `net_udp_port` of the readable `whatap.conf` files and the port registry, TCP sessions on 6600 plus the `whatap.server.port` named there (each port labelled by its source), plus every socket of a whatap-named process; port registry contents |
 | 7 | Agent logs | `whatap-hook.log` head (banner + `successfully injected <module>` lines = which libraries the agent hooked in this process) and tail (recent), the newest `whatap-boot-YYYYMMDD.log` (Go side) head + tail — all bounded reads |
-| 8 | Odoo application facts | odoo master/worker processes, Odoo version (`odoo/release.py`, read as text — no odoo code runs), `odoo.conf` (path from `-c`/`ODOO_RC`/packaged defaults; see the data-scope note below) with the `logfile` key resolved and the worker log tailed (the HTTP-worker traceback lives there, not in the master/startup log), listening sockets (8069/8072), systemd unit facts (`Environment=`/`ExecStart` visibility for `whatap-start-agent` PATH issues), `injected odoo` hook-evidence counts. Cheap no-op on non-Odoo hosts. Interpretation aid: the agent's Odoo support matrix (14–19 from agent 2.1.3; JSON-RPC errors return HTTP 200 and are not captured; WebSocket/Longpolling/Cron not instrumented) is maintained in the internal "Odoo 지원" Notion document |
+| 8 | Odoo application facts | odoo master/worker processes, Odoo version (`odoo/release.py`, read as text — no odoo code runs), `odoo.conf` (path from `-c`/`ODOO_RC`/packaged defaults; see "What the report can contain" below) with the `logfile` key resolved and the worker log tailed (with `logfile` unset, odoo writes to the process stdout/stderr, e.g. the container log) (the HTTP-worker traceback lives there, not in the master/startup log), listening sockets (8069/8072), systemd unit facts (`Environment=`/`ExecStart` visibility for `whatap-start-agent` PATH issues), `injected odoo` hook-evidence counts. Cheap no-op on non-Odoo hosts. Interpretation aid: the agent's Odoo support matrix (14–19 from agent 2.1.3; JSON-RPC errors return HTTP 200 and are not captured; WebSocket/Longpolling/Cron not instrumented) is maintained in the internal "Odoo 지원" Notion document |
 | 9 | Kubernetes / operator injection context | `/whatap-agent` volume, `WHATAP_PYTHON_AGENT_PATH` (symlink vs regular file), k8s env facts |
 
-## Security note
+## How python processes are found
 
-Framework policy: WhaTap configuration files (`whatap.conf`, `container.conf`)
-are dumped **verbatim, never masked** — a mistyped license or server address
-must be readable to be verified or refuted. `OTEL_*` variables of app
-processes are also reported verbatim. Handle the report accordingly.
+A process is a python process when its `comm`, its `argv0` or its
+`/proc/<pid>/exe` names a python interpreter. `comm` alone is not enough: an
+app started from a shebang script (`gunicorn`, `uvicorn`, `celery`,
+`odoo-bin`, `whatap-start-agent`) is named after the script by the kernel,
+which puts the interpreter from the `#!` line into `argv0`. `exe` covers an
+`argv0` rewritten by setproctitle, for the processes the run may resolve. The
+whole of `/proc` is read in one pass; `environ` and `cwd` are read only for
+the matches.
 
-One data-scope exception (not masking): `odoo.conf` is a **customer-owned**
-file that carries plaintext secrets by design (`db_password`, `admin_passwd`).
-Those two keys are **not collected** — the report dumps the rest of the file
-verbatim and states how many lines were omitted. This follows the same
-precedent as the k8s collector not collecting Kubernetes Secret values.
+## Collection status
+
+`agent` is obtained when a visible agent home, a whatap package dir, a
+whatap package found by an interpreter, or a `whatap_python` process exists.
+Its absence is `na` only when every input was read. When the run cannot read
+the `environ`/`cwd` of a candidate process (other users' processes as
+non-root), `/proc` is mounted with `hidepid`, a home path is behind a
+directory it may not search, or an interpreter's package lookup fails, the
+absence is `missed` and names those pids or paths. `conf` is obtained when a
+`whatap.conf` in an agent home is readable; a home whose path does not exist
+gives `na` with `path not found`, a home or file the run may not read gives
+`missed` with `permission denied`.
+
+## What the report can contain
+
+Nothing is masked, with one omission: in `odoo.conf` the `db_password` and
+`admin_passwd` lines are not collected (the report says how many were left
+out). That is the only content the collector leaves out. Every place a secret
+can arrive from:
+
+- `whatap.conf` and `container.conf` of every agent home, verbatim
+  (`license`, server addresses, any other key the operator put there).
+- The environment of python and `whatap_python` processes: every `WHATAP_*`
+  and `OTEL_*` variable (OTLP headers can carry tokens), `PYTHONPATH`,
+  `VIRTUAL_ENV`, `PYTHONHOME`.
+- Command lines of python, `whatap_python` and odoo processes and of pid 1
+  (first 300 characters): an argument such as `--db_password=...` appears as
+  given.
+- `pip list` output and the installed-distribution names (package names only).
+- `odoo.conf`, verbatim, **except** the `db_password` and `admin_passwd` lines,
+  which are not collected (the report states how many were left out); the tail
+  of the odoo `logfile`.
+- `whatap-hook.log` and `whatap-boot-*.log` heads and tails, and
+  `systemctl cat 'odoo*'` (an `Environment=` line can carry a secret).
+- The collector's own environment: `WHATAP_PYTHON_AGENT_PATH`, `POD_NAME`,
+  `NODE_NAME`, `POD_NAMESPACE`, `OKIND`, `ONAME`, `ONODE`.
+
+`security.conf` and `paramkey.txt` in an agent home are reported by presence
+and size only; their content is not collected.
+
+The collector itself puts no credential on a command line.
 
 ## Load profile
 
 Tier 0 only: read-only, bounded reads (`tail -n`, line-capped dumps, capped
-process/interpreter detail), per-probe timeout 15s. No `--bundle` tier yet;
+process/interpreter detail), every external command capped at 15 s and the
+whole run at `RUN_DEADLINE` (300 s). No `--bundle` tier yet;
 copy the bundle plumbing from `collect-collserver.sh` if the domain team
 needs raw log artifacts.
 
