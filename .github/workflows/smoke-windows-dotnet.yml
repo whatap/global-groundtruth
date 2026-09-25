@@ -91,7 +91,7 @@ jobs:
         run: |
           $r = Get-Content report-ps51.txt
           foreach ($needle in @(
-            "administrator role: True",
+            "privilege: elevated",
             ".NET Framework 4.x Release",
             "IIS version",
             "W3SVC Environment",

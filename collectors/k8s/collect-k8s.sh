@@ -29,19 +29,29 @@
 #
 # OUTPUT IS VERBATIM: framework policy (docs/authoring-guide.md step 3) — no
 # masking; a value has to be readable to be verified or refuted against the
-# other side. Kubernetes Secret VALUES are still never fetched (`get secret
-# -o yaml|json` is not used anywhere); secrets appear only as name/type/key
-# tables — that is a data-scope choice, not masking.
+# other side. `get secret -o yaml|json` is not used anywhere: secrets appear as
+# name/type tables, and the one Secret field read is the webhook certificate
+# Secret's public `cert.pem`, of which only the fingerprint is printed. Other
+# places a secret can arrive from (pod env values, helm values, the operator
+# env, in-container whatap.conf) are listed in README.md, "What the report can
+# contain".
 #
 # NOTE: no `set -e` / no `set -u`. A collector must run to completion and emit
 # its footer even when individual steps fail; each step guards itself.
 # -----------------------------------------------------------------------------
 
+# bash only: arrays, `read -d`, $SECONDS. Another shell would run on and give
+# wrong answers silently, so it stops here instead.
+if [ -z "${BASH_VERSION:-}" ]; then
+    printf '%s\n' "collect-k8s.sh needs bash (run it as ./collect-k8s.sh or bash collect-k8s.sh)" >&2
+    exit 2
+fi
+
 export LC_ALL=C
 
 # ---- collector metadata -----------------------------------------------------
 COLLECTOR_NAME="whatap-k8s"
-VERSION="0.6.1"
+VERSION="0.7.0"
 DOMAIN="k8s"
 TARGET="k8s-cluster/unresolved"      # refined after CLI/context/namespace discovery
 
@@ -92,8 +102,10 @@ by accident.
 Section J runs even with no --apm-target: it always reports the cluster-wide
 inventory of pods carrying a whatap APM init container.
 
-Output is verbatim (framework policy: no masking). Kubernetes Secret values
-are never fetched; secrets appear only as name/type/key tables.
+Output is verbatim (framework policy: no masking). Secrets appear as
+name/type tables; the one Secret field read is the webhook certificate
+Secret's public cert.pem, printed as a fingerprint only. README.md, "What the
+report can contain", lists every place a secret can arrive from.
 EOF
 }
 
@@ -152,24 +164,50 @@ _init_errfile() { _errfile="$(_tmp probe.err)"; }
 _timeout_bin=""
 CMD_TIMEOUT=20
 
+# _cutw N -> each line cut to N characters at a word boundary, marked "..."
+_cutw() {
+    awk -v n="$1" '{ if (length($0) <= n) { print; next }
+        s = substr($0, 1, n); i = n
+        while (i > 0 && substr(s, i, 1) != " ") i--
+        if (i > n / 2) s = substr(s, 1, i - 1)
+        print s " ..." }'
+}
+
 _classify_err() {
-    # reads a stderr file, prints a short classified reason
-    local txt=""
+    # reads a stderr file, prints a short classified reason. kubectl's own
+    # errors are matched first and by their exact wording, so a missing
+    # context or an unreachable API server is never read as a missing path.
+    local txt="" first=""
     [ -f "$_errfile" ] && txt="$(cat "$_errfile" 2>/dev/null)"
+    first="$(printf '%s' "$txt" | head -n1 | sed 's/^Error from server ([A-Za-z]*): //; s/^error: //' | _cutw 160)"
     case "$txt" in
-        *[Ff]orbidden*|*[Uu]nauthorized*)
-            echo "permission denied"; return ;;
+        *"context \""*"\" does not exist"*|*"context was not found for specified context"*)
+            printf 'context not found: %s' "$first"; return ;;
+        *"(Forbidden)"*|*" is forbidden: "*)
+            printf 'forbidden: %s' "$first"; return ;;
+        *"(Unauthorized)"*|*"must be logged in to the server"*)
+            printf 'unauthorized: %s' "$first"; return ;;
+        *"connection refused"*|*" was refused"*)
+            printf 'connection refused: %s' "$first"; return ;;
+        *"context deadline exceeded"*|*"Client.Timeout"*|*"i/o timeout"*|*"TLS handshake timeout"*|*"(Timeout)"*)
+            printf 'API request timed out: %s' "$first"; return ;;
+        *"no such host"*|*"no route to host"*|*"network is unreachable"*|*"Unable to connect to the server"*)
+            printf 'API server unreachable: %s' "$first"; return ;;
         *"doesn't have a resource type"*|*"the server could not find the requested resource"*|*"o matches for kind"*)
             echo "not applicable: resource type not present"; return ;;
-        *NotFound*|*"ot found"*)
-            echo "not applicable: object not found"; return ;;
+        *"(NotFound)"*)
+            printf 'object not found: %s' "$first"; return ;;
+        *"executable file not found"*)
+            printf 'command not found in container: %s' "$first"; return ;;
+        *"command not found"*)
+            printf 'command not found: %s' "$first"; return ;;
         *[Pp]"ermission denied"*|*"peration not permitted"*|*"peration not supported"*)
             echo "permission denied"; return ;;
-        *"o such file"*|*"annot access"*|*"oes not exist"*|*"o such device"*)
+        *"o such file"*|*"annot access"*|*"o such device"*)
             echo "path not found"; return ;;
     esac
     if [ -n "$txt" ]; then
-        printf 'error: %s' "$(printf '%s' "$txt" | head -n1 | cut -c1-100)"
+        printf 'error: %s' "$first"
     else
         echo "nonzero exit"
     fi
@@ -606,27 +644,24 @@ _emit_env_table() {
         $1=="E" { k=c "|" $2; n[k]++; if (n[k]==2) order[++m]=k }
         END { for (i=1;i<=m;i++) { split(order[i],a,"|"); printf "%s: %s occurs %d times\n", a[1], a[2], n[order[i]] } }')"
     if [ -n "$dups" ]; then
-        _emit_labeled "$label / repeated env names (Kubernetes applies the first occurrence)" "$dups"
+        _emit_labeled "$label / repeated env names" "$dups"
     else
         fact "$label / repeated env names: none"
     fi
 }
 
-# probe "label" CMD [ARGS...] -> emits output as facts, or "label: n/a (<why>)"
+# probe "label" CMD [ARGS...] -> emits output as facts, or "label: n/a (<why>)".
+# Every call runs under _bounded (CMD_TIMEOUT, RUN_DEADLINE).
 probe() {
     local label="$1"; shift
-    local bin="$1"
-    if ! command -v "$bin" >/dev/null 2>&1; then
-        fact "$label: n/a (command not found: $bin)"; return
-    fi
+    [ -n "$(_cmd_kind "$1")" ] || { fact "$label: n/a (command not found: $1)"; return; }
+    _past_deadline && { fact "$label: n/a (run deadline reached: ${RUN_DEADLINE}s)"; return; }
     local out rc
-    if [ -n "$_timeout_bin" ]; then
-        out="$("$_timeout_bin" "$CMD_TIMEOUT" "$@" 2>"$_errfile")"; rc=$?
-    else
-        out="$("$@" 2>"$_errfile")"; rc=$?
-    fi
-    if [ "$rc" -eq 124 ] && [ -n "$_timeout_bin" ]; then
-        fact "$label: n/a (timed out: ${CMD_TIMEOUT}s)"; return
+    out="$(_bounded "$@" 2>"$_errfile")"; rc=$?
+    if [ "$rc" -eq 124 ]; then
+        if _past_deadline; then fact "$label: n/a (run deadline reached: ${RUN_DEADLINE}s)"
+        else fact "$label: n/a (timed out: ${CMD_TIMEOUT}s)"; fi
+        return
     fi
     if [ "$rc" -ne 0 ]; then
         fact "$label: n/a ($(_classify_err))"; return
@@ -658,27 +693,59 @@ k8s_cli_discover() {
     [ -n "$OPT_KUBECONFIG" ] && KOPTS[${#KOPTS[@]}]="--kubeconfig=$OPT_KUBECONFIG"
 }
 
-# run_k ARGS... -> low-level CLI call with the double timeout (client-side
-# --request-timeout + external `timeout`, because `timeout` cannot wrap a shell
-# function). Sets K_OUT / K_RC; stderr lands in $_errfile for _classify_err.
+# run_k ARGS... -> low-level CLI call, bounded twice: kubectl's own
+# --request-timeout (in KOPTS) and _bounded (CMD_TIMEOUT, RUN_DEADLINE).
+# Sets K_OUT / K_RC; stderr lands in $_errfile for _classify_err.
+# Once the reachability check has failed (API_OK=0), every API call is skipped
+# with that one reason instead of timing each out; local ones (config,
+# version --client) still run.
 K_OUT=""; K_RC=1
+API_OK=""            # "" = not checked yet, 1 = answered, 0 = not usable
+API_WHY=""           # the reason, when API_OK=0
 run_k() {
     K_OUT=""; K_RC=1
     [ -n "$KCTL_BIN" ] || { : > "$_errfile" 2>/dev/null; return 1; }
-    if [ -n "$_timeout_bin" ]; then
-        K_OUT="$("$_timeout_bin" "$CMD_TIMEOUT" "$KCTL_BIN" "${KOPTS[@]}" "$@" 2>"$_errfile")"; K_RC=$?
-    else
-        K_OUT="$("$KCTL_BIN" "${KOPTS[@]}" "$@" 2>"$_errfile")"; K_RC=$?
+    if [ "$API_OK" = 0 ]; then
+        case "$1 $2" in
+            "config "*|"version --client") ;;
+            *) K_RC=125; return 1 ;;
+        esac
     fi
+    K_OUT="$(_bounded "$KCTL_BIN" "${KOPTS[@]}" "$@" 2>"$_errfile")"; K_RC=$?
     return "$K_RC"
 }
 
 _k_reason() {
     # prints the n/a reason for the last run_k (assumes K_RC != 0 or empty K_OUT)
     if [ -z "$KCTL_BIN" ]; then echo "command not found: kubectl/oc"; return; fi
-    if [ "$K_RC" -eq 124 ] && [ -n "$_timeout_bin" ]; then echo "timed out: ${CMD_TIMEOUT}s"; return; fi
+    if [ "$K_RC" -eq 125 ]; then echo "skipped: $API_WHY"; return; fi
+    if [ "$K_RC" -eq 124 ]; then
+        if _past_deadline; then echo "run deadline reached: ${RUN_DEADLINE}s"
+        else echo "timed out: ${CMD_TIMEOUT}s"; fi
+        return
+    fi
     if [ "$K_RC" -ne 0 ]; then _classify_err; return; fi
     echo "empty output"
+}
+
+# k8s_api_check -> one reachability call before anything depends on the API.
+# /version is readable by every authenticated and anonymous identity by
+# default, so a refusal there is still an answer from the server: forbidden
+# counts as reachable and the per-call reasons below say what was refused.
+k8s_api_check() {
+    if [ -z "$KCTL_BIN" ]; then API_OK=0; API_WHY="command not found: kubectl/oc"; return; fi
+    local saved="$CMD_TIMEOUT" why
+    CMD_TIMEOUT=10
+    run_k get --raw /version --request-timeout=5s
+    # the reason is built while the check's own cap is still in force
+    why="$(_k_reason)"
+    CMD_TIMEOUT="$saved"
+    if [ "$K_RC" -eq 0 ]; then API_OK=1; return; fi
+    case "$(cat "$_errfile" 2>/dev/null)" in
+        *"(Forbidden)"*|*" is forbidden: "*) API_OK=1; return ;;
+    esac
+    API_WHY="API check (get --raw /version, 5s) failed: $why"
+    API_OK=0
 }
 
 # kprobe "label" ARGS... -> emits CLI output as facts, or "label: n/a (<why>)"
@@ -700,7 +767,22 @@ kfilter() {
 }
 
 # kval ARGS... -> capture-only: prints stdout on success, nothing on failure.
-kval() { run_k "$@" || return 1; printf '%s\n' "$K_OUT"; }
+# It runs inside $(...), so its outcome travels through a file: _kv_why right
+# after the call prints the reason of a failed call, or nothing when it
+# answered. A fact then says n/a (<reason>) for a failed list and "none" only
+# for one that answered empty (decision 1 holds for fact lines too).
+kval() {
+    if run_k "$@"; then : > "$(_tmp kval.why)" 2>/dev/null; printf '%s\n' "$K_OUT"
+    else _k_reason > "$(_tmp kval.why)" 2>/dev/null; return 1; fi
+}
+# Without a private temp directory the outcome cannot travel back, and an
+# empty list is then not claimed to be an empty answer.
+_kv_why() {
+    if [ -z "$_tmp_dir" ]; then echo "call outcome not recorded: no private temp directory"; return; fi
+    cat "$(_tmp kval.why)" 2>/dev/null
+}
+# _none_or_na WHY WHAT -> "none <WHAT>" when WHY is empty, else "n/a (WHY)"
+_none_or_na() { if [ -n "$1" ]; then printf 'n/a (%s)' "$1"; else printf 'none %s' "$2"; fi; }
 
 # emit_log_tail POD CONTAINER LINES [previous] -> bounded log tail
 emit_log_tail() {
@@ -749,22 +831,30 @@ NS=""; NS_SRC=""; NS_ALL=""
 k8s_ns_discover() {
     if [ -n "$OPT_NS" ]; then NS="$OPT_NS"; NS_SRC="option --namespace"; return; fi
     [ -n "$KCTL_BIN" ] || { NS_SRC="n/a (command not found: kubectl/oc)"; return; }
-    local out
+    [ "$API_OK" = 0 ] && { NS_SRC="n/a (skipped: $API_WHY)"; return; }
+    local out fails=""
     # 1) server-side label select on the two known whatap labels
-    out="$(kval get pods -A -l name=whatap-node-agent -o 'jsonpath={range .items[*]}{.metadata.namespace}{"\n"}{end}' | sort -u | grep -v '^$')"
-    if [ -n "$out" ]; then
-        NS="$(printf '%s\n' "$out" | head -n1)"; NS_ALL="$out"; NS_SRC="pods labeled name=whatap-node-agent"; return
-    fi
-    out="$(kval get pods -A -l app.kubernetes.io/name=whatap-operator -o 'jsonpath={range .items[*]}{.metadata.namespace}{"\n"}{end}' | sort -u | grep -v '^$')"
-    if [ -n "$out" ]; then
-        NS="$(printf '%s\n' "$out" | head -n1)"; NS_ALL="$out"; NS_SRC="pods labeled app.kubernetes.io/name=whatap-operator"; return
-    fi
+    if run_k get pods -A -l name=whatap-node-agent -o 'jsonpath={range .items[*]}{.metadata.namespace}{"\n"}{end}'; then
+        out="$(printf '%s\n' "$K_OUT" | sort -u | grep -v '^$')"
+        if [ -n "$out" ]; then
+            NS="$(printf '%s\n' "$out" | head -n1)"; NS_ALL="$out"; NS_SRC="pods labeled name=whatap-node-agent"; return
+        fi
+    else fails="$fails; label name=whatap-node-agent: $(_k_reason)"; fi
+    if run_k get pods -A -l app.kubernetes.io/name=whatap-operator -o 'jsonpath={range .items[*]}{.metadata.namespace}{"\n"}{end}'; then
+        out="$(printf '%s\n' "$K_OUT" | sort -u | grep -v '^$')"
+        if [ -n "$out" ]; then
+            NS="$(printf '%s\n' "$out" | head -n1)"; NS_ALL="$out"; NS_SRC="pods labeled app.kubernetes.io/name=whatap-operator"; return
+        fi
+    else fails="$fails; label app.kubernetes.io/name=whatap-operator: $(_k_reason)"; fi
     # 2) last resort: one cluster-wide pod scan by name prefix
-    out="$(kval get pods -A --no-headers | awk '$2 ~ /^whatap-/ {print $1}' | sort -u)"
-    if [ -n "$out" ]; then
-        NS="$(printf '%s\n' "$out" | head -n1)"; NS_ALL="$out"; NS_SRC="pod name scan (whatap-*)"; return
-    fi
-    NS_SRC="n/a (no whatap workloads discovered)"
+    if run_k get pods -A --no-headers; then
+        out="$(printf '%s\n' "$K_OUT" | awk '$2 ~ /^whatap-/ {print $1}' | sort -u)"
+        if [ -n "$out" ]; then
+            NS="$(printf '%s\n' "$out" | head -n1)"; NS_ALL="$out"; NS_SRC="pod name scan (whatap-*)"; return
+        fi
+    else fails="$fails; pod name scan: $(_k_reason)"; fi
+    if [ -n "$fails" ]; then NS_SRC="n/a (no whatap workloads in the pod lists that answered; failed:${fails#;})"
+    else NS_SRC="n/a (no whatap workloads in any namespace: labels name=whatap-node-agent, app.kubernetes.io/name=whatap-operator, pod names whatap-*)"; fi
 }
 
 WA_CRD=""            # full CRD name, e.g. whatapagents.monitoring.whatap.com
@@ -784,21 +874,49 @@ ALL_HOOKS=""         # every admission hook in the cluster as "config<TAB>hookNa
                      # API server keys its metrics by hook NAME alone, and kubebuilder
                      # scaffolds generic names (mpod.kb.io), so a name used by a second
                      # operator would silently share whatap's counters
+ALL_HOOKS_WHY=""     # why ALL_HOOKS is empty
+DSC_WHY="" DS_WHY="" OP_WHY="" DEP_WHY="" HS_WHY="" WH_WHY="" SP_WHY=""   # why the list behind each failed
 HELM_SECRETS=""      # sh.helm.release.v1.* secret names mentioning whatap
 
+CR_STATE=""          # listed | nocrd | failed
+SCOPE_WHY=""         # why the crd scope read failed
+CR_WHY=""            # what was read, or why the list failed
 discover_workloads() {
-    [ -n "$KCTL_BIN" ] || return
+    [ -n "$KCTL_BIN" ] || { CR_STATE=failed; CR_WHY="command not found: kubectl/oc"; return; }
+    [ "$API_OK" = 0 ] && { CR_STATE=failed; CR_WHY="skipped: $API_WHY"; return; }
     local out line
-    # CRDs
-    out="$(kval get crd 2>/dev/null | grep -Ei 'whatap|^NAME')"
-    CRD_TABLE="$(printf '%s\n' "$out" | grep -Eiv '^NAME')"
+    # CRDs. The CR goal rests on this list and on the CR list below: an absence
+    # is stated only when both calls answered, cluster-wide.
+    if run_k get crd; then
+        CRD_TABLE="$(printf '%s\n' "$K_OUT" | grep -Ei 'whatap' | grep -Eiv '^NAME')"
+    else
+        CR_STATE=failed; CR_WHY="crd list: $(_k_reason)"
+        CRD_TABLE=""
+    fi
     WA_CRD="$(printf '%s\n' "$CRD_TABLE" | awk '$1 ~ /^whatapagents\./ {print $1; exit}')"
+    if [ -z "$CR_STATE" ] && [ -z "$WA_CRD" ]; then
+        CR_STATE=nocrd; CR_WHY="the cluster-wide crd list answered and carries no whatapagents.* crd"
+    fi
     if [ -n "$WA_CRD" ]; then
-        WA_SCOPE="$(kval get crd "$WA_CRD" -o 'jsonpath={.spec.scope}')"
-        if [ "$WA_SCOPE" = "Namespaced" ]; then
-            out="$(kval get "$WA_CRD" -A -o 'jsonpath={range .items[*]}{.metadata.namespace}{" "}{.metadata.name}{"\n"}{end}')"
+        local where="" scopewhy=""
+        # scope unknown (the read failed): list across all namespaces, which
+        # also answers for a cluster-scoped kind
+        if run_k get crd "$WA_CRD" -o 'jsonpath={.spec.scope}'; then WA_SCOPE="$K_OUT"
+        else WA_SCOPE=""; scopewhy="$(_k_reason)"; SCOPE_WHY="$scopewhy"; fi
+        if [ "$WA_SCOPE" = "Namespaced" ] || [ -z "$WA_SCOPE" ]; then
+            where=" across all namespaces"
+            run_k get "$WA_CRD" -A -o 'jsonpath={range .items[*]}{.metadata.namespace}{" "}{.metadata.name}{"\n"}{end}'
         else
-            out="$(kval get "$WA_CRD" -o 'jsonpath={range .items[*]}{" "}{.metadata.name}{"\n"}{end}')"
+            run_k get "$WA_CRD" -o 'jsonpath={range .items[*]}{" "}{.metadata.name}{"\n"}{end}'
+        fi
+        if [ "$K_RC" -eq 0 ]; then
+            out="$K_OUT"; CR_STATE=listed
+            CR_WHY="the $WA_CRD list${where} answered with no items"
+        else
+            out=""; CR_STATE=failed
+            CR_WHY="$WA_CRD list${where}: $(_k_reason)"
+            [ -n "$scopewhy" ] && CR_WHY="$CR_WHY; crd scope not read: $scopewhy"
+            [ -n "$OPT_NS" ] && CR_WHY="$CR_WHY (this run had --namespace $OPT_NS; the list is cluster-wide)"
         fi
         # parallel arrays; cap 3 instances
         local _n=0 _ns _nm
@@ -817,17 +935,17 @@ EOF
     fi
     # namespace-scoped workloads
     if [ -n "$NS" ]; then
-        DS_NAME="$(kval get ds -n "$NS" -o name | grep -Ei 'whatap' | head -n1)"
+        DS_NAME="$(kval get ds -n "$NS" -o name | grep -Ei 'whatap' | head -n1)"; DS_WHY="$(_kv_why)"
         DS_NAME="${DS_NAME##*/}"
         if [ -n "$DS_NAME" ]; then
-            DS_CONTAINERS="$(kval get ds "$DS_NAME" -n "$NS" -o 'jsonpath={range .spec.template.spec.containers[*]}{.name}{" "}{end}')"
+            DS_CONTAINERS="$(kval get ds "$DS_NAME" -n "$NS" -o 'jsonpath={range .spec.template.spec.containers[*]}{.name}{" "}{end}')"; DSC_WHY="$(_kv_why)"
         fi
-        OP_DEPLOY="$(kval get deploy -n "$NS" -o name | grep -Ei 'whatap-operator' | head -n1)"
+        OP_DEPLOY="$(kval get deploy -n "$NS" -o name | grep -Ei 'whatap-operator' | head -n1)"; OP_WHY="$(_kv_why)"
         OP_DEPLOY="${OP_DEPLOY##*/}"
-        WHATAP_DEPLOYS="$(kval get deploy -n "$NS" 2>/dev/null | grep -Ei 'whatap|^NAME')"
-        HELM_SECRETS="$(kval get secrets -n "$NS" -o name | grep -E 'sh\.helm\.release\.v1\..*whatap' | sed 's#^secret/##')"
+        WHATAP_DEPLOYS="$(kval get deploy -n "$NS" 2>/dev/null | grep -Ei 'whatap|^NAME')"; DEP_WHY="$(_kv_why)"
+        HELM_SECRETS="$(kval get secrets -n "$NS" -o name | grep -E 'sh\.helm\.release\.v1\..*whatap' | sed 's#^secret/##')"; HS_WHY="$(_kv_why)"
     fi
-    WEBHOOKS="$(kval get mutatingwebhookconfigurations,validatingwebhookconfigurations -o name | grep -Ei 'whatap')"
+    WEBHOOKS="$(kval get mutatingwebhookconfigurations,validatingwebhookconfigurations -o name | grep -Ei 'whatap')"; WH_WHY="$(_kv_why)"
     # per-hook names: the API server keys its admission metrics by these, not by the
     # configuration object name, so they have to be resolved to read the counters
     local wh
@@ -835,8 +953,13 @@ EOF
         WEBHOOK_HOOKS="$WEBHOOK_HOOKS $(kval get "$wh" -o 'jsonpath={range .webhooks[*]}{.name}{" "}{end}')"
     done
     WHATAP_CROLES="$(kval get clusterroles -o name | grep -Ei 'whatap' | sed 's#^clusterrole\.rbac\.authorization\.k8s\.io/##' | head -n 5)"
-    ALL_HOOKS="$(kval get mutatingwebhookconfigurations,validatingwebhookconfigurations \
-        -o 'jsonpath={range .items[*]}{.metadata.name}{"\t"}{range .webhooks[*]}{.name}{","}{end}{"\n"}{end}' | grep -v '^$' | head -n 60)"
+    if run_k get mutatingwebhookconfigurations,validatingwebhookconfigurations \
+        -o 'jsonpath={range .items[*]}{.metadata.name}{"\t"}{range .webhooks[*]}{.name}{","}{end}{"\n"}{end}'; then
+        ALL_HOOKS="$(printf '%s\n' "$K_OUT" | grep -v '^$' | head -n 60)"
+        [ -n "$ALL_HOOKS" ] || ALL_HOOKS_WHY="the list answered with no items"
+    else
+        ALL_HOOKS_WHY="$(_k_reason)"
+    fi
 }
 
 # APM_SEL_VALS: every label VALUE named by an APM target's podSelector, one per
@@ -863,9 +986,12 @@ SP_POD=(); SP_PHASE=(); SP_RST=()
 pick_sample_pods() {
     [ -n "$KCTL_BIN" ] && [ -n "$NS" ] || return
     local raw sorted line
-    raw="$(kval get pods -n "$NS" -l name=whatap-node-agent -o 'jsonpath={range .items[*]}{.metadata.name}{"|"}{.status.phase}{"|"}{range .status.containerStatuses[*]}{.restartCount}{","}{end}{"\n"}{end}')"
+    raw="$(kval get pods -n "$NS" -l name=whatap-node-agent -o 'jsonpath={range .items[*]}{.metadata.name}{"|"}{.status.phase}{"|"}{range .status.containerStatuses[*]}{.restartCount}{","}{end}{"\n"}{end}')"; SP_WHY="$(_kv_why)"
     if [ -z "$raw" ] && [ -n "$DS_NAME" ]; then
-        raw="$(kval get pods -n "$NS" -o 'jsonpath={range .items[*]}{.metadata.name}{"|"}{.status.phase}{"|"}{range .status.containerStatuses[*]}{.restartCount}{","}{end}{"\n"}{end}' | grep "^$DS_NAME-")"
+        # a failed label list stays failed even when the prefix fallback answers empty
+        local sp1="$SP_WHY"
+        raw="$(kval get pods -n "$NS" -o 'jsonpath={range .items[*]}{.metadata.name}{"|"}{.status.phase}{"|"}{range .status.containerStatuses[*]}{.restartCount}{","}{end}{"\n"}{end}' | grep "^$DS_NAME-")"; SP_WHY="$(_kv_why)"
+        [ -z "$raw" ] && [ -n "$sp1" ] && SP_WHY="label list: $sp1${SP_WHY:+; pod list: $SP_WHY}"
     fi
     [ -n "$raw" ] || return
     sorted="$(printf '%s\n' "$raw" | awk -F'|' 'NF>=2 { n=split($3,a,","); t=0; for(i=1;i<=n;i++) t+=a[i]; print t "|" $1 "|" $2 }' | sort -t'|' -k1,1nr)"
@@ -892,7 +1018,7 @@ run_report() {
     _note_privilege
     fact "privilege: $PRIV_WHY"
     _note_boot
-    fact "run host: $(hostname 2>/dev/null || echo unknown) (bastion/workstation — not a cluster node)"
+    fact "run host: $(hostname 2>/dev/null || echo unknown)"
     fact "tools:"
     local t
     for t in kubectl oc helm awk grep sed sort tar gzip timeout curl; do
@@ -903,17 +1029,36 @@ run_report() {
     fact "KUBECONFIG env: ${KUBECONFIG:-not set}"
     kprobe "current context" config current-context
     kprobe "client version" version --client
-    fact "namespace: ${NS:-n/a} (via $NS_SRC)"
+    if [ "$API_OK" = 1 ]; then fact "api reachability (get --raw /version, 5s): answered"
+    else fact "api reachability (get --raw /version, 5s): n/a (${API_WHY#API check (get --raw /version, 5s) failed: })"; fi
+    if [ -n "$NS" ]; then fact "namespace: $NS (via $NS_SRC)"; else fact "namespace: $NS_SRC"; fi
     if [ -n "$NS_ALL" ] && [ "$(printf '%s\n' "$NS_ALL" | wc -l | tr -d ' ')" -gt 1 ]; then
-        fact "note: whatap workloads seen in multiple namespaces; this run covers '$NS':"
+        fact "whatap workloads seen in multiple namespaces; this run covers '$NS':"
         printf '%s\n' "$NS_ALL" | while IFS= read -r _l; do printf '        %s\n' "$_l"; done
     fi
-    fact "note: every 'n/a (...)' below names why a value was not obtained"
+
+    # Fail fast (engineering guideline 2): with no API every section below
+    # would time out call by call. Each is still named, with the one reason.
+    if [ "$API_OK" != 1 ]; then
+        local st
+        for st in "A. Cluster & API server" "B. Nodes" "C. WhaTap CRDs & WhatapAgent CR" \
+                  "D. Operator, RBAC & admission webhooks" "E. Agent workloads" \
+                  "F. Events, quotas & namespace constraints" "G. Logs (bounded tails)" \
+                  "H. Helm & deployed image inventory" "I. In-pod node facts (kubectl exec into node-agent pods)" \
+                  "J. APM auto-instrumentation"; do
+            section "$st"
+            fact "n/a (skipped: $API_WHY)"
+        done
+        missed api "$API_WHY"
+        missed cr "not listed: $API_WHY"
+        emit_status
+        emit_footer
+        return
+    fi
 
     # -- A. Cluster & API server ----------------------------------------------
     section "A. Cluster & API server"
     kprobe "kubectl version (client+server)" version
-    local ready
     if run_k get --raw /readyz && [ -n "$K_OUT" ]; then fact "apiserver /readyz: $K_OUT"
     elif run_k get --raw /healthz && [ -n "$K_OUT" ]; then fact "apiserver /healthz: $K_OUT"
     else fact "apiserver readiness endpoints: n/a ($(_k_reason))"; fi
@@ -924,23 +1069,31 @@ run_report() {
     subsection "platform markers (verbatim; reader interprets)"
     kprobe "first node providerID" get nodes -o 'jsonpath={.items[0].spec.providerID}'
     local nlabels
-    nlabels="$(kval get nodes -o 'jsonpath={.items[0].metadata.labels}' | tr ' ,' '\n\n' | grep -Ei 'eks|gke|aks|azure|cce|openshift|cloud\.google|paas' | head -n 15)"
-    if [ -n "$nlabels" ]; then _emit_labeled "first node platform-ish labels" "$nlabels"
-    else fact "first node platform-ish labels: none matched (eks/gke/aks/azure/cce/openshift/paas)"; fi
-    local osgroups
-    osgroups="$(kval api-versions | grep -ci openshift)"
-    if [ "${osgroups:-0}" -gt 0 ] 2>/dev/null; then
-        fact "openshift api groups: $osgroups"
-        kprobe "clusterversion" get clusterversion
-        kfilter "scc (whatap-filtered)" 'whatap|^NAME' get scc
+    if run_k get nodes -o 'jsonpath={.items[0].metadata.labels}'; then
+        nlabels="$(printf '%s\n' "$K_OUT" | tr ' ,' '\n\n' | grep -Ei 'eks|gke|aks|azure|cce|openshift|cloud\.google|paas' | head -n 15)"
+        if [ -n "$nlabels" ]; then _emit_labeled "first node platform-ish labels" "$nlabels"
+        else fact "first node platform-ish labels: none matched (eks/gke/aks/azure/cce/openshift/paas)"; fi
     else
-        fact "openshift api groups: 0 (clusterversion/scc probes not applicable)"
+        fact "first node platform-ish labels: n/a ($(_k_reason))"
+    fi
+    local osgroups
+    if run_k api-versions; then
+        osgroups="$(printf '%s\n' "$K_OUT" | grep -ci openshift)"
+        if [ "${osgroups:-0}" -gt 0 ] 2>/dev/null; then
+            fact "openshift api groups: $osgroups"
+            kprobe "clusterversion" get clusterversion
+            kfilter "scc (whatap-filtered)" 'whatap|^NAME' get scc
+        else
+            fact "openshift api groups: 0 (clusterversion/scc not probed)"
+        fi
+    else
+        fact "openshift api groups: n/a ($(_k_reason))"
     fi
 
     # -- B. Nodes ---------------------------------------------------------------
     section "B. Nodes"
-    local ntable ncount
-    ntable="$(kval get nodes -o custom-columns=NAME:.metadata.name,KUBELET:.status.nodeInfo.kubeletVersion,OS:.status.nodeInfo.osImage,KERNEL:.status.nodeInfo.kernelVersion,RUNTIME:.status.nodeInfo.containerRuntimeVersion,ARCH:.status.nodeInfo.architecture)"
+    local ntable="" ncount
+    run_k get nodes -o custom-columns=NAME:.metadata.name,KUBELET:.status.nodeInfo.kubeletVersion,OS:.status.nodeInfo.osImage,KERNEL:.status.nodeInfo.kernelVersion,RUNTIME:.status.nodeInfo.containerRuntimeVersion,ARCH:.status.nodeInfo.architecture && ntable="$K_OUT"
     if [ -n "$ntable" ]; then
         ncount="$(printf '%s\n' "$ntable" | grep -c . )"; ncount=$((ncount - 1))
         _emit_labeled "nodes (first 50)" "$(printf '%s\n' "$ntable" | head -n 51)"
@@ -967,13 +1120,27 @@ run_report() {
     # -- C. WhaTap CRDs & WhatapAgent CR ----------------------------------------
     section "C. WhaTap CRDs & WhatapAgent CR"
     if [ -n "$CRD_TABLE" ]; then _emit_labeled "whatap crds" "$CRD_TABLE"
-    else fact "whatap crds: none found (no crd names matching 'whatap', or crd list not permitted)"; fi
-    fact "install generation markers: crd=$( [ -n "$WA_CRD" ] && echo "present ($WA_CRD)" || echo absent ) ds-containers=${DS_CONTAINERS:-n/a} helm-release-secrets=$( [ -n "$HELM_SECRETS" ] && printf '%s' "$HELM_SECRETS" | tr '\n' ',' || echo none-seen )"
+    elif [ "$CR_STATE" = failed ] && [ -z "$WA_CRD" ]; then fact "whatap crds: n/a ($CR_WHY)"
+    else fact "whatap crds: none (no crd name matching 'whatap' in the crd list)"; fi
+    local m_crd m_hs
+    if [ -n "$WA_CRD" ]; then m_crd="present ($WA_CRD)"
+    elif [ "$CR_STATE" = failed ]; then m_crd="n/a ($CR_WHY)"
+    else m_crd="absent"; fi
+    if [ -n "$HELM_SECRETS" ]; then m_hs="$(printf '%s' "$HELM_SECRETS" | tr '\n' ',')"
+    elif [ -z "$NS" ]; then m_hs="n/a (no whatap namespace discovered)"
+    else m_hs="$(_none_or_na "$HS_WHY" "")"; m_hs="${m_hs% }"; fi
+    local m_dsc
+    if [ -n "$DS_CONTAINERS" ]; then m_dsc="$DS_CONTAINERS"
+    elif [ -z "$NS" ]; then m_dsc="n/a (no whatap namespace discovered)"
+    elif [ -z "$DS_NAME" ]; then m_dsc="n/a (no whatap daemonset: $(_none_or_na "$DS_WHY" "listed"))"
+    else m_dsc="n/a (${DSC_WHY:-empty output})"; fi
+    fact "install generation markers: crd=$m_crd ds-containers=$m_dsc helm-release-secrets=$m_hs"
     if [ -n "$WA_CRD" ]; then
-        fact "crd scope: ${WA_SCOPE:-n/a}"
+        fact "crd scope: ${WA_SCOPE:-n/a (${SCOPE_WHY:-not read})}"
         kprobe "crd stored/served versions" get crd "$WA_CRD" -o 'jsonpath={range .spec.versions[*]}{.name}{" served="}{.served}{" storage="}{.storage}{"\n"}{end}'
         if [ "${#CR_NAMES[@]}" -eq 0 ]; then
-            fact "whatapagent instances: none found"
+            if [ "$CR_STATE" = listed ]; then fact "whatapagent instances: none ($CR_WHY)"
+            else fact "whatapagent instances: n/a ($CR_WHY)"; fi
         fi
         local i cr crns crref
         i=0
@@ -1010,7 +1177,7 @@ run_report() {
             i=$((i + 1))
         done
     else
-        fact "whatapagent cr probes: n/a (not applicable: whatapagents crd not present)"
+        fact "whatapagent cr probes: n/a ($CR_WHY)"
     fi
     subsection "configmaps in ${NS:-<no namespace>}"
     if [ -n "$NS" ]; then kprobe "configmaps (name/data/age)" get cm -n "$NS"
@@ -1028,7 +1195,8 @@ run_report() {
             -o 'jsonpath={range .spec.template.spec.containers[*]}{.name}{" command="}{.command}{" args="}{.args}{" env="}{range .env[*]}{.name}{"="}{.value}{";"}{end}{"\n"}{end}'
         kfilter "operator replicasets (revision/image history)" "whatap-operator|^NAME" get rs -n "$NS" -o custom-columns=NAME:.metadata.name,REVISION:.metadata.annotations.deployment\.kubernetes\.io/revision,IMAGE:.spec.template.spec.containers[0].image,CREATED:.metadata.creationTimestamp
     else
-        fact "operator deployment: none found in ${NS:-<no namespace>}"
+        if [ -z "$NS" ]; then fact "operator deployment: n/a (no whatap namespace discovered)"
+        else fact "operator deployment: $(_none_or_na "$OP_WHY" "named whatap-operator in $NS")"; fi
     fi
     subsection "admission webhooks"
     if [ -n "$WEBHOOKS" ]; then
@@ -1057,17 +1225,21 @@ run_report() {
                     # its own CA per process, and the registered caBundle can match only
                     # one of them, so more than one ready address is itself the fact.
                     local eaddr ecount
-                    eaddr="$(kval get endpoints "$svcname" -n "$svcns" -o 'jsonpath={range .subsets[*]}{range .addresses[*]}{.ip}{":"}{end}{"\n"}{end}' | tr ':' '\n' | grep -v '^$')"
-                    ecount="$(printf '%s\n' "$eaddr" | grep -c . )"
-                    if [ -n "$eaddr" ]; then _emit_labeled "ready backend addresses: $ecount" "$eaddr"
-                    else fact "ready backend addresses: 0 (no ready endpoint — every call to this webhook fails)"; fi
+                    if run_k get endpoints "$svcname" -n "$svcns" -o 'jsonpath={range .subsets[*]}{range .addresses[*]}{.ip}{":"}{end}{"\n"}{end}'; then
+                        eaddr="$(printf '%s\n' "$K_OUT" | tr ':' '\n' | grep -v '^$')"
+                        ecount="$(printf '%s\n' "$eaddr" | grep -c . )"
+                        if [ -n "$eaddr" ]; then _emit_labeled "ready backend addresses: $ecount" "$eaddr"
+                        else fact "ready backend addresses: 0"; fi
+                    else
+                        fact "ready backend addresses: n/a ($(_k_reason))"
+                    fi
                 done
             else
                 fact "webhook $wh backend service: n/a (no clientConfig.service — url-based or empty)"
             fi
         done
     else
-        fact "whatap mutating/validating webhooks: none found"
+        fact "whatap mutating/validating webhooks: $(_none_or_na "$WH_WHY" "named whatap")"
     fi
 
     subsection "every admission webhook in the cluster (config -> hook names)"
@@ -1075,7 +1247,7 @@ run_report() {
     # pods is part of the injection path (it can inject a conflicting env earlier in the
     # list), and a hook NAME reused by another configuration shares whatap's metric series.
     if [ -n "$ALL_HOOKS" ]; then _emit_labeled "webhook configurations (name -> hooks)" "$ALL_HOOKS"
-    else fact "webhook configurations: n/a ($(_k_reason))"; fi
+    else fact "webhook configurations: n/a (${ALL_HOOKS_WHY:-not listed})"; fi
 
     subsection "webhook serving certificate vs registered caBundle"
     # The operator generates a fresh self-signed CA on every process start (cmd/main.go
@@ -1108,7 +1280,8 @@ run_report() {
     if [ -n "$NS" ] && have openssl; then
         # the Secret name is discovered, not assumed — it has differed across versions
         local certsec secfp
-        certsec="$(kval get secrets -n "$NS" -o name | sed 's#^secret/##' | grep -Ei 'webhook.*cert|cert.*webhook' | head -n1)"
+        local cs_why
+        certsec="$(kval get secrets -n "$NS" -o name | sed 's#^secret/##' | grep -Ei 'webhook.*cert|cert.*webhook' | head -n1)"; cs_why="$(_kv_why)"
         if [ -n "$certsec" ]; then
             secfp="$(kval get secret "$certsec" -n "$NS" -o 'jsonpath={.data.cert\.pem}' \
                 | base64 -d 2>/dev/null \
@@ -1116,19 +1289,19 @@ run_report() {
             if [ -n "$secfp" ]; then fact "secret $certsec cert.pem (public CA field only): $secfp"
             else fact "secret $certsec cert.pem: n/a (field absent or not parseable as a certificate)"; fi
         else
-            fact "webhook certificate secret: none found in $NS matching webhook*cert (the operator may be keeping the CA only in its emptyDir)"
+            fact "webhook certificate secret: $(_none_or_na "$cs_why" "in $NS matching webhook*cert")"
         fi
     fi
     # When each side was produced: an operator process that started AFTER the caBundle was
     # last written is serving a CA the configuration does not carry.
     if [ -n "$OP_DEPLOY" ]; then
-        kprobe "operator pod process start / restarts (a restart regenerates the CA)" get pods -n "$NS" \
+        kprobe "operator pod process start / restarts" get pods -n "$NS" \
             -l app.kubernetes.io/name=whatap-operator \
             -o 'jsonpath={range .items[*]}{.metadata.name}{" podStart="}{.status.startTime}{" containerStarted="}{range .status.containerStatuses[*]}{.state.running.startedAt}{" restarts="}{.restartCount}{end}{"\n"}{end}'
     fi
     local wh3
     for wh3 in $WEBHOOKS; do
-        kprobe "$wh3 last written (managedFields times — when the caBundle was last set)" get "$wh3" \
+        kprobe "$wh3 last written (managedFields times)" get "$wh3" \
             -o 'jsonpath={range .metadata.managedFields[*]}{.manager}{" op="}{.operation}{" time="}{.time}{"\n"}{end}'
     done
     # Best effort: the CA the running process actually has on disk. The operator image may
@@ -1163,7 +1336,6 @@ run_report() {
     # webhook at all, what HTTP code came back, and how many calls were let through
     # without the webhook (fail-open, which is what failurePolicy: Ignore does).
     # Available on managed control planes too, where the API server log is not.
-    fact "counter meanings: request_total = calls made (per HTTP code) / fail_open_count = calls admitted WITHOUT the webhook after a failed call / admission_duration_seconds_count = calls attempted"
     if [ -n "$WEBHOOK_HOOKS" ]; then
         fact "whatap hook names (metric label 'name'): $(printf '%s' "$WEBHOOK_HOOKS" | tr -s ' ' | sed 's/^ //; s/ $//')"
         if run_k get --raw /metrics; then
@@ -1172,7 +1344,7 @@ run_report() {
             mpat="$(printf '%s\n' $WEBHOOK_HOOKS | grep -v '^$' | sed 's/\./\\./g' | awk '{printf "%s%s", (NR>1 ? "|" : ""), $0}')"
             mrows="$(printf '%s\n' "$K_OUT" | grep -E '^apiserver_admission_webhook_(request_total|fail_open_count|admission_duration_seconds_count)' | grep -E "name=\"($mpat)\"")"
             if [ -n "$mrows" ]; then _emit_labeled "whatap hook counters" "$mrows"
-            else fact "whatap hook counters: no metric series carries these hook names (the API server has not recorded a call for them)"; fi
+            else fact "whatap hook counters: no metric series carries these hook names"; fi
             # every fail-open in the cluster, for context: another webhook failing the
             # same way points at the path rather than at whatap
             mfo="$(printf '%s\n' "$K_OUT" | grep -E '^apiserver_admission_webhook_fail_open_count')"
@@ -1188,7 +1360,7 @@ run_report() {
                 if [ -n "$hdup" ]; then
                     _emit_labeled "hook names carried by more than one webhook configuration (their counters are shared)" "$hdup"
                 else
-                    fact "hook names carried by more than one webhook configuration: none — each counter series above belongs to one configuration"
+                    fact "hook names carried by more than one webhook configuration: none"
                 fi
             fi
         else
@@ -1233,7 +1405,8 @@ run_report() {
         fact "daemonset container names (discovered): ${DS_CONTAINERS:-n/a}"
         kprobe "daemonset yaml" get ds "$DS_NAME" -n "$NS" -o yaml
     else
-        fact "node-agent daemonset: none found in ${NS:-<no namespace>}"
+        if [ -z "$NS" ]; then fact "node-agent daemonset: n/a (no whatap namespace discovered)"
+        else fact "node-agent daemonset: $(_none_or_na "$DS_WHY" "named whatap in $NS")"; fi
     fi
     subsection "node-agent pods"
     if [ "${#SP_POD[@]}" -gt 0 ]; then
@@ -1253,11 +1426,13 @@ run_report() {
             i=$((i + 1))
         done
     else
-        fact "node-agent pods: none found (daemonset absent, selector mismatch, or list not permitted)"
+        if [ -z "$NS" ]; then fact "node-agent pods: n/a (no whatap namespace discovered)"
+        else fact "node-agent pods: $(_none_or_na "$SP_WHY" "(label name=whatap-node-agent${DS_NAME:+, then pods named $DS_NAME-*})")"; fi
     fi
     subsection "other whatap deployments in ${NS:-<no namespace>}"
     if [ -n "$WHATAP_DEPLOYS" ]; then _emit_labeled "deployments" "$WHATAP_DEPLOYS"
-    else fact "deployments: n/a (none found or list not permitted)"; fi
+    elif [ -z "$NS" ]; then fact "deployments: n/a (no whatap namespace discovered)"
+    else fact "deployments: $(_none_or_na "$DEP_WHY" "named whatap")"; fi
 
     # -- F. Events, quotas & namespace constraints --------------------------------
     section "F. Events, quotas & namespace constraints"
@@ -1334,7 +1509,7 @@ run_report() {
             done
             i=$((i + 1))
         done
-        [ "${#SP_POD[@]}" -eq 0 ] && fact "node-agent pod logs: n/a (no node-agent pods found)"
+        [ "${#SP_POD[@]}" -eq 0 ] && fact "node-agent pod logs: n/a (${SP_WHY:-no node-agent pods found})"
     else
         fact "log probes: n/a (not applicable: no whatap namespace discovered)"
     fi
@@ -1346,14 +1521,20 @@ run_report() {
     # x509 / connection refused), which the counters in section D do not.
     # A self-hosted control plane exposes it as a mirror pod in kube-system; a managed
     # control plane does not, and then the host's own log is the only source.
-    local apods ap an=0
-    apods="$(kval get pods -n kube-system -l component=kube-apiserver -o name | sed 's#^pod/##')"
+    local apods ap an=0 apfail=""
+    if run_k get pods -n kube-system -l component=kube-apiserver -o name; then
+        apods="$(printf '%s\n' "$K_OUT" | sed 's#^pod/##' | grep -v '^$')"
+    else apfail="label component=kube-apiserver: $(_k_reason)"; fi
     if [ -z "$apods" ]; then
-        apods="$(kval get pods -n kube-system --no-headers | awk '$1 ~ /^kube-apiserver-/ {print $1}')"
+        if run_k get pods -n kube-system --no-headers; then
+            apods="$(printf '%s\n' "$K_OUT" | awk '$1 ~ /^kube-apiserver-/ {print $1}')"
+        else apfail="${apfail:+$apfail; }pod list: $(_k_reason)"; fi
     fi
-    if [ -n "$apods" ]; then
+    if [ -z "$apods" ] && [ -n "$apfail" ]; then
+        fact "kube-apiserver pods: n/a ($apfail)"
+    elif [ -n "$apods" ]; then
         fact "kube-apiserver pods found: $(printf '%s' "$apods" | tr '\n' ' ')"
-        fact "bounds: --tail=2000 per pod, up to 3 pods, then filtered to webhook/whatap lines (cap 80). A failure older than that tail is still counted in the section D counters."
+        fact "bounds: --tail=2000 per pod, up to 3 pods, then filtered to webhook/whatap lines (cap 80)"
         for ap in $apods; do
             [ "$an" -ge 3 ] && break
             an=$((an + 1))
@@ -1367,7 +1548,7 @@ run_report() {
             fi
         done
     else
-        fact "kube-apiserver pods: none found in kube-system (managed control plane, or the API server does not run as a pod) — the control-plane host's own log is then the only source for webhook call failures; the section D counters still apply"
+        fact "kube-apiserver pods: none in kube-system (label component=kube-apiserver, name prefix kube-apiserver-)"
     fi
 
     # -- H. Helm & deployed image inventory ----------------------------------------
@@ -1378,8 +1559,14 @@ run_report() {
         [ -n "$OPT_KUBECONFIG" ] && HOPTS[${#HOPTS[@]}]="--kubeconfig=$OPT_KUBECONFIG"
         [ -n "$OPT_CONTEXT" ] && HOPTS[${#HOPTS[@]}]="--kube-context=$OPT_CONTEXT"
         local hl rel relns
-        hl="$("$_timeout_bin" "$CMD_TIMEOUT" helm list -A "${HOPTS[@]}" 2>"$_errfile" | grep -Ei 'whatap|^NAME')"
-        if [ -n "$hl" ]; then
+        local hlrc
+        hl="$(_bounded helm list -A "${HOPTS[@]}" 2>"$_errfile")"; hlrc=$?
+        hl="$(printf '%s\n' "$hl" | grep -Ei 'whatap|^NAME')"
+        if [ "$hlrc" -ne 0 ]; then
+            if [ "$hlrc" -eq 124 ] && _past_deadline; then fact "helm releases: n/a (run deadline reached: ${RUN_DEADLINE}s)"
+            elif [ "$hlrc" -eq 124 ]; then fact "helm releases: n/a (timed out: ${CMD_TIMEOUT}s)"
+            else fact "helm releases: n/a ($(_classify_err))"; fi
+        elif [ -n "$hl" ]; then
             _emit_labeled "helm releases (whatap-filtered)" "$hl"
             printf '%s\n' "$hl" | awk 'NR>1 || $1!="NAME" {print $1, $2}' | grep -vi '^NAME' | head -n 3 | while read -r rel relns; do
                 [ -n "$rel" ] || continue
@@ -1387,13 +1574,14 @@ run_report() {
                 probe "helm values $rel (user-supplied)" helm get values "$rel" -n "$relns" "${HOPTS[@]}"
             done
         else
-            fact "helm releases: n/a (empty output)"
+            fact "helm releases: none (whatap-filtered helm list -A)"
         fi
     else
-        fact "helm release facts: degraded to release-secret names (command not found: helm)"
+        fact "helm releases: n/a (command not found: helm)"
     fi
     if [ -n "$HELM_SECRETS" ]; then _emit_labeled "helm release secrets in ${NS:-?} (name = sh.helm.release.v1.<release>.v<revision>)" "$HELM_SECRETS"
-    else fact "helm release secrets: none seen in ${NS:-<no namespace>}"; fi
+    elif [ -z "$NS" ]; then fact "helm release secrets: n/a (no whatap namespace discovered)"
+    else fact "helm release secrets: $(_none_or_na "$HS_WHY" "in $NS")"; fi
     subsection "images declared by whatap workloads in ${NS:-<no namespace>}"
     if [ -n "$NS" ]; then
         local imgs
@@ -1403,7 +1591,6 @@ run_report() {
     else
         fact "image inventory: n/a (not applicable: no whatap namespace discovered)"
     fi
-    fact "note: external registry tag listings are out of scope for this collector (clusters are often airgapped); the analyst checks registries separately"
 
     # -- I. In-pod node facts (kubectl exec, best-effort) ---------------------------
     section "I. In-pod node facts (kubectl exec into node-agent pods)"
@@ -1448,7 +1635,7 @@ run_report() {
                 [ "${SP_PHASE[$i]}" = "Running" ] && { EXEC_PODS="$EXEC_PODS ${SP_POD[$i]}"; n=$((n + 1)); }
                 i=$((i + 1))
             done
-            progress "[Tier2] --exec-per-node: running read-only commands inside $n node-agent pods"
+            warn "[Tier2] --exec-per-node: running read-only commands inside $n node-agent pods"
             fact "exec fan-out: $n running pods (--exec-per-node, cap 30)"
         else
             local with="" without=""
@@ -1502,14 +1689,11 @@ run_report() {
     # Section C carries the CR targets and their selectors; the namespace/pod labels
     # below are the other half of that comparison.
     section "J. APM auto-instrumentation"
-    fact "webhook scope: whatap admission acts on pods at CREATE (see the webhook rules in section D) — a pod created before the operator/CR existed carries no injection until it is recreated"
-    fact "states reported: declared (workload template) / admitted (pod spec) / running (--apm-exec only)"
 
     # ---- name mapping: the identifiers that have to line up before anything is injected --
     # Every one of these is a name or label the operator matches by string. They are
     # collected together, verbatim, so each side of every match can be read off one page.
     subsection "name mapping inputs (CR name, selectors, labels)"
-    fact "operator reference (whatap-operator internal/webhook/v2alpha1/whatapagent_webhook.go): the pod-mutating path resolves ONE cluster-scoped WhatapAgent by the fixed name 'whatap'; a CR under any other name is not read by that path. The CR names present in this cluster are listed below."
     if [ -n "$WA_CRD" ]; then
         kprobe "whatapagent CR names present (cluster)" get "$WA_CRD" -o 'jsonpath={range .items[*]}{.metadata.name}{" apiVersion="}{.apiVersion}{" created="}{.metadata.creationTimestamp}{"\n"}{end}'
         if run_k get "$WA_CRD" -o 'jsonpath={.items[*].metadata.name}'; then
@@ -1522,15 +1706,15 @@ run_report() {
         fi
         # how many targets exist at all, stated separately so "no targets declared" is
         # never confused with "the selector probe returned nothing"
-        local tgtnames
-        tgtnames="$(kval get "$WA_CRD" -o 'jsonpath={range .items[*]}{.metadata.name}{"="}{range .spec.features.apm.instrumentation.targets[*]}{.name}{","}{end}{"\n"}{end}')"
-        if [ -n "$tgtnames" ]; then _emit_labeled "apm instrumentation targets declared per cr (cr=target,target,...; empty after '=' means none declared)" "$tgtnames"
+        local tgtnames=""
+        run_k get "$WA_CRD" -o 'jsonpath={range .items[*]}{.metadata.name}{"="}{range .spec.features.apm.instrumentation.targets[*]}{.name}{","}{end}{"\n"}{end}' && tgtnames="$K_OUT"
+        if [ -n "$tgtnames" ]; then _emit_labeled "apm instrumentation targets declared per cr (cr=target,target,...)" "$tgtnames"
         else fact "apm instrumentation targets declared per cr: n/a ($(_k_reason))"; fi
         # per-target selectors, one line per target, in the shape they are matched in:
         # namespaceSelector by name OR by namespace label; podSelector by pod label
         kprobe "target selectors (matched against namespace names/labels and pod labels)" get "$WA_CRD" -o 'jsonpath={range .items[*]}{"cr="}{.metadata.name}{"\n"}{range .spec.features.apm.instrumentation.targets[*]}{"  target="}{.name}{" enabled="}{.enabled}{" lang="}{.language}{"\n"}{"    namespaceSelector.matchNames="}{.namespaceSelector.matchNames}{"\n"}{"    namespaceSelector.matchLabels="}{.namespaceSelector.matchLabels}{"\n"}{"    namespaceSelector.matchExpressions="}{.namespaceSelector.matchExpressions}{"\n"}{"    podSelector.matchLabels="}{.podSelector.matchLabels}{"\n"}{"    podSelector.matchExpressions="}{.podSelector.matchExpressions}{"\n"}{end}{end}'
     else
-        fact "whatapagent CR name mapping: n/a (not applicable: whatapagents crd not present)"
+        fact "whatapagent CR name mapping: n/a ($CR_WHY)"
     fi
     # the namespace side of namespaceSelector, for every namespace in the cluster
     kprobe "namespace names + labels (the namespaceSelector match input)" get ns --show-labels
@@ -1569,8 +1753,8 @@ run_report() {
     fi
 
     if [ "${#APM_TGTS[@]}" -eq 0 ]; then
-        fact "per-target inspection: n/a (not requested — pass --apm-target NS[/NAME] for workload/pod/env/log facts)"
-        [ "$OPT_APM_EXEC" = 1 ] && fact "in-container probes: n/a (--apm-exec given with no --apm-target: nothing to exec into)"
+        fact "per-target inspection: n/a (not requested: no --apm-target given)"
+        [ "$OPT_APM_EXEC" = 1 ] && fact "in-container probes: n/a (--apm-exec given with no --apm-target)"
     else
         local ti tgt tns twl
         ti=0
@@ -1686,7 +1870,7 @@ run_report() {
             # ---- Tier 2: running state inside the application container --------------
             if [ "$OPT_APM_EXEC" = 1 ]; then
                 local xp xc xn=0
-                progress "[Tier2] --apm-exec: running read-only commands inside application containers in $tns"
+                warn "[Tier2] --apm-exec: running read-only commands inside application containers in $tns"
                 for xp in $tpods; do
                     [ "$xn" -ge 3 ] && break
                     xc="$(kval get pod "$xp" -n "$tns" -o 'jsonpath={.spec.containers[0].name}')"
@@ -1716,18 +1900,17 @@ run_report() {
                 done
                 [ "$xn" = 0 ] && fact "in-container probes: n/a (no pod/container resolved in $tns)"
             else
-                fact "in-container probes: n/a (not requested — pass --apm-exec for running-state facts)"
+                fact "in-container probes: n/a (not requested: no --apm-exec given)"
             fi
             ti=$((ti + 1))
         done
         [ "${#APM_TGTS[@]}" -gt 5 ] && fact "targets capped: first 5 of ${#APM_TGTS[@]} processed"
     fi
 
-    if [ -n "$KCTL_BIN" ] && run_k version --request-timeout=5s >/dev/null 2>&1; then got api
-    elif [ -z "$KCTL_BIN" ]; then missed api "command not found: kubectl (and no oc)"
-    else missed api "kubectl found but the API did not answer (see section A for the reason)"; fi
+    got api
     if [ "${#CR_NAMES[@]}" -gt 0 ]; then got cr
-    else na cr "no WhatapAgent CR exists in any namespace"; fi
+    elif [ "$CR_STATE" = listed ] || [ "$CR_STATE" = nocrd ]; then na cr "$CR_WHY"
+    else missed cr "${CR_WHY:-the whatapagents list was not reached}"; fi
 
     emit_status
     emit_footer
@@ -1787,24 +1970,61 @@ collect_bundle_agents() {
     progress "agents: yaml/tables written"
 }
 
+# Caps for the per-container log files. A namespace with many pods would
+# otherwise pull every container twice at 5 MB each.
+BUNDLE_LOG_PODS=20          # pods whose containers are fetched
+BUNDLE_LOG_BYTES=2000000    # per container file (--limit-bytes)
+BUNDLE_LOG_TOTAL=60000000   # all log files together
 collect_bundle_logs() {
     local dest="$1"; mkdir -p "$dest" 2>/dev/null
     [ -n "$NS" ] || return
-    local podconts line pod conts cont
-    podconts="$(kval get pods -n "$NS" -o 'jsonpath={range .items[*]}{.metadata.name}{"="}{range .spec.containers[*]}{.name}{","}{end}{"\n"}{end}')"
+    local podconts line pod conts cont cname crst npod=0 skipped_pods=""
+    # containerStatuses carry the restart count, so --previous is asked only
+    # where a previous instance exists; a pod with no status yet has no log
+    run_k get pods -n "$NS" -o 'jsonpath={range .items[*]}{.metadata.name}{"="}{range .status.containerStatuses[*]}{.name}{":"}{.restartCount}{","}{end}{"\n"}{end}'
+    podconts="$K_OUT"
     for line in $podconts; do
         pod="${line%%=*}"; conts="$(printf '%s' "${line#*=}" | tr ',' ' ')"
+        [ -n "$conts" ] || continue
+        if [ "$npod" -ge "$BUNDLE_LOG_PODS" ]; then skipped_pods="$skipped_pods $pod"; continue; fi
+        npod=$((npod + 1))
         for cont in $conts; do
-            [ -n "$cont" ] || continue
-            if run_k logs -n "$NS" "$pod" -c "$cont" --tail=2000 --limit-bytes=5000000 && [ -n "$K_OUT" ]; then
-                printf '%s\n' "$K_OUT" > "$dest/${pod}_${cont}.log" 2>/dev/null
+            cname="${cont%%:*}"; crst="${cont#*:}"
+            [ -n "$cname" ] || continue
+            # checked before the fetch with the per-file cap, so the total stays under the cap
+            if [ $((BL_SUM + BUNDLE_LOG_BYTES + 1)) -gt "$BUNDLE_LOG_TOTAL" ]; then BL_LEFT="$BL_LEFT $pod/$cname"; continue; fi
+            if run_k logs -n "$NS" "$pod" -c "$cname" --tail=2000 --limit-bytes="$BUNDLE_LOG_BYTES" && [ -n "$K_OUT" ]; then
+                printf '%s\n' "$K_OUT" > "$dest/${pod}_${cname}.log" 2>/dev/null
+                BL_SUM=$((BL_SUM + ${#K_OUT} + 1)); BL_FILES=$((BL_FILES + 1))
             fi
-            if run_k logs -n "$NS" "$pod" -c "$cont" --tail=2000 --limit-bytes=5000000 --previous && [ -n "$K_OUT" ]; then
-                printf '%s\n' "$K_OUT" > "$dest/${pod}_${cont}.previous.log" 2>/dev/null
+            [ "${crst:-0}" -gt 0 ] 2>/dev/null || continue
+            [ $((BL_SUM + BUNDLE_LOG_BYTES + 1)) -gt "$BUNDLE_LOG_TOTAL" ] && { BL_LEFT="$BL_LEFT $pod/$cname(previous)"; continue; }
+            if run_k logs -n "$NS" "$pod" -c "$cname" --tail=2000 --limit-bytes="$BUNDLE_LOG_BYTES" --previous && [ -n "$K_OUT" ]; then
+                printf '%s\n' "$K_OUT" > "$dest/${pod}_${cname}.previous.log" 2>/dev/null
+                BL_SUM=$((BL_SUM + ${#K_OUT} + 1)); BL_FILES=$((BL_FILES + 1))
             fi
         done
     done
-    progress "logs: per-container files written (tail 2000 / 5MB caps)"
+    BL_PODS_LEFT="$skipped_pods"
+    progress "logs: $BL_FILES files, $BL_SUM bytes so far"
+}
+
+# the log caps cover logs/ and apm-targets/ together; CAPS.txt is written
+# after both, into logs/
+BL_SUM=0 BL_FILES=0 BL_LEFT="" BL_PODS_LEFT=""
+write_bundle_caps() {
+    local dest="$1"; mkdir -p "$dest" 2>/dev/null
+    {
+        printf 'namespace: %s\n' "${NS:-n/a}"
+        printf 'caps: %s pods, tail 2000 lines and %s bytes per container file, %s bytes in total (logs/ and apm-targets/ together)\n' \
+            "$BUNDLE_LOG_PODS" "$BUNDLE_LOG_BYTES" "$BUNDLE_LOG_TOTAL"
+        printf 'previous-instance logs: fetched only for containers with restartCount > 0\n'
+        printf 'files written: %s, bytes: %s\n' "$BL_FILES" "$BL_SUM"
+        printf 'pods left out by the pod cap:%s\n' "${BL_PODS_LEFT:- none}"
+        printf 'containers left out by the total cap:%s\n' "${BL_LEFT:- none}"
+    } > "$dest/CAPS.txt" 2>/dev/null
+    [ -n "$BL_PODS_LEFT$BL_LEFT" ] && warn "bundle logs: caps reached; left out:${BL_PODS_LEFT}${BL_LEFT} (listed in logs/CAPS.txt)"
+    progress "logs: $BL_FILES files, $BL_SUM bytes (caps in logs/CAPS.txt)"
 }
 
 collect_bundle_cluster() {
@@ -1856,8 +2076,10 @@ collect_bundle_apm() {
             conts="$(kval get pod "$tp" -n "$tns" -o 'jsonpath={range .spec.initContainers[*]}{.name}{"\n"}{end}{range .spec.containers[*]}{.name}{"\n"}{end}')"
             for cont in $conts; do
                 [ -n "$cont" ] || continue
-                if run_k logs -n "$tns" "$tp" -c "$cont" --limit-bytes=2000000 && [ -n "$K_OUT" ]; then
+                if [ $((BL_SUM + BUNDLE_LOG_BYTES + 1)) -gt "$BUNDLE_LOG_TOTAL" ]; then BL_LEFT="$BL_LEFT $tns/$tp/$cont"; continue; fi
+                if run_k logs -n "$tns" "$tp" -c "$cont" --limit-bytes="$BUNDLE_LOG_BYTES" && [ -n "$K_OUT" ]; then
                     printf '%s\n' "$K_OUT" > "$dest/$tns/${tp}_${cont}.log" 2>/dev/null
+                    BL_SUM=$((BL_SUM + ${#K_OUT} + 1)); BL_FILES=$((BL_FILES + 1))
                 fi
             done
         done
@@ -1873,28 +2095,48 @@ collect_bundle_helm() {
     local HOPTS=()
     [ -n "$OPT_KUBECONFIG" ] && HOPTS[${#HOPTS[@]}]="--kubeconfig=$OPT_KUBECONFIG"
     [ -n "$OPT_CONTEXT" ] && HOPTS[${#HOPTS[@]}]="--kube-context=$OPT_CONTEXT"
-    helm list -A "${HOPTS[@]}" 2>/dev/null | grep -Ei 'whatap|^NAME' > "$dest/releases.txt" 2>/dev/null
-    awk 'NR>1 {print $1, $2}' "$dest/releases.txt" 2>/dev/null | head -n 3 | while read -r rel relns; do
+    local hrc
+    _bounded helm list -A "${HOPTS[@]}" > "$(_tmp helm.list)" 2>"$(_tmp helm.err)"; hrc=$?
+    if [ "$hrc" -ne 0 ]; then
+        local hwhy
+        if [ "$hrc" -eq 124 ] && _past_deadline; then hwhy="run deadline reached: ${RUN_DEADLINE}s"
+        elif [ "$hrc" -eq 124 ]; then hwhy="timed out: ${CMD_TIMEOUT}s"
+        else hwhy="exit $hrc$(head -n1 "$(_tmp helm.err)" 2>/dev/null | _cutw 160 | sed 's/^/: /')"; fi
+        warn "helm: list failed ($hwhy); no releases written"
+        printf 'helm list -A failed: %s\n' "$hwhy" > "$dest/releases-failed.txt" 2>/dev/null
+        return
+    fi
+    grep -Ei 'whatap|^NAME' "$(_tmp helm.list)" > "$dest/releases.txt" 2>/dev/null
+    local rel relns
+    awk 'NR>1 {print $1, $2}' "$dest/releases.txt" 2>/dev/null | head -n 3 > "$(_tmp helm.rels)" 2>/dev/null
+    while read -r rel relns; do
         [ -n "$rel" ] || continue
-        helm history "$rel" -n "$relns" "${HOPTS[@]}" > "$dest/history-$rel.txt" 2>/dev/null
-        helm get values "$rel" -n "$relns" "${HOPTS[@]}" 2>/dev/null > "$dest/values-$rel.yaml" 2>/dev/null
-    done
+        _bounded helm history "$rel" -n "$relns" "${HOPTS[@]}" > "$dest/history-$rel.txt" 2>/dev/null
+        _bounded helm get values "$rel" -n "$relns" "${HOPTS[@]}" > "$dest/values-$rel.yaml" 2>/dev/null
+    done < "$(_tmp helm.rels)"
     progress "helm: releases/history/values written"
 }
 
 do_bundle() {
     local work tarball
-    work="$(mktemp -d 2>/dev/null || echo "$OPT_OUT/$BASENAME.tmp.$$")"
-    mkdir -p "$work" 2>/dev/null
+    # the work tree lives in the run's private directory, removed on exit
+    if [ -n "$_tmp_dir" ]; then work="$(_tmp bundle)"
+    else work="$OPT_OUT/$BASENAME.work"; fi
+    mkdir -m 700 "$work" 2>/dev/null || { warn "bundle: cannot create a work directory ($work)"; return 1; }
     run_report > "$work/report.txt" 2>/dev/null
     progress "report: written to bundle"
-    collect_bundle_cr       "$work/cr"
-    collect_bundle_operator "$work/operator"
-    collect_bundle_agents   "$work/agents"
-    collect_bundle_logs     "$work/logs"
-    collect_bundle_cluster  "$work/cluster"
-    collect_bundle_apm      "$work/apm-targets"
-    collect_bundle_helm     "$work/helm"
+    if [ "$API_OK" = 1 ]; then
+        collect_bundle_cr       "$work/cr"
+        collect_bundle_operator "$work/operator"
+        collect_bundle_agents   "$work/agents"
+        collect_bundle_logs     "$work/logs"
+        collect_bundle_cluster  "$work/cluster"
+        collect_bundle_apm      "$work/apm-targets"
+        write_bundle_caps       "$work/logs"
+        collect_bundle_helm     "$work/helm"
+    else
+        warn "bundle: API artifacts skipped ($API_WHY); the bundle carries the report only"
+    fi
 
     tarball="$OPT_OUT/$BASENAME.tar.gz"
     if have tar; then
@@ -1903,12 +2145,16 @@ do_bundle() {
         if tar -C "$work" -czf "$tarball" . 2>/dev/null && [ -f "$tarball" ]; then
             progress "bundle: $tarball"
             rm -rf "$work" 2>/dev/null
-        else
-            warn "tar failed — artifacts left under $work"
+            return 0
         fi
+        warn "tar failed — artifacts copied to $OPT_OUT/$BASENAME instead"
     else
-        warn "tar: command not found — artifacts left under $work"
+        warn "tar: command not found — artifacts copied to $OPT_OUT/$BASENAME instead"
     fi
+    # the private directory is removed on exit, so the artifacts are kept by copying
+    if cp -R "$work" "$OPT_OUT/$BASENAME" 2>/dev/null; then return 0; fi
+    warn "bundle: artifacts could not be copied to $OPT_OUT/$BASENAME"
+    return 1
 }
 
 # =============================================================================
@@ -1936,6 +2182,8 @@ mkdir -p "$OPT_OUT" 2>/dev/null
 
 progress "resolving CLI / namespace / whatap workloads ..."
 k8s_cli_discover
+k8s_api_check
+[ "$API_OK" = 1 ] || warn "Kubernetes API not usable — API sections skipped: $API_WHY"
 k8s_ns_discover
 discover_workloads
 discover_apm_selector_values
@@ -1947,7 +2195,8 @@ CTX_NAME="$OPT_CONTEXT"
 # from. What could not be resolved is the status section's business.
 if [ -n "$CTX_NAME" ]; then TARGET="k8s-cluster/$(printf '%s' "$CTX_NAME" | tr ' ' '_')${NS:+@ns:$NS}"
 else TARGET="host/$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || echo unknown)${NS:+@ns:$NS}"; fi
-progress "cli: ${KCTL_BIN:-none}; context: ${CTX_NAME:-unknown}; namespace: ${NS:-unresolved} (via $NS_SRC); node-agent pods: ${#SP_POD[@]}"
+if [ -n "$NS" ]; then _nsline="namespace: $NS (via $NS_SRC)"; else _nsline="namespace: $NS_SRC"; fi
+progress "cli: ${KCTL_BIN:-none}; context: ${CTX_NAME:-unknown}; $_nsline; node-agent pods: ${#SP_POD[@]}"
 
 TS="$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null || echo unknown)"
 HOST="$(hostname 2>/dev/null || echo unknown)"
@@ -1955,7 +2204,7 @@ BASENAME="whatap-k8s-${HOST}-${TS}"
 
 if [ "$OPT_BUNDLE" = 1 ]; then
     progress "mode: bundle (Tier 0 report + Tier 1 artifacts) -> $OPT_OUT/$BASENAME.tar.gz"
-    do_bundle
+    do_bundle || exit 1
     progress "done."
 elif [ "$OPT_STDOUT" = 1 ]; then
     progress "mode: stdout (Tier 0 report, read-only API GETs)"
@@ -1968,5 +2217,4 @@ else
     progress "report written: $OUTFILE"
 fi
 
-[ -n "$_errfile" ] && rm -f "$_errfile" 2>/dev/null
 exit 0

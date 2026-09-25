@@ -1,6 +1,8 @@
 # collectors/db — WhaTap DB-monitoring collector
 
-> **Status: v0 implemented** (2026-07-16). Owned by the DB domain team once
+> **Status: v0 implemented** (2026-07-16; validated at `collect-db.sh` 0.1.x
+> on mock install trees and live PostgreSQL 16 / MySQL 8.4 — see "Verification
+> status"; the script's own `VERSION` is the current one). Owned by the DB domain team once
 > handed over (CONTRACT rule 4); until then managed by the Global team.
 > Scope grounded in a full read of #ext-db-모니터링-기술문의 (2025-04 → 2026-07,
 > ~282 field questions) plus deep-reads of the four longest support threads.
@@ -49,10 +51,58 @@ emits the matching sections; what is absent is reported with its reason.
      directives are skipped by the JDBC runner), so the same file serves both.
 4. **Windows (MSSQL)**: use `windows/collect-db-mssql.ps1` instead of the bash
    collector, plus `windows/mssql.sql` via sqlcmd (no JDBC runner for MSSQL in
-   this version — its pack uses GO batches).
+   this version — its pack uses GO batches):
 
-No agent process running? Point the collector at the install dir:
+   ```
+   .\collect-db-mssql.ps1 -File
+   sqlcmd -S <db_ip>,<db_port> -U <monitoring_user> -i mssql.sql -o mssql-facts.txt
+   ```
+
+   Leave `-P` out so sqlcmd asks for the password; a `-P <password>` argument
+   is visible in the process list. `-AgentHome <dir>` adds an install dir the
+   process scan cannot see (`-Home` still binds as an alias).
+
+No agent process running, or one whose install dir the report says it could
+not resolve? Point the collector at the install dir:
 `./collect-db.sh --file --home /path/to/agent`.
+
+## Report sections and goals
+
+`collect-db.sh` sections, in emission order: `[1]` Collection environment,
+A. Host & platform, B. Component discovery & host role, C. Agent home
+inventory, D. Configuration (verbatim), E. Runtime processes, F. Agent logs,
+G. Topology & network, H. Engine-specific facts, I. XOS / DB-host side facts,
+J. SQL pack per instance, then the opt-ins K. TLS handshake probe (`--tls`)
+and L. SQL pack over JDBC (`--sql`), and Collection status.
+
+Goals: `components` (a dbx/dmx/prx/xos process — a java process whose
+arguments name the whatap.agent jar or class — or a dbxc/xcub binary; the
+collector's own shell ancestry is never counted), `home` (every component
+process mapped to an install dir: its cwd or the dir of an absolute jar path;
+a cwd that is deleted, cannot be entered, or is a system root such as `/` is
+not taken), `conf` (every discovered `whatap.conf` / `xos.conf`, symlinks
+included, readable, and the search under each home complete), plus `tls` and
+`sql` only when `--tls` / `--sql` was given.
+
+A `--home` resolves only the processes it matches: the process's cwd is the
+home or under it, or its relative `-jar` path exists under the home. An
+unrelated `--home` resolves nothing. As non-root, another user's
+`/proc/<pid>/cwd` is unreadable, so a process started with a relative `-jar`
+path has no resolvable home and `home` is `missed` with the privilege gap (the
+gap is added only when privilege was the cause). With `/proc` mounted
+`hidepid` (and the run not in its `gid=` group), "no component process" is
+`missed`, not `na`; an unreadable mountinfo is reported as unknown visibility.
+A requested `--sql` / `--tls` that could not run (no credentials, no driver,
+no jshell/jrunscript, a connect error, no openssl, or an endpoint whose
+section G connect probe failed) is `missed`. `--tls` is `got` only when
+openssl reports a negotiated protocol and cipher.
+
+Reading the report: `db endpoint class` says whether `db_ip` is loopback, an
+address of this host, a DNS name, or none of this host's addresses; loopback
+or a local address means the DB is co-located with the agent. On a host with
+no xos or DB server process, or with DB server processes but no DBX
+component, the run prints a `!!` line on the terminal naming the other host
+to run it on.
 
 ## Engine coverage (v0)
 
@@ -113,5 +163,36 @@ Collection-server-side facts (server version, metrics categories) belong to
   `oracle.sql` and `windows/mssql.sql` are syntax-reviewed only — first field
   runs double as their validation. The Nashorn (JDK 8 jrunscript) runner path
   is untested on a live JDK 8.
-- `collect-db-mssql.ps1` is not covered by `tools/validate.sh` (bash-only);
-  CONTRACT conformance is by review.
+- `collect-db-mssql.ps1`: `tools/validate.sh` parses it with pwsh and lints
+  it; 0.3.0 runs to its footer under pwsh 7 on Linux and passes
+  `tools/validate.sh --report` (Windows-only probes report n/a there). Not yet
+  run on a Windows host. It was not runnable before 0.3.0: its `-Home`
+  parameter clashed with the read-only `$HOME` and every run stopped with
+  "Cannot overwrite variable Home".
+
+## What the report can contain
+
+Configuration and logs are quoted verbatim (framework policy: no masking). A
+secret can arrive from:
+
+- **`whatap.conf`** (section D, and key lines in G/H): the license key,
+  `db_user`, `aws_access_key` / **`aws_secret_key`**, `aws_arn`, and
+  `connect_option`, which is printed verbatim in section G and as part of the
+  JDBC URL in section L; a driver option string can carry `password=` or a
+  keystore password.
+- **`dbx.conf`, `prx.conf`, dbxc `config.yaml`, `xos.conf`** (sections D and
+  I), dumped verbatim.
+- **Process command lines** (sections E and I, `ps ... args`): whatever the
+  agent or the DB server was started with.
+- **Cron entries** (section E): lines of `/etc/crontab` and `/etc/cron.d/*`
+  that mention whatap, which can carry credentials passed to a job.
+- **Agent logs** (section F, a 200-line tail and samples) and the
+  **slow-query file** named by `xos.conf` (section I, last 3 lines): SQL text
+  and bind values as the DB logged them.
+- **SQL pack output** (section L): result rows of the monitoring views,
+  including session and query text.
+- **Credentials for `--sql`** are not printed (the user name is). They reach
+  the JDBC runner through its environment only, never its command line.
+
+Windows (`collect-db-mssql.ps1`): `whatap.conf` verbatim, agent process command
+lines (first 180 characters), agent log tail.

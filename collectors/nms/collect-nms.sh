@@ -35,11 +35,18 @@
 #   * Reasoned absence: probe/read_proc/dump helpers classify every miss.
 # -----------------------------------------------------------------------------
 
+# bash only: arrays, `read -d`, $SECONDS. Another shell would run on and give
+# wrong answers silently, so it stops here instead.
+if [ -z "${BASH_VERSION:-}" ]; then
+    printf '%s\n' "collect-nms.sh needs bash (run it as ./collect-nms.sh or bash collect-nms.sh)" >&2
+    exit 2
+fi
+
 export LC_ALL=C
 
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-nms"
-VERSION="0.5.1"
+VERSION="0.6.0"
 DOMAIN="nms"
 TARGET="host/$(hostname 2>/dev/null || echo unknown)"
 
@@ -536,14 +543,25 @@ _emit_labeled() {
 }
 
 # probe "label" CMD [ARGS...] -> output as facts, or "label: n/a (<why>)".
+# CMD may be a file, a shell function or a builtin; _bounded caps all three. A
+# non-zero exit that still printed something is reported with its output, since
+# for many commands the exit code is the answer (systemctl is-active prints
+# "inactive" and exits 3).
 probe() {
     local label="$1"; shift
-    command -v "$1" >/dev/null 2>&1 || { fact "$label: n/a (command not found: $1)"; return; }
+    [ -n "$(_cmd_kind "$1")" ] || { fact "$label: n/a (command not found: $1)"; return; }
+    _past_deadline && { fact "$label: n/a (run deadline reached: ${RUN_DEADLINE}s)"; return; }
     local out rc
-    if [ -n "$_timeout_bin" ]; then out="$("$_timeout_bin" "$CMD_TIMEOUT" "$@" 2>"$_errfile")"; rc=$?
-    else out="$("$@" 2>"$_errfile")"; rc=$?; fi
-    [ "$rc" -eq 124 ] && [ -n "$_timeout_bin" ] && { fact "$label: n/a (timed out: ${CMD_TIMEOUT}s)"; return; }
-    [ "$rc" -ne 0 ] && { fact "$label: n/a ($(_classify_err))"; return; }
+    out="$(_bounded "$@" 2>"$_errfile")"; rc=$?
+    if [ "$rc" -eq 124 ]; then
+        if _past_deadline; then fact "$label: n/a (run deadline reached: ${RUN_DEADLINE}s)"
+        else fact "$label: n/a (timed out: ${CMD_TIMEOUT}s)"; fi
+        return
+    fi
+    if [ "$rc" -ne 0 ]; then
+        [ -n "$out" ] && { _emit_labeled "$label (exit $rc)" "$out"; return; }
+        fact "$label: n/a ($(_classify_err))"; return
+    fi
     [ -z "$out" ] && { fact "$label: n/a (empty output)"; return; }
     _emit_labeled "$label" "$out"
 }
@@ -551,14 +569,45 @@ probe() {
 # probe_merged: like probe but folds stderr into stdout (python --version etc.).
 probe_merged() {
     local label="$1"; shift
-    local bin="$1"
-    command -v "$bin" >/dev/null 2>&1 || { fact "$label: n/a (command not found: $bin)"; return; }
+    [ -n "$(_cmd_kind "$1")" ] || { fact "$label: n/a (command not found: $1)"; return; }
+    _past_deadline && { fact "$label: n/a (run deadline reached: ${RUN_DEADLINE}s)"; return; }
     local out rc
-    if [ -n "$_timeout_bin" ]; then out="$("$_timeout_bin" "$CMD_TIMEOUT" "$@" 2>&1)"; rc=$?
-    else out="$("$@" 2>&1)"; rc=$?; fi
-    [ "$rc" -eq 124 ] && [ -n "$_timeout_bin" ] && { fact "$label: n/a (timed out: ${CMD_TIMEOUT}s)"; return; }
-    [ -z "$out" ] && { fact "$label: n/a (empty output)"; return; }
-    _emit_labeled "$label" "$out"
+    out="$(_bounded "$@" 2>&1)"; rc=$?
+    if [ "$rc" -eq 124 ]; then
+        if _past_deadline; then fact "$label: n/a (run deadline reached: ${RUN_DEADLINE}s)"
+        else fact "$label: n/a (timed out: ${CMD_TIMEOUT}s)"; fi
+        return
+    fi
+    if [ -z "$out" ]; then
+        if [ "$rc" -ne 0 ]; then fact "$label: n/a (empty output, exit $rc)"; else fact "$label: n/a (empty output)"; fi
+        return
+    fi
+    if [ "$rc" -ne 0 ]; then _emit_labeled "$label (exit $rc)" "$out"
+    else _emit_labeled "$label" "$out"; fi
+}
+
+# curl_reach URL -> one bounded HEAD request. curl prints its -w line even on
+# failure (HTTP 000), and its exit code names the failure, so both are stated.
+_curl_rc_name() {
+    case "$1" in
+        5) echo "could not resolve proxy" ;;
+        6) echo "could not resolve host" ;;
+        7) echo "failed to connect" ;;
+        28) echo "operation timed out" ;;
+        35) echo "TLS connect error" ;;
+        47) echo "too many redirects" ;;
+        52) echo "empty reply from server" ;;
+        56) echo "failure receiving network data" ;;
+        60) echo "peer certificate cannot be authenticated" ;;
+        *) echo "see curl(1) EXIT CODES" ;;
+    esac
+}
+curl_reach() {
+    local url="$1" out rc
+    out="$(_bounded curl -sI --max-time 5 -o /dev/null -w 'HTTP %{http_code} in %{time_total}s' "$url" 2>"$_errfile")"; rc=$?
+    if [ "$rc" -eq 0 ]; then fact "$url: $out"
+    elif [ "$rc" -eq 124 ]; then fact "$url: n/a (timed out: ${CMD_TIMEOUT}s)"
+    else fact "$url: ${out:-no -w output}; curl rc=$rc ($(_curl_rc_name "$rc"))"; fi
 }
 
 # read_proc "label" PATH -> content of a /proc or /sys file, or a reason.
@@ -597,9 +646,13 @@ dump_file() {
 
 # file_meta PATH -> "bytes / mtime" one-liner for a file.
 file_meta() {
-    local path="$1"
+    local path="$1" sz
+    # size from stat (no read needed); an unreadable file is said so
+    sz="$(_bounded stat -c %s "$path" 2>/dev/null)"
+    [ -n "$sz" ] || sz="$({ wc -c < "$path"; } 2>/dev/null | tr -d ' ')"
+    [ -r "$path" ] || sz="${sz:-n/a} (not readable)"
     printf '%s bytes, mtime %s' \
-        "$(wc -c < "$path" 2>/dev/null | tr -d ' ')" \
+        "${sz:-n/a}" \
         "$(date -u -r "$path" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo n/a)"
 }
 
@@ -621,7 +674,7 @@ elapsed_s() {  # elapsed_s START END -> "X.XXX" (awk does the float math)
 }
 
 # systemd helper — avoid `--value` (unsupported on systemd < 230)
-sd_show() { have systemctl && systemctl show -p "$1" "$2.service" 2>/dev/null | cut -d= -f2-; }
+sd_show() { have systemctl && _bounded systemctl show -p "$1" "$2.service" 2>/dev/null | cut -d= -f2-; }
 
 # ---- discovery ----------------------------------------------------------------
 # Install root: resolved from the package manifest first (Contract rule 2) —
@@ -629,24 +682,132 @@ sd_show() { have systemctl && systemctl show -p "$1" "$2.service" 2>/dev/null | 
 # docs.whatap.io/nms/install-agent). The path seen in field sessions
 # (/usr/share/whatap-nms) is only a fallback that is used when it exists on disk.
 NMS_ROOT=""
+NMS_ROOT_SRC=""
 NMS_PKG="whatap-nms"
+NMS_PIDS=""          # pids whose cmdline names wtnms / icmptcphealthd / whatap-nms
+PKG_SCAN=""          # which package manifests were read
+PROC_HIDDEN=""       # non-empty when /proc hides other users' processes
+PROC_SCAN_CUT=""     # non-empty when the /proc scan stopped early
+PROC_STATE=""         # what the run knows about /proc visibility, for [1]
+_proc_hidden() {
+    # hidepid=1|noaccess: other users' /proc/<pid> entries are listed but not
+    # readable; hidepid=2|invisible: they are not listed at all. A run holding
+    # the gid= group is exempt. Unread mountinfo is not "no hidepid".
+    local o hp g
+    if [ "$(id -u 2>/dev/null)" = 0 ]; then PROC_STATE="run as root (hidepid does not apply)"; return 1; fi
+    if [ ! -r /proc/self/mountinfo ]; then
+        PROC_STATE="n/a (/proc/self/mountinfo not readable; visibility of other users' processes unknown)"; return 0
+    fi
+    # the last /proc mount in mountinfo is the one on top
+    o="$(awk '$5 == "/proc" {o = $6 "," $NF} END {print o}' /proc/self/mountinfo 2>/dev/null)"
+    if [ -z "$o" ]; then
+        PROC_STATE="n/a (no /proc mount in /proc/self/mountinfo; visibility of other users' processes unknown)"; return 0
+    fi
+    hp="$(printf '%s' "$o" | tr ',' '\n' | sed -n 's/^hidepid=//p' | tail -n1)"
+    g="$(printf '%s' "$o" | tr ',' '\n' | sed -n 's/^gid=//p' | tail -n1)"
+    case "$hp" in
+        ""|0|off) PROC_STATE="no hidepid option on the /proc mount"; return 1 ;;
+    esac
+    if [ -n "$g" ] && id -G 2>/dev/null | tr ' ' '\n' | grep -qx "$g"; then
+        PROC_STATE="mounted with hidepid=$hp, gid=$g, a group of this run (other users' processes readable)"; return 1
+    fi
+    case "$hp" in
+        1|noaccess) PROC_STATE="mounted with hidepid=$hp${g:+ (gid=$g is not a group of this run)}: other users' /proc/<pid> entries listed but not readable" ;;
+        *)          PROC_STATE="mounted with hidepid=$hp${g:+ (gid=$g is not a group of this run)}: other users' processes not listed" ;;
+    esac
+    return 0
+}
+PKG_FAIL=""          # a package-manifest query that failed or timed out
+PKG_MANIFEST=""      # the rpm/dpkg file list of the package, when it answered
+# _pkg_list TOOL ARGS... -> fills PKG_MANIFEST; a "not installed" answer is an
+# answer, a timeout or any other failure goes to PKG_FAIL
+_pkg_list() {
+    local out rc err
+    out="$(_bounded "$@" 2>"$(_tmp pkg.err)")"; rc=$?
+    err="$(head -n1 "$(_tmp pkg.err)" 2>/dev/null | cut -c1-120)"
+    if [ "$rc" -eq 0 ]; then PKG_MANIFEST="$out"; return 0; fi
+    case "$out $err" in
+        *"is not installed"*|*"not installed"*) return 1 ;;
+    esac
+    if [ "$rc" -eq 124 ]; then PKG_FAIL="${PKG_FAIL:+$PKG_FAIL; }$1 $2 timed out (${CMD_TIMEOUT}s)"
+    else PKG_FAIL="${PKG_FAIL:+$PKG_FAIL; }$1 $2 exit $rc${err:+: $err}"; fi
+    return 1
+}
+# _self_tree -> this collector's own pid and its ancestors, so the parent shell
+# that ran "bash collect-nms.sh" (or a wrapper naming whatap-nms) is never
+# counted as an nms process
+_self_tree() {
+    local p="$$" n=0
+    while [ -n "$p" ] && [ "$p" != 0 ] && [ "$n" -lt 30 ]; do
+        printf ' %s ' "$p"
+        p="$(awk '/^PPid:/{print $2; exit}' "/proc/$p/status" 2>/dev/null)"
+        n=$((n + 1))
+    done
+}
 discover_root() {
     # match a path whose component is the whatap-nms directory itself, and skip
     # documentation paths (/usr/share/doc/whatap-nms sorts before the real root
     # in the dpkg manifest — caught in live validation on Ubuntu 24.04)
-    local p="" _mgrep='/whatap-nms\(/\|$\)'
+    local p="" _mgrep='/whatap-nms\(/\|$\)' _d _a0 _self
     if have rpm; then
-        p="$(rpm -ql "$NMS_PKG" 2>/dev/null | grep -v '/doc/' | grep -m1 "$_mgrep")"
+        PKG_SCAN="rpm"
+        _pkg_list rpm -ql "$NMS_PKG" && p="$(printf '%s\n' "$PKG_MANIFEST" | grep -v '/doc/' | grep -m1 "$_mgrep")"
+        [ -n "$p" ] && NMS_ROOT_SRC="rpm manifest"
     fi
     if [ -z "$p" ] && have dpkg; then
-        p="$(dpkg -L "$NMS_PKG" 2>/dev/null | grep -v '/doc/' | grep -m1 "$_mgrep")"
+        PKG_SCAN="${PKG_SCAN:+$PKG_SCAN, }dpkg"
+        _pkg_list dpkg -L "$NMS_PKG" && p="$(printf '%s\n' "$PKG_MANIFEST" | grep -v '/doc/' | grep -m1 "$_mgrep")"
+        [ -n "$p" ] && NMS_ROOT_SRC="dpkg manifest"
     fi
     if [ -n "$p" ]; then
         # trim to the .../whatap-nms directory component
         NMS_ROOT="$(printf '%s\n' "$p" | sed 's#\(/whatap-nms\)/.*#\1#')"
-        [ -d "$NMS_ROOT" ] || NMS_ROOT=""
+        [ -d "$NMS_ROOT" ] || { NMS_ROOT=""; NMS_ROOT_SRC=""; }
     fi
-    [ -z "$NMS_ROOT" ] && [ -d /usr/share/whatap-nms ] && NMS_ROOT=/usr/share/whatap-nms
+    # process scan on the executable, not on any argument: argv[0] whose
+    # basename is an nms binary, or an argv[0] under a .../whatap-nms/ tree
+    # (the bundled venv python that runs uvicorn). "less .../whatap-nms/x.log"
+    # names the path only as an argument and is not counted.
+    _self="$(_self_tree)"
+    # one pass, no fork per process: argv[0] is read with the read builtin up
+    # to its NUL; /proc/<pid>/exe is read only for a relative interpreter
+    # argv[0] (python3, uvicorn), whose executable may sit under the venv
+    local _n=0 _via _exe
+    for _d in /proc/[0-9]*; do
+        _n=$((_n + 1))
+        if [ $((_n % 200)) -eq 0 ] && _past_deadline; then PROC_SCAN_CUT="run deadline reached after $_n /proc entries"; break; fi
+        case "$_self" in *" ${_d#/proc/} "*) continue ;; esac
+        _a0=""
+        IFS= read -r -d '' _a0 2>/dev/null < "$_d/cmdline"
+        [ -n "$_a0" ] || continue
+        _via="argv[0]"
+        case "${_a0##*/}" in
+            wtnms*|icmptcphealthd|icmphealthd) ;;
+            *)  case "$_a0" in
+                    */whatap-nms/*) ;;
+                    /*) continue ;;
+                    python*|uvicorn*|gunicorn*)
+                        _exe="$(readlink "$_d/exe" 2>/dev/null)"
+                        case "$_exe" in */whatap-nms/*) _a0="$_exe"; _via="/proc/<pid>/exe" ;; *) continue ;; esac ;;
+                    *) continue ;;
+                esac ;;
+        esac
+        NMS_PIDS="$NMS_PIDS ${_d#/proc/}"
+        if [ -z "$NMS_ROOT" ]; then
+            # a relative argv[0] is resolved through /proc/<pid>/exe when readable
+            case "$_a0" in /*) ;; *) _exe="$(readlink "$_d/exe" 2>/dev/null)"; [ -n "$_exe" ] && { _a0="$_exe"; _via="/proc/<pid>/exe"; } ;; esac
+            case "$_a0" in
+                /*/whatap-nms/*)
+                    p="${_a0%%/whatap-nms/*}/whatap-nms"
+                    [ -d "$p" ] && { NMS_ROOT="$p"; NMS_ROOT_SRC="$_via of pid ${_d#/proc/}"; } ;;
+            esac
+        fi
+    done
+    NMS_PIDS="${NMS_PIDS# }"
+    _proc_hidden && PROC_HIDDEN="$PROC_STATE"
+    if [ -z "$NMS_ROOT" ] && [ -d /usr/share/whatap-nms ]; then
+        NMS_ROOT=/usr/share/whatap-nms; NMS_ROOT_SRC="on-disk path"
+    fi
 }
 
 NMS_UNITS="uvicorn nmscore icmptcphealthd icmphealthd"
@@ -656,6 +817,9 @@ run_report() {
     emit_header
 
     goal install "NMS installation on disk"
+    goal conf    "NMS configuration files"
+    goal logs    "NMS logs"
+    [ "$OPT_SNMP" = 1 ] && goal snmp "SNMP GET probe (--snmp)"
 
     # [1] capability preamble — pre-explains every downstream "command not found"
     section "Collection environment"
@@ -672,8 +836,20 @@ run_report() {
         else printf '        %-14s absent\n' "$t"; fi
     done
     discover_root
-    if [ -n "$NMS_ROOT" ]; then fact "nms install root (resolved): $NMS_ROOT"
-    else fact "nms install root: n/a (rpm manifest gave no path and /usr/share/whatap-nms not present)"; fi
+    # why the root is unknown, when the reason is a blocked input rather than
+    # an empty one; install, conf and logs all rest on it
+    ROOT_BLOCK=""
+    if [ -z "$NMS_ROOT" ]; then
+        if [ -n "$PKG_FAIL" ]; then ROOT_BLOCK="package manifest not read: $PKG_FAIL"
+        elif [ -n "$NMS_PIDS" ]; then ROOT_BLOCK="nms processes seen (pids $NMS_PIDS) but no install root resolved from their argv[0], exe or a package manifest"
+        elif [ -n "$PROC_HIDDEN" ]; then ROOT_BLOCK="no install root in ${PKG_SCAN:-any package manifest} or /usr/share/whatap-nms, and the process scan was incomplete (/proc $PROC_HIDDEN)$(_priv_hint)"
+        elif [ -n "$PROC_SCAN_CUT" ]; then ROOT_BLOCK="no install root in ${PKG_SCAN:-any package manifest} or /usr/share/whatap-nms, and the process scan stopped early ($PROC_SCAN_CUT)"
+        fi
+    fi
+    fact "/proc: ${PROC_STATE:-n/a (mountinfo not read)}"
+    if [ -n "$NMS_ROOT" ]; then fact "nms install root (resolved): $NMS_ROOT (via $NMS_ROOT_SRC)"
+    else fact "nms install root: n/a (no path from ${PKG_SCAN:-no package manifest (rpm, dpkg absent)}, no nms process argv[0] under a whatap-nms tree, /usr/share/whatap-nms not present)"; fi
+    [ -n "$PKG_FAIL" ] && fact "package manifest query: n/a ($PKG_FAIL)"
 
     # [2] host & platform — asked as "OS 종류와" in field sessions (2026-01-20)
     section "A. Host & platform"
@@ -807,7 +983,7 @@ run_report() {
         subsection "filesystem free space at root"
         probe "df" df -h "$NMS_ROOT"
     else
-        fact "n/a (install root not resolved — see section [1])"
+        fact "n/a (install root not resolved)"
     fi
 
     # [7] runtime services & processes — the three units and their start order
@@ -819,32 +995,28 @@ run_report() {
         for _u in $NMS_UNITS; do
             _ls="$(sd_show LoadState "$_u")"
             if [ "$_ls" = "loaded" ]; then
-                fact "$_u.service: active=$(systemctl is-active "$_u.service" 2>/dev/null) enabled=$(systemctl is-enabled "$_u.service" 2>/dev/null) restarts=$(sd_show NRestarts "$_u")"
+                fact "$_u.service: active=$(_bounded systemctl is-active "$_u.service" 2>/dev/null) enabled=$(_bounded systemctl is-enabled "$_u.service" 2>/dev/null) restarts=$(sd_show NRestarts "$_u")"
                 fact "    since: $(sd_show ActiveEnterTimestamp "$_u")"
                 fact "    unit file: $(sd_show FragmentPath "$_u")"
                 fact "    ExecStart: $(sd_show ExecStart "$_u" | cut -c1-200)"
             else
-                fact "$_u.service: n/a (LoadState=${_ls:-unknown} — unit not installed on this host)"
+                fact "$_u.service: n/a (LoadState=${_ls:-unknown})"
             fi
         done
     else
         fact "systemd: n/a (command not found: systemctl)"
     fi
-    subsection "nms-related processes"
-    if have ps; then
-        # grep -v collect-nms: this collector's own command line contains
-        # "whatap-nms" (script path / report name) — self-matches are excluded
-        probe "ps (wtnms / icmptcphealthd / whatap-nms)" sh -c "ps -eo pid,ppid,rss,etime,args | grep -E 'wtnms|icmptcphealthd|whatap-nms' | grep -vE 'grep|collect-nms'; :"
-    else
-        local _pid _cl _hit=0
-        for _pid in /proc/[0-9]*; do
-            _cl="$(tr '\0' ' ' < "$_pid/cmdline" 2>/dev/null)"
-            case "$_cl" in
-                *wtnms*|*icmptcphealthd*|*whatap-nms*)
-                    _hit=1; fact "pid ${_pid#/proc/}: $(printf '%s' "$_cl" | cut -c1-200)" ;;
-            esac
+    subsection "nms-related processes (/proc scan of argv[0]: wtnms* / icmptcphealthd / icmphealthd / under a whatap-nms tree)"
+    if [ -n "$NMS_PIDS" ]; then
+        local _pid
+        for _pid in $NMS_PIDS; do
+            if have ps; then probe "pid $_pid" ps -o pid=,ppid=,user=,rss=,etime=,args= -p "$_pid"
+            else fact "pid $_pid: $(tr '\0' ' ' 2>/dev/null < "/proc/$_pid/cmdline" | cut -c1-200)"; fi
         done
-        [ "$_hit" = 0 ] && fact "no matching process found in /proc scan"
+    elif [ -n "$PROC_HIDDEN" ]; then
+        fact "no matching process visible ($PROC_HIDDEN)"
+    else
+        fact "no matching process in the /proc scan"
     fi
 
     # [8] network endpoints — UDP 514 (syslog) is shared territory: a co-located
@@ -870,7 +1042,15 @@ run_report() {
     subsection "outbound connections of nms processes (manager -> WhaTap server)"
     if have ss; then
         probe "established (wtnms*)" sh -c "ss -tnp state established 2>/dev/null | grep -E 'wtnms|icmptcphealthd|uvicorn' | head -n 20; :"
-        probe "established to :6600 (collection-server data port per docs)" sh -c "ss -tn state established 2>/dev/null | awk '\$4 ~ /:6600\$/ || \$5 ~ /:6600\$/' | head -n 10; :"
+        # ss -p names another user's socket owner only to root; a non-root
+        # run lists every :6600 session and says the owner is not visible
+        if [ "$(id -u 2>/dev/null)" != 0 ]; then
+            probe "established to :6600 (owner not visible to uid $(id -u 2>/dev/null))" sh -c "ss -tn state established 2>/dev/null | awk '\$3 ~ /:6600\$/ || \$4 ~ /:6600\$/ || \$5 ~ /:6600\$/' | head -n 10; :"
+        elif [ -n "$NMS_PIDS" ]; then
+            probe "established to :6600 by nms pids ($NMS_PIDS)" sh -c "ss -tnp state established 2>/dev/null | awk '\$4 ~ /:6600\$/ || \$5 ~ /:6600\$/' | grep -E 'pid=($(printf '%s' "$NMS_PIDS" | tr ' ' '|')),' | head -n 10; :"
+        else
+            fact "established to :6600 by nms pids: n/a (no nms process found)"
+        fi
     else
         fact "n/a (command not found: ss)"
     fi
@@ -886,7 +1066,7 @@ run_report() {
     local _url
     for _url in https://repo.whatap.io https://pypi.org; do
         if have curl; then
-            probe "$_url" sh -c "curl -sI --max-time 5 -o /dev/null -w 'HTTP %{http_code} in %{time_total}s' $_url"
+            curl_reach "$_url"
         elif have wget; then
             probe "$_url" sh -c "wget -q --spider -T 5 -t 1 $_url && echo reachable"
         else
@@ -900,13 +1080,12 @@ run_report() {
     # install-agent): -a sets the access key, -s the WhaTap server IP
     # (multi-IP "a/b" form exists), -v prints the current configuration.
     section "I. Configuration (verbatim)"
-    subsection "wtinitset -v (official config viewer)"
+    subsection "wtinitset -v"
     probe_merged "wtinitset -v" wtinitset -v
     subsection "discovered *.conf files"
     local _cfgs="" _cf
-    if have rpm; then
-        _cfgs="$(rpm -ql "$NMS_PKG" 2>/dev/null | grep '\.conf$' | head -n 20)"
-    fi
+    # the package manifest already read in discovery (rpm or dpkg)
+    _cfgs="$(printf '%s\n' "$PKG_MANIFEST" | grep '\.conf$' | head -n 20)"
     if [ -n "$NMS_ROOT" ]; then
         # etc/nmscore.conf is the documented location (FAQ: vi /usr/share/whatap-nms/etc/nmscore.conf);
         # etc/mibmods.toml is the MIB module registry (live-install observation)
@@ -917,6 +1096,26 @@ run_report() {
             "$(ls -1 "$NMS_ROOT"/conf/*.conf 2>/dev/null)")"
     fi
     _cfgs="$(printf '%s\n' "$_cfgs" "$(ls -1 /etc/whatap-nms/*.conf 2>/dev/null)" | grep -v '^$' | sort -u)"
+    # the conf goal: every discovered file read, and the dirs searched readable
+    local _cf_bad="" _cf_n=0 _cfd
+    while IFS= read -r _cf; do
+        [ -n "$_cf" ] && [ -e "$_cf" ] || continue
+        _cf_n=$((_cf_n + 1))
+        [ -r "$_cf" ] || _cf_bad="$_cf_bad $_cf"
+    done <<EOF
+$_cfgs
+EOF
+    for _cfd in /etc/whatap-nms ${NMS_ROOT:+"$NMS_ROOT" "$NMS_ROOT/etc" "$NMS_ROOT/conf"}; do
+        [ -d "$_cfd" ] || continue
+        { [ -r "$_cfd" ] && [ -x "$_cfd" ]; } || _cf_bad="$_cf_bad $_cfd/"
+    done
+    [ -n "$_cf_bad" ] && fact "not readable (permission denied):$_cf_bad"
+    if [ -n "$PKG_FAIL" ] && [ "$_cf_n" -eq 0 ]; then missed conf "package manifest not read: $PKG_FAIL"
+    elif [ -n "$_cf_bad" ]; then missed conf "permission denied:$_cf_bad$(_priv_hint)"
+    elif [ "$_cf_n" -gt 0 ]; then got conf
+    elif [ -n "$NMS_ROOT" ]; then missed conf "install root $NMS_ROOT resolved, no *.conf found under it, its etc/ or /etc/whatap-nms"
+    elif [ -n "$ROOT_BLOCK" ]; then missed conf "no install root resolved ($ROOT_BLOCK)"
+    else na conf "no install root resolved; no *.conf in /etc/whatap-nms"; fi
     if [ -n "$_cfgs" ]; then
         printf '%s\n' "$_cfgs" | while IFS= read -r _cf; do
             [ -e "$_cf" ] || { fact "$_cf: n/a (listed in package manifest, path not found on disk)"; continue; }
@@ -929,15 +1128,32 @@ run_report() {
         subsection "keys of record across discovered conf files"
         probe "grep" sh -c "printf '%s\n' \"$_cfgs\" | while IFS= read -r f; do [ -e \"\$f\" ] && grep -HnE '^[[:space:]]*(MANAGER_WEB_PORT|MANAGER_HTTPS_ENABLED|MANAGER_HTTPS_WEB_PORT|MAX_REPETITIONS|IFX_32BIT_PPS_FALLBACK)' \"\$f\"; done; :"
     else
-        fact "no *.conf discovered via package manifest, install root, or /etc/whatap-nms"
+        if [ -n "$_cf_bad" ]; then fact "no *.conf read (see the not-readable entries above)"
+        else fact "no *.conf discovered via package manifest, install root, or /etc/whatap-nms"; fi
     fi
 
     # [11] logs & events — pkg-install-error.log is the first artifact support
     # asks for on an install failure (2026-06-09); /var/log/nmscore/nmscore.log
     # is the artifact the FAQ names for MIB module-load and engine issues
     section "J. Logs & recent events"
-    local _logdir=/var/log/whatap-nms
-    if [ -d "$_logdir" ]; then
+    local _logdir=/var/log/whatap-nms _lg_bad="" _lg_n=0 _lgd _lgf
+    for _lgd in /var/log/whatap-nms /var/log/nmscore; do
+        [ -d "$_lgd" ] || continue
+        if [ ! -r "$_lgd" ] || [ ! -x "$_lgd" ]; then _lg_bad="$_lg_bad $_lgd/"; continue; fi
+        for _lgf in "$_lgd"/*.log; do
+            [ -e "$_lgf" ] || continue
+            _lg_n=$((_lg_n + 1))
+            [ -r "$_lgf" ] || _lg_bad="$_lg_bad $_lgf"
+        done
+    done
+    if [ -n "$_lg_bad" ]; then missed logs "permission denied:$_lg_bad$(_priv_hint)"
+    elif [ "$_lg_n" -gt 0 ]; then got logs
+    elif [ -n "$ROOT_BLOCK" ]; then missed logs "no *.log read, and the install was not resolved ($ROOT_BLOCK)"
+    elif [ -n "$NMS_ROOT" ] || [ -n "$NMS_PIDS" ]; then na logs "no *.log in /var/log/whatap-nms or /var/log/nmscore (absent, or read and empty)"
+    else na logs "no install root or nms process; /var/log/whatap-nms and /var/log/nmscore absent or empty"; fi
+    if [ -d "$_logdir" ] && { [ ! -r "$_logdir" ] || [ ! -x "$_logdir" ]; }; then
+        fact "$_logdir: n/a (permission denied)"
+    elif [ -d "$_logdir" ]; then
         subsection "log inventory ($_logdir)"
         probe "ls" ls -la "$_logdir"
         subsection "pkg-install-error.log (last 60 lines)"
@@ -948,7 +1164,7 @@ run_report() {
             [ -e "$_lf" ] || continue
             [ "$_lf" = "$_logdir/pkg-install-error.log" ] && continue
             _cnt=$((_cnt + 1))
-            [ "$_cnt" -gt 8 ] && { fact "(more *.log files not tailed — see inventory above)"; break; }
+            [ "$_cnt" -gt 8 ] && { fact "(further *.log files not tailed: cap 8)"; break; }
             fact "$_lf ($(file_meta "$_lf")):"
             tail_file "$_lf" 25
         done
@@ -957,10 +1173,12 @@ run_report() {
         fact "$_logdir: n/a (path not found)"
     fi
     local _coredir=/var/log/nmscore
-    if [ -d "$_coredir" ]; then
+    if [ -d "$_coredir" ] && { [ ! -r "$_coredir" ] || [ ! -x "$_coredir" ]; }; then
+        fact "$_coredir: n/a (permission denied)"
+    elif [ -d "$_coredir" ]; then
         subsection "nms engine log inventory ($_coredir)"
         probe "ls" ls -la "$_coredir"
-        subsection "nmscore.log (last 80 lines — MIB module load results land here per FAQ)"
+        subsection "nmscore.log (last 80 lines)"
         tail_file "$_coredir/nmscore.log" 80
     else
         fact "$_coredir: n/a (path not found)"
@@ -984,28 +1202,54 @@ run_report() {
     if [ "$OPT_SNMP" = 1 ]; then
         section "K. SNMP probe (opt-in) — target $SNMP_HOST:$SNMP_PORT, SNMPv2c"
         if have snmpget; then
-            local _oid _name _t0 _t1 _out _rc
-            for _oid in "sysDescr.0=1.3.6.1.2.1.1.1.0" "sysUpTime.0=1.3.6.1.2.1.1.3.0" "ifNumber.0=1.3.6.1.2.1.2.1.0"; do
-                _name="${_oid%%=*}"
-                warn "sending 1 SNMP GET ($_name) to $SNMP_HOST:$SNMP_PORT"
-                _t0="$(now_s)"
-                if [ -n "$_timeout_bin" ]; then
-                    _out="$("$_timeout_bin" 15 snmpget -v2c -c "$SNMP_COMM" -t 10 -r 0 "$SNMP_HOST:$SNMP_PORT" "${_oid#*=}" 2>&1)"; _rc=$?
-                else
-                    _out="$(snmpget -v2c -c "$SNMP_COMM" -t 10 -r 0 "$SNMP_HOST:$SNMP_PORT" "${_oid#*=}" 2>&1)"; _rc=$?
-                fi
-                _t1="$(now_s)"
-                fact "$_name: rc=$_rc elapsed=$(elapsed_s "$_t0" "$_t1")s"
-                fact "    reply: $(printf '%s' "$_out" | head -n1 | cut -c1-160)"
-            done
-            fact "note: single GET requests only; this collector never walks a device"
+            local _oid _name _t0 _t1 _out _rc _snmpdir _okn=0 _fails=""
+            # the community string reaches snmpget through a mode-600 snmp.conf
+            # in the run's private directory, never through its command line
+            _snmpdir="$(_tmp snmpconf)"
+            # net-snmp reads SNMPCONFPATH instead of its default search path,
+            # so the default path (system snmp.conf) is kept in front and the
+            # private file comes last, where its values win. "mibs :" loads no
+            # MIB module: numeric OIDs are asked, and a host without MIB files
+            # does not bury the reply under "Cannot find module" lines
+            local _snmpdef
+            _snmpdef="$(_bounded net-snmp-config --snmpconfpath 2>/dev/null)"
+            [ -n "$_snmpdef" ] || _snmpdef="/etc/snmp:/usr/share/snmp:/usr/local/etc/snmp:/usr/local/share/snmp:${HOME:-/nonexistent}/.snmp"
+            case "$SNMP_COMM" in
+                *[[:space:]\#\"\']*|"")
+                    fact "n/a (community string is empty or holds whitespace, '#' or a quote; snmp.conf cannot carry it)"
+                    warn "--snmp: community string is empty or holds whitespace, '#' or a quote; SNMP probe not sent"
+                    missed snmp "community string not usable in snmp.conf (empty, whitespace, '#' or a quote)"
+                    _snmpdir="" ;;
+            esac
+            if [ -z "$_snmpdir" ]; then :
+            elif mkdir -m 700 "$_snmpdir" 2>/dev/null \
+                && ( umask 077; printf 'defVersion 2c\ndefCommunity %s\nmibs :\n' "$SNMP_COMM" > "$_snmpdir/snmp.conf" ) 2>/dev/null; then
+                for _oid in "sysDescr.0=1.3.6.1.2.1.1.1.0" "sysUpTime.0=1.3.6.1.2.1.1.3.0" "ifNumber.0=1.3.6.1.2.1.2.1.0"; do
+                    _name="${_oid%%=*}"
+                    warn "sending 1 SNMP GET ($_name) to $SNMP_HOST:$SNMP_PORT"
+                    _t0="$(now_s)"
+                    _out="$(SNMPCONFPATH="$_snmpdef:$_snmpdir" CMD_TIMEOUT=15 _bounded snmpget -t 10 -r 0 "$SNMP_HOST:$SNMP_PORT" "${_oid#*=}" 2>&1)"; _rc=$?
+                    _t1="$(now_s)"
+                    fact "$_name: rc=$_rc elapsed=$(elapsed_s "$_t0" "$_t1")s"
+                    if [ -n "$_out" ]; then _emit_labeled "    reply" "$(printf '%s\n' "$_out" | grep -v '^$' | head -n 5 | cut -c1-160)"
+                    else fact "    reply: (no output)"; fi
+                    if [ "$_rc" -eq 0 ]; then _okn=$((_okn + 1)); else _fails="$_fails $_name(rc=$_rc)"; fi
+                done
+                if [ "$_okn" -eq 3 ]; then got snmp
+                else missed snmp "SNMP GET without a reply:$_fails"; fi
+            else
+                fact "n/a (snmp.conf could not be written in the run's private directory)"
+                missed snmp "snmp.conf could not be written in the run's private directory"
+            fi
         else
-            fact "n/a (command not found: snmpget — net-snmp-utils not installed on this host)"
+            fact "n/a (command not found: snmpget)"
+            missed snmp "command not found: snmpget"
         fi
     fi
 
     if [ -n "$NMS_ROOT" ]; then got install
-    else na install "whatap-nms is not installed on this host (package scan, process scan and /usr/share/whatap-nms all empty)"; fi
+    elif [ -n "$ROOT_BLOCK" ]; then missed install "$ROOT_BLOCK"
+    else na install "no whatap-nms path in ${PKG_SCAN:-any package manifest (rpm, dpkg absent)}, no nms process in the /proc scan, /usr/share/whatap-nms not present"; fi
 
     emit_status
     emit_footer
@@ -1023,7 +1267,10 @@ if [ "$OPT_FILE" = 0 ] && [ "$OPT_STDOUT" = 0 ]; then
 fi
 
 if [ "$OPT_SNMP" = 1 ]; then
-    warn "Tier 2 --snmp enabled: this run sends 3 SNMP GET requests to $SNMP_HOST:$SNMP_PORT (single GETs, no walk)."
+    case "$SNMP_COMM" in
+        *[[:space:]\#\"\']*|"") ;;   # rejected in section K, nothing is sent
+        *) warn "Tier 2 --snmp enabled: this run sends 3 SNMP GET requests to $SNMP_HOST:$SNMP_PORT (single GETs, no walk)." ;;
+    esac
 fi
 
 _run_init

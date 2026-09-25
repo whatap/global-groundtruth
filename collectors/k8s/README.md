@@ -1,6 +1,7 @@
 # collectors/k8s — SEEDED v0
 
-> **Status: SEEDED v0** (`collect-k8s.sh` 0.4.4). Owned by the k8s domain team
+> **Status: SEEDED v0** (validated at `collect-k8s.sh` 0.4.4; the script's own
+> `VERSION` is the current one). Owned by the k8s domain team
 > (CONTRACT rule 4); until handover it is managed by the Global team.
 > Verified end-to-end against one live kubeadm cluster (v1.32, containerd,
 > whatap-operator 2.9.7 + node-agent DaemonSet + APM auto-instrumented app).
@@ -25,6 +26,17 @@ workstation, not on the node. One report, MECE sections:
 | [10] I. In-pod node facts | `kubectl exec` into up to 2 running node-agent pods: container-log symlink real target (standard `/var/log/pods` vs CCE `/mnt/paas/...`), log roots & runtime sockets (candidate paths derived from the DS's declared mounts, e.g. `/rootfs`), cgroup fs type, node-helper health endpoint, kubelet cmdline (only when hostPID) |
 | [11] J. APM auto-instrumentation | **always**: name-mapping inputs (WhatapAgent CR names + whether one is named `whatap`, per-target namespaceSelector/podSelector, every namespace's labels) and a cluster-wide inventory of instrumented pods by **two** markers (whatap init container **or** the `whatap-apm-injected` annotation), with the mismatch list. With `--apm-target NS[/NAME]`: workload template env **as declared** vs pod env **as admitted** (per container, in API order, with repeated-name detection, **including `envFrom` ConfigMap/Secret sources** — a container with an empty `.env[]` is not a container without environment), init-container state (waiting reason/message), volumes/mounts, securityContext, every pod's labels + injection markers, init-container log and app-container log **head**, namespace events. Pods named by a CR target's `podSelector` are detailed first, so a per-target cap never skips the workloads the CR actually asks for. With `--apm-exec` (Tier 2): `/proc/1/environ` and cmdline, agent home, `whatap.conf`, agent logs, `/tmp/whatap-*.lock`, runtime version |
 
+Before any of this, one reachability call (`kubectl get --raw /version`,
+5 s). When it fails (unreachable API server, a context that does not exist,
+bad credentials) every API section is printed with that one reason, the API
+and CR goals are `missed`, and the run reaches its footer in seconds instead of
+timing out call by call.
+
+The `cr` goal is `na` only when the lists behind it answered: the cluster-wide
+CRD list carries no `whatapagents.*` CRD, or the WhatapAgent list (across all
+namespaces for a namespaced CRD) answered with no items. A forbidden, failed or
+timed-out CRD or CR list is `missed` with the call's reason.
+
 Everything is **discovered** (CRD group, namespace, DS/container names, mount
 prefixes), never hardcoded, so a new platform or install generation needs no
 code change (CONTRACT rule 2). A value that cannot be obtained is reported as
@@ -32,10 +44,69 @@ code change (CONTRACT rule 2). A value that cannot be obtained is reported as
 
 **Verbatim output:** framework policy (authoring-guide step 3) — no masking;
 a value has to be readable to be verified or refuted. This applies to the report and every
-bundle artifact. Secret **values are never fetched** (`get secret -o yaml|json`
-is not used anywhere); secrets appear as name/type tables only. The bundle
-still contains real logs — move it over a trusted channel and delete it when
-the case closes.
+bundle artifact. See "What the report can contain" below.
+
+### Reading the report (explanations kept out of the report)
+
+- **Admission timing.** The whatap mutating webhook acts on pods at CREATE
+  (see the webhook rules in section D). A pod created before the operator or
+  the CR existed carries no injection until it is recreated. Section J reports
+  three states: declared (workload template), admitted (pod spec), running
+  (`--apm-exec` only, `/proc/1/environ`).
+- **CR name.** In whatap-operator (`internal/webhook/v2alpha1/whatapagent_webhook.go`)
+  the pod-mutating path resolves one cluster-scoped WhatapAgent by the fixed
+  name `whatap`; section J states whether a CR by that name is present.
+- **Admission counters** (section D, kube-apiserver `/metrics`):
+  `request_total` = calls made, per HTTP code; `fail_open_count` = calls
+  admitted without the webhook after a failed call; `admission_duration_seconds_count`
+  = calls attempted. They are keyed by hook name only, so a hook name carried
+  by two configurations shares one series; no series for a whatap hook name
+  means the API server has recorded no call under that name.
+- **Webhook CA.** The operator generates a self-signed CA on every process
+  start (`cmd/main.go generateSelfSignedCert`) into an emptyDir, so a restart
+  produces a new CA; the three fingerprints and their production times in
+  section D are what to compare. No webhook-cert Secret in the namespace is
+  consistent with a CA kept only in the emptyDir.
+- **No kube-apiserver pods** in kube-system: a managed control plane, or an
+  API server that does not run as a pod. The control-plane host's own log is
+  then the only source for webhook call failures; the section D counters still
+  apply. The kube-apiserver tail is 2000 lines, and a failure older than that
+  is still counted by the section D counters.
+- **CR targets line.** `apm instrumentation targets declared per cr` prints
+  `cr=target,target,...`; nothing after `=` means that CR declares no target.
+- **Absence lines.** A list that answered empty prints `none ...`; a list whose
+  call failed or was refused prints `n/a (<reason>)` instead.
+- **Repeated env names.** Kubernetes applies the first occurrence of a
+  duplicated env name in a container.
+- **Registries.** External registry tag listings are out of scope (clusters are
+  often air-gapped); section H lists the images in use.
+
+## What the report can contain
+
+The report and the bundle are not masked. A secret can arrive from:
+
+- **Pod and workload env values** — section J env tables (`--apm-target`),
+  the operator container env (section D, `operator container command/args`),
+  the full operator Deployment, DaemonSet, WhatapAgent CR yaml (section C/D/E),
+  target `envs` in the CR, and in the bundle every pod/workload yaml under
+  `apm-targets/`. Whatever a customer put in `.env[].value` (license keys,
+  passwords, tokens) is printed as is. `valueFrom`/`envFrom` references are
+  printed as names only; the referenced Secret is not read.
+- **Helm values** — `helm get values` per whatap release (section H and
+  `helm/values-*.yaml` in the bundle).
+- **In-container files** (`--apm-exec` only) — `whatap.conf` as present in the
+  application container (license key), `/proc/1/environ` filtered to
+  whatap/loader/license keys, agent log lines.
+- **Logs** — operator, master-agent, node-agent, init-container and
+  application log heads/tails; the bundle carries up to 2 MB per container.
+- **Secrets** — `get secret -o yaml|json` is not used. Secrets appear as
+  name/type/data-count tables. The one Secret field read is `cert.pem` of the
+  webhook-certificate Secret (a public certificate); only its fingerprint and
+  subject are printed. The operator pod's `/etc/webhook/certs/ca.crt` is read
+  and fingerprinted the same way; key files are never read.
+
+Move the report and bundle over a trusted channel and delete them when the
+case closes.
 
 ## (b) Delivery — what the field engineer runs
 
@@ -56,8 +127,8 @@ Load tiers:
 
 | Tier | Flags | Behavior |
 |---|---|---|
-| 0 (default) | `--file` / `--stdout` | read-only API GETs, bounded log tails (`--tail`, default 200), exec into at most 2 agent pods; every call double-bounded (`--request-timeout=15s` + `timeout 20`) |
-| 1 | `--bundle` | Tier 0 report + full CR/DS/operator/webhook yaml, per-container logs for **all** whatap pods (tail 2000 / 5 MB caps), events, nodes, helm values — all verbatim |
+| 0 (default) | `--file` / `--stdout` | read-only API GETs, bounded log tails (`--tail`, default 200), exec into at most 2 agent pods; every call double-bounded (kubectl `--request-timeout=15s` + the shared `_bounded` cap, 20 s, inside the 300 s run deadline); helm calls bounded the same way |
+| 1 | `--bundle` | Tier 0 report + full CR/DS/operator/webhook yaml, per-container logs of the whatap namespace pods (caps: 20 pods, tail 2000 lines and 2 MB per file, 60 MB in total across `logs/` and the `--apm-target` logs; `--previous` only for containers with restarts; `logs/CAPS.txt` states the caps and what was left out), events, nodes, helm values — all verbatim |
 | 2 (opt-in) | `--exec-per-node` | in-pod probes on every running node-agent pod (cap 30); announces the fan-out on stderr first |
 | 2 (opt-in) | `--apm-exec` | read-only probes **inside** the `--apm-target` application containers (up to 3 pods per target): pid 1 cmdline + environ, agent home, `whatap.conf`, agent logs, port registry, runtime version |
 | opt-in | `--apm-target NS[/NAME]` | reads an **application** namespace: workloads, pods, env tables, logs, events (explicit opt-in because it leaves the whatap namespace); repeatable, cap 5. Section J's name-mapping and cluster-wide inventory run without it |

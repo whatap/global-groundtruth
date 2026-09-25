@@ -1,6 +1,7 @@
 # collectors/nms
 
-> **Status: SEEDED v0 (`collect-nms.sh` 0.3.0).** A working collector exists and
+> **Status: SEEDED v0 (validated at `collect-nms.sh` 0.3.0; the script's
+> `VERSION` is the current one).** A working collector exists and
 > is owned, for now, by the Global team (framework owner). Handover transfers
 > ongoing ownership to the NMS development team (CONTRACT rule 4).
 > **Live-validated on Ubuntu 24.04 with a real `whatap-nms` 1.0.2 (deb)
@@ -35,8 +36,12 @@ section) lives in the analysis workspace at
 One `.txt` report, organized into MECE domains:
 
 - **`[1]` Collection environment** — bash, uid, present/absent tools, resolved
-  install root (from the rpm manifest; `/usr/share/whatap-nms` only as an
-  on-disk fallback).
+  install root (from the rpm or dpkg manifest, then from the executable of a
+  running nms process — its argv[0], or `/proc/<pid>/exe` for a relative one —
+  when it lies under a `.../whatap-nms/` tree;
+  `/usr/share/whatap-nms` only as an on-disk fallback), and whether `/proc` is
+  mounted with `hidepid` (a non-root run then cannot see other users'
+  processes, and "no process" is `missed`, not `na`).
 - **A. Host & platform** — OS/kernel/arch, CPU/memory, virtualization, SELinux.
   (Asked verbatim in cases: "OS 종류와", RHEL 8 vs 9 vs Rocky.)
 - **B. Time & clock synchronization** — `date -u`, timedatectl/chrony/ntpstat.
@@ -60,21 +65,30 @@ One `.txt` report, organized into MECE domains:
   24.04 — httptools vs `uvicorn[standard]==0.49.0` dependency conflict.)
 - **F. Runtime services & processes** — unit state / enabled / restart count /
   ExecStart for `uvicorn`, `nmscore`, `icmptcphealthd` (and the pre-rename
-  `icmphealthd`), plus a `wtnms*` process scan.
+  `icmphealthd`), plus the `/proc` scan, which matches the executable only:
+  argv[0] basename `wtnms*` / `icmptcphealthd` / `icmphealthd`, an argv[0]
+  under a `whatap-nms` tree, or a relative `python*` / `uvicorn*` /
+  `gunicorn*` argv[0] whose `/proc/<pid>/exe` is under one. A process that only
+  names a whatap-nms path as an argument (`less .../whatap-nms/x.log`), and the
+  collector's own shell ancestry, are not counted.
 - **G. Network endpoints** — listening TCP/UDP sockets, a filtered view of the
   ports of record (161/162/514/1514/5000/5141/6600/8443 — a co-located WhaTap
   collection server also binds 514/udp and the later starter loses the bind;
   6600/tcp is the documented outbound data port), established outbound
-  connections of nms processes and to :6600, resolver/route/proxy.
+  connections of nms processes and the :6600 sessions — filtered to the pids
+  of the process scan only when the run is root; a non-root `ss -p` names
+  only the run's own sockets, so a non-root run lists every established
+  :6600 session labelled "owner not visible to uid N" — resolver/route/proxy.
 - **H. Outbound reachability** — two bounded HEAD requests (5s cap each) to
-  `repo.whatap.io` and `pypi.org`. (Closed networks break the post-install pip
+  `repo.whatap.io` and `pypi.org`, each with curl's `-w` line (`HTTP 000` on
+  failure) and curl's exit code and its name when non-zero. (Closed networks break the post-install pip
   step with `ResolutionImpossible`; whether the host can reach out is itself a
   recurring question.)
 - **I. Configuration** — `wtinitset -v` (the official config viewer), then
   every discovered `*.conf`/`*.toml` (package manifest, `<root>`,
   `<root>/etc`, `/etc/whatap-nms`) dumped **verbatim** — this includes
   `etc/nmscore.conf` and the MIB module registry `etc/mibmods.toml`. Verbatim
-  by framework policy (see the security note): a mistyped community string or
+  by framework policy (see "What the report can contain"): a mistyped community string or
   a wrong server address has to be readable to be verified or refuted against
   the device side. A flat "keys of record" grep (`MANAGER_WEB_PORT`,
   `MANAGER_HTTPS_ENABLED`, `MANAGER_HTTPS_WEB_PORT`, `MAX_REPETITIONS`,
@@ -85,6 +99,16 @@ One `.txt` report, organized into MECE domains:
   tail (the artifact the FAQ names for MIB module-load results), per-unit
   journal tails.
 - **K. SNMP probe** *(Tier 2, opt-in — see below)*.
+
+Goals in the status section: `install`, `conf` (every discovered `*.conf`,
+and the directories `/etc/whatap-nms`, the install root, its `etc/` and
+`conf/` readable; a permission-denied file or directory is `missed` with the
+privilege gap), `logs` (the same for `/var/log/whatap-nms` and
+`/var/log/nmscore`). When the install root is unknown because an input was
+blocked (a failed manifest query, a hidden or cut-short process scan, a
+process seen but not resolved), `install`, `conf` and `logs` are all
+`missed` with that reason; and `snmp` only when `--snmp`
+was given (a GET without a reply, or no `snmpget`, is `missed`).
 
 Values are **discovered, not assumed**; an absent value is reported as
 `n/a (<why>)` — `command not found`, `permission denied`, `path not found`,
@@ -124,18 +148,38 @@ Progress is narrated on **stderr** (`>> ...`); the report itself stays clean.
   while a device that never answers points at device-side SNMP policy or
   filtering).
 
-## (c) Security note
+## What the report can contain
 
 Config dumps are collected **verbatim, unmasked** — framework policy
-([authoring-guide](../../docs/authoring-guide.md) step 3): these files carry
-no plaintext secrets worth masking (genuinely sensitive WhaTap material is
-stored encrypted), and a masked value would destroy the diagnostic fact it is
-supposed to carry. It is still one file leaving a customer network — move it
-over a trusted channel and delete it when the case is closed. The `--snmp`
-probe requires the operator to type the community string on the command line;
-shell history caveat applies.
+([authoring-guide](../../docs/authoring-guide.md) step 3): a masked value
+would destroy the fact it is supposed to carry. A secret can arrive from:
 
-## (d) How it was built / how to maintain
+- **Configuration files** (section I): `wtinitset -v` output and every
+  discovered `*.conf` / `*.toml` (`etc/nmscore.conf`, `etc/mibmods.toml`,
+  `/etc/whatap-nms/*.conf`) — the WhaTap access key, the server address, SNMP
+  community strings or v3 credentials if the manager keeps them there, HTTPS
+  settings.
+- **Repository definitions** (section D): whatap `*.repo` / apt `*.list`
+  files, whose `baseurl` / `deb` lines can carry `user:password@`.
+- **Process command lines** (section F): `ps` args of nms processes, and the
+  `ExecStart` of each unit.
+- **Environment** (section G): proxy variables of the run's own environment
+  and `/etc/environment`, which can carry `user:password@` proxy credentials.
+- **Logs and journal** (section J): whatever the manager and the package
+  post-install step wrote.
+- **`--snmp`**: the community string is not printed in the report and is not
+  put on `snmpget`'s command line (it reaches `snmpget` through a mode-600
+  `snmp.conf` in the run's private directory, removed on exit, appended to the
+  default net-snmp search path). A community holding whitespace, `#` or a
+  quote cannot be carried there; the probe is then not sent and the goal is
+  `missed`. It is on this
+  collector's own command line, so it is in `ps` for the run and in the shell
+  history.
+
+It is one file leaving a customer network — move it over a trusted channel and
+delete it when the case is closed.
+
+## (c) How it was built / how to maintain
 
 Copied from [../../templates/collector-skeleton/](../../templates/collector-skeleton/),
 following [../../docs/authoring-guide.md](../../docs/authoring-guide.md) and

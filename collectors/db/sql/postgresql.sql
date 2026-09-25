@@ -10,7 +10,7 @@
 -- Facts only — this script reports what is, never what it means.
 -- ---------------------------------------------------------------------------
 \pset pager off
-SELECT '==== WhaTap Global Groundtruth — db/sql/postgresql.sql v0.1.0 ====' AS banner;
+SELECT '==== WhaTap Global Groundtruth — db/sql/postgresql.sql v0.2.0 ====' AS banner;
 
 SELECT '[1] server & session identity' AS section;
 SELECT version();
@@ -22,10 +22,13 @@ SELECT current_database() AS current_database,
        now()              AS db_time_now;
 
 SELECT '[2] monitoring account roles (pg_monitor is the documented grant)' AS section;
-SELECT pg_has_role(current_user, 'pg_monitor',           'member') AS has_pg_monitor,
-       pg_has_role(current_user, 'pg_read_all_settings', 'member') AS has_pg_read_all_settings,
-       pg_has_role(current_user, 'pg_read_all_stats',    'member') AS has_pg_read_all_stats,
-       pg_has_role(current_user, 'pg_signal_backend',    'member') AS has_pg_signal_backend;
+-- one statement per role: pg_monitor / pg_read_all_* exist from PG 10 and
+-- pg_signal_backend from 9.6; pg_has_role errors on an unknown role, which
+-- would otherwise lose all four columns on an older server
+SELECT pg_has_role(current_user, 'pg_monitor',           'member') AS has_pg_monitor;
+SELECT pg_has_role(current_user, 'pg_read_all_settings', 'member') AS has_pg_read_all_settings;
+SELECT pg_has_role(current_user, 'pg_read_all_stats',    'member') AS has_pg_read_all_stats;
+SELECT pg_has_role(current_user, 'pg_signal_backend',    'member') AS has_pg_signal_backend;
 SELECT rolname, rolsuper, rolreplication, rolcanlogin, rolvaliduntil
 FROM pg_roles WHERE rolname = current_user;
 

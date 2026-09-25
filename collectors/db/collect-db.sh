@@ -26,14 +26,22 @@
 #
 # NOTE: no `set -e` by design — the collector must reach its footer even when
 # every probe fails. Config files are dumped verbatim (framework policy:
-# genuinely sensitive material is stored encrypted, masking destroys facts).
+# masking destroys facts); README.md, "What the report can contain", lists
+# every place a secret can arrive from.
 # -----------------------------------------------------------------------------
+
+# bash only: arrays, `read -d`, $SECONDS. Another shell would run on and give
+# wrong answers silently, so it stops here instead.
+if [ -z "${BASH_VERSION:-}" ]; then
+    printf '%s\n' "collect-db.sh needs bash (run it as ./collect-db.sh or bash collect-db.sh)" >&2
+    exit 2
+fi
 
 export LC_ALL=C
 
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-db"
-VERSION="0.3.1"
+VERSION="0.4.0"
 DOMAIN="db"
 TARGET="db-host/$(hostname 2>/dev/null || echo unknown)"
 
@@ -518,9 +526,10 @@ CMD_TIMEOUT=20
 NET_TIMEOUT=5
 _init_probe() {
     _errfile="$(_tmp probe.err)"
+    _logwin="$(_tmp logwin)"
     have timeout && _timeout_bin="$(command -v timeout)"
 }
-_end_probe() { [ -n "$_errfile" ] && rm -f "$_errfile" "$_logwin" 2>/dev/null; }
+_end_probe() { :; }   # _run_cleanup removes the run directory
 
 _classify_err() {
     local txt=""
@@ -546,11 +555,15 @@ _emit_labeled() {
 
 probe() {
     local label="$1"; shift
-    command -v "$1" >/dev/null 2>&1 || { fact "$label: n/a (command not found: $1)"; return; }
+    [ -n "$(_cmd_kind "$1")" ] || { fact "$label: n/a (command not found: $1)"; return; }
+    _past_deadline && { fact "$label: n/a (run deadline reached: ${RUN_DEADLINE}s)"; return; }
     local out rc
-    if [ -n "$_timeout_bin" ]; then out="$("$_timeout_bin" "$CMD_TIMEOUT" "$@" 2>"$_errfile")"; rc=$?
-    else out="$("$@" 2>"$_errfile")"; rc=$?; fi
-    [ "$rc" -eq 124 ] && [ -n "$_timeout_bin" ] && { fact "$label: n/a (timed out: ${CMD_TIMEOUT}s)"; return; }
+    out="$(_bounded "$@" 2>"$_errfile")"; rc=$?
+    if [ "$rc" -eq 124 ]; then
+        if _past_deadline; then fact "$label: n/a (run deadline reached: ${RUN_DEADLINE}s)"
+        else fact "$label: n/a (timed out: ${CMD_TIMEOUT}s)"; fi
+        return
+    fi
     [ "$rc" -ne 0 ] && { fact "$label: n/a ($(_classify_err))"; return; }
     [ -z "$out" ] && { fact "$label: n/a (empty output)"; return; }
     _emit_labeled "$label" "$out"
@@ -559,12 +572,15 @@ probe() {
 # probe_merged: like probe but folds stderr into stdout (java -version etc.).
 probe_merged() {
     local label="$1"; shift
-    local bin="$1"
-    command -v "$bin" >/dev/null 2>&1 || { fact "$label: n/a (command not found: $bin)"; return; }
+    [ -n "$(_cmd_kind "$1")" ] || { fact "$label: n/a (command not found: $1)"; return; }
+    _past_deadline && { fact "$label: n/a (run deadline reached: ${RUN_DEADLINE}s)"; return; }
     local out rc
-    if [ -n "$_timeout_bin" ]; then out="$("$_timeout_bin" "$CMD_TIMEOUT" "$@" 2>&1)"; rc=$?
-    else out="$("$@" 2>&1)"; rc=$?; fi
-    [ "$rc" -eq 124 ] && [ -n "$_timeout_bin" ] && { fact "$label: n/a (timed out: ${CMD_TIMEOUT}s)"; return; }
+    out="$(_bounded "$@" 2>&1)"; rc=$?
+    if [ "$rc" -eq 124 ]; then
+        if _past_deadline; then fact "$label: n/a (run deadline reached: ${RUN_DEADLINE}s)"
+        else fact "$label: n/a (timed out: ${CMD_TIMEOUT}s)"; fi
+        return
+    fi
     [ -z "$out" ] && { fact "$label: n/a (empty output)"; return; }
     _emit_labeled "$label" "$out"
 }
@@ -606,9 +622,9 @@ dump_file() {
     local label="$1" path="$2" max="${3:-400}" total
     [ -e "$path" ] || { fact "$label: n/a (path not found: $path)"; return; }
     [ -r "$path" ] || { fact "$label: n/a (permission denied: $path)"; return; }
-    total="$(wc -l < "$path" 2>/dev/null | tr -d ' ')"
+    total="$(_bounded wc -l "$path" 2>/dev/null | awk '{print $1}')"
     fact "$label (verbatim, $total lines$( [ "${total:-0}" -gt "$max" ] && printf ', first %s shown' "$max" )):"
-    head -n "$max" "$path" 2>/dev/null | while IFS= read -r _l || [ -n "$_l" ]; do printf '        %s\n' "$_l"; done
+    _bounded head -n "$max" "$path" 2>/dev/null | while IFS= read -r _l || [ -n "$_l" ]; do printf '        %s\n' "$_l"; done
 }
 
 # conf_get FILE KEY -> value of the last non-comment "KEY=..." line, trimmed.
@@ -618,25 +634,32 @@ conf_get() {
 }
 
 # tcp_probe "label" HOST PORT -> single bounded TCP connect attempt (load-safe:
-# one attempt, NET_TIMEOUT cap, skipped when no timeout binary exists).
+# one attempt, NET_TIMEOUT cap through _bounded).
 tcp_probe() {
     local label="$1" host="$2" port="$3" rc t0 t1
     [ -n "$host" ] && [ -n "$port" ] || { fact "$label: n/a (not applicable: host/port not set)"; return; }
-    if [ -z "$_timeout_bin" ]; then
-        fact "$label: n/a (not applicable: timeout binary absent, connect probe skipped)"
-        return
-    fi
     t0="$(date +%s 2>/dev/null)"
-    "$_timeout_bin" "$NET_TIMEOUT" bash -c "exec 3<>/dev/tcp/$host/$port" 2>/dev/null
+    CMD_TIMEOUT="$NET_TIMEOUT" _bounded bash -c "exec 3<>/dev/tcp/$host/$port" 2>/dev/null
     rc=$?
     t1="$(date +%s 2>/dev/null)"
     if [ "$rc" -eq 0 ]; then
         fact "$label: tcp connect to $host:$port succeeded ($((t1 - t0))s)"
     elif [ "$rc" -eq 124 ]; then
         fact "$label: tcp connect to $host:$port timed out (${NET_TIMEOUT}s)"
+        TCP_DOWN="$TCP_DOWN|$host:$port=tcp connect timed out (${NET_TIMEOUT}s, section G)|"
     else
         fact "$label: tcp connect to $host:$port did not connect (rc=$rc, $((t1 - t0))s)"
+        TCP_DOWN="$TCP_DOWN|$host:$port=tcp connect did not connect (rc=$rc, section G)|"
     fi
+}
+# endpoints whose section G connect probe failed: "|host:port=reason|..."
+TCP_DOWN=""
+# tcp_down HOST PORT -> prints the recorded reason and returns 0 when the probe failed
+tcp_down() {
+    case "$TCP_DOWN" in
+        *"|$1:$2="*) printf '%s' "$TCP_DOWN" | tr '|' '\n' | grep -F -m1 "$1:$2=" | cut -d= -f2- ; return 0 ;;
+    esac
+    return 1
 }
 
 # ---- discovery (run once) ------------------------------------------------------
@@ -646,8 +669,88 @@ DBP_PIDS=(); DBP_KINDS=()    # database server processes on this host
 HOME_DIRS=(); HOME_SRCS=()   # agent install dir candidates + how each was found
 INST_DIRS=()                 # dirs containing a whatap.conf (one per agent instance)
 XOS_CONFS=()                 # xos.conf files found under homes
+UNRES_HOME=""                # "pid(kind) ..." whose install dir could not be read off /proc
+UNRES_WHY=""                 # "pid: reason; ..." for the processes in UNRES_HOME
+UNRES_PID=(); UNRES_CWD=(); UNRES_JAR=(); UNRES_W=(); UNRES_P=()   # per process, before --home matching
+UNRES_BYHOME=""              # "pid(kind) -> home" resolved by a matching --home
+UNRES_PRIV=0                 # 1 when a privilege gap left a process unresolved
+OPT_HOME_ADDED=0             # --home dirs that resolved to an existing directory
+OPT_HOME_BAD=""              # --home values that did not
+OPT_HOME_OK=""               # --home dirs accepted, physical, one per line
+ADD_HOME_DIR=""              # the physical dir the last successful add_home settled on
+FIND_DENIED=""               # homes whose search for whatap.conf/xos.conf hit a denied entry
+FIND_FAILED=""               # homes whose search timed out or failed otherwise
+ADD_HOME_WHY=""              # why the last add_home rejected its dir
+PROC_HIDDEN=""               # non-empty when /proc hides other users' processes
+
+# _proc_hidden -> 0 when a non-root run sees /proc through hidepid=1|2|
+# invisible|noaccess, i.e. other users' processes are hidden or unreadable
+PROC_STATE=""         # what the run knows about /proc visibility, for [1]
+_proc_hidden() {
+    # hidepid=1|noaccess: other users' /proc/<pid> entries are listed but not
+    # readable; hidepid=2|invisible: they are not listed at all. A run holding
+    # the gid= group is exempt. Unread mountinfo is not "no hidepid".
+    local o hp g
+    if [ "$(id -u 2>/dev/null)" = 0 ]; then PROC_STATE="run as root (hidepid does not apply)"; return 1; fi
+    if [ ! -r /proc/self/mountinfo ]; then
+        PROC_STATE="n/a (/proc/self/mountinfo not readable; visibility of other users' processes unknown)"; return 0
+    fi
+    # the last /proc mount in mountinfo is the one on top
+    o="$(awk '$5 == "/proc" {o = $6 "," $NF} END {print o}' /proc/self/mountinfo 2>/dev/null)"
+    if [ -z "$o" ]; then
+        PROC_STATE="n/a (no /proc mount in /proc/self/mountinfo; visibility of other users' processes unknown)"; return 0
+    fi
+    hp="$(printf '%s' "$o" | tr ',' '\n' | sed -n 's/^hidepid=//p' | tail -n1)"
+    g="$(printf '%s' "$o" | tr ',' '\n' | sed -n 's/^gid=//p' | tail -n1)"
+    case "$hp" in
+        ""|0|off) PROC_STATE="no hidepid option on the /proc mount"; return 1 ;;
+    esac
+    if [ -n "$g" ] && id -G 2>/dev/null | tr ' ' '\n' | grep -qx "$g"; then
+        PROC_STATE="mounted with hidepid=$hp, gid=$g, a group of this run (other users' processes readable)"; return 1
+    fi
+    case "$hp" in
+        1|noaccess) PROC_STATE="mounted with hidepid=$hp${g:+ (gid=$g is not a group of this run)}: other users' /proc/<pid> entries listed but not readable" ;;
+        *)          PROC_STATE="mounted with hidepid=$hp${g:+ (gid=$g is not a group of this run)}: other users' processes not listed" ;;
+    esac
+    return 0
+}
 
 cmdline_of() { tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null; }
+
+# _self_tree -> " pid " for this collector and each of its ancestors, so the
+# shell that started the collector is never counted as a component process
+_self_tree() {
+    local p="$$" n=0
+    while [ -n "$p" ] && [ "$p" != 0 ] && [ "$n" -lt 30 ]; do
+        printf ' %s ' "$p"
+        p="$(awk '/^PPid:/{print $2; exit}' "/proc/$p/status" 2>/dev/null)"
+        n=$((n + 1))
+    done
+}
+
+# _kind_of_proc PID ARGS -> the component kind of one /proc process, or "".
+# ARGS is the cmdline with one argument per line. The java agents (dbx, dmx,
+# prx, xos) count only when the program is java (argv[0] or /proc/<pid>/exe)
+# and an argument names the whatap.agent jar or class: a shell or an editor
+# whose arguments merely mention the jar is not an agent.
+_kind_of_proc() {
+    local a0 w0 exe k
+    a0="$(printf '%s\n' "$2" | head -n1)"; w0="${a0%% *}"; w0="${w0##*/}"
+    case "$w0" in
+        java|javaw|jsvc) ;;
+        *) exe="$(readlink "/proc/$1/exe" 2>/dev/null)"; exe="${exe##*/}"
+           case "$exe" in
+               java|javaw|jsvc) ;;
+               *) case "$w0" in *dbxc*) echo dbxc ;; *xcub*) echo xcub ;; esac
+                  return ;;
+           esac ;;
+    esac
+    k="$(printf '%s\n' "$2" | grep -oE 'whatap\.agent\.(dbx|dmx|prx|xos)' | head -n1)"
+    printf '%s' "${k#whatap.agent.}"
+}
+
+# _has_glob PATTERN-EXPANSION... -> 0 when the shell glob matched a path (no fork)
+_has_glob() { for _g in "$@"; do [ -e "$_g" ] && return 0; done; return 1; }
 
 _kind_of_cmdline() {
     case "$1" in
@@ -676,16 +779,26 @@ _db_kind_of_comm() {
     esac
 }
 
-add_home() { # DIR SRC — dedupe on DIR
-    local d="$1" s="$2" i=0
-    [ -n "$d" ] && [ -d "$d" ] || return
-    d="$(cd "$d" 2>/dev/null && pwd)" || return
+add_home() { # DIR SRC — dedupe on DIR; returns 1 with ADD_HOME_WHY when DIR is unusable
+    local d="$1" s="$2" i=0 r
+    ADD_HOME_WHY=""
+    [ -n "$d" ] || { ADD_HOME_WHY="empty path"; return 1; }
+    case "$d" in *" (deleted)") ADD_HOME_WHY="$d: directory deleted"; return 1 ;; esac
+    [ -d "$d" ] || { ADD_HOME_WHY="$d: not a directory or not reachable"; return 1; }
+    # physical path: /proc/<pid>/cwd is physical, so every comparison is too
+    r="$(cd "$d" 2>/dev/null && pwd -P)" || { ADD_HOME_WHY="$d: cannot be entered (permission denied)"; return 1; }
+    d="$r"
+    case "$d" in
+        /|/proc|/proc/*|/sys|/sys/*|/dev|/dev/*|/run|/tmp|/var/tmp)
+            ADD_HOME_WHY="$d: not taken as an install dir (a system root)"; return 1 ;;
+    esac
     while [ "$i" -lt "${#HOME_DIRS[@]}" ]; do
-        [ "${HOME_DIRS[$i]}" = "$d" ] && return
+        [ "${HOME_DIRS[$i]}" = "$d" ] && { ADD_HOME_DIR="$d"; return 0; }
         i=$((i + 1))
     done
     HOME_DIRS[${#HOME_DIRS[@]}]="$d"
     HOME_SRCS[${#HOME_SRCS[@]}]="$s"
+    ADD_HOME_DIR="$d"
 }
 
 add_inst() { # DIR — dedupe
@@ -699,23 +812,54 @@ add_inst() { # DIR — dedupe
 }
 
 discover() {
-    local d pid cl kind comm jarpath cwd h
+    local d pid cl args kind comm jarpath reljar cwd h self
+    self="$(_self_tree)"
 
     # 1) process scan — /proc when available, `ps` otherwise (AIX / HP-UX etc.)
     if [ -d /proc/1 ]; then
         for d in /proc/[0-9]*; do
             [ -r "$d/cmdline" ] || continue
             pid="${d#/proc/}"
-            cl="$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null)"
+            case "$self" in *" $pid "*) continue ;; esac
+            # a cheap filter first: only a cmdline naming a component is read twice
+            cl="$(tr '\0' ' ' 2>/dev/null < "$d/cmdline")"
             [ -n "$cl" ] || continue
-            kind="$(_kind_of_cmdline "$cl")"
+            case "$cl" in *whatap.agent.*|*dbxc*|*xcub*) ;; *) cl="" ;; esac
+            kind=""
+            if [ -n "$cl" ]; then
+                args="$(tr '\0' '\n' 2>/dev/null < "$d/cmdline")"
+                kind="$(_kind_of_proc "$pid" "$args")"
+            fi
             if [ -n "$kind" ]; then
                 AG_PIDS[${#AG_PIDS[@]}]="$pid"
                 AG_KINDS[${#AG_KINDS[@]}]="$kind"
                 cwd="$(readlink "/proc/$pid/cwd" 2>/dev/null)"
-                add_home "$cwd" "cwd of $kind process $pid"
-                jarpath="$(printf '%s\n' "$cl" | tr ' ' '\n' | grep -E '^/.*whatap\.agent\.[a-z]+.*\.jar$' | head -n1)"
-                [ -n "$jarpath" ] && add_home "$(dirname "$jarpath")" "jar path of $kind process $pid"
+                local ok=0 why="" priv=0
+                if [ -z "$cwd" ]; then why="/proc/$pid/cwd not readable"; priv=1
+                elif add_home "$cwd" "cwd of $kind process $pid"; then ok=1
+                else why="cwd $ADD_HOME_WHY"; case "$ADD_HOME_WHY" in *"permission denied"*) priv=1 ;; esac; fi
+                # one argument per line, so a path with spaces stays whole; a
+                # cmdline that is a single string (exec -a) falls back to the
+                # span from the first "/" to the jar name
+                jarpath="$(printf '%s\n' "$args" | grep -E '^/.*whatap\.agent\.[a-z]+[^/]*\.jar$' | head -n1)"
+                [ -n "$jarpath" ] || jarpath="$(printf '%s\n' "$args" | grep -oE ' /.*whatap\.agent\.[a-z]+[^/]*\.jar' | head -n1 | sed 's/^ //')"
+                reljar="$(printf '%s\n' "$args" | grep -E '^([^/ -][^ ]*)?whatap\.agent\.[a-z]+[^/ ]*\.jar$' | head -n1)"
+                [ -n "$reljar" ] || reljar="$(printf '%s\n' "$args" | grep -oE '(^| )-jar ([^ /][^ ]*)?whatap\.agent\.[a-z]+[^ /]*\.jar' | head -n1 | sed 's/.*-jar //')"
+                if [ -n "$jarpath" ]; then
+                    if add_home "$(dirname "$jarpath")" "jar path of $kind process $pid"; then ok=1
+                    else why="$why${why:+, }jar dir $ADD_HOME_WHY"; fi
+                else
+                    why="$why${why:+, }no absolute whatap.agent jar path in the cmdline"
+                fi
+                # a relative -jar path is resolved against the cwd; a cwd that
+                # cannot be read or entered leaves the home of this process unknown
+                if [ "$ok" = 0 ]; then
+                    UNRES_PID[${#UNRES_PID[@]}]="$pid($kind)"
+                    UNRES_CWD[${#UNRES_CWD[@]}]="${cwd% (deleted)}"
+                    UNRES_JAR[${#UNRES_JAR[@]}]="$reljar"
+                    UNRES_W[${#UNRES_W[@]}]="$why"
+                    UNRES_P[${#UNRES_P[@]}]="$priv"
+                fi
                 continue
             fi
             comm="$(cat "$d/comm" 2>/dev/null)"
@@ -727,38 +871,88 @@ discover() {
         done
     else
         # non-Linux fallback: parse `ps`, derive homes from absolute jar paths
-        ps -ef 2>/dev/null | while IFS= read -r _l; do :; done   # capability check only
-        for pid in $(ps -ef 2>/dev/null | awk '/whatap\.agent\.|dbxc|xcub/ && !/awk/ {print $2}'); do
-            cl="$(ps -o args= -p "$pid" 2>/dev/null)"
+        for pid in $(_bounded ps -ef 2>/dev/null | awk '/whatap\.agent\.|dbxc|xcub/ && !/awk/ {print $2}'); do
+            cl="$(_bounded ps -o args= -p "$pid" 2>/dev/null)"
             kind="$(_kind_of_cmdline "$cl")"
             [ -n "$kind" ] || continue
             AG_PIDS[${#AG_PIDS[@]}]="$pid"
             AG_KINDS[${#AG_KINDS[@]}]="$kind"
             jarpath="$(printf '%s\n' "$cl" | tr ' ' '\n' | grep -E '^/.*whatap\.agent\.[a-z]+.*\.jar$' | head -n1)"
-            [ -n "$jarpath" ] && add_home "$(dirname "$jarpath")" "jar path of $kind process $pid (ps)"
+            if [ -n "$jarpath" ] && add_home "$(dirname "$jarpath")" "jar path of $kind process $pid (ps)"; then :
+            else
+                UNRES_PID[${#UNRES_PID[@]}]="$pid($kind)"; UNRES_CWD[${#UNRES_CWD[@]}]=""; UNRES_JAR[${#UNRES_JAR[@]}]=""
+                UNRES_W[${#UNRES_W[@]}]="${jarpath:+jar dir $ADD_HOME_WHY}${jarpath:-no absolute whatap.agent jar path in ps args}"
+                UNRES_P[${#UNRES_P[@]}]=0
+            fi
         done
     fi
+    _proc_hidden && PROC_HIDDEN="$PROC_STATE"
 
     # 2) homes given on the command line
     if [ -n "$OPT_HOMES" ]; then
-        printf '%s' "$OPT_HOMES" > "${TMPDIR:-/tmp}/.ggt.$$.homes" 2>/dev/null
         while IFS= read -r h; do
-            [ -n "$h" ] && add_home "$h" "option --home"
-        done < "${TMPDIR:-/tmp}/.ggt.$$.homes"
-        rm -f "${TMPDIR:-/tmp}/.ggt.$$.homes" 2>/dev/null
+            [ -n "$h" ] || continue
+            if add_home "$h" "option --home"; then OPT_HOME_ADDED=$((OPT_HOME_ADDED + 1)); OPT_HOME_OK="$OPT_HOME_OK$ADD_HOME_DIR$_nl"
+            else OPT_HOME_BAD="$OPT_HOME_BAD${OPT_HOME_BAD:+; }$ADD_HOME_WHY"; fi
+        done <<EOF
+$OPT_HOMES
+EOF
     fi
+
+    # an unresolved process counts as resolved by a --home only when the home
+    # matches it: its known cwd is the home or under it, or its relative jar
+    # path exists under the home. An unrelated --home resolves nothing.
+    local ui=0 hh hr
+    while [ "$ui" -lt "${#UNRES_PID[@]}" ]; do
+        hr=""
+        while IFS= read -r hh; do
+            [ -n "$hh" ] || continue
+            # already physical and accepted by add_home; a rejected --home matches nothing
+            if [ -n "${UNRES_CWD[$ui]}" ]; then
+                case "${UNRES_CWD[$ui]}/" in "$hh"/*) hr="$hh" ;; esac
+            fi
+            [ -z "$hr" ] && [ -n "${UNRES_JAR[$ui]}" ] && [ -f "$hh/${UNRES_JAR[$ui]}" ] && hr="$hh"
+            [ -n "$hr" ] && break
+        done <<EOF
+$OPT_HOME_OK
+EOF
+        if [ -n "$hr" ]; then
+            UNRES_BYHOME="$UNRES_BYHOME${UNRES_BYHOME:+; }${UNRES_PID[$ui]} -> $hr"
+        else
+            UNRES_HOME="$UNRES_HOME ${UNRES_PID[$ui]}"
+            UNRES_WHY="$UNRES_WHY${UNRES_WHY:+; }${UNRES_PID[$ui]%%(*}: ${UNRES_W[$ui]}"
+            [ "${UNRES_P[$ui]}" = 1 ] && UNRES_PRIV=1
+        fi
+        ui=$((ui + 1))
+    done
+    UNRES_HOME="${UNRES_HOME# }"
 
     # 3) instances = dirs holding a whatap.conf under each home (depth-capped);
     #    xos.conf files are recorded the same way
     local i=0 f
     while [ "$i" -lt "${#HOME_DIRS[@]}" ]; do
         h="${HOME_DIRS[$i]}"
-        for f in $(find "$h" -maxdepth 2 -name whatap.conf -type f 2>/dev/null | head -n 20); do
-            add_inst "$(dirname "$f")"
-        done
-        for f in $(find "$h" -maxdepth 2 -name xos.conf -type f 2>/dev/null | head -n 20); do
-            XOS_CONFS[${#XOS_CONFS[@]}]="$f"
-        done
+        # find exits non-zero on a denied entry: the search is then incomplete.
+        # A cap (124) or another failure is told apart from a denial.
+        local frc
+        _bounded find "$h" -maxdepth 2 \( -name whatap.conf -o -name xos.conf \) \( -type f -o -type l \) > "$(_tmp confs)" 2>"$(_tmp confs.err)"
+        frc=$?
+        if [ "$frc" -eq 124 ]; then FIND_FAILED="$FIND_FAILED${FIND_FAILED:+; }$h (timed out: ${CMD_TIMEOUT}s)"
+        elif [ "$frc" -ne 0 ]; then
+            if grep -q 'ermission denied' "$(_tmp confs.err)" 2>/dev/null; then FIND_DENIED="$FIND_DENIED $h"
+            else FIND_FAILED="$FIND_FAILED${FIND_FAILED:+; }$h (find exit $frc: $(head -n1 "$(_tmp confs.err)" 2>/dev/null | cut -c1-100))"; fi
+        fi
+        # line-wise: install paths can contain spaces
+        while IFS= read -r f; do
+            [ -n "$f" ] && add_inst "$(dirname "$f")"
+        done <<EOF
+$(grep '/whatap\.conf$' "$(_tmp confs)" 2>/dev/null | head -n 20)
+EOF
+        while IFS= read -r f; do
+            [ -n "$f" ] && XOS_CONFS[${#XOS_CONFS[@]}]="$f"
+        done <<EOF
+$(grep '/xos\.conf$' "$(_tmp confs)" 2>/dev/null | head -n 20)
+EOF
         i=$((i + 1))
     done
 
@@ -912,7 +1106,7 @@ _pick_java_bindir() {
     [ -z "$_JBIN" ] && have java && _JBIN="$(dirname "$(command -v java)")"
     [ -n "$_JBIN" ] || return 1
     if [ -x "$_JBIN/jshell" ]; then _JDBC_MODE="jshell"
-    elif [ -x "$_JBIN/jrunscript" ] && "$_JBIN/jrunscript" -e 'print(1)' >/dev/null 2>&1; then _JDBC_MODE="jrunscript"
+    elif [ -x "$_JBIN/jrunscript" ] && _bounded "$_JBIN/jrunscript" -e 'print(1)' >/dev/null 2>&1; then _JDBC_MODE="jrunscript"
     else return 1; fi
     return 0
 }
@@ -951,26 +1145,20 @@ _run_jdbc_pack() { # PACKFILE URL JAR -> runner output on stdout
     local rfile out
     # UTF-8 is forced on the runner VM: the report must carry DB text (Korean
     # query text etc.) byte-true even though the collector itself runs LC_ALL=C
+    # credentials travel in the child's environment only, never on a command
+    # line; the runner file lives in the run's private directory
     if [ "$_JDBC_MODE" = "jshell" ]; then
-        rfile="${TMPDIR:-/tmp}/.ggt.$$.runner.jsh"
+        rfile="$(_tmp runner.jsh)"
         _write_runner_jsh "$rfile"
-        if [ -n "$_timeout_bin" ]; then
-            WHATAP_GGT_PACK="$1" WHATAP_GGT_URL="$2" WHATAP_GGT_USER="$CRED_USER" WHATAP_GGT_PW="$CRED_PW" \
-                "$_timeout_bin" 120 "$_JBIN/jshell" -q -J-Dfile.encoding=UTF-8 -R-Dfile.encoding=UTF-8 --class-path "$3" "$rfile" 2>&1
-        else
-            WHATAP_GGT_PACK="$1" WHATAP_GGT_URL="$2" WHATAP_GGT_USER="$CRED_USER" WHATAP_GGT_PW="$CRED_PW" \
-                "$_JBIN/jshell" -q -J-Dfile.encoding=UTF-8 -R-Dfile.encoding=UTF-8 --class-path "$3" "$rfile" 2>&1
-        fi
+        CMD_TIMEOUT=120 WHATAP_GGT_PACK="$1" WHATAP_GGT_URL="$2" WHATAP_GGT_USER="$CRED_USER" WHATAP_GGT_PW="$CRED_PW" \
+            _bounded "$_JBIN/jshell" -q -J-Dfile.encoding=UTF-8 -R-Dfile.encoding=UTF-8 --class-path "$3" "$rfile" 2>&1
+        echo "$?" > "$(_tmp runner.rc)"
     else
-        rfile="${TMPDIR:-/tmp}/.ggt.$$.runner.js"
+        rfile="$(_tmp runner.js)"
         _write_runner_js "$rfile"
-        if [ -n "$_timeout_bin" ]; then
-            WHATAP_GGT_PACK="$1" WHATAP_GGT_URL="$2" WHATAP_GGT_USER="$CRED_USER" WHATAP_GGT_PW="$CRED_PW" \
-                "$_timeout_bin" 120 "$_JBIN/jrunscript" -J-Dfile.encoding=UTF-8 -cp "$3" "$rfile" 2>&1
-        else
-            WHATAP_GGT_PACK="$1" WHATAP_GGT_URL="$2" WHATAP_GGT_USER="$CRED_USER" WHATAP_GGT_PW="$CRED_PW" \
-                "$_JBIN/jrunscript" -J-Dfile.encoding=UTF-8 -cp "$3" "$rfile" 2>&1
-        fi
+        CMD_TIMEOUT=120 WHATAP_GGT_PACK="$1" WHATAP_GGT_URL="$2" WHATAP_GGT_USER="$CRED_USER" WHATAP_GGT_PW="$CRED_PW" \
+            _bounded "$_JBIN/jrunscript" -J-Dfile.encoding=UTF-8 -cp "$3" "$rfile" 2>&1
+        echo "$?" > "$(_tmp runner.rc)"
     fi
     rm -f "$rfile" 2>/dev/null
 }
@@ -978,15 +1166,15 @@ _run_jdbc_pack() { # PACKFILE URL JAR -> runner output on stdout
 # ---- log window helpers --------------------------------------------------------
 LOG_TAIL_LINES=200      # verbatim tail of the newest agent log
 LOG_SCAN_LINES=5000     # bounded window for pattern counting (never whole logs)
-_logwin="${TMPDIR:-/tmp}/.ggt.$$.logwin"
+_logwin=""              # set by _init_probe, inside the run's private directory
 
 newest_matching() { # DIR GLOB -> newest matching file path (mtime), or empty
-    ls -1t "$1"/$2 2>/dev/null | head -n1
+    _bounded ls -1t "$1"/$2 2>/dev/null | head -n1
 }
 
 load_logwin() { # FILE -> fills $_logwin with its last LOG_SCAN_LINES lines
     : > "$_logwin" 2>/dev/null
-    [ -n "$1" ] && [ -r "$1" ] && tail -n "$LOG_SCAN_LINES" "$1" > "$_logwin" 2>/dev/null
+    [ -n "$1" ] && [ -r "$1" ] && _bounded tail -n "$LOG_SCAN_LINES" "$1" > "$_logwin" 2>/dev/null
 }
 
 count_in_win() { # LABEL ERE
@@ -1006,6 +1194,10 @@ run_report() {
     emit_header
 
     goal components "whatap DB-monitoring components on this host"
+    goal home       "agent install dir of each component"
+    goal conf       "component configuration (whatap.conf / xos.conf)"
+    [ "$OPT_TLS" = 1 ] && goal tls "TLS handshake probe (--tls)"
+    [ "$OPT_SQL" = 1 ] && goal sql "SQL pack over JDBC (--sql)"
 
     # [1] capability preamble — makes downstream "command not found" self-evident
     section "Collection environment"
@@ -1019,7 +1211,7 @@ run_report() {
         if have "$t"; then printf '        %-12s present\n' "$t"
         else printf '        %-12s absent\n' "$t"; fi
     done
-    [ -z "$_timeout_bin" ] && fact "note: timeout binary absent — network connect probes are skipped"
+    fact "/proc: ${PROC_STATE:-n/a (mountinfo not read)}"
 
     # [2] host & platform — arch and Java repeatedly needed in field threads
     section "A. Host & platform"
@@ -1067,9 +1259,16 @@ run_report() {
     [ $((n_dbx + n_dmx + n_prx + n_dbxc)) -gt 0 ] && role_agent="yes"
     { [ $((n_xos + n_xcub)) -gt 0 ] || [ "${#DBP_PIDS[@]}" -gt 0 ]; } && role_dbhost="yes"
     fact "host role by discovery: dbx-agent-side=$role_agent db-host-side=$role_dbhost"
-    if [ "${#HOME_DIRS[@]}" -eq 0 ]; then
+    if [ -n "$UNRES_HOME" ]; then
+        fact "install dir of process(es) $UNRES_HOME: n/a ($UNRES_WHY)"
+    fi
+    [ -n "$OPT_HOME_BAD" ] && fact "--home not usable: $OPT_HOME_BAD"
+    [ -n "$UNRES_BYHOME" ] && fact "install dir resolved by a matching --home: $UNRES_BYHOME"
+    if [ "${#HOME_DIRS[@]}" -eq 0 ] && [ -z "$UNRES_HOME" ] && [ "${#AG_PIDS[@]}" -eq 0 ]; then
         fact "agent install dir: n/a (no whatap component process found and no --home given)"
     fi
+    [ -n "$FIND_DENIED" ] && fact "whatap.conf/xos.conf search incomplete (a denied entry within depth 2) under:$FIND_DENIED"
+    [ -n "$FIND_FAILED" ] && fact "whatap.conf/xos.conf search incomplete: $FIND_FAILED"
     i=0
     while [ "$i" -lt "${#HOME_DIRS[@]}" ]; do
         fact "install dir candidate: ${HOME_DIRS[$i]} (via ${HOME_SRCS[$i]})"
@@ -1094,12 +1293,12 @@ run_report() {
         probe "top-level (depth 1)" ls -1 "$h"
         # component jar/binary file names carry version + build
         local jars
-        jars="$(ls -l "$h"/whatap.agent.*.jar "$h"/whatap.agent.xos* "$h"/xos/whatap.agent.xos* 2>/dev/null)"
+        jars="$(_bounded ls -l "$h"/whatap.agent.*.jar "$h"/whatap.agent.xos* "$h"/xos/whatap.agent.xos* 2>/dev/null)"
         if [ -n "$jars" ]; then _emit_labeled "whatap component files (name=version, with mtime)" "$jars"
         else fact "whatap component files: n/a (no whatap.agent.* under $h at depth 1)"; fi
         if [ -d "$h/jdbc" ]; then
             probe "jdbc drivers" ls -1 "$h/jdbc"
-            if ls "$h/jdbc"/orai18n* >/dev/null 2>&1; then fact "orai18n jar: present in jdbc/"
+            if _has_glob "$h/jdbc"/orai18n*; then fact "orai18n jar: present in jdbc/"
             else fact "orai18n jar: not present in jdbc/"; fi
         else
             fact "jdbc drivers: n/a (path not found: $h/jdbc)"
@@ -1107,14 +1306,14 @@ run_report() {
         local f
         for f in uid.sh db.user start.sh startd.sh stop.sh prx.conf dbx.conf; do
             if [ -e "$h/$f" ]; then
-                fact "$f: present ($(ls -l "$h/$f" 2>/dev/null | awk '{print $5" bytes, "$6" "$7" "$8}'))"
+                fact "$f: present ($(_bounded ls -l "$h/$f" 2>/dev/null | awk '{print $5" bytes, "$6" "$7" "$8}'))"
             else
                 fact "$f: not present at $h"
             fi
         done
         local pidf
         for pidf in "$h"/*.pid "$h"/dbx "$h"/xcub-*.whatap; do
-            [ -e "$pidf" ] && fact "pid file: $pidf ($(cat "$pidf" 2>/dev/null | head -n1 | cut -c1-40))"
+            [ -e "$pidf" ] && fact "pid file: $pidf ($(_bounded head -n1 "$pidf" 2>/dev/null | cut -c1-40))"
         done
         probe "dbxc-ctl version" "$h/dbxc-ctl" version
         i=$((i + 1))
@@ -1172,7 +1371,7 @@ run_report() {
     else
         fact "systemd: n/a (command not found: systemctl)"
     fi
-    probe "cron entries mentioning whatap" sh -c "cat /etc/crontab /etc/cron.d/* 2>/dev/null | grep -i whatap | head -n 10"
+    probe "cron entries mentioning whatap" sh -c 'm="$(cat /etc/crontab /etc/cron.d/* 2>/dev/null | grep -i whatap | head -n 10)"; if [ -n "$m" ]; then printf "%s\n" "$m"; else echo none; fi'
     fact "watched ports (defaults + conf whatap.server.port/xos_port): $WATCH_PORTS"
     if have ss; then
         probe "sockets on watched ports" sh -c "ss -tunap 2>/dev/null | grep -E ':($WATCH_PORTS_RE)[[:space:]]' | head -n 20"
@@ -1189,18 +1388,19 @@ run_report() {
     while [ "$i" -lt "${#HOME_DIRS[@]}" ]; do
         local h="${HOME_DIRS[$i]}" ldir=""
         for ldir in "$h/logs" "$h"; do
-            ls "$ldir"/whatap*.log >/dev/null 2>&1 && break
+            _has_glob "$ldir"/whatap*.log && break
             ldir=""
         done
         if [ -z "$ldir" ]; then i=$((i + 1)); continue; fi
         logged=1
         subsection "log dir: $ldir"
-        probe "log files (newest 15)" sh -c "ls -lt '$ldir' 2>/dev/null | head -n 16"
+        # paths travel as arguments ($1), never inside the script text
+        probe "log files (newest 15)" sh -c 'ls -lt "$1" 2>/dev/null | head -n 16' sh "$ldir"
         local nlog; nlog="$(newest_matching "$ldir" 'whatap*.log')"
         if [ -n "$nlog" ]; then
             fact "newest agent log: $nlog"
-            fact "newest agent log mtime: $(ls -l "$nlog" 2>/dev/null | awk '{print $6" "$7" "$8}')"
-            fact "last log line (verbatim): $(tail -n1 "$nlog" 2>/dev/null | cut -c1-200)"
+            fact "newest agent log mtime: $(_bounded ls -l "$nlog" 2>/dev/null | awk '{print $6" "$7" "$8}')"
+            fact "last log line (verbatim): $(_bounded tail -n1 "$nlog" 2>/dev/null | cut -c1-200)"
             fact "system time at collection: $(date '+%Y-%m-%d %H:%M:%S %Z(%z)' 2>/dev/null)"
             load_logwin "$nlog"
             local wa
@@ -1212,13 +1412,13 @@ run_report() {
             count_in_win "connection error lines" 'CONNECTION ERROR|openConnection error|Communications link failure'
             count_in_win "activate/inactivate transitions" 'inactivated|activated'
             subsection "verbatim tail ($LOG_TAIL_LINES lines): $nlog"
-            tail -n "$LOG_TAIL_LINES" "$nlog" 2>/dev/null | while IFS= read -r _l || [ -n "$_l" ]; do printf '        %s\n' "$_l"; done
+            _bounded tail -n "$LOG_TAIL_LINES" "$nlog" 2>/dev/null | while IFS= read -r _l || [ -n "$_l" ]; do printf '        %s\n' "$_l"; done
         fi
         local plog; plog="$(newest_matching "$ldir" 'prx*.log')"
         if [ -n "$plog" ]; then
             subsection "oracle-pro prx log: $plog"
-            fact "prx log mtime: $(ls -l "$plog" 2>/dev/null | awk '{print $6" "$7" "$8}')"
-            probe "prx rss / restart lines (last 30 matches)" sh -c "tail -n $LOG_SCAN_LINES '$plog' 2>/dev/null | grep -iE 'rss|restart|start' | tail -n 30"
+            fact "prx log mtime: $(_bounded ls -l "$plog" 2>/dev/null | awk '{print $6" "$7" "$8}')"
+            probe "prx rss / restart lines (last 30 matches)" sh -c 'tail -n "$2" "$1" 2>/dev/null | grep -iE "rss|restart|start" | tail -n 30 | grep . || echo none' sh "$plog" "$LOG_SCAN_LINES"
         fi
         i=$((i + 1))
     done
@@ -1227,7 +1427,7 @@ run_report() {
     # [8] topology & network — the agent host and DB host are often different
     section "G. Topology & network (per instance)"
     local myips
-    myips="$(hostname -I 2>/dev/null || ip -o -4 addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | tr '\n' ' ')"
+    myips="$(_bounded hostname -I 2>/dev/null || _bounded ip -o -4 addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | tr '\n' ' ')"
     fact "local ip addresses: ${myips:-n/a (hostname -I and ip unavailable)}"
     if [ "${#INST_DIRS[@]}" -eq 0 ]; then
         fact "n/a (no instance dir discovered)"
@@ -1244,7 +1444,7 @@ run_report() {
         wport="$(conf_get "$cf" 'whatap\.server\.port')"
         fact "dbms: ${dbms:-n/a (key not set in whatap.conf)}"
         fact "db_ip: ${dbip:-n/a (key not set)}   db_port: ${dbport:-n/a (key not set)}"
-        fact "whatap.server.host: ${whost:-n/a (key not set)}   whatap.server.port: ${wport:-not set (default 6600)}"
+        fact "whatap.server.host: ${whost:-n/a (key not set)}   whatap.server.port: ${wport:-not set (the connect probe below uses 6600)}"
         # connection options, verbatim + key names split out — misspelled keys
         # are silently ignored by JDBC drivers, so the raw spelling is the fact
         local copt3 dbssl3
@@ -1261,7 +1461,7 @@ run_report() {
         if [ -n "$dbip" ]; then
             case "$dbip" in
                 127.*|localhost|::1)
-                    fact "db endpoint class: loopback (DB co-located with agent)" ;;
+                    fact "db endpoint class: loopback" ;;
                 *[a-zA-Z]*)
                     fact "db endpoint class: DNS name"
                     probe "db endpoint resolution" getent hosts "$dbip"
@@ -1275,9 +1475,9 @@ run_report() {
                     esac ;;
                 *)
                     if [ -n "$myips" ] && printf '%s' " $myips " | grep -q " $dbip "; then
-                        fact "db endpoint class: local address of this host (DB co-located with agent)"
+                        fact "db endpoint class: an address of this host"
                     else
-                        fact "db endpoint class: remote address (agent host and DB host differ)"
+                        fact "db endpoint class: not an address of this host"
                     fi ;;
             esac
             tcp_probe "db reachability" "$dbip" "${dbport:-}"
@@ -1292,71 +1492,6 @@ run_report() {
     done
     fact "proxy env: http_proxy=${http_proxy:-unset} https_proxy=${https_proxy:-unset} no_proxy=${no_proxy:-unset}"
 
-    # TLS handshake probe — opt-in: shows what the SERVER offers (TLS version,
-    # cipher, certificate dates and signature algorithm), the counterpart to
-    # the runtime policy in section A/E and the connect_option in section G
-    if [ "$OPT_TLS" = 1 ]; then
-        section "T. TLS handshake probe (opt-in)"
-        if ! have openssl; then
-            fact "n/a (command not found: openssl)"
-        elif [ "${#INST_DIRS[@]}" -eq 0 ]; then
-            fact "n/a (no instance dir discovered)"
-        else
-            fact "openssl: $(openssl version 2>/dev/null)"
-            i=0
-            while [ "$i" -lt "${#INST_DIRS[@]}" ]; do
-                local idir="${INST_DIRS[$i]}" cf="${INST_DIRS[$i]}/whatap.conf"
-                local dbms dbip dbport dbssl copt st out certinfo sig
-                dbms="$(conf_get "$cf" dbms)"
-                dbip="$(conf_get "$cf" db_ip)"
-                dbport="$(conf_get "$cf" db_port)"
-                dbssl="$(conf_get "$cf" db_ssl)"
-                copt="$(conf_get "$cf" connect_option)"
-                subsection "instance: $idir (dbms=${dbms:-unset}, target ${dbip:-?}:${dbport:-?})"
-                if [ -z "$dbip" ] || [ -z "$dbport" ]; then
-                    fact "n/a (not applicable: db_ip/db_port not set)"
-                    i=$((i + 1)); continue
-                fi
-                st=""
-                case "$dbms" in
-                    mysql|mariadb)  st="-starttls mysql" ;;
-                    postgres*|pg)   st="-starttls postgres" ;;
-                    redis|valkey)
-                        case "$dbssl$copt" in
-                            *true*|*ssl*) st="" ;;
-                            *) fact "n/a (not applicable: db_ssl/ssl option not set — plain protocol)"
-                               i=$((i + 1)); continue ;;
-                        esac ;;
-                    mssql)  fact "n/a (not applicable: TLS runs inside the TDS prelogin — not probeable with openssl s_client)"
-                            i=$((i + 1)); continue ;;
-                    oracle) fact "n/a (not applicable: TCPS/native negotiation not probed in this version)"
-                            i=$((i + 1)); continue ;;
-                    *)      fact "n/a (not applicable: dbms=${dbms:-unset})"
-                            i=$((i + 1)); continue ;;
-                esac
-                warn "sending 1 TLS handshake to $dbip:$dbport ($dbms)"
-                if [ -n "$_timeout_bin" ]; then
-                    out="$(printf '' | "$_timeout_bin" 15 openssl s_client $st -connect "$dbip:$dbport" 2>&1)"
-                else
-                    fact "handshake: n/a (not applicable: timeout binary absent, probe skipped)"
-                    i=$((i + 1)); continue
-                fi
-                _emit_labeled "handshake summary" "$(printf '%s\n' "$out" \
-                    | grep -aE '^New, |Protocol *:|Cipher *(is|:)|Server public key|Verification|Verify return code|verify error|error|alert ' \
-                    | head -n 10)"
-                certinfo="$(printf '%s\n' "$out" | openssl x509 -noout -subject -issuer -dates 2>/dev/null)"
-                if [ -n "$certinfo" ]; then
-                    _emit_labeled "server certificate" "$certinfo"
-                    sig="$(printf '%s\n' "$out" | openssl x509 -noout -text 2>/dev/null | grep -m1 'Signature Algorithm' | sed 's/^ *//')"
-                    [ -n "$sig" ] && fact "certificate signature: $sig"
-                else
-                    fact "server certificate: n/a (no certificate in handshake output)"
-                fi
-                i=$((i + 1))
-            done
-        fi
-    fi
-
     # [9] engine-specific facts, driven by dbms= of each instance
     section "H. Engine-specific facts (per instance)"
     if [ "${#INST_DIRS[@]}" -eq 0 ]; then
@@ -1369,10 +1504,11 @@ run_report() {
         dbms="$(conf_get "$cf" dbms)"
         subsection "instance: $idir (dbms=${dbms:-unset})"
         # engine-relevant conf keys, verbatim lines (value + spelling as-is)
-        probe "engine-relevant conf lines" sh -c "grep -E '^[[:space:]]*(statements|statements_min_row|min_row|slow_query_log|connect_option|db_ssl|metalock|deadlock_interval|conn_fail_count|replication_name|skip_user|skip_whatap_session|cloud_watch|cloud_watch_metrics|cloud_watch_instance|aws_arn|aws_access_key|aws_secret_key|redis_autoscale|mslog|oname|whatap\.name|db=|db_user|plan_db|xos=|xos_port)' '$cf' 2>/dev/null"
+        # grep exit 1 (no line) is "none"; exit 2 (unreadable) stays an error
+        probe "engine-relevant conf lines" sh -c 'grep -E "^[[:space:]]*(statements|statements_min_row|min_row|slow_query_log|connect_option|db_ssl|metalock|deadlock_interval|conn_fail_count|replication_name|skip_user|skip_whatap_session|cloud_watch|cloud_watch_metrics|cloud_watch_instance|aws_arn|aws_access_key|aws_secret_key|redis_autoscale|mslog|oname|whatap\.name|db=|db_user|plan_db|xos=|xos_port)" "$1"; r=$?; [ "$r" = 1 ] && { echo none; exit 0; }; exit "$r"' sh "$cf"
         # locate this instance's log window (instance logs/ first, then home)
         for ldir2 in "$idir/logs" "$idir" "$(dirname "$idir")/logs"; do
-            ls "$ldir2"/whatap*.log >/dev/null 2>&1 && break
+            _has_glob "$ldir2"/whatap*.log && break
             ldir2=""
         done
         nlog2=""
@@ -1417,13 +1553,13 @@ run_report() {
                 count_in_win "mongo timeout/format lines" 'MongoTimeout|numberFormatException'
                 ;;
             cubrid)
-                fact "engine-specific facts: not covered (cubrid) — common sections above still apply"
+                fact "engine-specific facts: none collected for dbms=cubrid"
                 ;;
             "")
                 fact "engine-specific facts: n/a (dbms key not set in whatap.conf)"
                 ;;
             *)
-                fact "engine-specific facts: not covered for dbms=$dbms — common sections above still apply"
+                fact "engine-specific facts: none collected for dbms=$dbms"
                 ;;
         esac
         # cloud overlay: CloudWatch / IAM traces regardless of engine
@@ -1453,7 +1589,7 @@ run_report() {
     fi
 
     # [10] XOS / DB-host side — present only when this host runs the DB or XOS
-    section "J. XOS / DB-host side facts"
+    section "I. XOS / DB-host side facts"
     local xosseen=0
     if [ "$(_count_kind xos)" -gt 0 ] || [ "$(_count_kind xcub)" -gt 0 ] || [ "${#XOS_CONFS[@]}" -gt 0 ] || [ "${#DBP_PIDS[@]}" -gt 0 ]; then
         xosseen=1
@@ -1471,10 +1607,10 @@ run_report() {
             if [ -n "$sq" ]; then
                 fact "slow_query target: $sq"
                 if [ -r "$sq" ]; then
-                    fact "slow_query target file: readable ($(ls -l "$sq" 2>/dev/null | awk '{print $5" bytes, mtime "$6" "$7" "$8}'))"
+                    fact "slow_query target file: readable ($(_bounded ls -l "$sq" 2>/dev/null | awk '{print $5" bytes, mtime "$6" "$7" "$8}'))"
                     probe "slow_query target last 3 lines (verbatim)" tail -n 3 "$sq"
-                    fact "lines with SQLSTATE prefix '00000:' in last 200: $(tail -n 200 "$sq" 2>/dev/null | grep -c '00000:' 2>/dev/null)"
-                    fact "lines containing non-ASCII bytes in last 200: $(tail -n 200 "$sq" 2>/dev/null | grep -c '[^ -~]' 2>/dev/null)"
+                    fact "lines with SQLSTATE prefix '00000:' in last 200: $(_bounded tail -n 200 "$sq" 2>/dev/null | grep -c '00000:' 2>/dev/null)"
+                    fact "lines containing non-ASCII bytes in last 200: $(_bounded tail -n 200 "$sq" 2>/dev/null | grep -c '[^ -~]' 2>/dev/null)"
                 elif [ -e "$sq" ]; then
                     fact "slow_query target file: n/a (permission denied: $sq)"
                 else
@@ -1503,28 +1639,23 @@ run_report() {
                 mysql/mariadb)  [ -n "$dexe" ] && probe_merged "server version" "$dexe" --version ;;
                 mongodb)        [ -n "$dexe" ] && probe_merged "server version" "$dexe" --version ;;
                 redis/valkey)   [ -n "$dexe" ] && probe_merged "server version" "$dexe" --version ;;
-                *)              fact "server version: n/a (not probed for $dkind — see sql pack)" ;;
+                *)              fact "server version: n/a (not probed for $dkind)" ;;
             esac
             i=$((i + 1))
         done
     fi
 
-    # [11] what to run next — completes CONTRACT rule 3 for DB-side facts
-    section "I. Companion steps for DB-side facts"
-    fact "the sections above cover host-side facts only; DB-internal facts (grants,"
-    fact "parameters, monitoring views) come from the SQL pack. Two ways to run it:"
-    fact "(1) preferred — rerun with --sql: uses the agent's own java + jdbc/ driver,"
-    fact "    no DB client needed (asks for the monitoring account on the terminal)"
-    fact "(2) through a DB client where one exists (psql / mysql / sqlplus / sqlcmd)"
+    # [11] which SQL pack matches each instance (DB-internal facts come from it)
+    section "J. SQL pack per instance"
     i=0
-    local said=0
+    local said=0 packable=0
     while [ "$i" -lt "${#INST_DIRS[@]}" ]; do
         local dbms
         dbms="$(conf_get "${INST_DIRS[$i]}/whatap.conf" dbms)"
         case "$dbms" in
-            postgres*|pg)   fact "instance ${INST_DIRS[$i]}: sql/postgresql.sql"; said=1 ;;
-            mysql|mariadb)  fact "instance ${INST_DIRS[$i]}: sql/mysql.sql"; said=1 ;;
-            oracle)         fact "instance ${INST_DIRS[$i]}: sql/oracle.sql"; said=1 ;;
+            postgres*|pg)   fact "instance ${INST_DIRS[$i]}: sql/postgresql.sql"; said=1; packable=1 ;;
+            mysql|mariadb)  fact "instance ${INST_DIRS[$i]}: sql/mysql.sql"; said=1; packable=1 ;;
+            oracle)         fact "instance ${INST_DIRS[$i]}: sql/oracle.sql"; said=1; packable=1 ;;
             mssql)          fact "instance ${INST_DIRS[$i]}: windows/mssql.sql (sqlcmd only in this version)"; said=1 ;;
             "")             ;;
             *)              fact "instance ${INST_DIRS[$i]}: no SQL pack for dbms=$dbms in this version"; said=1 ;;
@@ -1532,22 +1663,124 @@ run_report() {
         i=$((i + 1))
     done
     [ "$said" = 0 ] && fact "no instance with a dbms= key was discovered on this host"
+    fact "--sql given: $( [ "$OPT_SQL" = 1 ] && echo "yes (section L)" || echo no)"
+    [ "$packable" = 1 ] && [ "$OPT_SQL" = 0 ] && \
+        warn "DB-internal facts (grants, parameters, monitoring views) come from the SQL pack: rerun with --sql, or run the pack above through a DB client"
     if [ "${#AG_PIDS[@]}" -gt 0 ] && [ "$(_count_kind xos)" -eq 0 ] && [ "${#DBP_PIDS[@]}" -eq 0 ]; then
-        fact "split topology note: if the DB host is a reachable on-prem server,"
-        fact "run this same script there as well (XOS / DB server facts live there)"
+        warn "no xos or DB server process on this host: when the DB host is a reachable on-prem server, run this same script there as well"
     fi
     if [ "${#AG_PIDS[@]}" -eq 0 ] && [ "${#DBP_PIDS[@]}" -gt 0 ]; then
-        fact "split topology note: the DBX agent host is elsewhere — run this same"
-        fact "script on the agent host as well"
+        warn "DB server process(es) but no DBX component on this host: run this same script on the DBX agent host as well"
+    fi
+
+    # TLS handshake probe — opt-in: shows what the SERVER offers (TLS version,
+    # cipher, certificate dates and signature algorithm), the counterpart to
+    # the runtime policy in section A/E and the connect_option in section G
+    if [ "$OPT_TLS" = 1 ]; then
+        section "K. TLS handshake probe (opt-in)"
+        local tls_ok=0 tls_fail="" tls_na=""
+        if ! have openssl; then
+            fact "n/a (command not found: openssl)"
+            tls_fail="command not found: openssl"
+        elif [ "${#INST_DIRS[@]}" -eq 0 ]; then
+            fact "n/a (no instance dir discovered)"
+            tls_fail="no instance dir (whatap.conf) discovered on this host"
+        else
+            fact "openssl: $(_bounded openssl version 2>/dev/null)"
+            i=0
+            while [ "$i" -lt "${#INST_DIRS[@]}" ]; do
+                local idir="${INST_DIRS[$i]}" cf="${INST_DIRS[$i]}/whatap.conf"
+                local dbms dbip dbport dbssl copt st out certinfo sig
+                dbms="$(conf_get "$cf" dbms)"
+                dbip="$(conf_get "$cf" db_ip)"
+                dbport="$(conf_get "$cf" db_port)"
+                dbssl="$(conf_get "$cf" db_ssl)"
+                copt="$(conf_get "$cf" connect_option)"
+                subsection "instance: $idir (dbms=${dbms:-unset}, target ${dbip:-?}:${dbport:-?})"
+                if [ -z "$dbip" ] || [ -z "$dbport" ]; then
+                    fact "n/a (not applicable: db_ip/db_port not set)"
+                    tls_na="$tls_na $idir: db_ip/db_port not set;"
+                    i=$((i + 1)); continue
+                fi
+                st=""
+                case "$dbms" in
+                    mysql|mariadb)  st="-starttls mysql" ;;
+                    postgres*|pg)   st="-starttls postgres" ;;
+                    redis|valkey)
+                        case "$dbssl$copt" in
+                            *true*|*ssl*) st="" ;;
+                            *) fact "n/a (not applicable: db_ssl/ssl option not set)"
+                               tls_na="$tls_na $idir: redis without db_ssl/ssl option;"
+                               i=$((i + 1)); continue ;;
+                        esac ;;
+                    mssql)  fact "n/a (not applicable: dbms=mssql, TLS inside the TDS prelogin is not probed with openssl s_client)"
+                            tls_na="$tls_na $idir: dbms=mssql not probed;"
+                            i=$((i + 1)); continue ;;
+                    oracle) fact "n/a (not applicable: dbms=oracle, TCPS/native negotiation not probed in this version)"
+                            tls_na="$tls_na $idir: dbms=oracle not probed;"
+                            i=$((i + 1)); continue ;;
+                    *)      fact "n/a (not applicable: dbms=${dbms:-unset})"
+                            tls_na="$tls_na $idir: dbms=${dbms:-unset} not probed;"
+                            i=$((i + 1)); continue ;;
+                esac
+                local down
+                if down="$(tcp_down "$dbip" "$dbport")"; then
+                    fact "handshake: n/a (skipped: $down)"
+                    tls_fail="$tls_fail $dbip:$dbport not probed: $down;"
+                    i=$((i + 1)); continue
+                fi
+                warn "sending 1 TLS handshake to $dbip:$dbport ($dbms)"
+                local trc summ
+                # shellcheck disable=SC2086
+                out="$(printf '' | CMD_TIMEOUT=15 _bounded openssl s_client $st -connect "$dbip:$dbport" 2>&1)"; trc=$?
+                if [ "$trc" -eq 124 ]; then
+                    fact "handshake: n/a (timed out: 15s)"
+                    tls_fail="$tls_fail $dbip:$dbport timed out (15s);"
+                    i=$((i + 1)); continue
+                fi
+                summ="$(printf '%s\n' "$out" \
+                    | grep -aE '^New, |Protocol *:|Cipher *(is|:)|Server public key|Verification|Verify return code|verify error|error|alert ' \
+                    | head -n 10)"
+                # obtained only when openssl reports a negotiated session
+                # (protocol + cipher); anything else is openssl's own message
+                if printf '%s\n' "$out" | grep -aqE '^New, (TLS|SSL)|^ *Protocol *: *(TLS|SSL)' \
+                   && printf '%s\n' "$out" | grep -aqE 'Cipher( is| *:) *[A-Z0-9]' \
+                   && ! printf '%s\n' "$out" | grep -aqE 'Cipher( is| *:) *(\(NONE\)|0000)'; then
+                    tls_ok=$((tls_ok + 1))
+                else
+                    local tmsg
+                    tmsg="$(printf '%s\n' "$out" | grep -aiE -m1 'error|errno|unknown|alert|failure|NONE|no peer|didn.t' | cut -c1-120)"
+                    [ -n "$tmsg" ] || tmsg="$(printf '%s\n' "$out" | grep -a -m1 . | cut -c1-120)"
+                    tls_fail="$tls_fail $dbip:$dbport no TLS session (openssl rc=$trc: ${tmsg:-no output});"
+                fi
+                if [ -n "$summ" ]; then _emit_labeled "handshake summary" "$summ"
+                else _emit_labeled "handshake: no session lines; openssl output (first 5 lines, exit $trc)" "$(printf '%s\n' "$out" | head -n 5)"; fi
+                certinfo="$(printf '%s\n' "$out" | openssl x509 -noout -subject -issuer -dates 2>/dev/null)"
+                if [ -n "$certinfo" ]; then
+                    _emit_labeled "server certificate" "$certinfo"
+                    sig="$(printf '%s\n' "$out" | openssl x509 -noout -text 2>/dev/null | grep -m1 'Signature Algorithm' | sed 's/^ *//')"
+                    [ -n "$sig" ] && fact "certificate signature: $sig"
+                else
+                    fact "server certificate: n/a (no certificate in handshake output)"
+                fi
+                i=$((i + 1))
+            done
+        fi
+        if [ -n "$tls_fail" ]; then tls_fail="${tls_fail# }"; missed tls "${tls_fail%;}"
+        elif [ "$tls_ok" -gt 0 ]; then got tls
+        else na tls "no instance with a TLS-probeable endpoint:${tls_na%;}"; fi
     fi
 
     # [12] Tier 2, opt-in: SQL pack over JDBC — the agent-native path
     if [ "$OPT_SQL" = 1 ]; then
-        section "K. SQL pack over JDBC (opt-in)"
+        section "L. SQL pack over JDBC (opt-in)"
+        local sql_ok=0 sql_fail="" sql_na=""
         if [ "${#INST_DIRS[@]}" -eq 0 ]; then
             fact "n/a (no instance dir discovered)"
+            sql_fail="no instance dir (whatap.conf) discovered on this host"
         elif ! _pick_java_bindir; then
-            fact "n/a (no usable jshell/jrunscript found — JDK 9+ has jshell, JDK 8 has Nashorn jrunscript)"
+            fact "n/a (no jshell or working jrunscript next to ${_JBIN:-any discovered java})"
+            sql_fail="no jshell or working jrunscript next to ${_JBIN:-any discovered java} (run it on a host with a JDK 8+ java)"
         else
             fact "runner: $_JDBC_MODE from $_JBIN"
             i=0
@@ -1583,21 +1816,34 @@ run_report() {
                         alturl="jdbc:oracle:thin:@$dbip:$dbport:$dbname" ;;
                     *)
                         fact "n/a (not applicable: no JDBC pack for dbms=${dbms:-unset} in this version)"
+                        sql_na="$sql_na $idir: no JDBC pack for dbms=${dbms:-unset};"
                         i=$((i + 1)); continue ;;
                 esac
                 if [ ! -f "$pack" ]; then
-                    fact "n/a (path not found: $pack — keep the sql/ dir next to this script)"
+                    fact "n/a (path not found: $pack)"
+                    sql_fail="$sql_fail $idir: path not found: $pack (keep the sql/ dir next to this script);"
                     i=$((i + 1)); continue
                 fi
                 if [ -z "$jar" ]; then
                     fact "n/a (no matching driver jar under any discovered jdbc/ dir)"
+                    sql_fail="$sql_fail $idir: no matching driver jar under any discovered jdbc/ dir;"
                     i=$((i + 1)); continue
                 fi
                 fact "driver jar: $jar"
                 fact "jdbc url: $url"
-                if ! _get_creds "$idir"; then i=$((i + 1)); continue; fi
+                local down
+                if down="$(tcp_down "$dbip" "$dbport")"; then
+                    fact "pack: n/a (skipped: $down)"
+                    sql_fail="$sql_fail $idir: not sent: $down;"
+                    i=$((i + 1)); continue
+                fi
+                if ! _get_creds "$idir"; then
+                    sql_fail="$sql_fail $idir: no credentials (set WHATAP_GGT_USER / WHATAP_GGT_PW, or run it on a terminal);"
+                    i=$((i + 1)); continue
+                fi
                 warn "sending read-only SQL pack $(basename "$pack") to $dbip:$dbport as $CRED_USER over JDBC"
                 out="$(_run_jdbc_pack "$pack" "$url" "$jar")"
+                local jrc; jrc="$(cat "$(_tmp runner.rc)" 2>/dev/null)"
                 if [ -n "$alturl" ] && printf '%s' "$out" | grep -q '^CONNECT-ERROR'; then
                     fact "first URL form did not connect; retrying SID form"
                     fact "jdbc url (retry): $alturl"
@@ -1610,16 +1856,63 @@ $(_run_jdbc_pack "$pack" "$alturl" "$jar")"
                     fact "pack output (verbatim):"
                     printf '%s\n' "$out" | while IFS= read -r _l || [ -n "$_l" ]; do printf '        %s\n' "$_l"; done
                 else
-                    fact "pack output: n/a (empty output)"
+                    case "$jrc" in
+                        124) fact "pack output: n/a (timed out: 120s or run deadline)" ;;
+                        *)   fact "pack output: n/a (empty output, runner exit ${jrc:-unknown})" ;;
+                    esac
+                fi
+                # connected at least once (the retry output follows the first)
+                if [ -z "$out" ]; then
+                    sql_fail="$sql_fail $idir: runner produced no output (exit ${jrc:-unknown}$( [ "$jrc" = 124 ] && echo ', timed out'));"
+                elif printf '%s\n' "$out" | grep -q '^([0-9]* rows)$\|^SQL-ERROR: \|^(ok)$'; then
+                    sql_ok=$((sql_ok + 1))
+                else
+                    local cerr
+                    cerr="$(printf '%s\n' "$out" | grep -m1 '^CONNECT-ERROR' | cut -c1-160)"
+                    [ -n "$cerr" ] || cerr="runner output: $(printf '%s\n' "$out" | grep -m1 . | cut -c1-120)"
+                    sql_fail="$sql_fail $idir: $cerr;"
                 fi
                 CRED_PW=""
                 i=$((i + 1))
             done
         fi
+        if [ -n "$sql_fail" ]; then sql_fail="${sql_fail# }"; missed sql "${sql_fail%;}"
+        elif [ "$sql_ok" -gt 0 ]; then got sql
+        else na sql "no instance with a JDBC pack:${sql_na%;}"; fi
     fi
 
+    # components: na only when the process scan could see every process
     if [ "${#AG_PIDS[@]}" -gt 0 ]; then got components
-    else na components "no dbx/dmx/prx/dbxc process on this host; section B states the host role it does have"; fi
+    elif [ -n "$PROC_HIDDEN" ]; then missed components "no whatap component process visible, and the process scan was incomplete ($PROC_HIDDEN)$(_priv_hint)"
+    else na components "no dbx/dmx/prx/xos/xcub/dbxc process in the /proc scan; section B states the host role it does have"; fi
+    # home: every component process mapped to a readable install dir
+    # a --home that resolved stands in for the processes /proc could not map
+    if [ -n "$OPT_HOME_BAD" ]; then
+        missed home "--home not usable: $OPT_HOME_BAD"
+    elif [ -n "$UNRES_HOME" ]; then
+        missed home "install dir of process(es) $UNRES_HOME not resolved: $UNRES_WHY (or pass --home <dir>)$( [ "$UNRES_PRIV" = 1 ] && _priv_hint)"
+    elif [ "${#HOME_DIRS[@]}" -gt 0 ]; then got home
+    elif [ -n "$PROC_HIDDEN" ]; then missed home "no component process visible ($PROC_HIDDEN), no --home given$(_priv_hint)"
+    else na home "no component process and no --home given"; fi
+    # conf: every discovered config readable, and the search under each home complete
+    local cbad="" ci=0
+    while [ "$ci" -lt "${#INST_DIRS[@]}" ]; do
+        [ -r "${INST_DIRS[$ci]}/whatap.conf" ] || cbad="$cbad ${INST_DIRS[$ci]}/whatap.conf"
+        ci=$((ci + 1))
+    done
+    ci=0
+    while [ "$ci" -lt "${#XOS_CONFS[@]}" ]; do
+        [ -r "${XOS_CONFS[$ci]}" ] || cbad="$cbad ${XOS_CONFS[$ci]}"
+        ci=$((ci + 1))
+    done
+    if [ -n "$cbad" ]; then missed conf "permission denied:$cbad$(_priv_hint)"
+    elif [ -n "$FIND_DENIED" ]; then missed conf "search for whatap.conf/xos.conf hit a denied entry under:$FIND_DENIED$(_priv_hint)"
+    elif [ -n "$FIND_FAILED" ]; then missed conf "search for whatap.conf/xos.conf incomplete: $FIND_FAILED"
+    elif [ "${#INST_DIRS[@]}" -gt 0 ] || [ "${#XOS_CONFS[@]}" -gt 0 ]; then got conf
+    elif [ -n "$UNRES_HOME" ] || [ -n "$OPT_HOME_BAD" ] || { [ "${#HOME_DIRS[@]}" -eq 0 ] && [ -n "$PROC_HIDDEN" ]; }; then
+        missed conf "install dir not resolved for every component (see the home goal)$( { [ "$UNRES_PRIV" = 1 ] || [ -n "$PROC_HIDDEN" ]; } && _priv_hint)"
+    elif [ "${#HOME_DIRS[@]}" -gt 0 ]; then na conf "no whatap.conf or xos.conf within depth 2 of the install dir(s) (all read)"
+    else na conf "no install dir on this host to read a configuration from"; fi
 
     emit_status
     emit_footer

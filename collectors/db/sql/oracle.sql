@@ -14,14 +14,18 @@ WHENEVER SQLERROR CONTINUE
 SET PAGESIZE 200 LINESIZE 220 TRIMSPOOL ON TAB OFF
 SET ECHO OFF FEEDBACK ON
 
-SELECT '==== WhaTap Global Groundtruth — db/sql/oracle.sql v0.1.0 ====' AS banner FROM dual;
+SELECT '==== WhaTap Global Groundtruth — db/sql/oracle.sql v0.2.0 ====' AS banner FROM dual;
 
 SELECT '[1] server & session identity' AS section FROM dual;
 SELECT banner FROM v$version;
 SELECT instance_name, host_name, version, status, database_status, startup_time
 FROM v$instance;
-SELECT name, open_mode, log_mode, database_role, cdb FROM v$database;
-SELECT USER AS connected_as, sys_context('USERENV','CON_NAME') AS container,
+SELECT name, open_mode, log_mode, database_role FROM v$database;
+-- 12c+ only (v$database.cdb, CON_NAME): kept in their own statements so an
+-- 11g error here does not take the columns above and below with it
+SELECT cdb FROM v$database;
+SELECT sys_context('USERENV','CON_NAME') AS container FROM dual;
+SELECT USER AS connected_as,
        sys_context('USERENV','SERVICE_NAME') AS service,
        TO_CHAR(SYSDATE,'YYYY-MM-DD HH24:MI:SS') AS db_time_now
 FROM dual;

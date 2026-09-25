@@ -288,7 +288,14 @@ for f in "${targets[@]}"; do
             grep -v '^[[:space:]]*#' "$f" | grep -qE '^\s*Add-Goal' \
                 || problems+=("no goals declared: nothing calls Add-Goal")
             grep -v '^[[:space:]]*#' "$f" | grep -qF 'Fact "privilege: ' \
-                || problems+=("the environment section does not state the privilege: no 'privilege:' fact") ;;
+                || problems+=("the environment section does not state the privilege: no 'privilege:' fact")
+            # The PowerShell port of the shared blocks owes the same lines and
+            # streams (output-format.md, "Scope"): the boot time, and no
+            # Write-Host, which reaches stdout under pwsh -File.
+            grep -v '^[[:space:]]*#' "$f" | grep -qF 'host boot(UTC): ' \
+                || problems+=("the environment section does not state the host boot time: no 'host boot(UTC):' fact")
+            grep -v '^[[:space:]]*#' "$f" | grep -qE '(^|[^A-Za-z-])Write-Host([^A-Za-z-]|$)' \
+                && problems+=("Write-Host is used: operator messages go to [Console]::Error (it reaches stdout under pwsh -File)") ;;
         *)
             grep -v '^[[:space:]]*#' "$f" | grep -qE '(^|[[:space:]])emit_status([[:space:]]|$)' \
                 || problems+=("no completeness roll-up: nothing calls emit_status")

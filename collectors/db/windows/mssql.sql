@@ -1,17 +1,18 @@
--- WhaTap Global Groundtruth — DB collector SQL pack: SQL Server (T-SQL)
+-- WhaTap Global Groundtruth -- DB collector SQL pack: SQL Server (T-SQL)
 -- ---------------------------------------------------------------------------
 -- Run with the SAME account the WhaTap DBX agent uses (read-only queries):
 --
---   sqlcmd -S <db_ip>,<db_port> -U <monitoring_user> -P <password> -i mssql.sql -o mssql-facts.txt
+--   sqlcmd -S <db_ip>,<db_port> -U <monitoring_user> -i mssql.sql -o mssql-facts.txt
+--   (no -P: sqlcmd asks for the password; a -P argument shows in the process list)
 --
 -- sqlcmd continues to the next batch after an error; a printed error is
--- itself a fact (it shows what the monitoring account cannot do — e.g. a
+-- itself a fact (it shows what the monitoring account cannot do -- e.g. a
 -- missing VIEW SERVER STATE or xp_readerrorlog EXECUTE surfaces here).
 -- Paste the FULL output together with the collect-db-mssql.ps1 report.
--- Facts only — this script reports what is, never what it means.
+-- Facts only -- this script reports what is, never what it means.
 -- ---------------------------------------------------------------------------
 
-PRINT '==== WhaTap Global Groundtruth — db/windows/mssql.sql v0.1.0 ====';
+PRINT '==== WhaTap Global Groundtruth -- db/windows/mssql.sql v0.2.0 ====';
 GO
 
 PRINT '[1] server & session identity';
@@ -35,7 +36,7 @@ WHERE s.name = SUSER_NAME();
 SELECT * FROM fn_my_permissions(NULL, 'SERVER');
 GO
 
-PRINT '[3] xp_readerrorlog EXECUTE permission (checked in master — grantable only there)';
+PRINT '[3] xp_readerrorlog EXECUTE permission (checked in master -- grantable only there)';
 USE master;
 SELECT HAS_PERMS_BY_NAME('sys.xp_readerrorlog', 'OBJECT', 'EXECUTE') AS has_xp_readerrorlog_execute;
 GO
@@ -45,7 +46,7 @@ SELECT name, state_desc, recovery_model_desc, is_read_only
 FROM sys.databases ORDER BY name;
 GO
 
-PRINT '[5] AlwaysOn availability state (errors when HADR is off — that is the fact)';
+PRINT '[5] AlwaysOn availability state (no rows when HADR is off or no availability group exists)';
 SELECT ag.name AS ag_name, rs.role_desc, rs.connected_state_desc, rs.synchronization_health_desc
 FROM sys.dm_hadr_availability_replica_states rs
 JOIN sys.availability_groups ag ON rs.group_id = ag.group_id;
