@@ -135,6 +135,26 @@ if command -v dash >/dev/null 2>&1; then
     check "dash: an unwritable --file warns and exits 1" '[ "$drc" = 1 ] && grep -q "^!! the report was not written" "$T/ro-dash.err"'
 fi
 
+echo "== 1d. caps from the environment, and no private directory =="
+cat > "$T/caps.sh" <<'EOF'
+set -- --stdout
+. "$LIB"
+exec 3>&2
+CMD_TIMEOUT="$CT"; RUN_DEADLINE="$RD"
+_run_init
+echo "CT=$CMD_TIMEOUT RD=$RUN_DEADLINE dir=${_tmp_dir:-none}"
+probe "fn" true
+EOF
+for sh in bash dash; do
+    command -v "$sh" >/dev/null 2>&1 || continue
+    out="$(LIB="$T/lib.sh" CT=abc RD=99999999999999999999 "$sh" "$T/caps.sh" 2>&1)"
+    check "$sh: a non-numeric CMD_TIMEOUT is replaced, and said"  'printf "%s" "$out" | grep -q "CMD_TIMEOUT=abc ignored" && printf "%s" "$out" | grep -q "CT=20 "'
+    check "$sh: an oversized RUN_DEADLINE is replaced, and said"   'printf "%s" "$out" | grep -q "RD=300 "'
+    check "$sh: no shell arithmetic error"                         '! printf "%s" "$out" | grep -qi "illegal number\|integer expression"'
+    out="$(LIB="$T/lib.sh" CT=5 RD=60 TMPDIR=/nonexistent/ggt "$sh" "$T/caps.sh" 2>&1)"
+    check "$sh: a missing private directory is said"               'printf "%s" "$out" | grep -q "no private temp directory could be made" && printf "%s" "$out" | grep -q "dir=none"'
+done
+
 echo "== 1b. Ctrl-C leaves nothing behind =="
 cat > "$T/intr.sh" <<'EOF'
 set -- --stdout

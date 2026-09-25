@@ -351,6 +351,17 @@ _run_cleanup() {
     _tmp_dir=""
 }
 
+# _cap_or NAME VALUE DEFAULT -> VALUE when it is 1..999999, else DEFAULT, and a
+# warn naming what was ignored
+_cap_or() {
+    case "$2" in
+        ''|*[!0-9]*|0*) ;;
+        *) [ "${#2}" -le 6 ] && { printf '%s' "$2"; return 0; } ;;
+    esac
+    warn "$1=$2 ignored (not a number 1..999999), using $3"
+    printf '%s' "$3"
+}
+
 # _run_init -> the private temp directory, the traps, and timeout(1). Call it
 # once in main, before anything creates a temp file.
 _run_init() {
@@ -367,6 +378,11 @@ _run_init() {
         */*|*.sh) [ -f "$0" ] || _stdin_script=1 ;;
         *)        _stdin_script=1 ;;
     esac
+    [ -n "$_tmp_dir" ] || warn "no private temp directory could be made under ${TMPDIR:-/tmp}; values that need one are reported as n/a"
+    # Caps from the environment are numbers or they are not used. `abc` made
+    # every [ -lt ] fail and 0 means "no limit" to timeout(1) (found 2026-09-25).
+    RUN_DEADLINE="$(_cap_or RUN_DEADLINE "$RUN_DEADLINE" 300)"
+    CMD_TIMEOUT="$(_cap_or CMD_TIMEOUT "${CMD_TIMEOUT:-20}" 20)"
     trap '_run_cleanup' EXIT
     trap '_run_cleanup; exit 129' HUP
     trap '_run_cleanup; exit 130' INT
