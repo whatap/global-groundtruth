@@ -73,7 +73,8 @@ got stray
 emit_status
 RUN_DEADLINE=1; sleep 2
 probe "late" echo hi
-emit_status | grep 'run deadline'
+probe "late too" echo hi
+emit_status | grep -E 'run deadline|not run|host load|run time'
 EOF
 
 for sh in bash dash; do
@@ -105,6 +106,16 @@ for sh in bash dash; do
     check "an unresolved goal is not reached"               'printf "%s" "$out" | grep -q "E — not reached"'
     check "past the deadline a probe does not run"          'printf "%s" "$out" | grep -q "late: n/a (run deadline reached: 1s)"'
     check "the status names the deadline"                   'printf "%s" "$out" | grep -q "run deadline: reached at 1s"'
+    # where the time went, and the load it ran under (2026-09-25)
+    check "the status gives the run time"                   'printf "%s" "$out" | grep -Eq "run time: [0-9]+s of [0-9]+s allowed"'
+    check "a capped call is named with its cap"             'printf "%s" "$out" | grep -Eq "^ +[0-9]+\.[0-9]s  sleep, 1 capped at 2s$"'
+    check "one command's calls are summed, capped ones counted" 'printf "%s" "$out" | grep -Eq "^ +[0-9]+\.[0-9]s  sh x3, 2 capped at 2s$"' \
+          "$(printf '%s' "$out" | grep -E '^ +[0-9]+\.[0-9]s  ')"
+    check "fast calls are timed in ms, not rounded to 0"    'printf "%s" "$out" | grep -Eq "^ +0\.[0-9]s  tr$|^ +0\.[0-9]s  myfn"'
+    check "the time outside bounded calls is given"         'printf "%s" "$out" | grep -q "(outside bounded calls: shell work and file reads)"' 
+    check "calls not run past the deadline are counted"     'printf "%s" "$out" | grep -q "echo x2 not run (deadline)"'
+    check "the host load is given at start and end"         'printf "%s" "$out" | grep -q "host load at start: load " && printf "%s" "$out" | grep -q "host load at end:   load "'
+    check "no argument of a logged call is kept"            '! printf "%s" "$out" | grep -Eq "^ +[0-9]+\.[0-9]s  .*(30|TERM|trap)"'
     check "the private directory is gone after exit"        '[ -n "$tmpd" ] && [ ! -e "$tmpd" ]'
     [ "$sh" = dash ] && check "no bash-only construct in the blocks" '! printf "%s" "$out" | grep -q "Bad substitution\|Syntax error"'
 done
@@ -160,8 +171,49 @@ for sh in bash dash; do
     check "$sh: a non-numeric CMD_TIMEOUT is replaced, and said"  'printf "%s" "$out" | grep -q "CMD_TIMEOUT=abc ignored" && printf "%s" "$out" | grep -q "CT=20 "'
     check "$sh: an oversized RUN_DEADLINE is replaced, and said"   'printf "%s" "$out" | grep -q "RD=300 "'
     check "$sh: no shell arithmetic error"                         '! printf "%s" "$out" | grep -qi "illegal number\|integer expression"'
+    # the private directory removed under a running collector (a tmp cleaner):
+    # the time log must not print the failed redirect on every call
+    out="$(LIB="$T/lib.sh" CT=5 RD=60 "$sh" -c '. "$LIB"; exec 3>&2; _run_init; rm -rf "$_tmp_dir"; _bounded true; _bounded true; echo rc=$?' 2>&1)"
+    check "$sh: a vanished private directory is silent in the time log" '[ "$out" = rc=0 ]' "$out"
     out="$(LIB="$T/lib.sh" CT=5 RD=60 TMPDIR=/nonexistent/ggt "$sh" "$T/caps.sh" 2>&1)"
     check "$sh: a missing private directory is said"               'printf "%s" "$out" | grep -q "no private temp directory could be made" && printf "%s" "$out" | grep -q "dir=none"'
+done
+
+echo "== 1e. where the time went =="
+cat > "$T/tl.sh" <<'EOF'
+set -- --stdout
+. "$LIB"
+exec 3>&2
+_run_init; _init_probe
+echo "ms_date=$_ms_date"
+d=$_tmp_dir; i=0
+while [ "$i" -lt 300 ]; do _bounded true; [ -d "$d" ] || break; i=$((i + 1)); done
+echo "dir-survived=$i"
+: > "$_tmp_dir/time.log"
+goal a "A"; got a
+for c in c01 c02 c03 c04 c05 c06 c07 c08 c09 c10 c11; do _time_log 1 ran "$c"; done
+_time_log 3000 "capped at 3s" sleep 9; _time_log 2000 "cut at the deadline" sleep 9
+_time_log 0 "not run" lostcmd x
+_time_log 10 ran echo hunter2; _time_log 10 ran kubectl --request-timeout=1s get pods
+_time_log 10 ran kubectl --token secret get
+_time_log 10 ran "$(printf 'we\nird')"
+emit_status
+EOF
+mkdir -p "$T/nodate-ns" && printf '#!/bin/sh\ncase "$1" in +%%s%%N) exec /bin/date +%%s ;; esac\nexec /bin/date "$@"\n' > "$T/nodate-ns/date" && chmod +x "$T/nodate-ns/date"
+for sh in bash dash; do
+    command -v "$sh" >/dev/null 2>&1 || continue
+    out="$(LIB="$T/lib.sh" "$sh" "$T/tl.sh" 2>&1)"
+    # the watchdog's TERM ran the inherited trap and removed the directory
+    # within 1..176 calls under bash (2026-09-25)
+    check "$sh: 300 bounded builtins keep the private directory" 'printf "%s" "$out" | grep -q "dir-survived=300"' "$(printf '%s' "$out" | grep dir-survived)"
+    check "$sh: not-run rows are listed past the top 10"   'printf "%s" "$out" | grep -q "lostcmd x1 not run (deadline)"'
+    check "$sh: mixed outcomes of one command are each counted" 'printf "%s" "$out" | grep -Eq "sleep x2, 1 capped at 3s, 1 cut at the deadline$"'
+    check "$sh: an argument of a plain command is never kept" '! printf "%s" "$out" | grep -q hunter2'
+    check "$sh: a subcommand tool keeps its subcommand"     'printf "%s" "$out" | grep -Eq "  kubectl get$"' "$(printf '%s' "$out" | grep kubectl)"
+    check "$sh: an option before it hides the subcommand, never the value" 'printf "%s" "$out" | grep -Eq "  kubectl$" && ! printf "%s" "$out" | grep -q secret'
+    check "$sh: a name with odd bytes is ?"                 'printf "%s" "$out" | grep -Eq "  \?$" && ! printf "%s" "$out" | grep -q ird'
+    [ "$sh" = dash ] && check "dash: a date that drops %N is not taken for ms" \
+        '[ "$(PATH="$T/nodate-ns:$PATH" LIB="$T/lib.sh" dash "$T/tl.sh" 2>&1 | sed -n "s/^ms_date=//p")" = 0 ]'
 done
 
 echo "== 1b. Ctrl-C leaves nothing behind =="
@@ -238,6 +290,12 @@ mut "no footer"                      '$d'
 mut "text after the footer"          '$a\trailing'
 cp "$T/good.txt" "$T/whatap-other-host-20260101T000000Z.txt"
 check "fails: a file name with another token" '! "$V" --report "$T/whatap-other-host-20260101T000000Z.txt" >/dev/null'
+
+# a pipe into _bounded is refused at the source; `||` is not a pipe
+sed 's/^COLLECTOR_NAME=.*/COLLECTOR_NAME="whatap-pipetest"/' "$SK" > "$T/collect-pipetest.sh"
+printf 'y() { printf a | _bounded cat; }\nz() { _bounded true || _bounded false; }\n' >> "$T/collect-pipetest.sh"
+check "validate: a pipe into _bounded fails, and names the line" '"$V" "$T/collect-pipetest.sh" 2>&1 | grep -q "a pipe into _bounded (line [0-9]*)"'
+check "validate: || _bounded is not taken for a pipe" '[ "$("$V" "$T/collect-pipetest.sh" 2>&1 | grep -c "a pipe into _bounded (line [0-9]*)")" = 1 ] && ! "$V" "$T/collect-pipetest.sh" 2>&1 | grep -q "line [0-9]* [0-9]"'
 
 # ---- 4. every collector, for real -------------------------------------------
 echo "== 4. every shell collector, run here =="

@@ -34,6 +34,7 @@ The starter for a new collector. It already emits the shared report shape
    | `read_proc "label" P`  | a `/proc` or `/sys` file's content, or a classified reason     |
    | `_bounded CMD…`        | runs CMD under `CMD_TIMEOUT` and `RUN_DEADLINE`; 124 on a cap  |
    | `_bounded_in FILE CMD…`| the same, with FILE as CMD's stdin (never `< FILE` on `_bounded`) |
+   | `SLOW_SEC`             | a bounded call this long or longer is named in the status (3s) |
    | `warn "text"`          | `!! text` to the terminal (fd 3), not silenced by `--quiet`   |
    | `_tmp NAME`            | a path in the run's private directory, removed on exit/Ctrl-C  |
    | `goal` / `got` / `na` / `missed` | declare and resolve what the run came for      |
@@ -43,7 +44,11 @@ The starter for a new collector. It already emits the shared report shape
    report `n/a` rather than a default). Prefer `probe`/`read_proc` over `try`
    so a missing value carries *why* it is missing (guideline 4).
 
-   Run every external command through `probe` or `_bounded`, and resolve a
+   Run every external command through `probe` or `_bounded`: that is also how
+   the status learns where the time went (see output-format.md, "Where the time
+   went, and why"). A command run outside them is neither capped nor counted.
+   Never pipe into `_bounded`: when the script is read from stdin its stdin is
+   /dev/null, so write the input to `_tmp` and use `_bounded_in`. Resolve a
    goal `na` only when every input behind it was read (output-format.md,
    "Three outcomes").
 

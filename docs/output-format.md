@@ -200,6 +200,15 @@ for and whether it got it:
     obtained: running whatap modules, log inventory
     not applicable to this host (this is an answer, not a gap):
         yard data path — this host runs no yard
+    run time: 64s of 300s allowed
+    host load at start: load 7.90 6.12 5.01; psi avg10 (some/full) cpu 31.20/0.00 io 48.10/40.02 memory 0.00/0.00; mem available 812 of 7821 MiB; procs running 9, blocked 6
+    host load at end:   load 9.40 6.80 5.30; psi avg10 (some/full) cpu 28.70/0.00 io 52.33/44.90 memory 0.00/0.00; mem available 790 of 7821 MiB; procs running 7, blocked 8
+    bounded calls: 57; stopped at their cap or the deadline: 2; not run past the deadline: 0
+    where the time went (every bounded call, summed per command, largest first):
+          40.0s  find x2, 2 capped at 20s
+          18.2s  (outside bounded calls: shell work and file reads)
+           4.1s  du
+           1.3s  systemctl show x3
     blocked (running this differently would obtain these):
         WHATAP_HOME contents — uid 3103 cannot reach /data/whatap
         module configs — uid 3103 cannot reach /data/whatap
@@ -264,6 +273,30 @@ collector-engineering.md, guideline 2). Probes after the deadline are not run;
 their facts say `n/a (run deadline reached: <N>s)`, the goals they would have
 resolved are `missed`, and the status section says the deadline was reached.
 The collector still reaches its footer.
+
+**Where the time went, and why.** A `run deadline reached` or a `timed out`
+says what was lost, not what ate the time. So every bounded call is timed (in
+ms where the shell or `date` can), the status section always gives
+`run time:`, and when any bounded call was slow (`SLOW_SEC`, 3s), stopped at
+its cap, or not run past the deadline, it adds:
+
+- `host load at start:` and `host load at end:` — load average, pressure stall
+  (PSI avg10, some/full) for cpu, io and memory, available memory, and the
+  processes running and blocked on I/O. Read from `/proc` only. The example
+  above reads as an I/O-starved host (io PSI 48%, 6–8 blocked), which is why
+  `find` hit its cap, not a collector fault.
+- `where the time went:` — every bounded call summed per command, the ten
+  largest, each with how many were capped or cut at the deadline; the time
+  spent outside bounded calls (shell work, file reads); and every command
+  that was not run past the deadline (`<cmd> xN not run (deadline)`), however
+  many there are.
+
+Only a command's name is kept, plus the subcommand word for tools built that
+way (`kubectl get`, `zfs list`, `systemctl show`), never an argument, which
+can hold a path or a credential. A name with unusual bytes is shown as `?`.
+Collector-specific causes (the API server's latency, the database round trip)
+belong in that collector's own facts, so a reader can set them against these
+lines.
 
 The same gaps are repeated on **stderr**, and that repetition is **not**
 silenced by `--quiet`, so the operator sees them while still logged in to the

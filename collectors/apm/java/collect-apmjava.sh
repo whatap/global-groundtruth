@@ -335,6 +335,13 @@ _note_boot() {
 # returns 124, so a host where every command hangs still yields a report that
 # reaches its footer, and emit_status says the deadline was reached.
 #
+# Where the time went. _bounded logs every call it makes or refuses, with its
+# time in ms, and emit_status sums them per command when any call was slow
+# (SLOW_SEC), capped or not run. A report that says "run deadline reached" used to
+# leave the reader guessing which command ate the time (2026-09-25). Only the
+# command's name and a subcommand word are kept, never its arguments, which
+# can hold a path or a credential.
+#
 # _tmp NAME. One private directory per run, removed on exit and on INT, TERM
 # and HUP. A Ctrl-C used to leave config copies and thread dumps in /tmp, and a
 # $$-named path in a shared /tmp is one a root run follows through a planted
@@ -350,6 +357,8 @@ RUN_DEADLINE="${RUN_DEADLINE:-300}"
 _tmp_dir=""
 _run_t0=""
 _timeout_k=""     # 5 when timeout(1) takes -k (_run_init)
+_load0=""         # _host_load at _run_init
+SLOW_SEC=3        # a bounded call at least this long is named in the status
 _stdin_script=0   # 1 when the shell reads this script from stdin (sh -s)
 _nl='
 '
@@ -376,7 +385,13 @@ _cmd_kind() {
     esac
 }
 
+# _in_child=1 in the background jobs _bounded_in forks. They inherit the traps,
+# and bash can deliver the watchdog's TERM before the job has reset them, so a
+# killed watchdog ran this cleanup and removed the whole run's directory mid-run
+# (found 2026-09-25: lost within 1 to 176 `_bounded true` calls under bash).
+_in_child=0
 _run_cleanup() {
+    [ "$_in_child" = 1 ] && return 0
     case "$_tmp_dir" in */ggt.*) rm -rf "$_tmp_dir" 2>/dev/null ;; esac
     _tmp_dir=""
 }
@@ -396,6 +411,10 @@ _cap_or() {
 # once in main, before anything creates a temp file.
 _run_init() {
     _run_t0="$(date +%s 2>/dev/null)"
+    _load0="$(_host_load)"
+    # 16+ digits: a date that drops %N silently prints bare seconds (10 digits)
+    [ -z "${EPOCHREALTIME:-}" ] && case "$(date +%s%N 2>/dev/null)" in *[!0-9]*|'') ;; ????????????????*) _ms_date=1 ;; esac
+    _now_ms; _run_ms0="$_ms"
     case "$_run_t0" in ''|*[!0-9]*) _run_t0="" ;; esac
     # No predictable fallback name: without mktemp the run has no directory,
     # and _tmp answers /dev/null.
@@ -444,6 +463,68 @@ _kill_tree() {
     kill -"$sig" $all 2>/dev/null
 }
 
+# _now_ms -> _ms, milliseconds since the epoch. A variable, not output: every
+# bounded call is timed twice, and $(...) would fork each time. bash has
+# EPOCHREALTIME (no fork); elsewhere date +%s%N when it gives nanoseconds
+# (_ms_date=1, set in _run_init), else whole seconds. Timing in ms lets forty
+# 0.3s calls add up to the 12s they took, which whole seconds counted as 0.
+_ms_date=0
+_run_ms0=0
+_ms=0
+_now_ms() {
+    local t="${EPOCHREALTIME:-}" f
+    if [ -n "$t" ]; then
+        f="${t#*.}000"; f="${f%"${f#???}"}"
+        _ms="${t%.*}$f"
+    elif [ "$_ms_date" = 1 ]; then
+        t="$(date +%s%N 2>/dev/null)"; _ms="${t%??????}"
+    else
+        _ms="$(date +%s 2>/dev/null || echo 0)000"
+    fi
+}
+
+# _time_log MS KIND CMD ARGS... -> one line for emit_status: the command's name,
+# and for a tool whose first word is a subcommand (kubectl get, zfs list) that
+# word, after any --opt=value. Nothing else of the call, so no argument can
+# carry a path or a secret into the report; a name with odd bytes is "?".
+_time_log() {
+    [ -n "$_tmp_dir" ] || return 0
+    local ms="$1" kind="$2" c="${3##*/}" w=""
+    shift 3
+    case "$c" in
+        kubectl|oc|helm|zfs|zpool|systemctl|journalctl|timedatectl|chronyc|npm|pip|pip3|openssl|docker|crictl|ctr|ip)
+            while [ $# -gt 0 ]; do case "$1" in -*=*) shift ;; *) break ;; esac; done
+            case "${1:-}" in [a-z]*) case "$1" in *[!a-z0-9-]*) ;; *) w=" $1" ;; esac ;; esac ;;
+    esac
+    case "$c" in ''|*[!A-Za-z0-9._+-]*) c='?' ;; esac
+    # braces: a redirect is opened before 2>/dev/null applies to it
+    { printf '%s\t%s\t%s\n' "$ms" "$kind" "$c$w" >> "$_tmp_dir/time.log"; } 2>/dev/null
+}
+
+# _host_load -> one line on how busy the host is: load average, pressure stall
+# (PSI) avg10 for cpu/io/memory, available memory, and the processes running
+# and blocked on I/O. Read at the start and at the end of the run, so a slow or
+# capped call in the status can be set against the load it ran under. Only
+# /proc files, no command per process.
+_host_load() {
+    LC_ALL=C awk '
+        FILENAME == "/proc/loadavg" { la = "load " $1 " " $2 " " $3 }
+        FILENAME ~ /^\/proc\/pressure\// {
+            k = substr(FILENAME, 16)
+            for (i = 2; i <= NF; i++) if ($i ~ /^avg10=/) p[k] = p[k] (p[k] == "" ? "" : "/") substr($i, 7)
+        }
+        /^MemTotal:/ { mt = $2 } /^MemAvailable:/ { ma = $2 }
+        /^procs_running/ { pr = $2 } /^procs_blocked/ { pb = $2 }
+        END {
+            psi = ""; n = split("cpu io memory", K, " ")
+            for (i = 1; i <= n; i++) if (K[i] in p) psi = psi " " K[i] " " p[K[i]]
+            printf "%s; ", (la != "" ? la : "load n/a")
+            if (psi != "") printf "psi avg10 (some/full)%s; ", psi
+            if (mt) printf "mem available %d of %d MiB; ", ma / 1024, mt / 1024; else printf "mem n/a; "
+            printf "procs running %s, blocked %s", (pr != "" ? pr : "n/a"), (pb != "" ? pb : "n/a")
+        }' /proc/loadavg /proc/pressure/cpu /proc/pressure/io /proc/pressure/memory /proc/meminfo /proc/stat 2>/dev/null
+}
+
 # _bounded CMD... -> CMD under the caps. Its stdin is the caller's when this
 # script was run from a file, and /dev/null when the script itself is on stdin.
 # _bounded_in FILE CMD... -> the same, with FILE as CMD's stdin. Use it, not a
@@ -451,11 +532,11 @@ _kill_tree() {
 _bounded() { _bounded_in "" "$@"; }
 
 _bounded_in() {
-    local in="$1" t="${CMD_TIMEOUT:-20}" left start rc p w
+    local in="$1" t="${CMD_TIMEOUT:-20}" left rc p w d m0
     shift
-    start="$(_elapsed)"
-    left=$((RUN_DEADLINE - start))
-    [ "$left" -le 0 ] && return 124
+    left=$((RUN_DEADLINE - $(_elapsed)))
+    [ "$left" -le 0 ] && { _time_log 0 "not run" "$@"; return 124; }
+    _now_ms; m0="$_ms"
     [ "$left" -lt "$t" ] && t="$left"
     if [ -n "${_timeout_bin:-}" ] && [ "$(_cmd_kind "$1")" = file ]; then
         if [ -n "$in" ];                   then "$_timeout_bin" ${_timeout_k:+-k "$_timeout_k"} "$t" "$@" < "$in"
@@ -469,6 +550,7 @@ _bounded_in() {
         # stdin through fd 4 when it is passed on: POSIX gives an async list
         # /dev/null as stdin before its own redirections, so a plain 0<&0
         # hands dash /dev/null.
+        _in_child=1
         set -m 2>/dev/null
         if [ -n "$in" ];                   then "$@" < "$in" &
         elif [ "$_stdin_script" = 1 ];     then "$@" < /dev/null &
@@ -476,15 +558,23 @@ _bounded_in() {
         p=$!
         set +m 2>/dev/null
         ( i=0
-          while [ "$i" -lt "$t" ]; do sleep 1; kill -0 "$p" 2>/dev/null || exit 0; i=$((i + 1)); done
+          # sleep in the background and wait: a TERM then ends the watchdog at
+          # once, where dash let a foreground sleep finish (60-280ms a call)
+          while [ "$i" -lt "$t" ]; do sleep 1 & wait $!; kill -0 "$p" 2>/dev/null || exit 0; i=$((i + 1)); done
           kill -TERM -- "-$p" 2>/dev/null; _kill_tree TERM "$p"
           sleep 2
           kill -KILL -- "-$p" 2>/dev/null; _kill_tree KILL "$p" ) >/dev/null 2>&1 &
         w=$!
+        _in_child=0
         wait "$p"; rc=$?
         kill "$w" 2>/dev/null; wait "$w" 2>/dev/null
     fi
-    case "$rc" in 124|137|143) [ $(( $(_elapsed) - start )) -ge "$t" ] && rc=124 ;; esac
+    _now_ms; d=$((_ms - m0))
+    case "$rc" in 124|137|143) [ "$((d / 1000))" -ge "$t" ] && rc=124 ;; esac
+    if [ "$rc" = 124 ]; then
+        if [ "$t" -lt "${CMD_TIMEOUT:-20}" ]; then w="cut at the deadline"; else w="capped at ${t}s"; fi
+    else w="ran"; fi
+    _time_log "$d" "$w" "$@"
     return "$rc"
 }
 
@@ -569,6 +659,44 @@ missed() { _res="$_res$1${_tab}missed$_tab$(_flat "$2")$_nl"; }
 # narration, and an automated caller wants it most of all.
 notice() { printf '>> %s\n' "$*" >&3 2>/dev/null; }
 
+# _emit_time -> the run time; and when a call was slow (SLOW_SEC), capped or not
+# run, the host load at the start and the end of the run and where the time
+# went: every bounded call summed per command, largest first, with how many
+# were capped, and the time spent outside them. A "run deadline reached" can
+# then be read against the load and the facts above it.
+_emit_time() {
+    local f="${_tmp_dir:+$_tmp_dir/time.log}" counts
+    fact "run time: $(_elapsed)s of ${RUN_DEADLINE}s allowed"
+    [ -n "$f" ] && [ -s "$f" ] || return 0
+    # calls, stopped at a cap or the deadline, not run, slow
+    counts="$(awk -F'\t' -v s="$SLOW_SEC" '
+        { n++ } $2 ~ /^(capped|cut)/ { c++ } $2 == "not run" { r++ } $2 != "not run" && $1 >= s * 1000 { w++ }
+        END { printf "%d %d %d %d", n, c, r, w }' "$f")"
+    set -- $counts
+    [ "$2" -gt 0 ] || [ "$3" -gt 0 ] || [ "$4" -gt 0 ] || return 0
+    fact "host load at start: ${_load0:-n/a}"
+    fact "host load at end:   $(_host_load)"
+    fact "bounded calls: $1; stopped at their cap or the deadline: $2; not run past the deadline: $3"
+    fact "where the time went (every bounded call, summed per command, largest first):"
+    _now_ms
+    LC_ALL=C awk -F'\t' -v run="$((_ms - _run_ms0))" '
+        $2 == "not run" { nr[$3]++; next }
+        { ms[$3] += $1; n[$3]++; tot += $1; if ($2 != "ran") { o[$3, $2]++; if (!(($3, $2) in seen)) { seen[$3, $2] = 1; ol[$3] = ol[$3] SUBSEP $2 } } }
+        END {
+            for (k in ms) {
+                x = ""; m = split(substr(ol[k], 2), L, SUBSEP)
+                for (i = 1; i <= m; i++) x = x ", " o[k, L[i]] " " L[i]
+                printf "%d\t%6.1fs  %s%s%s\n", ms[k], ms[k] / 1000, k, (n[k] > 1 ? " x" n[k] : ""), x
+            }
+            out = run - tot
+            if (out > 0) printf "%d\t%6.1fs  (outside bounded calls: shell work and file reads)\n", out, out / 1000
+        }' "$f" | sort -t "$_tab" -k1,1nr | head -n 10 | cut -f2- \
+        | while IFS= read -r l; do fact "    $l"; done
+    # every command lost to the deadline, whatever the table above kept
+    awk -F'\t' '$2 == "not run" { c[$3]++ } END { for (k in c) printf "%s x%d\n", k, c[k] }' "$f" | sort \
+        | while IFS= read -r l; do fact "         -   $l not run (deadline)"; done
+}
+
 # emit_status -> the roll-up section. Call it immediately before emit_footer.
 # Also repeats each gap on fd 3 so the operator sees it while still logged in.
 emit_status() {
@@ -617,6 +745,7 @@ EOF
     fi
     [ -n "$stray" ] && fact "resolved but never declared: $stray"
     [ -n "$deadline" ] && fact "run deadline: $deadline"
+    _emit_time
     if [ "$blocked" -eq 0 ] && [ -z "$deadline" ]; then
         fact "status: COMPLETE"
         notice "status: COMPLETE — nothing was blocked${nas:+ ($nacount not applicable to this host)}"

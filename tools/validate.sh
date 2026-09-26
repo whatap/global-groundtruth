@@ -305,6 +305,11 @@ for f in "${targets[@]}"; do
                 || problems+=("the environment section does not state the privilege: no 'privilege:' fact")
             grep -v '^[[:space:]]*#' "$f" | grep -qE '(^|[[:space:]])_note_boot([[:space:]]|$)' \
                 || problems+=("the environment section does not state the host boot time: nothing calls _note_boot")
+            # A pipe into _bounded reads /dev/null when the script itself is on
+            # stdin (sh -s), and the command sees nothing: collserver found no
+            # JVM under bash -s and said "none" (2026-09-25). Use _bounded_in.
+            _pb="$(grep -nE '(^|[^|])\|&?[[:space:]]*_bounded([[:space:]]|$)' "$f" | grep -vE '^[0-9]+:[[:space:]]*#' | head -n 3 | cut -d: -f1 | tr '\n' ' ')"
+            [ -n "$_pb" ] && problems+=("a pipe into _bounded (line ${_pb% }): its stdin is /dev/null under sh -s; write the input to _tmp and use _bounded_in")
             case "$bn" in collector-skeleton.sh) ;; *)
                 grep -qE '^_run_init$' "$f" \
                     || problems+=("main never calls _run_init: no deadline, no private temp directory, no cleanup") ;;
