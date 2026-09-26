@@ -45,6 +45,8 @@ export LC_ALL=C
 
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-apmnodejs"
+# 0.7.1  Shared helpers moved into the apm group block; report unchanged.
+#        The apm: blocks are copies of templates/groups/apm.sh.
 # 0.7.0  The npm and pm2 versions are read from the package.json next to the
 #        entry script each command resolves to (the line names the file);
 #        `npm/pm2 --version`, which starts node, runs only when that file gives
@@ -60,7 +62,7 @@ COLLECTOR_NAME="whatap-apmnodejs"
 #        reused by the report, and the detail list reads each environ once.
 #        The report is unchanged; 8.4 s -> 4.9 s on a host with 168 node
 #        processes, 18.3 s -> 9.5 s with 300 more (2026-09-25).
-VERSION="0.7.0"
+VERSION="0.7.1"
 DOMAIN="apm"
 TARGET="host/$(hostname 2>/dev/null || echo unknown)"
 
@@ -555,6 +557,8 @@ CMD_TIMEOUT="${CMD_TIMEOUT:-15}"
 # Call after _run_init: the error file lives in the run's private directory.
 _init_probe() { _errfile="$(_tmp probe.err)"; }
 
+# ---- apm: probe helpers — DO NOT EDIT ---------------------------------------
+# members: apmjava apmnodejs apmphp apmpython
 _classify_err() {
     local txt=""
     [ -f "$_errfile" ] && txt="$(cat "$_errfile" 2>/dev/null)"
@@ -598,20 +602,6 @@ probe() {
     _emit_labeled "$label" "$out"
 }
 
-# _head_of N CMD... -> the first N lines of CMD's stdout, with CMD's own exit
-# status (a `CMD | head` pipeline reports head's, and hides a failed CMD as
-# empty output).
-_head_of() {
-    local n="$1" rc; shift
-    "$@" > "$(_tmp head.out)"; rc=$?
-    head -n "$n" "$(_tmp head.out)" 2>/dev/null
-    return "$rc"
-}
-
-# _ls_head DIR N -> `ls -la DIR`, first N lines, failing when ls fails. Takes the
-# path as an argument, so a quote or a space in it cannot break a `sh -c` string.
-_ls_head() { _head_of "$2" ls -la -- "$1"; }
-
 # read_proc "label" PATH -> content of a /proc or /sys file, or a reason.
 read_proc() {
     local label="$1" path="$2" out
@@ -633,6 +623,23 @@ _names() {
     done
     return 0
 }
+# ---- end apm: probe helpers
+
+# ---- apm: file helpers — DO NOT EDIT ----------------------------------------
+# members: apmnodejs apmphp apmpython
+# _head_of N CMD... -> the first N lines of CMD's stdout, with CMD's own exit
+# status (a `CMD | head` pipeline reports head's, and hides a failed CMD as
+# empty output).
+_head_of() {
+    local n="$1" rc; shift
+    "$@" > "$(_tmp head.out)"; rc=$?
+    head -n "$n" "$(_tmp head.out)" 2>/dev/null
+    return "$rc"
+}
+
+# _ls_head DIR N -> `ls -la DIR`, first N lines, failing when ls fails. Takes the
+# path as an argument, so a quote or a space in it cannot break a `sh -c` string.
+_ls_head() { _head_of "$2" ls -la -- "$1"; }
 
 # _file_lines head|tail "label" PATH CAP -> the first or last CAP lines of the
 # file, verbatim, or a reason. Configuration is dumped as is, never masked (the
@@ -647,6 +654,7 @@ _file_lines() {
     fact "$label ($w $cap of ${total:-?} lines):"
     "$how" -n "$cap" "$path" 2>/dev/null | while IFS= read -r _l || [ -n "$_l" ]; do printf '        %s\n' "$_l"; done
 }
+# ---- end apm: file helpers
 
 # conf_bytes "label" PATH -> byte-level facts about a config file that plain
 # `cat` hides: total bytes and CR (\r, 0x0D) byte count. Windows-edited conf
@@ -717,7 +725,8 @@ cli_version() {
     else probe "$1 ($2 --version)" "$2" --version; fi
 }
 
-# ---- process table (internal; emits nothing) ----------------------------------
+# ---- apm: process table — DO NOT EDIT ---------------------------------------
+# members: apmnodejs apmphp apmpython
 # _proc_table -> one line per process that has a command line, fields joined by
 # the unit separator \037 (a whitespace IFS would merge empty fields):
 #   pid comm exe argv0 cmdline
@@ -747,6 +756,7 @@ _proc_table() {
         $1 == "A" { o[++n] = $2; a0[$2] = $3; cl[$2] = $4 }
         END { for (i = 1; i <= n; i++) { p = o[i]; print p "\037" c[p] "\037" e[p] "\037" a0[p] "\037" cl[p] } }'
 }
+# ---- end apm: process table
 
 # ---- discovery (internal; emits nothing) --------------------------------------
 # Populates:
@@ -788,6 +798,8 @@ resolve_fs() {
     return 1
 }
 
+# ---- apm: path helpers — DO NOT EDIT ----------------------------------------
+# members: apmnodejs apmphp apmpython
 # _absent_why PATH [SOURCE] -> why resolve_fs found nothing: "permission denied:
 # <dir>" when an existing ancestor cannot be searched by this uid, or when the
 # process named in SOURCE ("... pid N") has a root this uid cannot enter;
@@ -867,6 +879,7 @@ _add_home() {  # _add_home PATH SOURCE
     case "$_nl$D_HOMES" in *"$_nl$p|"*) return ;; esac
     if [ -n "$D_HOMES" ]; then D_HOMES="$D_HOMES$_nl$p|$s"; else D_HOMES="$p|$s"; fi
 }
+# ---- end apm: path helpers
 
 _add_pkg_dir() {  # _add_pkg_dir DIR SOURCE  (dedup on the resolved dir)
     local d="$1" s="$2" r
@@ -903,6 +916,11 @@ _add_node() {
 # _is_node NAME -> success when NAME is a node binary's file name
 _is_node() { case "$1" in node|nodejs|node[0-9]*) return 0 ;; esac; return 1; }
 
+# the names _env_pick fills, set before its first call
+_ev_WHATAP_HOME="" _ev_WHATAP_CONF_DIR="" _ev_WHATAP_CONF="" _ev_NODE_OPTIONS="" _ev_NODE_PATH=""
+
+# ---- apm: environ readers — DO NOT EDIT -------------------------------------
+# members: apmnodejs apmpython
 # _read_proc_env PID -> sets _env to the process environ, one variable per line;
 # returns 1 (and adds PID to D_UNREAD) when this uid cannot read it
 _read_proc_env() {
@@ -921,7 +939,6 @@ _read_proc_env() {
 # process. The lines are split by IFS, not by a `read` loop over a here-doc,
 # which costs a builtin call per line; ${v#*X} cuts are no cheaper, as they
 # rescan the string for each position.
-_ev_WHATAP_HOME="" _ev_WHATAP_CONF_DIR="" _ev_WHATAP_CONF="" _ev_NODE_OPTIONS="" _ev_NODE_PATH=""
 _env_pick() {
     local l n _o _p=""
     # a name absent from the whole environ is settled by one match on it,
@@ -939,6 +956,7 @@ _env_pick() {
     done
     set +f; IFS="$_o"
 }
+# ---- end apm: environ readers
 
 # _cwd_of PID -> _cw = the cwd discovery resolved for a node PID ("" when it
 # could not be read), so the report does not fork a readlink per process again
@@ -1098,6 +1116,8 @@ _scan_gaps() {
 # 20-digit x, and `[ x -lt n ]` on "abc" prints "Illegal number" and is false.
 # A value that fails is reported as a fact and not used.
 
+# ---- apm: numbers — DO NOT EDIT ---------------------------------------------
+# members: apmnodejs apmphp apmpython
 # _num_norm V MAXDIGITS -> V without leading zeros when it is 1..MAXDIGITS
 # digits (a leading zero would read as octal in $((...))); fails otherwise
 _num_norm() {
@@ -1123,9 +1143,6 @@ _conf_vals() {
     awk -F= -v k="$k" '{ gsub(/[ \t\r]/, "") } $1 == k && $2 != "" { print $2 }' "$@" 2>/dev/null
 }
 
-# _registry_vals FILE -> the raw first field of each port registry line
-_registry_vals() { [ -r "$1" ] && awk 'NF { print $1 }' "$1" 2>/dev/null; return 0; }
-
 # _ports_add LABEL <<VALUES -> the valid ports among VALUES (one per line) join
 # _pl, and "; PORTS (LABEL)" joins _plab; refused values join _pbad
 _ports_add() {
@@ -1142,6 +1159,10 @@ _ports_add() {
 
 # _uniq_ports PORT... -> the distinct ports, space-joined (validated numbers only)
 _uniq_ports() { [ "$#" -gt 0 ] || return 0; printf '%s\n' "$@" | sort -un | tr '\n' ' ' | sed 's/ $//'; }
+# ---- end apm: numbers
+
+# _registry_vals FILE -> the raw first field of each port registry line
+_registry_vals() { [ -r "$1" ] && awk 'NF { print $1 }' "$1" 2>/dev/null; return 0; }
 
 # _home_confs -> every readable conf file (whatap.conf and the WHATAP_CONF
 # names) of every visible agent home, one per line

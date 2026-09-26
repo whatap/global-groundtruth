@@ -56,6 +56,8 @@ export LC_ALL=C
 
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-apmphp"
+# 0.6.1  Shared helpers moved into the apm group block; report unchanged.
+#        The apm: blocks are copies of templates/groups/apm.sh.
 # 0.6.0  Section 4 reuses the `php-fpm -v` of section 3 also when section 3
 #        ran it under a name that resolves to the PATH php-fpm (a running
 #        php-fpm8.2 found before the php-fpm link to it); the machine arch is
@@ -68,7 +70,7 @@ COLLECTOR_NAME="whatap-apmphp"
 # 0.5.2  A directory this uid can read but not enter lists its names again
 #        (the refactor's _names dropped them; ls did not).
 # 0.5.1  Readability refactor; report unchanged.
-VERSION="0.6.0"
+VERSION="0.6.1"
 DOMAIN="apm"
 TARGET="host/$(hostname 2>/dev/null || echo unknown)"
 
@@ -564,6 +566,8 @@ CMD_TIMEOUT="${CMD_TIMEOUT:-15}"
 # Call after _run_init: the error and php -i files live in the run's private directory.
 _init_probe() { _errfile="$(_tmp probe.err)"; _infofile="$(_tmp probe.info)"; }
 
+# ---- apm: probe helpers — DO NOT EDIT ---------------------------------------
+# members: apmjava apmnodejs apmphp apmpython
 _classify_err() {
     local txt=""
     [ -f "$_errfile" ] && txt="$(cat "$_errfile" 2>/dev/null)"
@@ -607,20 +611,6 @@ probe() {
     _emit_labeled "$label" "$out"
 }
 
-# _head_of N CMD... -> the first N lines of CMD's stdout, with CMD's own exit
-# status (a `CMD | head` pipeline reports head's, and hides a failed CMD as
-# empty output).
-_head_of() {
-    local n="$1" rc; shift
-    "$@" > "$(_tmp head.out)"; rc=$?
-    head -n "$n" "$(_tmp head.out)" 2>/dev/null
-    return "$rc"
-}
-
-# _ls_head DIR N -> `ls -la DIR`, first N lines, failing when ls fails. Takes the
-# path as an argument, so a quote or a space in it cannot break a `sh -c` string.
-_ls_head() { _head_of "$2" ls -la -- "$1"; }
-
 # read_proc "label" PATH -> content of a /proc or /sys file, or a reason.
 read_proc() {
     local label="$1" path="$2" out
@@ -642,6 +632,23 @@ _names() {
     done
     return 0
 }
+# ---- end apm: probe helpers
+
+# ---- apm: file helpers — DO NOT EDIT ----------------------------------------
+# members: apmnodejs apmphp apmpython
+# _head_of N CMD... -> the first N lines of CMD's stdout, with CMD's own exit
+# status (a `CMD | head` pipeline reports head's, and hides a failed CMD as
+# empty output).
+_head_of() {
+    local n="$1" rc; shift
+    "$@" > "$(_tmp head.out)"; rc=$?
+    head -n "$n" "$(_tmp head.out)" 2>/dev/null
+    return "$rc"
+}
+
+# _ls_head DIR N -> `ls -la DIR`, first N lines, failing when ls fails. Takes the
+# path as an argument, so a quote or a space in it cannot break a `sh -c` string.
+_ls_head() { _head_of "$2" ls -la -- "$1"; }
 
 # _file_lines head|tail "label" PATH CAP -> the first or last CAP lines of the
 # file, verbatim, or a reason. Configuration is dumped as is, never masked (the
@@ -656,6 +663,7 @@ _file_lines() {
     fact "$label ($w $cap of ${total:-?} lines):"
     "$how" -n "$cap" "$path" 2>/dev/null | while IFS= read -r _l || [ -n "$_l" ]; do printf '        %s\n' "$_l"; done
 }
+# ---- end apm: file helpers
 
 # conf_bytes "label" PATH -> byte-level facts a plain `cat` hides: total bytes
 # and CR (\r, 0x0D) count. Windows-edited ini files reach Linux hosts through
@@ -747,7 +755,8 @@ php_info_block() {
     _emit_labeled "$label" "$out"
 }
 
-# ---- process table (internal; emits nothing) ----------------------------------
+# ---- apm: process table — DO NOT EDIT ---------------------------------------
+# members: apmnodejs apmphp apmpython
 # _proc_table -> one line per process that has a command line, fields joined by
 # the unit separator \037 (a whitespace IFS would merge empty fields):
 #   pid comm exe argv0 cmdline
@@ -777,6 +786,7 @@ _proc_table() {
         $1 == "A" { o[++n] = $2; a0[$2] = $3; cl[$2] = $4 }
         END { for (i = 1; i <= n; i++) { p = o[i]; print p "\037" c[p] "\037" e[p] "\037" a0[p] "\037" cl[p] } }'
 }
+# ---- end apm: process table
 
 # ---- discovery (internal; emits nothing) --------------------------------------
 # Populates:
@@ -837,6 +847,8 @@ resolve_fs() {
     return 1
 }
 
+# ---- apm: path helpers — DO NOT EDIT ----------------------------------------
+# members: apmnodejs apmphp apmpython
 # _absent_why PATH [SOURCE] -> why resolve_fs found nothing: "permission denied:
 # <dir>" when an existing ancestor cannot be searched by this uid, or when the
 # process named in SOURCE ("... pid N") has a root this uid cannot enter;
@@ -916,6 +928,7 @@ _add_home() {  # _add_home PATH SOURCE
     case "$_nl$D_HOMES" in *"$_nl$p|"*) return ;; esac
     if [ -n "$D_HOMES" ]; then D_HOMES="$D_HOMES$_nl$p|$s"; else D_HOMES="$p|$s"; fi
 }
+# ---- end apm: path helpers
 
 _add_svc() {  # _add_svc PATH
     local p="$1"
@@ -1174,6 +1187,8 @@ _scan_gaps() {
 # 20-digit x, and `[ x -lt n ]` on "abc" prints "Illegal number" and is false.
 # A value that fails is reported as a fact and not used.
 
+# ---- apm: numbers — DO NOT EDIT ---------------------------------------------
+# members: apmnodejs apmphp apmpython
 # _num_norm V MAXDIGITS -> V without leading zeros when it is 1..MAXDIGITS
 # digits (a leading zero would read as octal in $((...))); fails otherwise
 _num_norm() {
@@ -1190,16 +1205,6 @@ _port_norm() {
     v="$(_num_norm "$1" 5)" || return 1
     [ "$v" -ge 1 ] && [ "$v" -le 65535 ] || return 1
     printf '%s' "$v"
-}
-
-# _cap_from NAME VALUE DEFAULT -> sets _cap to VALUE when it is 1..999999, else
-# to DEFAULT, and _cap_note to why VALUE was ignored (empty when unset or used)
-_cap_from() {
-    local v
-    _cap="$3" _cap_note=""
-    [ -n "$2" ] || return 0
-    if v="$(_num_norm "$2" 6)" && [ "$v" -ge 1 ]; then _cap="$v"; return 0; fi
-    _cap_note="$1=$(_quote_nl "$2") ignored (not a number 1..999999), using $3"
 }
 
 # _conf_vals KEY FILE... -> the raw values of KEY= in FILEs, one per line
@@ -1225,6 +1230,17 @@ _ports_add() {
 
 # _uniq_ports PORT... -> the distinct ports, space-joined (validated numbers only)
 _uniq_ports() { [ "$#" -gt 0 ] || return 0; printf '%s\n' "$@" | sort -un | tr '\n' ' ' | sed 's/ $//'; }
+# ---- end apm: numbers
+
+# _cap_from NAME VALUE DEFAULT -> sets _cap to VALUE when it is 1..999999, else
+# to DEFAULT, and _cap_note to why VALUE was ignored (empty when unset or used)
+_cap_from() {
+    local v
+    _cap="$3" _cap_note=""
+    [ -n "$2" ] || return 0
+    if v="$(_num_norm "$2" 6)" && [ "$v" -ge 1 ]; then _cap="$v"; return 0; fi
+    _cap_note="$1=$(_quote_nl "$2") ignored (not a number 1..999999), using $3"
+}
 
 # _net_ports -> sets _udp_ports / _tcp_ports to the ports the readable whatap
 # ini files name, or 6600 when none names one, and states which it used
@@ -1751,7 +1767,7 @@ _rep_binding() {
                     _t="$(readlink -f "$fsd/whatap.so" 2>/dev/null)"
                     if [ -n "$_t" ]; then
                         _b="$(basename "$_t")"
-                        fact "   it resolves to: $_b (name encodes: thread-safe build = $(case "$_b" in *_zts_*) echo yes ;; *) echo no ;; esac), PHP API = $(echo "$_b" | grep -oE '[0-9]{8}' | head -n1))"
+                        fact "   it resolves to: $_b (name encodes: thread-safe build = $(case "$_b" in (*_zts_*) echo yes ;; (*) echo no ;; esac), PHP API = $(echo "$_b" | grep -oE '[0-9]{8}' | head -n1))"
                     fi
                 else
                     fact "   whatap.so there: n/a (path not found: $_ed/whatap.so)"

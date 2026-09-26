@@ -64,7 +64,9 @@ COLLECTOR_NAME="whatap-apmpython"
 #        stdout encoding lacks), so one odd name cannot break a line or lose
 #        the list; a sys.path directory that cannot be stat'ed says why
 #        (2026-09-26).
-VERSION="0.9.0"
+# 0.9.1  Shared helpers moved into the apm group block; report unchanged.
+#        The apm: blocks are copies of templates/groups/apm.sh.
+VERSION="0.9.1"
 DOMAIN="apm"
 TARGET="host/$(hostname 2>/dev/null || echo unknown)"
 
@@ -564,6 +566,8 @@ CMD_TIMEOUT="${CMD_TIMEOUT:-15}"
 # Call after _run_init: the error file lives in the run's private directory.
 _init_probe() { _errfile="$(_tmp probe.err)"; }
 
+# ---- apm: probe helpers — DO NOT EDIT ---------------------------------------
+# members: apmjava apmnodejs apmphp apmpython
 _classify_err() {
     local txt=""
     [ -f "$_errfile" ] && txt="$(cat "$_errfile" 2>/dev/null)"
@@ -607,20 +611,6 @@ probe() {
     _emit_labeled "$label" "$out"
 }
 
-# _head_of N CMD... -> the first N lines of CMD's stdout, with CMD's own exit
-# status (a `CMD | head` pipeline reports head's, and hides a failed CMD as
-# empty output).
-_head_of() {
-    local n="$1" rc; shift
-    "$@" > "$(_tmp head.out)"; rc=$?
-    head -n "$n" "$(_tmp head.out)" 2>/dev/null
-    return "$rc"
-}
-
-# _ls_head DIR N -> `ls -la DIR`, first N lines, failing when ls fails. Takes the
-# path as an argument, so a quote or a space in it cannot break a `sh -c` string.
-_ls_head() { _head_of "$2" ls -la -- "$1"; }
-
 # read_proc "label" PATH -> content of a /proc or /sys file, or a reason.
 read_proc() {
     local label="$1" path="$2" out
@@ -642,6 +632,23 @@ _names() {
     done
     return 0
 }
+# ---- end apm: probe helpers
+
+# ---- apm: file helpers — DO NOT EDIT ----------------------------------------
+# members: apmnodejs apmphp apmpython
+# _head_of N CMD... -> the first N lines of CMD's stdout, with CMD's own exit
+# status (a `CMD | head` pipeline reports head's, and hides a failed CMD as
+# empty output).
+_head_of() {
+    local n="$1" rc; shift
+    "$@" > "$(_tmp head.out)"; rc=$?
+    head -n "$n" "$(_tmp head.out)" 2>/dev/null
+    return "$rc"
+}
+
+# _ls_head DIR N -> `ls -la DIR`, first N lines, failing when ls fails. Takes the
+# path as an argument, so a quote or a space in it cannot break a `sh -c` string.
+_ls_head() { _head_of "$2" ls -la -- "$1"; }
 
 # _file_lines head|tail "label" PATH CAP -> the first or last CAP lines of the
 # file, verbatim, or a reason. Configuration is dumped as is, never masked (the
@@ -656,6 +663,7 @@ _file_lines() {
     fact "$label ($w $cap of ${total:-?} lines):"
     "$how" -n "$cap" "$path" 2>/dev/null | while IFS= read -r _l || [ -n "$_l" ]; do printf '        %s\n' "$_l"; done
 }
+# ---- end apm: file helpers
 
 # pyprobe "label" PY_EXE CODE -> run a short python -c snippet under _bounded.
 # Never imports the `whatap` package itself (importing it has side effects);
@@ -874,7 +882,8 @@ _pyreport() {
     _emit_labeled "$label" "$out"
 }
 
-# ---- process table (internal; emits nothing) ----------------------------------
+# ---- apm: process table — DO NOT EDIT ---------------------------------------
+# members: apmnodejs apmphp apmpython
 # _proc_table -> one line per process that has a command line, fields joined by
 # the unit separator \037 (a whitespace IFS would merge empty fields):
 #   pid comm exe argv0 cmdline
@@ -904,6 +913,7 @@ _proc_table() {
         $1 == "A" { o[++n] = $2; a0[$2] = $3; cl[$2] = $4 }
         END { for (i = 1; i <= n; i++) { p = o[i]; print p "\037" c[p] "\037" e[p] "\037" a0[p] "\037" cl[p] } }'
 }
+# ---- end apm: process table
 
 # ---- discovery (internal; emits nothing) --------------------------------------
 # Populates:
@@ -950,6 +960,8 @@ resolve_fs() {
     return 1
 }
 
+# ---- apm: path helpers — DO NOT EDIT ----------------------------------------
+# members: apmnodejs apmphp apmpython
 # _absent_why PATH [SOURCE] -> why resolve_fs found nothing: "permission denied:
 # <dir>" when an existing ancestor cannot be searched by this uid, or when the
 # process named in SOURCE ("... pid N") has a root this uid cannot enter;
@@ -1022,19 +1034,22 @@ D_ODD="" D_ODD_HOME=""
 
 # Membership tests bound by the record delimiter, so /opt/whatap is not taken
 # for already listed when /data/opt/whatap is.
-_add_pkg_dir() {
-    local d="$1"
-    [ -n "$d" ] || return
-    case "$_nl$D_PKG_DIRS$_nl" in *"$_nl$d$_nl"*) return ;; esac
-    if [ -n "$D_PKG_DIRS" ]; then D_PKG_DIRS="$D_PKG_DIRS$_nl$d"; else D_PKG_DIRS="$d"; fi
-}
-
 _add_home() {  # _add_home PATH SOURCE
     local p="$1" s="$2"
     [ -n "$p" ] || return
     case "$p" in *"$_nl"*|*"|"*) D_ODD="$D_ODD \"$(_quote_nl "$p")\"" D_ODD_HOME=1; return ;; esac
     case "$_nl$D_HOMES" in *"$_nl$p|"*) return ;; esac
     if [ -n "$D_HOMES" ]; then D_HOMES="$D_HOMES$_nl$p|$s"; else D_HOMES="$p|$s"; fi
+}
+# ---- end apm: path helpers
+
+# _add_pkg_dir DIR -> add DIR to D_PKG_DIRS once (membership bound by the
+# record delimiter, as in _add_home)
+_add_pkg_dir() {
+    local d="$1"
+    [ -n "$d" ] || return
+    case "$_nl$D_PKG_DIRS$_nl" in *"$_nl$d$_nl"*) return ;; esac
+    if [ -n "$D_PKG_DIRS" ]; then D_PKG_DIRS="$D_PKG_DIRS$_nl$d"; else D_PKG_DIRS="$d"; fi
 }
 
 # Identity is the INVOCATION path, not its readlink target: a virtualenv's
@@ -1060,6 +1075,11 @@ _add_py() {
 # _is_py NAME -> success when NAME is a python interpreter's file name
 _is_py() { case "$1" in python|python[0-9]*|pypy|pypy[0-9]*) return 0 ;; esac; return 1; }
 
+# the names _env_pick fills, set before its first call
+_ev_WHATAP_HOME="" _ev_PYTHONPATH=""
+
+# ---- apm: environ readers — DO NOT EDIT -------------------------------------
+# members: apmnodejs apmpython
 # _read_proc_env PID -> sets _env to the process environ, one variable per line;
 # returns 1 (and adds PID to D_UNREAD) when this uid cannot read it
 _read_proc_env() {
@@ -1076,8 +1096,8 @@ _read_proc_env() {
 # none; the last line wins when a name repeats), for each NAME, in one pass
 # with shell builtins only: a $(...) per variable costs a fork per variable per
 # process. The lines are split by IFS, not by a `read` loop over a here-doc,
-# which costs a builtin call per line.
-_ev_WHATAP_HOME="" _ev_PYTHONPATH=""
+# which costs a builtin call per line; ${v#*X} cuts are no cheaper, as they
+# rescan the string for each position.
 _env_pick() {
     local l n _o _p=""
     # a name absent from the whole environ is settled by one match on it,
@@ -1095,6 +1115,7 @@ _env_pick() {
     done
     set +f; IFS="$_o"
 }
+# ---- end apm: environ readers
 
 discover() {
     progress "discovery: interpreters, processes, agent homes"
@@ -1245,6 +1266,8 @@ _uncounted() {
 # 20-digit x, and `[ x -lt n ]` on "abc" prints "Illegal number" and is false.
 # A value that fails is reported as a fact and not used.
 
+# ---- apm: numbers — DO NOT EDIT ---------------------------------------------
+# members: apmnodejs apmphp apmpython
 # _num_norm V MAXDIGITS -> V without leading zeros when it is 1..MAXDIGITS
 # digits (a leading zero would read as octal in $((...))); fails otherwise
 _num_norm() {
@@ -1263,25 +1286,12 @@ _port_norm() {
     printf '%s' "$v"
 }
 
-# _cap_from NAME VALUE DEFAULT -> sets _cap to VALUE when it is 1..999999, else
-# to DEFAULT, and _cap_note to why VALUE was ignored (empty when unset or used)
-_cap_from() {
-    local v
-    _cap="$3" _cap_note=""
-    [ -n "$2" ] || return 0
-    if v="$(_num_norm "$2" 6)" && [ "$v" -ge 1 ]; then _cap="$v"; return 0; fi
-    _cap_note="$1=$(_quote_nl "$2") ignored (not a number 1..999999), using $3"
-}
-
 # _conf_vals KEY FILE... -> the raw values of KEY= in FILEs, one per line
 _conf_vals() {
     local k="$1"; shift
     [ "$#" -gt 0 ] || return 0
     awk -F= -v k="$k" '{ gsub(/[ \t\r]/, "") } $1 == k && $2 != "" { print $2 }' "$@" 2>/dev/null
 }
-
-# _registry_vals FILE -> the raw first field of each port registry line
-_registry_vals() { [ -r "$1" ] && awk 'NF { print $1 }' "$1" 2>/dev/null; return 0; }
 
 # _ports_add LABEL <<VALUES -> the valid ports among VALUES (one per line) join
 # _pl, and "; PORTS (LABEL)" joins _plab; refused values join _pbad
@@ -1299,6 +1309,20 @@ _ports_add() {
 
 # _uniq_ports PORT... -> the distinct ports, space-joined (validated numbers only)
 _uniq_ports() { [ "$#" -gt 0 ] || return 0; printf '%s\n' "$@" | sort -un | tr '\n' ' ' | sed 's/ $//'; }
+# ---- end apm: numbers
+
+# _cap_from NAME VALUE DEFAULT -> sets _cap to VALUE when it is 1..999999, else
+# to DEFAULT, and _cap_note to why VALUE was ignored (empty when unset or used)
+_cap_from() {
+    local v
+    _cap="$3" _cap_note=""
+    [ -n "$2" ] || return 0
+    if v="$(_num_norm "$2" 6)" && [ "$v" -ge 1 ]; then _cap="$v"; return 0; fi
+    _cap_note="$1=$(_quote_nl "$2") ignored (not a number 1..999999), using $3"
+}
+
+# _registry_vals FILE -> the raw first field of each port registry line
+_registry_vals() { [ -r "$1" ] && awk 'NF { print $1 }' "$1" 2>/dev/null; return 0; }
 
 # _home_confs -> the readable whatap.conf of every visible agent home, one per
 # line

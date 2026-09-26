@@ -143,6 +143,9 @@ host yet.
 ## Checklist
 
 - [ ] Copied from the skeleton; four metadata variables set.
+- [ ] A helper that behaves the same in sibling collectors is a group block in
+      `templates/groups/<group>.sh` (its `# members:` line names this
+      collector), not a hand copy; `tools/sync-shared-block.sh --check` passes.
 - [ ] Every section is facts only — no cause, no severity, no action.
 - [ ] Values are discovered (symlinks/mounts/args/config resolved), not hardcoded.
 - [ ] Absent values print `n/a` / `not found`, never a guessed default.

@@ -58,7 +58,9 @@
 # not this validator (its judgment-word pattern below obviously contains the
 # words), and not the test harness or the sync helper beside it. Pass a
 # collector, or a directory of collectors, or the repo root — the tools/
-# directory is skipped either way.
+# directory is skipped either way. So is templates/groups/: its files own the
+# group blocks, fragments with no header or main of their own, and each block
+# is validated where it runs, inside every member collector.
 # -----------------------------------------------------------------------------
 
 set -u
@@ -208,11 +210,15 @@ done
 
 # This script's own directory. Everything in it is a tool, never a collector.
 SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+# The owners of the group blocks (sync-shared-block.sh): fragments, not collectors.
+GROUPS_DIR="$(cd "$SELF_DIR/../templates/groups" 2>/dev/null && pwd)"
 
 rc=0
 for f in "${targets[@]}"; do
     bn="$(basename "$f")"
-    [ "$(cd "$(dirname "$f")" && pwd)" = "$SELF_DIR" ] && continue
+    fdir="$(cd "$(dirname "$f")" && pwd)"
+    [ "$fdir" = "$SELF_DIR" ] && continue
+    [ -n "$GROUPS_DIR" ] && [ "$fdir" = "$GROUPS_DIR" ] && continue
 
     problems=()
     skipped=()

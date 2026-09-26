@@ -86,6 +86,10 @@ Five blocks are **synced**, not just copied: emit helpers, privilege, boot
 time, run helpers and collection completeness. Each runs from its `# ---- <name> — DO NOT EDIT`
 banner to its `# ---- end <name>` line, and `tools/sync-shared-block.sh
 --apply` overwrites whatever a collector changed between them. Change them
-here, in the skeleton, and run `--apply`; `--check` reports drift. Then run
+here, in the skeleton, and run `--apply`; `--check` reports drift.
+Helpers only some collectors share are **group blocks**, owned by
+`../groups/<group>.sh` (banner `# ---- <group>: <name> — DO NOT EDIT`, a
+`# members:` line, end `# ---- end <group>: <name>`); the same tool syncs them
+into the members it names and nowhere else. Then run
 `tools/test-framework.sh`: it tests the blocks under bash and dash, and runs
 every collector through `validate.sh --report`.

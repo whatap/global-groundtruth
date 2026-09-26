@@ -73,7 +73,9 @@ export LC_ALL=C
 
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-apmjava"
-VERSION="0.12.5"
+# 0.12.6  Shared helpers moved into the apm group block; report unchanged.
+#         The apm: blocks are copies of templates/groups/apm.sh.
+VERSION="0.12.6"
 DOMAIN="apm"
 TARGET="host/$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || echo unknown)"
 
@@ -648,6 +650,8 @@ _flag_text() {
     awk -F'\t' -v k="$1" '$1 == k && !s[$2]++ { printf "%s%s", (n++ ? "; " : ""), $2 }' "$(_tmp flags)" 2>/dev/null
 }
 
+# ---- apm: probe helpers — DO NOT EDIT ---------------------------------------
+# members: apmjava apmnodejs apmphp apmpython
 _classify_err() {
     local txt=""
     [ -f "$_errfile" ] && txt="$(cat "$_errfile" 2>/dev/null)"
@@ -700,6 +704,19 @@ read_proc() {
     [ -z "$out" ] && { fact "$label: n/a (empty output)"; return; }
     _emit_labeled "$label" "$out"
 }
+
+# _names DIR -> the names in DIR, as `ls DIR` lists them (no dot files, sorted).
+# Only an unmatched glob is skipped: in a DIR this uid can read but not enter,
+# -e fails on every entry although ls lists them all.
+_names() {
+    local n
+    for n in "$1"/*; do
+        [ "$n" = "$1/*" ] && [ ! -e "$n" ] && [ ! -L "$n" ] && continue
+        printf '%s\n' "${n##*/}"
+    done
+    return 0
+}
+# ---- end apm: probe helpers
 
 # _fsize PATH -> size in bytes from the inode (ls -Ln), without reading the
 # file: an agent or server log can be gigabytes, and counting its lines is a
@@ -882,16 +899,6 @@ _appclass_record() {
     [ -n "$_APPSINK" ] || return
     [ -n "$1" ] || return
     printf '%s\n' "$1" >> "$_APPSINK" 2>/dev/null
-}
-
-# _names DIR -> the names in DIR, one per line, as `ls DIR` prints them under
-# LC_ALL=C (sorted, no dot files), without parsing ls output. An unreadable or
-# empty DIR prints nothing.
-_names() {
-    for _ne in "$1"/*; do
-        [ "$_ne" = "$1/*" ] && [ ! -e "$_ne" ] && [ ! -L "$_ne" ] && continue
-        printf '%s\n' "${_ne##*/}"
-    done
 }
 
 # list_jars "indent" DIR CAP -> *.jar names in ONE directory level (no walk),
@@ -2411,7 +2418,7 @@ _rep_jvms() {
             printf '           detected as a JVM by: %s\n' "$(printf '%s\n' "$D_JVM_WHY" | awk -F'|' -v p="$pid" '$1==p{sub(/^[^|]*\|/,""); print; exit}')"
             printf '           comm: %s\n' "$(cat "/proc/$pid/comm" 2>/dev/null)"
             printf '           exe: %s\n' "$(readlink "/proc/$pid/exe" 2>/dev/null || echo 'n/a (permission denied or gone)')"
-            printf '           root and mount namespace: %s\n' "$(case "$(_ns_of "$pid")" in same) echo "the collector's own" ;; other) echo "not the collector's (root $(readlink "/proc/$pid/root" 2>/dev/null); paths are read through /proc/$pid/root)" ;; *) echo "n/a (/proc/$pid/root not readable)" ;; esac)"
+            printf '           root and mount namespace: %s\n' "$(case "$(_ns_of "$pid")" in (same) echo "the collector's own" ;; (other) echo "not the collector's (root $(readlink "/proc/$pid/root" 2>/dev/null); paths are read through /proc/$pid/root)" ;; (*) echo "n/a (/proc/$pid/root not readable)" ;; esac)"
             _pst="${_pst#*|}"
             printf '           uid/state/threads: %s\n' "${_pst%%|*}"
             printf '           VmRSS: %s\n' "${_pst#*|}"

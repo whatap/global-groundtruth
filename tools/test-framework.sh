@@ -319,6 +319,69 @@ check "--apply undoes it, keeps the one-liner after it" '"$M/tools/sync-shared-b
 sed -i '/^# ---- emit helpers — DO NOT EDIT/,/^# ---- end emit helpers$/d' "$M/collectors/x/collect-x.sh"
 "$M/tools/sync-shared-block.sh" --apply >/dev/null
 check "--apply inserts missing emit helpers"  '"$M/tools/sync-shared-block.sh" --check >/dev/null && bash -n "$M/collectors/x/collect-x.sh"'
+# group blocks: one owner under templates/groups, member x, non-member y
+mkdir -p "$M/templates/groups" "$M/collectors/y"
+cp "$M/collectors/x/collect-x.sh" "$M/collectors/y/collect-y.sh"
+cat > "$M/templates/groups/g.sh" <<'EOF'
+# owner of the g group blocks (test)
+# ---- g: one — DO NOT EDIT ----
+# members: x
+gone() { echo one; }
+# ---- end g: one
+
+# ---- g: two — DO NOT EDIT ----
+# members: x
+gtwo() { echo two; }
+# ---- end g: two
+EOF
+sed -n '2,5p;7,10p' "$M/templates/groups/g.sh" > "$M/g.blocks"
+printf '\n' >> "$M/collectors/x/collect-x.sh"; cat "$M/g.blocks" >> "$M/collectors/x/collect-x.sh"
+ysum="$(cksum < "$M/collectors/y/collect-y.sh")"
+check "group blocks in the member pass --check" '"$M/tools/sync-shared-block.sh" --check >/dev/null' \
+    "$("$M/tools/sync-shared-block.sh" --check | grep -v '^ok')"
+sed -i 's/^gone() { echo one; }$/gone() { echo drifted; }/' "$M/collectors/x/collect-x.sh"
+check "drift in a group block is reported" '"$M/tools/sync-shared-block.sh" --check | grep -q "^DRIFT .*collect-x.sh .*block g: one"'
+"$M/tools/sync-shared-block.sh" --apply >/dev/null
+check "--apply undoes group drift" '"$M/tools/sync-shared-block.sh" --check >/dev/null && grep -qx "gone() { echo one; }" "$M/collectors/x/collect-x.sh"'
+check "--apply leaves a non-member untouched" '[ "$(cksum < "$M/collectors/y/collect-y.sh")" = "$ysum" ]'
+check "a non-member is not reported MISSING" '! "$M/tools/sync-shared-block.sh" --check | grep -q "collect-y.sh .*block g:"'
+sed -i '/^# ---- g: one — DO NOT EDIT/,/^# ---- end g: one$/d' "$M/collectors/x/collect-x.sh"
+check "a missing group block is reported" '"$M/tools/sync-shared-block.sh" --check | grep -q "^MISSING .*collect-x.sh .*block g: one"'
+"$M/tools/sync-shared-block.sh" --apply >/dev/null
+check "--apply inserts it before the next block of the group" \
+    '"$M/tools/sync-shared-block.sh" --check >/dev/null && [ "$(grep -n "^# ---- g: one" "$M/collectors/x/collect-x.sh" | cut -d: -f1)" -lt "$(grep -n "^# ---- g: two" "$M/collectors/x/collect-x.sh" | cut -d: -f1)" ]'
+cat "$M/g.blocks" >> "$M/collectors/y/collect-y.sh"
+# shellcheck disable=SC2034  # ysum is read inside check's eval
+ysum="$(cksum < "$M/collectors/y/collect-y.sh")"
+check "a non-member carrying the block is reported STRAY" '"$M/tools/sync-shared-block.sh" --check | grep -q "^STRAY .*collect-y.sh .*block g: one"'
+"$M/tools/sync-shared-block.sh" --apply >/dev/null
+check "--apply leaves a STRAY copy alone" '[ "$(cksum < "$M/collectors/y/collect-y.sh")" = "$ysum" ]'
+sed -i '/^# ---- g: /,/^# ---- end g: two$/d' "$M/collectors/y/collect-y.sh"
+sed -i 's/^# members: x$/# members: x nosuch/' "$M/templates/groups/g.sh"
+check "a member with no collector file fails the run" '"$M/tools/sync-shared-block.sh" --check >/dev/null 2>&1; [ $? = 2 ]'
+sed -i 's/^# members: x nosuch$/# members: x/' "$M/templates/groups/g.sh"
+# a real member: php without its apm path helpers gets them back from --apply
+R="$T/repo"; mkdir -p "$R"
+cp -R "$ROOT/tools" "$ROOT/templates" "$ROOT/collectors" "$R/"
+sed -i '/^# ---- apm: path helpers — DO NOT EDIT/,/^# ---- end apm: path helpers$/d' "$R/collectors/apm/php/collect-apmphp.sh"
+check "php without apm: path helpers is reported MISSING" '"$R/tools/sync-shared-block.sh" --check | grep -q "^MISSING .*collect-apmphp.sh .*block apm: path helpers"'
+"$R/tools/sync-shared-block.sh" --apply >/dev/null
+check "--apply re-inserts php's apm: path helpers" '"$R/tools/sync-shared-block.sh" --check >/dev/null && bash -n "$R/collectors/apm/php/collect-apmphp.sh"'
+# the last block, and a member that carries a single block (java), come back
+# after the previous block they carry, or before the next one
+sed -i '/^# ---- apm: numbers — DO NOT EDIT/,/^# ---- end apm: numbers$/d' "$R/collectors/apm/php/collect-apmphp.sh"
+sed -i '/^# ---- apm: probe helpers — DO NOT EDIT/,/^# ---- end apm: probe helpers$/d' "$R/collectors/apm/java/collect-apmjava.sh"
+"$R/tools/sync-shared-block.sh" --apply >/dev/null
+check "--apply re-inserts php's last block (numbers)" '"$R/tools/sync-shared-block.sh" --check | grep -q "^ok .*collect-apmphp.sh .*block apm: numbers"'
+check "--apply re-inserts java's only group block" '"$R/tools/sync-shared-block.sh" --check >/dev/null && bash -n "$R/collectors/apm/java/collect-apmjava.sh"'
+sed -i 's/^# members: apmjava apmnodejs apmphp apmpython$/# members:   /' "$R/templates/groups/apm.sh"
+check "a members line with no stem fails the run" '"$R/tools/sync-shared-block.sh" --check >/dev/null 2>&1; [ $? = 2 ]'
+# the repo's group owners parse under bash and dash (the apm members run under both)
+for g in "$ROOT"/templates/groups/*.sh; do
+    [ -f "$g" ] || continue
+    check "$(basename "$g"): parses under bash and dash" 'bash -n "$g" && dash -n "$g"'
+done
+
 # every collector defines each shared name once: a second definition later in
 # the file would silently override the synced one
 dups=""
@@ -330,6 +393,23 @@ for f in $(cd "$ROOT" && git ls-files 'collectors/*collect-*.sh'); do
     done
 done
 check "each shared name is defined once per collector" '[ -z "$dups" ]' "$dups"
+# and each member defines every function of its group blocks once
+gdups=""
+for g in "$ROOT"/templates/groups/*.sh; do
+    [ -f "$g" ] || continue
+    while IFS= read -r l; do
+        case "$l" in
+            "# members: "*) mem="${l#"# members: "}" ;;
+            [A-Za-z_]*"() {"*)
+                n="${l%%()*}"
+                for stem in $mem; do
+                    f="$(cd "$ROOT" && git ls-files "collectors/*collect-$stem.sh")"
+                    [ -n "$f" ] && [ "$(grep -cE "^${n}[[:space:]]*\(\)" "$ROOT/$f")" = 1 ] || gdups="$gdups $stem:$n"
+                done ;;
+        esac
+    done < "$g"
+done
+check "each group-block function is defined once per member" '[ -z "$gdups" ]' "$gdups"
 
 # ---- 3. validate.sh --report ------------------------------------------------
 echo "== 3. validate.sh --report =="
