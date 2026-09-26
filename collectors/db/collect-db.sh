@@ -48,7 +48,9 @@ COLLECTOR_NAME="whatap-db"
 # 0.5.3  Each (file, key) of a config is read once per run: sections G, H, J,
 #        K and L asked for the same keys again, 7 forks and 6 execs each
 #        (72 reads -> 40 for 3 instances with --tls). Report unchanged.
-VERSION="0.5.3"
+# 0.6.0  The architecture is taken from the one `uname -smr` (no second
+#        `uname -m`).
+VERSION="0.6.0"
 DOMAIN="db"
 TARGET="db-host/$(hostname 2>/dev/null || echo unknown)"
 
@@ -1319,8 +1321,17 @@ _rep_host() {
     section "A. Host & platform"
     probe "hostname" hostname
     read_proc "os-release" /etc/os-release
-    probe "kernel" uname -smr
-    probe "architecture" uname -m
+    # the machine is the last field of `uname -smr` (uname prints the fields
+    # in its own order, and a kernel release has no blank)
+    _k="$(probe "kernel" uname -smr)"
+    printf '%s\n' "$_k"
+    case "$_k" in
+        "    kernel: n/a ("*) fact "architecture: n/a (${_k#    kernel: n/a (}" ;;
+        "    kernel: "*" "*)  fact "architecture: ${_k##* }" ;;
+        "    kernel (exit "*" "*)
+                             _e="${_k#    kernel (exit }"; fact "architecture (exit ${_e%%)*}): ${_k##* }" ;;
+        *)                   fact "architecture: n/a (no machine field in the uname -smr output)" ;;
+    esac
     probe "cpu count" nproc
     if [ -r /proc/meminfo ]; then
         fact "memory: $(awk '/^MemTotal/{t=$2} /^MemAvailable/{a=$2} END{printf "%d MB total, %d MB available", t/1024, a/1024}' /proc/meminfo 2>/dev/null)"
