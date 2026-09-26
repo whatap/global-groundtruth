@@ -123,6 +123,7 @@ host — one command, hand over one file (CONTRACT rule 3):
 ./collect-nms.sh --file                       # -> whatap-nms-<host>-<UTC>.txt  (attach this)
 ./collect-nms.sh --stdout                     # same report to stdout
 ./collect-nms.sh --file --quiet               # no progress narration (for automation)
+./collect-nms.sh --file --out /var/tmp        # the .txt in /var/tmp instead of the current dir
 ./collect-nms.sh                              # no arguments -> prints help (does not collect)
 ```
 

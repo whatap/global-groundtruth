@@ -30,7 +30,11 @@ export LC_ALL=C
 
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-nms"
-VERSION="0.6.2"
+# 0.7.0  --out DIR (default .) puts the --file report in DIR; a DIR that
+#        cannot be written stops the run before it collects (2026-09-26).
+#        A value option given nothing, or a value starting with '-', exits 2
+#        ("missing value for --out"); it took the next option as its value.
+VERSION="0.7.0"
 DOMAIN="nms"
 TARGET="host/$(hostname 2>/dev/null || echo unknown)"
 
@@ -38,6 +42,7 @@ TARGET="host/$(hostname 2>/dev/null || echo unknown)"
 OPT_FILE=0        # write the report to a .txt file
 OPT_STDOUT=0      # print the report to stdout
 OPT_QUIET=0       # suppress progress narration on stderr
+OPT_OUT="."       # output directory for --file
 OPT_SNMP=0        # Tier 2: timed SNMP GET probe against one device
 SNMP_HOST=""
 SNMP_COMM=""
@@ -54,6 +59,7 @@ explicit action flag so nothing starts by accident.
   $(basename "$0") --file     write the facts report -> ./$COLLECTOR_NAME-<host>-<UTC>.txt
   $(basename "$0") --stdout   print the facts report to stdout
   $(basename "$0") --quiet    silence progress on stderr (add to --file / --stdout)
+  $(basename "$0") --out DIR  output directory for --file (default: .)
 
   Tier 2 (opt-in, sends 3 SNMP GET requests to the target device — announced
   on stderr before running; single GETs only, never a walk):
@@ -64,17 +70,23 @@ explicit action flag so nothing starts by accident.
 EOF
 }
 
+# _optval NAME VALUE -> VALUE, or exit 2 when it is empty or starts with '-'
+# (then the next option was taken for the value: `--out --stdout`)
+_optval() {
+    case "$2" in ''|-*) printf -- 'missing value for %s\n' "$1" >&2; exit 2 ;; esac
+}
+
 ARGC=$#
 while [ $# -gt 0 ]; do
     case "$1" in
         --file)    OPT_FILE=1 ;;
         --stdout)  OPT_STDOUT=1 ;;
         --quiet)   OPT_QUIET=1 ;;
+        --out)     _optval --out "${2:-}"; OPT_OUT="$2"; shift ;;
+        --out=*)   _optval --out "${1#*=}"; OPT_OUT="${1#*=}" ;;
         --snmp)
             OPT_SNMP=1
-            if [ $# -lt 3 ]; then
-                printf -- '--snmp needs: --snmp <device-ip> <community> [port]\n' >&2; exit 2
-            fi
+            _optval --snmp "${2:-}"; _optval --snmp "${3:-}"
             SNMP_HOST="$2"; SNMP_COMM="$3"; shift 2
             case "${2:-}" in
                 [0-9]*) SNMP_PORT="$2"; shift ;;
@@ -1269,6 +1281,17 @@ fi
 
 _run_init
 _init_probe
+
+# The output directory is checked before collecting, so an unwritable one
+# fails at once rather than after a full run.
+if [ "$OPT_STDOUT" != 1 ]; then
+    mkdir -p "$OPT_OUT" 2>/dev/null
+    if [ ! -d "$OPT_OUT" ] || [ ! -w "$OPT_OUT" ] || [ ! -x "$OPT_OUT" ]; then
+        warn "the report was not written: output directory $OPT_OUT is not writable by uid $(id -u 2>/dev/null || echo '?')"
+        exit 1
+    fi
+fi
+
 if [ "$OPT_STDOUT" = 1 ]; then
     progress "collecting facts (read-only) -> stdout"
     run_report
@@ -1276,7 +1299,7 @@ if [ "$OPT_STDOUT" = 1 ]; then
 else
     HOST="$(hostname 2>/dev/null || echo unknown)"
     TS="$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null || echo unknown)"
-    OUTFILE="./$COLLECTOR_NAME-$HOST-$TS.txt"
+    OUTFILE="$OPT_OUT/$COLLECTOR_NAME-$HOST-$TS.txt"
     progress "collecting facts (read-only) -> writing $OUTFILE"
     _report_to_file "$OUTFILE" || exit 1
     progress "report written: $OUTFILE"
