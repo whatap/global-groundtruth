@@ -44,21 +44,15 @@
 export LC_ALL=C
 
 # ---- collector metadata -----------------------------------------------------
+# 0.6.4  A zpool status -vt that succeeds with no output (no pool imported) is
+#        one "empty output" line again, not a fallback to -v and -t (0.6.3).
 # 0.6.3  Readability refactor; report unchanged.
 # 0.6.2  The file-size walk is opt-in (Tier 2) again: on a yard of ~10^8 files
 #        it loads the special vdev and the ARC and cannot finish in its bound.
 #        df -i of every WhaTap path is in the report and df-i.txt in the
 #        bundle, so the file count is there without a walk.
-# 0.6.1  WHATAP_HOME is also found from a whatap JVM's working directory. Where
-#        a whatap JVM runs, a path-to-dataset goal is declared; a home not
-#        resolved there (a cwd this uid cannot read included) is blocked,
-#        whatever route resolved the home (-Dwhatap.server.home included); a
-#        home that is not there is "path not found" (na), a dangling home link
-#        says so, and only an unlistable one is blocked. A process counts as a
-#        whatap module only when it is java and names a server/opslake jar or
-#        the yard boot class (not -Dwhatap.server.host).
 COLLECTOR_NAME="whatap-collzfs"
-VERSION="0.6.3"
+VERSION="0.6.4"
 DOMAIN="collection-server"
 TARGET="collection-server-zfs/$(hostname 2>/dev/null || echo unknown)"   # refined after pool discovery
 
@@ -1495,8 +1489,10 @@ _rep_c() {
     # trim state, so two separate calls would print the tree twice. The answer
     # to the support test is the one printed.
     local zst
-    if zst="$(run_bounded "$CMD_TIMEOUT" zpool status -vt)" && [ -n "$zst" ]; then
-        _emit_labeled "zpool status -vt (verbose + trim state per vdev)" "$zst"
+    if zst="$(run_bounded "$CMD_TIMEOUT" zpool status -vt)"; then
+        # succeeded but printed nothing (no pool imported): one line, as probe says it
+        if [ -n "$zst" ]; then _emit_labeled "zpool status -vt (verbose + trim state per vdev)" "$zst"
+        else fact "zpool status -vt (verbose + trim state per vdev): n/a (empty output)"; fi
     else
         probe "zpool status -v" zpool status -v
         probe "zpool status -t (trim state per vdev)" zpool status -t
