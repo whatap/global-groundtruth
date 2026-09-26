@@ -56,13 +56,15 @@ export LC_ALL=C
 
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-apmphp"
+# 0.5.4  _proc_env compares the variable name literally; PATH lookups read
+#        their answer back from a file instead of a second lookup in a $(...).
 # 0.5.3  "ini directory trees present" prints "(no whatap entry)" for a tree
 #        without one (the column was blank) and names an unreadable tree;
 #        section 4 reuses the `php-fpm -v` section 3 ran on the same binary.
 # 0.5.2  A directory this uid can read but not enter lists its names again
 #        (the refactor's _names dropped them; ls did not).
 # 0.5.1  Readability refactor; report unchanged.
-VERSION="0.5.3"
+VERSION="0.5.4"
 DOMAIN="apm"
 TARGET="host/$(hostname 2>/dev/null || echo unknown)"
 
@@ -959,8 +961,22 @@ _is_php() { case "$1" in php|php[0-9]*|php-*|php5-*|lsphp*) return 0 ;; esac; re
 # _proc_env PID NAME -> value of NAME= in the process environ (empty if none).
 # The braces put the input redirection inside the silenced subshell: a process
 # that exits mid-scan would otherwise make the SHELL print "No such file".
+# NAME is compared literally; the first entry wins.
 _proc_env() {
-    { tr '\0' '\n' < "/proc/$1/environ" | grep "^$2=" | head -n1 | cut -d= -f2- ; } 2>/dev/null
+    { tr '\0' '\n' < "/proc/$1/environ" | _K="$2" awk 'BEGIN { k = ENVIRON["_K"] "=" }
+          index($0, k) == 1 { print substr($0, length(k) + 1); exit }' ; } 2>/dev/null
+}
+
+# _which NAME -> sets _wp to the path `command -v NAME` prints, empty when
+# there is none. The path is read back from a file under the run's directory,
+# not captured by a $(...); without that file it is looked up again.
+_which() {
+    _wp=""
+    if [ -n "$_tmp_dir" ] && command -v "$1" > "$_tmp_dir/cmdv" 2>/dev/null && IFS= read -r _wp < "$_tmp_dir/cmdv"; then
+        return 0
+    fi
+    command -v "$1" >/dev/null 2>&1 && _wp="$(command -v "$1" 2>/dev/null)"
+    return 0
 }
 
 _proc_cmd() {
@@ -1041,7 +1057,7 @@ EOF
     # php binaries on PATH and in the usual install locations (shallow globs
     # only — no directory walk)
     for c in php php-fpm php-cgi php5 php5-fpm php-zts zts-php lsphp; do
-        p="$(command -v "$c" 2>/dev/null)"
+        _which "$c"; p="$_wp"
         [ -n "$p" ] && _add_php "$p"
     done
     # Several PHP versions on one host is the normal case, not the exception,
@@ -1376,7 +1392,8 @@ _rep_env() {
     fact "collector cwd: $(pwd 2>/dev/null || echo unknown)"
     fact "tools:"
     for t in php php-fpm apachectl httpd apache2 nginx ipcs ss netstat systemctl rpm dpkg apk readlink timeout stat awk tr sha256sum; do
-        if command -v "$t" >/dev/null 2>&1; then printf '        %-12s present (%s)\n' "$t" "$(command -v "$t")"
+        _which "$t"
+        if [ -n "$_wp" ]; then printf '        %-12s present (%s)\n' "$t" "$_wp"
         else printf '        %-12s absent\n' "$t"; fi
     done
 }
@@ -1446,7 +1463,7 @@ EOF
         case "$php" in
             */php-fpm)
                 if [ -n "$_php_rc" ] && [ "$_php_rc" != 124 ] && [ -z "$_php_err" ] \
-                    && [ "$php" = "$(command -v php-fpm 2>/dev/null)" ]; then
+                    && _which php-fpm && [ "$php" = "$_wp" ]; then
                     _fpm_v_seen=1 _fpm_v_out="$_php_out"
                 fi ;;
         esac
@@ -1548,7 +1565,7 @@ EOF
     else fact "   none found (searched: newrelic, datadog/ddtrace, elastic, opentelemetry, tideways, blackfire, xdebug, xhprof, pinpoint, scoutapm, instana)"; fi
     fact "what the php commands on PATH resolve to:"
     for c in php php-fpm php-cgi; do
-        p="$(command -v "$c" 2>/dev/null)"
+        _which "$c"; p="$_wp"
         if [ -n "$p" ]; then printf '        %-10s %s -> %s\n' "$c" "$p" "$(readlink -f "$p" 2>/dev/null || echo 'n/a (unresolvable)')"
         else printf '        %-10s not on PATH\n' "$c"; fi
     done
@@ -1566,7 +1583,7 @@ _rep_web() {
     section "Web server / application server layer"
     fact "web / application server binaries on PATH:"
     for c in httpd apache2 apachectl php-fpm php5-fpm php-cgi nginx lighttpd frankenphp rr; do
-        p="$(command -v "$c" 2>/dev/null)"
+        _which "$c"; p="$_wp"
         if [ -n "$p" ]; then printf '        %-12s present (%s)\n' "$c" "$p"
         else printf '        %-12s absent\n' "$c"; fi
     done
