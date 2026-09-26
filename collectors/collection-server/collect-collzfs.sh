@@ -61,6 +61,14 @@ export LC_ALL=C
 
 # ---- collector metadata -----------------------------------------------------
 COLLECTOR_NAME="whatap-collzfs"
+# 0.6.1  WHATAP_HOME is also found from a whatap JVM's working directory. Where
+#        a whatap JVM runs, a path-to-dataset goal is declared; a home not
+#        resolved there (a cwd this uid cannot read included) is blocked,
+#        whatever route resolved the home (-Dwhatap.server.home included); a
+#        home that is not there is "path not found" (na), a dangling home link
+#        says so, and only an unlistable one is blocked. A
+#        process counts as a whatap module only when it is java and names a
+#        server/opslake jar or the yard boot class (not -Dwhatap.server.host).
 # 0.6.0  "No pool" is an answer only when `zpool list` ran and listed none: a
 #        list that was refused, failed or hung, and a kstat tree with no zpool,
 #        now block the pools goal instead of "none imported", COMPLETE. A third
@@ -76,7 +84,7 @@ COLLECTOR_NAME="whatap-collzfs"
 #        run's private directory; numeric options are checked (exit 2); an
 #        unwritable --out or failed tar exits 1; output is handed back under
 #        sudo. Needs bash, and says so under sh.
-VERSION="0.6.0"
+VERSION="0.6.1"
 DOMAIN="collection-server"
 TARGET="collection-server-zfs/$(hostname 2>/dev/null || echo unknown)"   # refined after pool discovery
 
@@ -1151,24 +1159,55 @@ WHOME=""
 WHOME_SRC=""
 YARDBASE=""
 
+# _is_whatap_server PID CMDLINE -> true for a java process that runs a WhaTap
+# backend module: a whatap.server.*.jar / whatap.opslake.*.jar on its command
+# line, or the yard boot class. "whatap.server." alone is not enough: the
+# WhaTap Java agent passes -Dwhatap.server.host=..., and `tail -f
+# whatap.server.log` names it too.
+_is_whatap_server() {
+    [[ "$2" =~ whatap\.(server|opslake)\.[A-Za-z0-9._-]+\.jar || "$2" =~ [A-Za-z0-9_]\.yard\.boot ]] || return 1
+    local comm="" a0="${2%% *}"
+    IFS= read -r comm < "/proc/$1/comm" 2>/dev/null
+    [ "$comm" = java ] || [ "${a0##*/}" = java ]
+}
+
+# A whatap JVM seen during resolve_home, and those whose cwd this uid could not
+# read: then "not resolved" is not an answer (the paths goal is blocked).
+ZH_JVM=""; ZH_UNREAD=""
 resolve_home() {
     local d cl v unit wd sd
-    if [ -n "$OPT_HOME" ]; then WHOME="$OPT_HOME"; WHOME_SRC="option --home"; return; fi
-    local f
+    # The process scan runs whatever route resolves the home: a running server
+    # module is what declares the paths goal (ZH_JVM).
+    local f jvms="" p u dhome="" dpid=""
     _scan_cmdlines
     while IFS= read -r f; do
         [ -n "$f" ] || continue
         d="${f%/cmdline}"
         cmdline_of "${d#/proc/}"; cl="$_CL"
-        case "$cl" in
-            *whatap.server.*|*whatap.opslake.*|*.yard.boot*) ;;
-            *) continue ;;
-        esac
+        _is_whatap_server "${d#/proc/}" "$cl" || continue
+        jvms="$jvms ${d#/proc/}"
+        [ -n "$dhome" ] && continue
         v="$(printf '%s\n' "$cl" | grep -oE '[-]Dwhatap\.server\.home=[^ ]+' | head -n1 | cut -d= -f2-)"
-        if [ -n "$v" ]; then WHOME="$v"; WHOME_SRC="process ${d#/proc/} (-Dwhatap.server.home)"; return; fi
+        [ -n "$v" ] && { dhome="$v"; dpid="${d#/proc/}"; }
     done <<EOF
 $_SCAN_OUT
 EOF
+    [ -n "$jvms" ] && ZH_JVM="${jvms# }" && ZH_JVM="${ZH_JVM%% *}"
+    if [ -n "$OPT_HOME" ]; then WHOME="$OPT_HOME"; WHOME_SRC="option --home"; return; fi
+    if [ -n "$dhome" ]; then WHOME="$dhome"; WHOME_SRC="process $dpid (-Dwhatap.server.home)"; return; fi
+    # a JVM's working directory, as collect-collserver.sh does: start scripts
+    # cd into the home; it counts when it holds a module conf or a server jar
+    for p in $jvms; do
+        wd="$(readlink "/proc/$p/cwd" 2>/dev/null)"
+        if [ -z "$wd" ]; then ZH_UNREAD="$ZH_UNREAD $p"; continue; fi
+        [ "$wd" != / ] || continue
+        for u in $WHATAP_UNITS; do
+            [ -f "$wd/conf/$u.conf" ] && { WHOME="$wd"; WHOME_SRC="process $p working directory"; return; }
+        done
+        for f in "$wd"/lib/whatap.server.*.jar "$wd"/lib/whatap.opslake.*.jar; do
+            [ -e "$f" ] && { WHOME="$wd"; WHOME_SRC="process $p working directory"; return; }
+        done
+    done
     if have systemctl; then
         for unit in $WHATAP_UNITS; do
             unit_loaded "$unit.service" || continue
@@ -1415,6 +1454,8 @@ run_report() {
 
     goal zfs   "ZFS present on this host"
     goal pools "pool topology and properties"
+    # Only where a whatap JVM runs: the path-to-dataset mapping is then expected.
+    [ -n "$ZH_JVM" ] && goal paths "WhaTap path to dataset mapping"
     [ "$ZFS_ON_HOST" = 1 ] && goal datasets "dataset properties and snapshots"
 
     # -- [1] Collection environment -------------------------------------------
@@ -2081,18 +2122,55 @@ _resolve_datasets() {
     else na datasets "zfs get ran and listed no filesystem or volume"; fi
 }
 
+# _dir_ok and _path_state are copies of collect-collserver.sh's, kept
+# identical so they can become a shared block.
+_dir_ok() { [ -d "$1" ] && [ -r "$1" ] && [ -x "$1" ]; }
+
+# _path_state P -> ok (listable), absent (the nearest existing ancestor was
+# searched and P is not there), notdir, dangling:TARGET, or unlistable
+_path_state() {
+    local p="$1" a t
+    _dir_ok "$p" && { printf ok; return; }
+    if [ -e "$p" ]; then [ -d "$p" ] && printf unlistable || printf notdir; return; fi
+    if [ -L "$p" ]; then
+        t="$(readlink "$p")"; a="$t"
+        case "$a" in /*) ;; *) a="$(dirname "$p")/$a" ;; esac
+        a="$(dirname "$a")"
+        if [ -d "$a" ] && [ -x "$a" ]; then printf 'dangling:%s' "$t"; else printf unlistable; fi
+        return
+    fi
+    a="$(dirname "$p")"
+    while [ ! -e "$a" ] && [ "$a" != / ] && [ "$a" != . ]; do a="$(dirname "$a")"; done
+    if [ -x "$a" ]; then printf absent; else printf unlistable; fi
+}
+
 # Section M body — also used in the "no ZFS on this host" short path.
 report_whatap_paths() {
     fact "WHATAP_HOME: ${WHOME:-n/a (not resolved)}"
     fact "WHATAP_HOME resolved by: $WHOME_SRC"
     [ -n "$CMDLINE_SCAN_WHY" ] && fact "whatap process scan: n/a ($CMDLINE_SCAN_WHY)"
+    [ -n "$ZH_UNREAD" ] && fact "whatap JVM working directory: n/a (not readable by uid $(id -u 2>/dev/null || echo '?'): pid$ZH_UNREAD)"
+    if [ -n "$ZH_JVM" ]; then
+        local _u; _u="$(id -u 2>/dev/null || echo '?')"
+        local _hs=""; [ -n "$WHOME" ] && _hs="$(_path_state "$WHOME")"
+        if [ -n "$WHOME" ]; then
+            case "$_hs" in
+                ok)         got paths ;;
+                absent)     na paths "WHATAP_HOME $WHOME (via $WHOME_SRC): path not found" ;;
+                dangling:*) na paths "WHATAP_HOME $WHOME (via $WHOME_SRC): dangling symlink to ${_hs#dangling:}" ;;
+                notdir)     na paths "WHATAP_HOME $WHOME (via $WHOME_SRC): not a directory" ;;
+                *)          missed paths "WHATAP_HOME $WHOME (via $WHOME_SRC) is not readable by uid $_u$(_priv_hint)" ;;
+            esac
+        elif [ -n "$ZH_UNREAD" ]; then missed paths "whatap JVM pid$ZH_UNREAD running, its cwd not readable by uid $(id -u 2>/dev/null || echo '?')$(_priv_hint); pass --home DIR"
+        else missed paths "whatap JVM pid $ZH_JVM running, home not resolved: no -Dwhatap.server.home and no module conf or server jar in its cwd; pass --home DIR"; fi
+    fi
     fact "yardbase: ${YARDBASE:-n/a (not resolved from yard.conf or WHATAP_HOME/yardbase)}"
     subsection "path -> filesystem -> dataset"
     local paths p ex ft sr pool
     paths="$WHOME $YARDBASE"
     [ -n "$WHOME" ] && paths="$paths $WHOME/logs $WHOME/conf $WHOME/db $WHOME/keeperbase $WHOME/logsink"
     if [ -z "$WHOME" ] && [ -z "$YARDBASE" ]; then
-        fact "n/a (WHATAP_HOME and yardbase both unresolved: no -Dwhatap.server.home in a readable whatap JVM, no WorkingDirectory in a loaded whatap unit, no conf/ + logs/ beside this script)"
+        fact "n/a (WHATAP_HOME and yardbase both unresolved: no -Dwhatap.server.home and no home as the cwd of a readable whatap JVM, no WorkingDirectory in a loaded whatap unit, no conf/ + logs/ beside this script)"
         return
     fi
     local seen=""

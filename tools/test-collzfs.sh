@@ -232,5 +232,85 @@ out="$(PATH="$S0" bash -s -- --stdout --no-filesizes < "$C" 2>/dev/null)"
 kill "$jvm" 2>/dev/null; wait "$jvm" 2>/dev/null
 has "bash -s: WHATAP_HOME comes from a whatap JVM" "$out" "(-Dwhatap.server.home)"
 
+echo "== 9. WHATAP_HOME from a whatap JVM's working directory =="
+H9="$ROOT/home9"; mkdir -p "$H9/conf"; : >| "$H9/conf/yard.conf"
+( cd "$H9" && exec -a "java -jar whatap.server.yard.jar" sleep 60 ) >/dev/null 2>&1 </dev/null &
+jvm=$!
+sleep 1
+out="$(PATH="$S0" "$C" --stdout --no-filesizes </dev/null 2>/dev/null)"
+kill "$jvm" 2>/dev/null; wait "$jvm" 2>/dev/null
+has "the home is the JVM's cwd" "$out" "WHATAP_HOME: $H9"
+has "and says so" "$out" "working directory"
+
+echo "== 10. a whatap JVM whose cwd this uid cannot read: blocked, not n/a =="
+if [ "$(id -u)" != 0 ] && sudo -n true 2>/dev/null; then
+  sudo -n -u nobody bash -c 'cd /tmp && exec -a "java -jar whatap.server.yard.jar" sleep 60' >/dev/null 2>&1 </dev/null &
+  sleep 1
+  opid="$(pgrep -u nobody -f '^java -jar whatap.server.yard.jar' | head -1)"
+  out="$(PATH="$S0" "$C" --stdout --no-filesizes </dev/null 2>/dev/null)"
+  [ -n "$opid" ] && sudo -n kill "$opid" 2>/dev/null; wait 2>/dev/null
+  has "the cwd is said to be unreadable" "$out" "whatap JVM working directory: n/a (not readable by uid $(id -u): pid"
+  has "and the paths goal is blocked with the privilege hint" "$out" "WhaTap path to dataset mapping — whatap JVM pid"
+  has "which names the uid" "$out" "its cwd not readable by uid $(id -u) (not elevated: run again with sudo)"
+  has "and the run is INCOMPLETE" "$out" "status: INCOMPLETE"
+else skip "the unreadable-cwd case (needs a non-root account with passwordless sudo)"; fi
+
+echo "== 11. only a java process that runs a server module counts =="
+F11="$ROOT/f11"; mkdir -p "$F11"; : >| "$F11/whatap.server.log"
+( cd "$F11" && exec -a "java -Dwhatap.server.host=10.0.0.1 -jar app.jar" sleep 60 ) >/dev/null 2>&1 </dev/null &
+p1=$!
+tail -f "$F11/whatap.server.log" >/dev/null 2>&1 </dev/null &
+p2=$!
+sleep 1
+out="$(PATH="$S0" "$C" --stdout --no-filesizes </dev/null 2>/dev/null)"
+kill "$p1" "$p2" 2>/dev/null; wait "$p1" "$p2" 2>/dev/null
+hasnt "an app JVM with the agent and a tail of a whatap log: no paths goal" "$out" "WhaTap path to dataset mapping"
+has "and the host stays COMPLETE" "$out" "status: COMPLETE"
+
+echo "== 12. the paths goal is declared whatever route resolved the home =="
+H12="$ROOT/home12"; mkdir -p "$H12/conf"
+( exec -a "java -Dwhatap.server.home=$H12 -jar whatap.server.yard.jar" sleep 60 ) >/dev/null 2>&1 </dev/null &
+jvm=$!
+sleep 1
+out="$(PATH="$S0" "$C" --stdout --no-filesizes </dev/null 2>/dev/null)"
+has "-Dwhatap.server.home: the goal is declared and obtained" "$out" "obtained: WhaTap path to dataset mapping"
+out="$(PATH="$S0" "$C" --stdout --no-filesizes --home "$ROOT/home12" </dev/null 2>/dev/null)"
+has "--home with a module running: declared too" "$out" "WhaTap path to dataset mapping"
+kill "$jvm" 2>/dev/null; wait "$jvm" 2>/dev/null
+( exec -a "java -Dwhatap.server.home=$ROOT/gone12 -jar whatap.server.yard.jar" sleep 60 ) >/dev/null 2>&1 </dev/null &
+jvm=$!
+sleep 1
+out="$(PATH="$S0" "$C" --stdout --no-filesizes </dev/null 2>/dev/null)"
+kill "$jvm" 2>/dev/null; wait "$jvm" 2>/dev/null
+# na_block REPORT -> only the lines under "not applicable to this host"
+na_block() { printf '%s\n' "$1" | awk '/not applicable to this host/ {f=1; next} f && /^        / {print; next} {f=0}'; }
+nas="$(na_block "$out")"
+has "a home that does not exist: n/a, path not found" "$nas" "WhaTap path to dataset mapping — WHATAP_HOME $ROOT/gone12 (via process $jvm (-Dwhatap.server.home)): path not found"
+has "and the run stays COMPLETE" "$out" "status: COMPLETE"
+# home12_case HOME -> the report with a module whose -D home is HOME
+home12_case() {
+    ( exec -a "java -Dwhatap.server.home=$1 -jar whatap.server.yard.jar" sleep 60 ) >/dev/null 2>&1 </dev/null &
+    local j=$!
+    sleep 1
+    PATH="$S0" "$C" --stdout --no-filesizes </dev/null 2>/dev/null
+    kill "$j" 2>/dev/null; wait "$j" 2>/dev/null
+}
+out="$(home12_case "$ROOT/nodata12/whatap")"
+has "a missing parent too (a /data/whatap on a host without /data): path not found" \
+    "$(na_block "$out")" "WHATAP_HOME $ROOT/nodata12/whatap (via process"
+has "and COMPLETE" "$out" "status: COMPLETE"
+ln -s "$ROOT/gone12b" "$ROOT/link12"
+out="$(home12_case "$ROOT/link12")"
+has "a dangling home link says so" "$out" "WHATAP_HOME $ROOT/link12 (via process"
+has "as a dangling symlink, not applicable" "$(na_block "$out")" "dangling symlink to $ROOT/gone12b"
+printf '%s' "$out" | grep -q "$ROOT/link12 (via process.*is not readable" && bad "not as unreadable" "absent" "present" || ok "not as unreadable"
+if [ "$(id -u)" != 0 ]; then
+    mkdir -p "$ROOT/locked12"; chmod 000 "$ROOT/locked12"
+    out="$(home12_case "$ROOT/locked12")"
+    has "an unlistable home: blocked with the uid and the hint" "$out" "WHATAP_HOME $ROOT/locked12 (via process"
+    has "which names the uid" "$out" "is not readable by uid $(id -u) (not elevated: run again with sudo)"
+    chmod 755 "$ROOT/locked12"
+else skip "the unlistable-home case (root lists everything)"; fi
+
 echo; echo "PASS=$PASS FAIL=$FAIL SKIP=$SKIP"
 [ "$FAIL" -eq 0 ]

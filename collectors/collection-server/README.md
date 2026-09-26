@@ -504,7 +504,9 @@ with sudo for those (`sudo ./collect-collmysql.sh --stdout`). A goal that root
 would have obtained is blocked with the uid and what refused it
 (`run as uid 1000; /var/lib/mysql is mysql:mysql 750 and not readable by this
 uid (not elevated: run again with sudo)`); that hint appears only in the status
-section and on the terminal, never in a fact line. Under sudo the `--file`
+section and on the terminal, never in a fact line. On a failed login the hint only states that the
+run was not elevated, as in every collector; it does not claim that sudo would
+fix the login (a TCP login, or a password account, is decided by the server). Under sudo the `--file`
 report is handed back to the invoking user. `--no-sudo`, which 0.6/0.7 needed,
 is accepted and warns that it is no longer needed.
 
@@ -690,7 +692,10 @@ something sensitive:
 - **The error log tail** (K) — whatever the server logged (failed logins with
   account and host names).
 - **Section A/[1]** — the account name the connection was attempted with and the
-  one the server matched, and the local `mysqld` command line from `ps`.
+  one the server matched, and the local `mysqld` command line from `ps`. `[1]`
+  prints the whole `--mysql-args` string as the operator gave it (a password
+  in it ends the run first; a word after a bare `-p` is printed, since the
+  client takes it as a database name).
 - **Section I** prints table names and event counts, not the decoded rows.
 
 - **The password** this collector was given is never printed; `[1]` says only

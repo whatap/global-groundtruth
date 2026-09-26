@@ -336,5 +336,59 @@ kill "$jvm" 2>/dev/null; wait "$jvm" 2>/dev/null
 has "bash -s: the module is seen" "$out" "obtained: running whatap modules"
 hasnt "and not read as none running" "$out" "no whatap JVM in any of the"
 
+echo "== 20. no heap dump found is 'none' =="
+out="$("$C" --home "$H" --stdout 2>/dev/null)"
+has "*.hprof: none" "$out" "*.hprof: none (no *.hprof in $H or $H/logs)"
+hasnt "not 'empty output'" "$out" "*.hprof: n/a (empty output)"
+
+echo "== 21. heap dumps in a directory this uid cannot list: n/a, not none =="
+if [ "$(id -u)" != 0 ]; then
+  H21="$ROOT/home21"; mkhome "$H21"; : >| "$H21/logs/java_pid1.hprof"; chmod 000 "$H21/logs"
+  out="$("$C" --home "$H21" --stdout 2>/dev/null)"
+  has "the unlistable logs/ makes it n/a" "$out" "*.hprof: n/a (not every directory searched was read)"
+  has "and names it with the uid" "$out" "*.hprof in $H21/logs: n/a (uid $(id -u) cannot list)"
+  hasnt "and not none" "$out" "*.hprof: none"
+  : >| "$H21/java_pid2.hprof"
+  out="$("$C" --home "$H21" --stdout 2>/dev/null)"
+  has "a dump found at the top is listed" "$out" "java_pid2.hprof"
+  has "and the unlistable logs/ is said next to it" "$out" "*.hprof in $H21/logs: n/a (uid $(id -u) cannot list)"
+  chmod 755 "$H21/logs"; rm -f "$H21/java_pid2.hprof"
+  if sudo -n true 2>/dev/null; then
+    # logs/ is a symlink into a directory only root can enter: -e fails, and
+    # that is not "absent".
+    RD="$(sudo -n mktemp -d /tmp/ggt-test21.XXXXXX)"; sudo -n touch "$RD/java_pid3.hprof"
+    H21b="$ROOT/home21b"; mkhome "$H21b"; rm -rf "$H21b/logs"; ln -s "$RD" "$H21b/logs"
+    out="$("$C" --home "$H21b" --stdout 2>/dev/null)"
+    has "logs/ -> a root-only directory: n/a with the uid, not none" "$out" "*.hprof in $H21b/logs: n/a (uid $(id -u) cannot list)"
+    hasnt "and not none" "$out" "*.hprof: none"
+    case "$RD" in /tmp/ggt-test21.*) sudo -n rm -rf "$RD" ;; esac
+  else skip "the root-only symlink case (needs passwordless sudo)"; fi
+  H21c="$ROOT/home21c"; mkhome "$H21c"; rm -rf "$H21c/logs"; : >| "$H21c/logs"
+  out="$("$C" --home "$H21c" --stdout 2>/dev/null)"
+  has "logs as a regular file: not a directory" "$out" "*.hprof in $H21c/logs: n/a (not a directory)"
+else skip "the unlistable-logs case (root lists everything)"; fi
+
+echo "== 22. only a java process that runs a server module counts =="
+F22="$ROOT/f22"; mkdir -p "$F22"; : >| "$F22/whatap.server.log"
+( exec -a "java -Dwhatap.server.host=10.0.0.1 -javaagent:whatap.agent.jar -jar app.jar" sleep 60 ) >/dev/null 2>&1 </dev/null &
+p1=$!
+tail -f "$F22/whatap.server.log" >/dev/null 2>&1 </dev/null &
+p2=$!
+sleep 1
+out="$("$C" --stdout 2>/dev/null)"
+kill "$p1" "$p2" 2>/dev/null; wait "$p1" "$p2" 2>/dev/null
+has "an app JVM with the WhaTap agent and a tail of a whatap log: no module" "$out" "running whatap modules — no whatap JVM in any of the"
+has "and the host stays COMPLETE" "$out" "status: COMPLETE"
+
+echo "== 23. a home that is not there, and a dangling logs link =="
+out="$("$C" --home "$ROOT/nohome" --stdout 2>/dev/null)"
+has "a missing home: path not found" "$out" "*.hprof in $ROOT/nohome: n/a (path not found)"
+hasnt "not 'cannot list'" "$out" "nohome: n/a (uid"
+out="$( cd "$ROOT" && "$C" --home relmissing --stdout 2>/dev/null )"
+has "a relative missing --home: path not found" "$out" "*.hprof in relmissing: n/a (path not found)"
+H23="$ROOT/home23"; mkhome "$H23"; rm -rf "$H23/logs"; ln -s "$ROOT/gone23" "$H23/logs"
+out="$("$C" --home "$H23" --stdout 2>/dev/null)"
+has "a dangling logs link says so" "$out" "*.hprof in $H23/logs: n/a (dangling symlink to $ROOT/gone23)"
+
 echo; echo "PASS=$PASS FAIL=$FAIL SKIP=$SKIP"
 [ "$FAIL" -eq 0 ]

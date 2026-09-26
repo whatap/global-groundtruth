@@ -67,6 +67,12 @@ COLLECTOR_NAME="whatap-collserver"
 #        summarized in the report's G section. Reason: a production collection
 #        server produced a 393MB bundle that the field could not move; 99.95% of
 #        it was logs (sf-whatap-web02-bsd, 2026-09-23).
+# 0.9.1  No *.hprof found is "none", not "n/a (empty output)", and only when
+#        every directory searched could be listed (a symlink this uid cannot
+#        follow is not absent; a missing home is "path not found", a dangling
+#        symlink says so); otherwise n/a with the uid, also next to dumps
+#        found elsewhere. A process counts as a whatap module only when it is
+#        java and names a server/opslake jar or the yard boot class.
 # 0.9.0  An absence is `na` only when every input behind it was read: an
 #        unreadable conf/ or logs/ (its glob came back literally and read as
 #        "holds no *.conf", COMPLETE), hidepid, unreadable cmdlines, a failed
@@ -83,7 +89,7 @@ COLLECTOR_NAME="whatap-collserver"
 #        as module defaults; the cwd is never measured for an unresolved
 #        yardbase; how-to-run text moved from facts to goal reasons. Needs
 #        bash, and says so under sh.
-VERSION="0.9.0"
+VERSION="0.9.1"
 DOMAIN="collection-server"
 TARGET="collection-server/$(hostname 2>/dev/null || echo unknown)"   # refined after WHATAP_HOME is resolved
 
@@ -985,6 +991,24 @@ WHATAP_HOME_CANDIDATES="/whatap /data/whatap /opt/whatap /app/whatap /home/whata
 # _dir_ok DIR -> true when this uid can list DIR (read + search)
 _dir_ok() { [ -d "$1" ] && [ -r "$1" ] && [ -x "$1" ]; }
 
+# _path_state P -> ok (listable), absent (the nearest existing ancestor was
+# searched and P is not there), notdir, dangling:TARGET, or unlistable
+_path_state() {
+    local p="$1" a t
+    _dir_ok "$p" && { printf ok; return; }
+    if [ -e "$p" ]; then [ -d "$p" ] && printf unlistable || printf notdir; return; fi
+    if [ -L "$p" ]; then
+        t="$(readlink "$p")"; a="$t"
+        case "$a" in /*) ;; *) a="$(dirname "$p")/$a" ;; esac
+        a="$(dirname "$a")"
+        if [ -d "$a" ] && [ -x "$a" ]; then printf 'dangling:%s' "$t"; else printf unlistable; fi
+        return
+    fi
+    a="$(dirname "$p")"
+    while [ ! -e "$a" ] && [ "$a" != / ] && [ "$a" != . ]; do a="$(dirname "$a")"; done
+    if [ -x "$a" ]; then printf absent; else printf unlistable; fi
+}
+
 # _looks_like_home DIR -> true when DIR holds a module config or a server jar
 _looks_like_home() {
     local d="$1" u f
@@ -997,6 +1021,18 @@ _looks_like_home() {
 
 # ---- discovery (run once) ---------------------------------------------------
 # PIDS[] and MODS[] are parallel indexed arrays of discovered whatap JVMs.
+# _is_whatap_server PID CMDLINE -> true for a java process that runs a WhaTap
+# backend module: a whatap.server.*.jar / whatap.opslake.*.jar on its command
+# line, or the yard boot class. "whatap.server." alone is not enough: the
+# WhaTap Java agent passes -Dwhatap.server.host=..., and `tail -f
+# whatap.server.log` names it too.
+_is_whatap_server() {
+    [[ "$2" =~ whatap\.(server|opslake)\.[A-Za-z0-9._-]+\.jar || "$2" =~ [A-Za-z0-9_]\.yard\.boot ]] || return 1
+    local comm="" a0="${2%% *}"
+    IFS= read -r comm < "/proc/$1/comm" 2>/dev/null
+    [ "$comm" = java ] || [ "${a0##*/}" = java ]
+}
+
 PROC_SEEN=0          # /proc/<pid> entries looked at
 PROC_UNREAD=0        # of those, cmdline not readable by this uid
 discover_services() {
@@ -1018,8 +1054,9 @@ discover_services() {
         [ -n "$f" ] || continue
         d="${f%/cmdline}"
         cmdline_of "${d#/proc/}"; cl="$_CL"
+        _is_whatap_server "${d#/proc/}" "$cl" || continue
         case "$cl" in
-            *whatap.server.*|*whatap.opslake.*|*.yard.boot*)
+            *)
                 pid="${d#/proc/}"
                 # module name comes from the jar (reliable), not the first cmdline
                 # token — otherwise "-Dwhatap.server.home=" would win every time.
@@ -1565,7 +1602,29 @@ EOF
     fi
     subsection "heap dumps / GC log / restart"
     if [ -n "$WHOME" ]; then
-        probe "*.hprof" sh -c 'ls -la "$1"/*.hprof "$1"/logs/*.hprof 2>/dev/null || true' sh "$WHOME"
+        # "none" only when every directory searched was read. A directory is
+        # skipped as absent only when its parent was listed and holds no such
+        # entry; a symlink this uid cannot follow is not absent.
+        local _hp="" _hu="" _f _hd _uid; _uid="$(id -u 2>/dev/null || echo '?')"
+        local _st
+        for _hd in "$WHOME" "$WHOME/logs"; do
+            _st="$(_path_state "$_hd")"
+            case "$_st" in
+                ok)         for _f in "$_hd"/*.hprof; do [ -e "$_f" ] && _hp=1; done ;;
+                # the home missing is said once; a logs/ missing from a listed home is no gap
+                absent)     [ "$_hd" = "$WHOME" ] && _hu="$_hu$_nl$_hd: n/a (path not found)" ;;
+                notdir)     _hu="$_hu$_nl$_hd: n/a (not a directory)" ;;
+                dangling:*) _hu="$_hu$_nl$_hd: n/a (dangling symlink to ${_st#dangling:})" ;;
+                *)          _hu="$_hu$_nl$_hd: n/a (uid $_uid cannot list)" ;;
+            esac
+            [ "$_hd" = "$WHOME" ] && [ "$_st" = absent ] && break
+        done
+        if [ -n "$_hp" ]; then probe "*.hprof" sh -c 'ls -la "$1"/*.hprof "$1"/logs/*.hprof 2>/dev/null || true' sh "$WHOME"
+        elif [ -z "$_hu" ]; then fact "*.hprof: none (no *.hprof in $WHOME or $WHOME/logs)"; fi
+        if [ -n "$_hu" ]; then
+            [ -z "$_hp" ] && fact "*.hprof: n/a (not every directory searched was read)"
+            printf '%s\n' "$_hu" | while IFS= read -r _l; do [ -n "$_l" ] && fact "*.hprof in $_l"; done
+        fi
         fact "gc log: $( ls "$WHOME"/logs/gc*.log >/dev/null 2>&1 && echo present || echo 'absent (no logs/gc*.log)' )"
         if [ -f "$WHOME/restart.out" ]; then fact "restart.out (last 20 lines):"; tail -n 20 "$WHOME/restart.out" 2>/dev/null | while IFS= read -r _l; do printf '        %s\n' "$_l"; done
         else fact "restart.out: n/a (path not found)"; fi

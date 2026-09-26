@@ -31,7 +31,10 @@
 export LC_ALL=C
 
 # ---- collector metadata -----------------------------------------------------
-# ---- collector metadata -----------------------------------------------------
+# 0.8.1  --connect-expired-password passes through. An empty line or end of
+#        input at the -p prompt says so instead of "none given", next to the
+#        shared privilege hint on a failed login.
+#        A word after a bare -p (a database name to the client) is warned about.
 # 0.8.0  Never elevates itself and never re-runs itself: the operator runs it
 #        with sudo when root is needed (a packaged MySQL that admits root over
 #        the unix socket, a binary log directory only root reads), and the goal
@@ -87,7 +90,7 @@ export LC_ALL=C
 #        given. The binlog n/a reason now separates "path not resolved" from
 #        "path not readable" — they are answered by different things.
 COLLECTOR_NAME="whatap-collmysql"
-VERSION="0.8.0"
+VERSION="0.8.1"
 DOMAIN="collection-server"
 TARGET="collection-server-mysql/$(hostname 2>/dev/null || echo unknown)"
 
@@ -855,6 +858,8 @@ _pw_opt() {
         [ -n "$n" ] || break
     done
     case "$n" in
+        # A real flag with no value (8.0 client): not a password.
+        connect-expired-password) return 1 ;;
         password|password[123]|pas|pass|passw|passwo|passwor)
             case "$last" in skip|enable|disable) printf 'drop' ;; *) printf 'pw' ;; esac
             return 0 ;;
@@ -889,6 +894,7 @@ _short_pw() {
     return 1
 }
 
+
 # _prompt_budget -> seconds the prompt may wait: PROMPT_TIMEOUT or what is left
 # of the run, whichever is less
 _prompt_budget() {
@@ -898,18 +904,25 @@ _prompt_budget() {
 }
 
 _take_password() {
-    local w out="" prompt=0 inargs=""
+    local w out="" prompt=0 inargs="" afterp=0
     set -f
     for w in $MYSQL_ARGS; do
+        # A word after a bare -p is the database name to the client, not the
+        # password; if it was meant as one it now sits on every command line.
+        # Warned about (never repeated), not changed: it is the operator's call.
+        if [ "$afterp" = 1 ]; then
+            case "$w" in -*) ;; *) warn "the word after a bare -p / --password in --mysql-args is taken as a database name by the client; if it is a password, use the prompt" ;; esac
+            afterp=0
+        fi
         case "$w" in
             --*=*) [ -n "$(_pw_opt "${w%%=*}")" ] && { inargs="${w%%=*}=..."; continue; } ;;
-            --*)   case "$(_pw_opt "$w")" in pw) prompt=1; continue ;; drop) continue ;; esac ;;
+            --*)   case "$(_pw_opt "$w")" in pw) prompt=1; afterp=1; continue ;; drop) continue ;; esac ;;
             -?*)   # A cluster of short options (-BpX, -Np): p takes the rest of
                    # the word as the password, unless an option that takes an
                    # argument (-u, -h, -P, -D, -S, -e, -R, -#) came first.
                    if _short_pw "$w"; then
                        if [ -n "$_SP_PW" ]; then inargs="${_SP_KEPT:--}p..."; continue; fi
-                       prompt=1; [ -n "$_SP_KEPT" ] && out="$out${out:+ }$_SP_KEPT"; continue
+                       prompt=1; afterp=1; [ -n "$_SP_KEPT" ] && out="$out${out:+ }$_SP_KEPT"; continue
                    fi ;;
         esac
         out="$out${out:+ }$w"
@@ -954,7 +967,9 @@ _take_password() {
     if [ "$prc" -gt 128 ]; then
         _PW=""; _PW_WHY="password prompt not answered within ${left}s"
         warn "$_PW_WHY; continuing without a password"
-    elif [ -n "$_PW" ]; then _PW_SRC="terminal prompt"; fi
+    elif [ -n "$_PW" ]; then _PW_SRC="terminal prompt"
+    elif [ "$prc" = 0 ]; then _PW_WHY="prompt answered with an empty line"
+    else _PW_WHY="prompt answered with end of input"; fi
 }
 
 # _load_password -> write the client option file for the password this run holds
@@ -1095,14 +1110,16 @@ run_report() {
     fact "mysql connection: $MYSQL_WHY"
     if [ "$MYSQL_OK" = 1 ]; then got login
     elif [ -z "$MYSQL_BIN" ]; then missed login "command not found: mysql or mariadb client"
-    elif [ -n "$_PW_WHY" ]; then missed login "$MYSQL_WHY; $_PW_WHY"
-    elif [ -z "$MYSQL_ARGS" ] && [ -z "$DEFAULTS_FILE$EXTRA_FILE" ] \
+    elif [ -z "$MYSQL_ARGS" ] && [ -z "$DEFAULTS_FILE$EXTRA_FILE" ] && [ -z "$_PW_WHY" ] \
          && ! (_bounded ps -eo args 2>/dev/null | grep -qE "[m]ysqld|[m]ariadbd"); then
         # The backend's MySQL is often on another host. No local server and no
         # connection arguments is therefore a run that asked nowhere, not an
         # answer: --mysql-args would obtain it.
-        missed login "no local mysqld found and no --mysql-args given (client without arguments: $MYSQL_WHY)"
-    else missed login "$MYSQL_WHY$(_priv_hint)"; fi
+        missed login "no local mysqld found and no --mysql-args given (client without arguments: $MYSQL_WHY)$(_priv_hint)"
+    # The prompt's outcome and the shared privilege hint both belong to the
+    # reason. The hint says only that the run was not elevated, as in every
+    # collector; it does not claim that sudo would fix this login.
+    else missed login "$MYSQL_WHY${_PW_WHY:+; $_PW_WHY}$(_priv_hint)"; fi
     fact "binlog decode tier: $([ "$OPT_BINLOG" = 1 ] && echo "on (newest $BINLOG_FILES files)" || echo "off")"
     fact "sampling tier: $([ "$OPT_SAMPLE" = 1 ] && echo "on (${SAMPLE_SEC}s x ${SAMPLE_COUNT})" || echo "off")"
 

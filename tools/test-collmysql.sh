@@ -80,7 +80,8 @@ fi
 for a in "$@"; do q="$a"; done
 [ -n "${MYSQL_SLEEP:-}" ] && [ "$q" = "SELECT 1" ] && sleep "$MYSQL_SLEEP"
 if [ -n "${MYSQL_FAIL:-}" ]; then
-    echo "ERROR 1045 (28000): Access denied for user 'x'@'localhost' (using password: YES)" >&2
+    # MYSQL_ERRMSG replaces the refusal, to test what each error earns.
+    echo "${MYSQL_ERRMSG:-ERROR 1045 (28000): Access denied for user 'x'@'localhost' (using password: YES)}" >&2
     exit 1
 fi
 for a in "$@"; do q="$a"; done
@@ -126,7 +127,7 @@ done
 chk "and still no sudo" "" "$(cat "$STUBLOG")"
 
 echo "== 2. the reason reaches the operator, not only the file =="
-err="$(MYSQL_FAIL=1 PATH="$S" bash "$C" --stdout --mysql-args "-u x" </dev/null 2>&1 >/dev/null)"
+err="$(MYSQL_FAIL=1 MYSQL_ERRMSG="ERROR 1698 (28000): Access denied for user 'root'@'localhost'" PATH="$S" bash "$C" --stdout --mysql-args "-u root" </dev/null 2>&1 >/dev/null)"
 has "the blocked line carries the refusal" "$err" "mysql login — access denied"
 has "and the privilege that would have answered it" "$err" "(not elevated: run again with sudo)"
 has "and the run is INCOMPLETE" "$err" "status: INCOMPLETE"
@@ -276,8 +277,8 @@ while time.time() - t0 < limit:
     if r:
         try: buf += os.read(m, 65536)
         except OSError: break
-    if key == "ctrlc" and not sent and b"MySQL password" in buf:
-        time.sleep(0.5); os.write(m, b"\x03"); sent = True
+    if key in ("ctrlc", "enter", "eof") and not sent and b"MySQL password" in buf:
+        time.sleep(0.5); os.write(m, {"ctrlc": b"\x03", "enter": b"\n", "eof": b"\x04"}[key]); sent = True
     if p.poll() is not None:
         time.sleep(0.3)
         try:
@@ -305,6 +306,12 @@ EOF
     if printf '%s' "$res" | grep -q 'MySQL password'; then
         chk "Ctrl-C at the password prompt leaves the terminal echoing" "echo=True" "$(printf '%s' "$res" | head -1 | grep -o 'echo=[A-Za-z]*')"
     else skip "the Ctrl-C-at-the-prompt case (no prompt appeared on the pty)"; fi
+    res="$(TMPDIR="$T11" PATH="$S" "$PY" "$ROOT/ptydrive.py" 30 enter bash "$C" --stdout --mysql-args "-u x -p" 2>&1)"
+    has "an empty line at the prompt is said as such" "$res" "password: n/a (prompt answered with an empty line)"
+    res="$(MYSQL_FAIL=1 MYSQL_ERRMSG="ERROR 1698 (28000): Access denied for user 'root'@'localhost'" TMPDIR="$T11" PATH="$S" "$PY" "$ROOT/ptydrive.py" 30 enter bash "$C" --stdout --mysql-args "-u x -p" 2>&1)"
+    has "a socket login after an empty answer: the reason carries both" "$res" "mysql login — access denied; prompt answered with an empty line (not elevated: run again with sudo)"
+    res="$(TMPDIR="$T11" PATH="$S" "$PY" "$ROOT/ptydrive.py" 30 eof bash "$C" --stdout --mysql-args "-u x -p" 2>&1)"
+    has "Ctrl-D at the prompt is said as such" "$res" "password: n/a (prompt answered with end of input)"
     chk "the prompt runs leave no ggt.* directory" "" "$(ls -A "$T11")"
 else skip "the prompt cases (setsid or python3 absent)"; fi
 chk "and no sudo was run by any case above" "" "$(cat "$STUBLOG")"
@@ -324,6 +331,36 @@ if ! ps -eo args 2>/dev/null | grep -qE '[m]ysqld|[m]ariadbd'; then
     has "and the run is INCOMPLETE" "$out" "status: INCOMPLETE"
 else skip "the no-local-mysqld case (a mysqld runs on this machine)"; fi
 chk "a bad --binlog count exits 2" "2" "$(PATH="$S" bash "$C" --stdout --no-sudo --binlog=two </dev/null >/dev/null 2>&1; echo $?)"
+
+echo "== 12. round 7: a no-value flag, TCP logins, a word after -p =="
+: >| "$A"
+STUBARGS="$A" PATH="$S" bash "$C" --stdout --mysql-args "-u x --connect-expired-password" </dev/null >/dev/null 2>&1
+grep -qx -- "--connect-expired-password" "$A" && ok "--connect-expired-password reaches the client unchanged" || bad "--connect-expired-password passes through" "in the client argv" "absent"
+: >| "$A"
+STUBARGS="$A" PATH="$S" bash "$C" --stdout --mysql-args "-u x --connect-expired-password=1" </dev/null >/dev/null 2>&1; rc=$?
+[ "$rc" = 0 ] && grep -qx -- "--connect-expired-password=1" "$A" && ok "--connect-expired-password=1 too, not refused" || bad "--connect-expired-password=1 passes through" "rc 0, in argv" "rc $rc"
+err="$(MYSQL_FAIL=1 PATH="$S" bash "$C" --stdout --mysql-args "-h 10.0.0.5 -u x" </dev/null 2>&1 >/dev/null)"
+has "a TCP login refused: blocked with the server's words" "$err" "mysql login — access denied"
+has "and the shared hint that the run was not elevated" "$err" "mysql login — access denied (not elevated: run again with sudo)"
+if [ -n "$SETSID" ]; then
+    err="$(PATH="$S" "$SETSID" bash "$C" --stdout --mysql-args "-u x -p $PW" </dev/null 2>&1 >/dev/null)"
+    has "a word after a bare -p is warned about as a database name" "$err" "is taken as a database name by the client; if it is a password, use the prompt"
+    hasnt "and the warning does not repeat it" "$(printf '%s' "$err" | grep 'database name')" "$PW"
+else skip "the word-after--p case (setsid absent)"; fi
+
+echo "== 13. round 10: the shared privilege hint, whatever the error =="
+for e in "ERROR 1045 (28000): Access denied for user 'op'@'localhost' (using password: NO)" \
+         "ERROR 1698 (28000): Access denied for user 'root'@'localhost'" \
+         "ERROR 2002 (HY000): Can't connect to local MySQL server through socket '/x.sock' (2)"; do
+    err="$(MYSQL_FAIL=1 MYSQL_ERRMSG="$e" PATH="$S" bash "$C" --stdout </dev/null 2>&1 >/dev/null)"
+    has "non-root, '${e%% (*}', no arguments: the hint is there" "$(printf '%s' "$err" | grep 'mysql login —')" "(not elevated: run again with sudo)"
+done
+if sudo -n true 2>/dev/null; then
+    out="$(sudo -n env PATH="$S" MYSQL_FAIL=1 bash "$C" --stdout --mysql-args "-u x" </dev/null 2>/dev/null)"
+    if printf '%s' "$out" | grep -q 'mysql login —' && ! printf '%s' "$out" | grep 'mysql login —' | grep -qF '(not elevated'; then
+        ok "a root run's failed login carries no privilege hint"
+    else bad "a root run carries no privilege hint" "no hint" "$(printf '%s' "$out" | grep -m1 'mysql login —')"; fi
+else skip "the root-run case (needs passwordless sudo)"; fi
 
 echo; echo "PASS=$PASS FAIL=$FAIL SKIP=$SKIP"
 [ "$FAIL" -eq 0 ]
