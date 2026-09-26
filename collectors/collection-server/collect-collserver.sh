@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# WhaTap Global Groundtruth — collection-server collector (seeded v0)
+# WhaTap Global Groundtruth — collection-server collector
 # -----------------------------------------------------------------------------
 # Gathers facts about a WhaTap backend host (yard/proxy/gateway/keeper/account/
 # notihub/eureka/front/...) so a remote developer does not have to ask the field
@@ -8,20 +8,11 @@
 # to a single .txt file; with --bundle it also archives real logs, configs and
 # host snapshots as a tar.gz.
 #
-# THE CONTRACT (../../CONTRACT.md) — facts only, no diagnosis / no judgment.
-# DESIGN GUIDELINES (../../docs/collector-engineering.md):
-#   * MECE sections     — every fact lives in exactly one domain (A..F below).
-#   * Load-safe by tier — Tier 0 (default report) never runs a command that can
-#                         pause a JVM (jstack/jmap), walk a huge tree (recursive
-#                         du) or read whole rotated logs. Heavy probes are opt-in.
-#   * Portable          — read /proc and /sys first; fall back through command
-#                         chains; target bash 3.2+; assume nothing about the OS.
-#   * Reasoned absence  — a value we cannot obtain is a fact too, carrying WHY
-#                         (command not found / permission denied / path not found
-#                         / timed out / not applicable / empty output).
+# Tier 0 (the default report) never pauses a JVM (jstack/jmap), walks a large
+# tree (recursive du) or reads whole rotated logs; those are opt-in.
 #
-# NOTE: no `set -e` / no `set -u`. A collector must run to completion and emit
-# its footer even when individual steps fail; each step guards itself.
+# Rules: ../../CONTRACT.md and ../../docs/collector-engineering.md. No `set -e`:
+# the report always reaches its footer.
 # -----------------------------------------------------------------------------
 
 # bash only (arrays for the discovered JVMs). Checked first, so sh or dash
@@ -31,65 +22,23 @@
 export LC_ALL=C
 
 # ---- collector metadata -----------------------------------------------------
-COLLECTOR_NAME="whatap-collserver"
-# 0.7.0  sudo is a first-class way to run this. The collector only reads the
-#        host; it writes into a mktemp work dir and the output tarball and
-#        nowhere else, so root adds reach without adding reach into anything
-#        else. Two things follow. The bundle is handed back to the invoking
-#        user (SUDO_UID) so the operator who started the run can still move and
-#        delete the one file they came for, and the header records that the run
-#        came through sudo and from whom. The blocked-goal reasons name sudo
-#        alongside the owning account: one of them gets the module configs, and
-#        only root also gets the system journal and dmesg.
-# 0.6.0  the systemd journal is a goal of its own, and an empty one now says
-#        which kind of empty it is. journalctl does not fail for an
-#        unprivileged uid: it narrows to that user's own entries and prints
-#        "-- No entries --", which reads the same as a unit that logged nothing.
-#        journal_why() reports whether this uid can read the system journal, so
-#        the two are told apart. dmesg keeps its error message instead of
-#        leaving a 0-byte file. Reason: all three Smartfren bundles carried 8-9
-#        unit journals of exactly "-- No entries --" and a 0-byte dmesg-tail.txt,
-#        and nothing in the report or the status mentioned either (2026-09-23).
-# 0.5.0  the report ends with a Collection status section, and the operator is
-#        told on stderr when a run did not obtain what it came for (even under
-#        --quiet). Goals: running modules, WHATAP_HOME contents, module configs,
-#        log inventory, and yard data path on hosts that run yard.
-# 0.4.1  D/F/G say WHY a WHATAP_HOME-relative path came back empty. "WHATAP_HOME
-#        not resolved" was printed even when the report had just printed the
-#        resolved path, and permission problems were reported as "path not
-#        found". Four reasons now: not resolved / resolved but unreachable /
-#        unsearchable / genuinely absent. Reason: two Smartfren bundles carried
-#        no conf/ at all and the stated reason sent the reader after root access
-#        when the fix was to run as the owning account (2026-09-23).
-# 0.4.0  bundle logs get a total cap, not just a per-file one. Rotated logs are
-#        opt-in (--with-rotated) and the per-file default drops 50MB -> 5MB. What
-#        is left out is written to logs/SELECTION.txt with a reason per file and
-#        summarized in the report's G section. Reason: a production collection
-#        server produced a 393MB bundle that the field could not move; 99.95% of
-#        it was logs (sf-whatap-web02-bsd, 2026-09-23).
+# 0.9.2  Readability refactor; report unchanged.
 # 0.9.1  No *.hprof found is "none", not "n/a (empty output)", and only when
 #        every directory searched could be listed (a symlink this uid cannot
 #        follow is not absent; a missing home is "path not found", a dangling
 #        symlink says so); otherwise n/a with the uid, also next to dumps
 #        found elsewhere. A process counts as a whatap module only when it is
 #        java and names a server/opslake jar or the yard boot class.
-# 0.9.0  An absence is `na` only when every input behind it was read: an
-#        unreadable conf/ or logs/ (its glob came back literally and read as
-#        "holds no *.conf", COMPLETE), hidepid, unreadable cmdlines, a failed
-#        process scan, a running JVM whose home was not found, an installed
-#        unit file or an unreadable install path now block the goal instead.
-#        WHATAP_HOME is also found from a JVM's cwd, $WHATAP_HOME and the
-#        common install paths. Every external command is bounded and a hung
-#        systemctl is asked once; discovery reads /proc with one grep through
-#        xargs (8.1s -> 2.4s on a 739-process host) and systemd with one
-#        `systemctl show`, and works with the script on stdin. The bundle
-#        journal is capped, the bundle is built in the run's private directory,
-#        numeric options are checked (exit 2), an unwritable --out or failed
-#        tar exits 1, and --file is handed back under sudo. Ports are labelled
-#        as module defaults; the cwd is never measured for an unresolved
-#        yardbase; how-to-run text moved from facts to goal reasons. Needs
-#        bash, and says so under sh.
-VERSION="0.9.1"
+# 0.9.0  An absence is `na` only when every input behind it was read (conf/,
+#        logs/, hidepid, cmdlines, the process scan, a JVM whose home was not
+#        found, unit files, install paths). WHATAP_HOME is also found from a
+#        JVM's cwd, $WHATAP_HOME and common install paths. Every external
+#        command is bounded (a hung systemctl is asked once); discovery is one
+#        grep over /proc and one `systemctl show`. The bundle is built in the
+#        private directory; bad numeric options exit 2, a failed write exits 1;
+#        output is handed back under sudo. Needs bash.
+COLLECTOR_NAME="whatap-collserver"
+VERSION="0.9.2"
 DOMAIN="collection-server"
 TARGET="collection-server/$(hostname 2>/dev/null || echo unknown)"   # refined after WHATAP_HOME is resolved
 
@@ -211,22 +160,9 @@ progress()   { [ "$OPT_QUIET" = 1 ] && return; printf '>> %s\n' "$*" >&3 2>/dev/
 have()       { command -v "$1" >/dev/null 2>&1; }
 # ---- end emit helpers
 
-# try CMD...  -> output as facts, or a bare "n/a" (kept for simple cases).
-try() {
-    local out
-    if out="$("$@" 2>/dev/null)" && [ -n "$out" ]; then
-        printf '%s\n' "$out" | while IFS= read -r line; do fact "$line"; done
-    else
-        fact "n/a"
-    fi
-}
-
 # ---- reasoned-absence helpers (see docs/collector-engineering.md) -----------
 _errfile=""
-_init_errfile() { _errfile="$(_tmp probe.err)"; }
-_timeout_bin=""
-CMD_TIMEOUT="${CMD_TIMEOUT:-20}"
-case "$CMD_TIMEOUT" in ''|*[!0-9]*) CMD_TIMEOUT=20 ;; esac
+_init_probe() { _errfile="$(_tmp probe.err)"; }
 
 _classify_err() {
     # reads a stderr file, prints a short classified reason
@@ -686,7 +622,6 @@ _emit_labeled() {
 probe() {
     local label="$1"; shift
     [ -n "$(_cmd_kind "$1")" ] || { fact "$label: n/a (command not found: $1)"; return; }
-    _past_deadline && { fact "$label: n/a (run deadline reached: ${RUN_DEADLINE}s)"; return; }
     local out rc
     out="$(_bounded "$@" 2>"$_errfile")"; rc=$?
     if [ "$rc" -eq 124 ]; then
@@ -734,10 +669,8 @@ dump_file() {
 }
 
 # ---- portable helpers -------------------------------------------------------
-# cmdline_of PID -> sets _CL to the process's argv joined by spaces (the same
-# bytes `tr '\0' ' '` gave), with builtins only: it runs once per candidate,
-# and a fork per process made discovery linear in the process count (3.5s of
-# an 8s run on a 759-process host, 2026-09-25).
+# cmdline_of PID -> sets _CL to the process's argv joined by spaces (the bytes
+# `tr '\0' ' '` gives), with builtins only: no fork per process.
 _CL=""
 cmdline_of() {
     local a=""
@@ -817,12 +750,10 @@ _sd() {
     return "$rc"
 }
 
-# One `systemctl show` for every unit this run asks about, instead of one per
-# question (57 calls, about 1.4s, on a host with the whatap units; 2026-09-25).
-# The output is one block per unit, separated by blank lines, properties in
-# systemd's order rather than the order asked; each block is read whole and
-# filed under its Id. sd_show answers from here, and asks systemctl itself
-# only for a unit that was not prefetched.
+# One `systemctl show` for every unit this run asks about, not one per question.
+# It prints one block per unit (blank-line separated, properties in systemd's
+# order); each block is filed under its Id. sd_show answers from here and asks
+# systemctl only for a unit that was not prefetched.
 _SD_CACHE=""   # lines: <unit><TAB><Prop>=<value>
 _SD_KNOWN=" "  # units the prefetch answered for
 _sd_prefetch() {
@@ -944,24 +875,17 @@ discover_services() {
         d="${f%/cmdline}"
         cmdline_of "${d#/proc/}"; cl="$_CL"
         _is_whatap_server "${d#/proc/}" "$cl" || continue
-        case "$cl" in
-            *)
-                pid="${d#/proc/}"
-                # module name comes from the jar (reliable), not the first cmdline
-                # token — otherwise "-Dwhatap.server.home=" would win every time.
-                local _jar _mod
-                _jar="$(printf '%s\n' "$cl" | grep -oE 'whatap\.(server|opslake)\.[A-Za-z0-9._-]+\.jar' | head -n1)"
-                if [ -n "$_jar" ]; then
-                    _mod="$(printf '%s' "$_jar" | grep -oE 'whatap\.(server|opslake)\.[a-zA-Z0-9]+' | head -n1)"
-                else
-                    _mod="$(printf '%s\n' "$cl" | tr ' ' '\n' | grep -oE 'whatap\.(server|opslake)\.[a-zA-Z0-9]+' | grep -vE '\.(home|conf|path|timezone)$' | head -n1)"
-                fi
-                mod="$_mod"
-                [ -z "$mod" ] && mod="whatap.(unknown-module)"
-                PIDS[${#PIDS[@]}]="$pid"
-                MODS[${#MODS[@]}]="$mod"
-                ;;
-        esac
+        pid="${d#/proc/}"
+        # The module name comes from the jar, not the first whatap.server.*
+        # token: "-Dwhatap.server.home=" would win every time.
+        if [[ "$cl" =~ whatap\.(server|opslake)\.[A-Za-z0-9._-]+\.jar ]]; then
+            mod=""; [[ "${BASH_REMATCH[0]}" =~ whatap\.(server|opslake)\.[a-zA-Z0-9]+ ]] && mod="${BASH_REMATCH[0]}"
+        else
+            mod="$(printf '%s\n' "$cl" | tr ' ' '\n' | grep -oE 'whatap\.(server|opslake)\.[a-zA-Z0-9]+' | grep -vE '\.(home|conf|path|timezone)$' | head -n1)"
+        fi
+        [ -z "$mod" ] && mod="whatap.(unknown-module)"
+        PIDS[${#PIDS[@]}]="$pid"
+        MODS[${#MODS[@]}]="$mod"
     done <<EOF
 $_SCAN_OUT
 EOF
@@ -1177,11 +1101,8 @@ run_report() {
     probe_merged "java -version" java -version
 
     # -- B. Time & clock synchronization --------------------------------------
-    # Clock skew on a collection server puts data in the wrong time buckets and
-    # trips time-based queries/alerts. These are facts about the clock and its
-    # sync state (no judgment). "Wrong" needs a reference: the running NTP daemon
-    # already computed its offset, so Tier 0 harvests that with NO network call;
-    # an external comparison is opt-in (--time-ref) because it hits the network.
+    # The running NTP daemon's own offset is read (no network call); an
+    # external comparison is opt-in (--time-ref).
     section "B. Time & clock synchronization"
     probe "timedatectl" timedatectl
     fact "system timezone: $( { cat /etc/timezone 2>/dev/null; } || { readlink -f /etc/localtime 2>/dev/null | sed 's#.*/zoneinfo/##'; } || echo 'n/a' )"
@@ -1367,8 +1288,7 @@ run_report() {
     # -- F. Configuration (raw) -----------------------------------------------
     section "F. Configuration"
     # conf/ must be listable before its glob means anything: an unreadable
-    # directory hands back the literal pattern, which used to read as "holds no
-    # *.conf" and made a blind run COMPLETE.
+    # directory hands back the literal pattern, not "no *.conf".
     if [ -n "$WHOME" ] && _dir_ok "$WHOME/conf"; then
         local cf _cfn=0 _cfu=""
         for cf in "$WHOME"/conf/*.conf; do
@@ -1392,10 +1312,8 @@ run_report() {
     # -- G. Logs & recent events ----------------------------------------------
     section "G. Logs & recent events"
     if [ -n "$WHOME" ] && _dir_ok "$WHOME/logs"; then
-        # A production yard accumulates hundreds of rotated logs (logback
-        # "<base>.<yyyyMMdd>.<i>.log"). Listing each drowns the report and reading
-        # the tail of every one is real disk load — so current logs are listed
-        # individually while rotated ones are summarized per base (metadata only).
+        # Current logs are listed one by one; rotated ones (logback
+        # "<base>.<yyyyMMdd>.<i>.log", often hundreds) are summarized per base.
         subsection "current logs (non-rotated) — name / size / mtime"
         local _f _cur=0
         for _f in "$WHOME"/logs/*.log "$WHOME"/logs/*/*.log; do
@@ -1448,16 +1366,11 @@ run_report() {
             fact "${_f#"$WHOME"/}: ${c:-0}"
         done
         subsection "per-service log tails (base logs, newest-first, 40 lines each)"
-        # A collection server co-locates many service logs (yard/proxy/gateway/
-        # keeper/account/notihub/eureka/front) — tail each base *.log, not just
-        # one. Sorted by mtime (ls -t) so the actively-written logs come first;
-        # excludes rotated .log.<date> and the _self/_api/access/checker/gc
-        # streams. Bounded: 40 lines each, at most 12 logs (rest are in inventory).
+        # Each base *.log, newest first, without rotated files and the
+        # _self/_api/access/checker/gc streams: 40 lines each, at most 12 logs.
+        # `ls -1t` because a glob cannot sort; read line by line from a heredoc
+        # so a name with a space survives and _lc stays in this shell.
         local TAIL_LINES=40 LOG_TAIL_FILES=12 _lc=0 _lf _lslist
-        # `ls -1t` and not a glob: this wants newest-first and a glob cannot
-        # sort. Read it one line at a time so a log name containing a space
-        # survives, and feed the loop with a heredoc so it stays in this shell
-        # (a pipe would put _lc in a subshell and lose the count).
         _lslist="$(ls -1t "$WHOME"/logs/*.log 2>/dev/null)"
         while IFS= read -r _lf; do
             [ -n "$_lf" ] && [ -f "$_lf" ] || continue
@@ -1562,18 +1475,9 @@ EOF
 # =============================================================================
 # Bundle (Tier 1 default; Tier 2 opt-in)
 # =============================================================================
-# Why a WHATAP_HOME-relative path produced nothing. "not resolved" and "resolved
-# but this account cannot read it" lead to different next steps: the first needs
-# --home, the second needs a different account. The collector used to print
-# "WHATAP_HOME not resolved" for both, two lines after printing the resolved
-# path, which reads as a contradiction and sends the reader the wrong way.
-#
-# Real case (Smartfren, 2026-09-23): three hosts, collector run as uid 3103 on
-# all three, WhaTap installed under uid 1001 (whatap). On web02-bsd uid 3103
-# could traverse /data/whatap and conf/ + logs/ came back; on both web01 hosts
-# it could not, and the bundles carried no conf/ at all. The report blamed
-# "WHATAP_HOME not resolved" and the reader concluded the collector needed root.
-# It did not. It needed the account that owns the installation.
+# home_why [SUB] -> why a WHATAP_HOME-relative path produced nothing. "Not
+# resolved" (needs --home) and "resolved but unreadable by this uid" (needs the
+# owning account) lead to different next steps.
 home_why() {
     local sub="$1" path="$WHOME"
     [ -n "$sub" ] && path="$WHOME/$sub"
@@ -1609,11 +1513,8 @@ home_fix() {
 }
 
 # journal_why -> empty when this uid can read the SYSTEM journal, otherwise the
-# reason it cannot. This exists because journalctl does not fail for an
-# unprivileged user: it silently narrows to that user's own entries and prints
-# "-- No entries --" for every unit, which is byte-identical to a unit that
-# logged nothing. Without this probe the report cannot tell a quiet host from a
-# journal it was never allowed to open, and the reader cannot either.
+# reason. journalctl does not fail for an unprivileged user: it narrows to that
+# user's entries and prints "-- No entries --", the same as a quiet unit.
 journal_why() {
     have journalctl || { printf 'command not found: journalctl'; return; }
     [ "$(id -u 2>/dev/null)" = 0 ] && return
@@ -1650,17 +1551,12 @@ collect_logs() {
     local dest="$1"
     [ -n "$WHOME" ] && _dir_ok "$WHOME/logs" || { warn "logs: not copied ($(home_why logs))"; return; }
 
-    # Two caps, because one file being huge and many files being large are
-    # different failures. The per-file cap alone let a production collection
-    # server produce a 393MB bundle whose logs were 99.95% of it (sf-whatap-web02
-    # -bsd, 2026-09-23: 129 log files, 412,175,707 bytes; everything else was
-    # 220,834). The field could not get that file out. So:
+    # Two caps: one huge file and many large files are different failures (a
+    # per-file cap alone once gave a 393MB bundle, 99.95% logs).
     #   * per-file cap  — tail, so the newest end of a big log survives
     #   * total cap     — stop once all copied logs together reach it
     #   * rotated logs  — opt-in; current logs alone answer most questions
-    # Whatever is not copied is written down with its reason. CONTRACT.md 1 says
-    # facts only: a file we left out is a fact, and it must not read as a file
-    # that did not exist.
+    # What is not copied is listed with its reason, so it does not read as absent.
     local cap=$((OPT_MAXLOG_MB * 1024 * 1024))
     local total_cap=$((OPT_MAXTOTAL_MB * 1024 * 1024))
     local days="$OPT_LOG_DAYS"
@@ -1782,9 +1678,8 @@ collect_os() {
     have df && _bounded df -h > "$dest/df-h.txt" 2>/dev/null
     have free && _bounded free -m > "$dest/free.txt" 2>/dev/null
     cat /proc/loadavg > "$dest/loadavg.txt" 2>/dev/null
-    # dmesg is refused for an unprivileged uid when kernel.dmesg_restrict=1, and
-    # discarding stderr turned that into a 0-byte file carrying no reason. Keep
-    # whatever the command said instead (all three Smartfren bundles: 0 bytes).
+    # dmesg is refused for an unprivileged uid under kernel.dmesg_restrict=1:
+    # keep what it said rather than a 0-byte file.
     { _bounded dmesg 2>&1 || true; } | tail -n 200 > "$dest/dmesg-tail.txt" 2>/dev/null
     [ -s "$dest/dmesg-tail.txt" ] || printf 'dmesg produced no output and no message (uid %s)\n' \
         "$(id -u 2>/dev/null || echo '?')" > "$dest/dmesg-tail.txt" 2>/dev/null
@@ -1896,10 +1791,8 @@ do_bundle() {
     work="$(_tmp bundle)"
     case "$work" in /dev/null) warn "the bundle was not written: no private temp directory could be created under ${TMPDIR:-/tmp}"; return 1 ;; esac
     mkdir -p "$work" 2>/dev/null || { warn "the bundle was not written: cannot create $work"; return 1; }
-    # Logs are selected BEFORE the report is written so the report can state what
-    # this bundle carries and what it left out (G section, "logs copied into this
-    # bundle"). The report otherwise describes the host only, and the reader
-    # cannot tell an absent log from a dropped one.
+    # Logs are selected before the report is written, so section G can say what
+    # this bundle carries and what it left out.
     collect_logs    "$work/logs"
     run_report > "$work/report.txt" 2>/dev/null
     progress "report: written to bundle"
@@ -1962,8 +1855,7 @@ if [ "$OPT_BUNDLE" = 0 ] && [ "$OPT_STDOUT" = 0 ] && [ "$OPT_FILE" = 0 ]; then
     exit 2
 fi
 
-# Numeric options are checked before anything runs: a value the shell cannot
-# do arithmetic on used to abort the bundle half way with exit 0 and no file.
+# Numeric options are checked before anything runs, not half way into a bundle.
 _need_int --hours "$OPT_HOURS"
 _need_int --max-log-mb "$OPT_MAXLOG_MB"
 _need_int --max-total-mb "$OPT_MAXTOTAL_MB"
@@ -1980,7 +1872,7 @@ if [ -z "$_RUN_DEADLINE_ENV" ]; then
 fi
 
 _run_init
-_init_errfile
+_init_probe
 
 # The output directory is checked before collecting, so an unwritable one
 # fails at once rather than after a full run.

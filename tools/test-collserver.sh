@@ -58,6 +58,18 @@ skip() { SKIP=$((SKIP+1)); printf '  ~ not checked: %s\n' "$1"; }
 chk()  { [ "$2" = "$3" ] && ok "$1" || bad "$1" "$2" "$3"; }
 has()  { printf '%s' "$2" | grep -qF -- "$3" && ok "$1" || bad "$1" "contains: $3" "absent"; }
 hasnt(){ printf '%s' "$2" | grep -qF -- "$3" && bad "$1" "absent: $3" "present" || ok "$1"; }
+# The collector finds whatap JVMs with one `xargs grep` over /proc/*/cmdline.
+# This xargs, first on PATH, passes on only the PIDs in ONLY_PIDS (empty: none),
+# so a whatap-looking process elsewhere on the host (a parallel suite's fake
+# JVM) cannot change what a test sees.
+mkdir -p "$ROOT/only"
+stub_write "$ROOT/only/xargs" <<EOF
+#!$(type -P bash)
+while IFS= read -r -d '' p; do
+    q="\${p#/proc/}"; case " \${ONLY_PIDS:-} " in *" \${q%%/*} "*) printf '%s\\0' "\$p" ;; esac
+done | exec $(type -P xargs) -r "\$@"
+EOF
+export PATH="$ROOT/only:$PATH" ONLY_PIDS=""
 mkhome() {
   local h="$1"; mkdir -p "$h/conf" "$h/logs" "$h/lib"
   printf 'yard_v4_start=20240101\n' > "$h/conf/yard.conf"; printf 'x=1\n' > "$h/conf/proxy.conf"
@@ -73,6 +85,7 @@ mkstub() {
            uniq xargs expr touch env tee timeout du; do
     p="$(type -P "$c" 2>/dev/null)" && [ -n "$p" ] && ln -sf "$p" "$s/$c"
   done
+  rm -f "$s/xargs"; stub_write "$s/xargs" < "$ROOT/only/xargs"
   stub_write "$s/systemctl" <<'EOF'
 #!/bin/sh
 case "$*" in *list-unit-files*) echo "yard.service enabled enabled"; exit 0 ;; esac
@@ -257,7 +270,7 @@ N="$ROOT/nothome"; mkdir -p "$N"
 ( cd "$N" && exec -a "java -jar whatap.server.yard.boot" sleep 60 ) >/dev/null 2>&1 </dev/null &
 jvm=$!
 sleep 1
-out="$("$C" --stdout 2>/dev/null)"
+out="$(ONLY_PIDS="$jvm" "$C" --stdout 2>/dev/null)"
 kill "$jvm" 2>/dev/null; wait "$jvm" 2>/dev/null
 has "the module is seen" "$out" "obtained: running whatap modules"
 has "home is blocked, naming the JVM" "$out" "WHATAP_HOME contents — WHATAP_HOME not resolved; pass --home DIR; whatap JVM pid"
@@ -331,7 +344,7 @@ N19="$ROOT/nothome19"; mkdir -p "$N19"
 ( cd "$N19" && exec -a "java -jar whatap.server.yard.boot" sleep 60 ) >/dev/null 2>&1 </dev/null &
 jvm=$!
 sleep 1
-out="$(bash -s -- --stdout < "$C" 2>/dev/null)"
+out="$(ONLY_PIDS="$jvm" bash -s -- --stdout < "$C" 2>/dev/null)"
 kill "$jvm" 2>/dev/null; wait "$jvm" 2>/dev/null
 has "bash -s: the module is seen" "$out" "obtained: running whatap modules"
 hasnt "and not read as none running" "$out" "no whatap JVM in any of the"
@@ -375,7 +388,7 @@ p1=$!
 tail -f "$F22/whatap.server.log" >/dev/null 2>&1 </dev/null &
 p2=$!
 sleep 1
-out="$("$C" --stdout 2>/dev/null)"
+out="$(ONLY_PIDS="$p1 $p2" "$C" --stdout 2>/dev/null)"
 kill "$p1" "$p2" 2>/dev/null; wait "$p1" "$p2" 2>/dev/null
 has "an app JVM with the WhaTap agent and a tail of a whatap log: no module" "$out" "running whatap modules — no whatap JVM in any of the"
 has "and the host stays COMPLETE" "$out" "status: COMPLETE"
