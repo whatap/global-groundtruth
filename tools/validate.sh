@@ -91,14 +91,19 @@ usage() {
 #            with N = a + b + c, and "status: COMPLETE" exactly when c is 0 and
 #            no run deadline was reached
 #   footer   the last line, exactly, after a blank line
+#   bytes    no UTF-8 BOM and no CR: a CRLF or BOM report is named as such and
+#            not checked further (every other rule would fail on it)
 # A section is a line at column 0 that starts with "[n] ". Fact lines are
 # indented by the shared helpers, so quoted content cannot open a section.
 check_report() {
-    awk -v footer="$FOOTER" -v domains="^($DOMAINS)\$" '
+    LC_ALL=C awk -v footer="$FOOTER" -v domains="^($DOMAINS)\$" '
     function bad(m) { print m; nbad++ }
-    { line[NR] = $0 }
+    { line[NR] = $0; if (/\r$/) ncr++ }
     END {
         if (NR == 0) { bad("empty file"); exit }
+        if (substr(line[1], 1, 3) == "\357\273\277") bad("starts with a UTF-8 BOM (a report is UTF-8 without BOM)")
+        if (ncr) bad(ncr " of " NR " lines end in CR (CRLF): a report uses LF line endings")
+        if (nbad) exit
         if (line[1] != "==== WhaTap Global Groundtruth Collection ====") bad("line 1 is not the title line")
         split("Collector:|Version:|Timestamp(UTC):|Domain:|Target:", lab, "|")
         for (i = 1; i <= 5; i++) {
@@ -171,7 +176,7 @@ if [ "$1" = --report ]; then
         out="$(check_report "$r")"
         # the file name, when it is a delivered report, shares the Collector token
         bn="$(basename "$r")"
-        coll="$(sed -n '2s/^Collector: *//p' "$r")"
+        coll="$(sed -n '2s/^Collector: *//p' "$r" | tr -d '\r')"
         case "$bn" in
             whatap-*.txt) case "$bn" in "$coll"-*) ;; *) out="${out:+$out
 }file name $bn does not start with $coll-" ;; esac ;;
