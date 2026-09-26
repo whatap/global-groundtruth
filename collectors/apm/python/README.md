@@ -136,7 +136,9 @@ The collector itself puts no credential on a command line.
 
 Tier 0 only: read-only, bounded reads (`tail -n`, line-capped dumps, capped
 process/interpreter detail), every external command capped at 15 s and the
-whole run at `RUN_DEADLINE` (300 s). No `--bundle` tier yet;
+whole run at `RUN_DEADLINE` (300 s). Each detailed interpreter (cap 8) is
+started three times: once for all ten lookups, once for `-m pip list`, and once
+for the Odoo `release.py` lookup (also on hosts without Odoo). No `--bundle` tier yet;
 copy the bundle plumbing from `collect-collserver.sh` if the domain team
 needs raw log artifacts.
 

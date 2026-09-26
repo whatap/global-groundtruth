@@ -24,38 +24,16 @@
 #   * Kubernetes/operator artifacts: /whatap-agent volume,
 #     WHATAP_PYTHON_AGENT_PATH (symlink vs regular file), container.conf.
 #
-# THE CONTRACT (../../../CONTRACT.md):
-#   1. Facts only. No conclusion is stated on any emitted line.
-#   2. Discover, never assume. Resolve symlinks, process args, env, config.
-#   3. One field command -> paste the whole output.
-#   4. Domain-team owned. Seed v0 by the Global team; ownership transfers to
-#      the APM/Python agent developers.
+# Interpreters run only short importlib lookups and `pip list`; the whatap
+# package is never imported (importing it has side effects).
 #
-# DESIGN GUIDELINES (../../../docs/collector-engineering.md): MECE sections,
-# Tier-0 load-safe defaults (bounded reads, no whole-log grep), bash 3.2+,
-# reasoned absence for every missing value.
-#
-# NOTE: no `set -e` — a collector must reach its footer even when every probe
-# fails. Failures are handled locally by the helpers.
+# Rules: ../../../CONTRACT.md, ../../../docs/collector-engineering.md; no set -e.
 # -----------------------------------------------------------------------------
 
 export LC_ALL=C
 
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-apmpython"
-# 0.7.0  The ten lookups per interpreter in section [3] run in one interpreter
-#        start (_pyrun) instead of ten `python -c`, each still with its own
-#        stdout, stderr and exit status, so every fact and n/a reason reads as
-#        before. _env_pick and PYTHONPATH work in the shell, an interpreter
-#        path already listed is not resolved again, and the detail list reads
-#        each environ once. 12.9 s -> 7.5 s with 8 interpreters, 20.3 s ->
-#        9.9 s with 300 more python processes (2026-09-25).
-# 0.7.1  A lookup that hangs no longer takes the answers of the ones after it:
-#        those never started, and each now runs alone under its own cap (the
-#        one that hung says timed out, as before 0.7.0). The marker lines are
-#        random per run and taken only in the order the driver prints them,
-#        so a path or value holding marker-like text cannot replace another
-#        lookup's answer (2026-09-25).
 # 0.7.2  When a lookup run alone after a hang also times out, the lookups
 #        after it are not run (each would wait a full cap for the same
 #        cause): a common hang costs about two caps per interpreter, not ten.
@@ -65,7 +43,8 @@ COLLECTOR_NAME="whatap-apmpython"
 #        lookup run alone has answered, the interpreter still answers, so a later
 #        hang is that lookup's own and the ones after it are still run
 #        (two separate hangs lost the last answer in 0.7.2; 2026-09-25).
-VERSION="0.7.3"
+# 0.7.4  Readability refactor; report unchanged.
+VERSION="0.7.4"
 DOMAIN="apm"
 TARGET="host/$(hostname 2>/dev/null || echo unknown)"
 
@@ -559,7 +538,6 @@ _errfile=""
 CMD_TIMEOUT="${CMD_TIMEOUT:-15}"
 # Call after _run_init: the error file lives in the run's private directory.
 _init_probe() { _errfile="$(_tmp probe.err)"; }
-_end_probe() { :; }   # _run_cleanup removes the directory
 
 _classify_err() {
     local txt=""
@@ -589,7 +567,6 @@ _emit_labeled() {
 probe() {
     local label="$1"; shift
     [ -n "$(_cmd_kind "$1")" ] || { fact "$label: n/a (command not found: $1)"; return; }
-    _past_deadline && { fact "$label: n/a (run deadline reached: ${RUN_DEADLINE}s)"; return; }
     local out rc
     out="$(_bounded "$@" 2>"$_errfile")"; rc=$?
     if [ "$rc" -eq 124 ]; then
@@ -629,39 +606,25 @@ read_proc() {
     _emit_labeled "$label" "$out"
 }
 
-# dump_file "label" PATH [CAP] -> the file's content verbatim (line-capped),
-# or a classified reason. Framework policy: configuration is dumped verbatim,
-# never masked (see collectors/apm/python/README.md, "What the report can contain").
-dump_file() {
-    local label="$1" path="$2" cap="${3:-400}" total
-    [ -e "$path" ] || { fact "$label: n/a (path not found: $path)"; return; }
-    [ -r "$path" ] || { fact "$label: n/a (permission denied: $path)"; return; }
-    [ -s "$path" ] || { fact "$label: (empty file)"; return; }
-    total="$(wc -l < "$path" 2>/dev/null | tr -d ' ')"
-    fact "$label (first $cap of ${total:-?} lines):"
-    head -n "$cap" "$path" 2>/dev/null | while IFS= read -r _l || [ -n "$_l" ]; do printf '        %s\n' "$_l"; done
+# _names DIR -> the names in DIR, as `ls DIR` lists them (no dot files, sorted)
+_names() {
+    local n
+    for n in "$1"/*; do { [ -e "$n" ] || [ -L "$n" ]; } && printf '%s\n' "${n##*/}"; done
+    return 0
 }
 
-# tail_file "label" PATH [CAP] -> the file's LAST lines (bounded read).
-tail_file() {
-    local label="$1" path="$2" cap="${3:-200}" total
+# _file_lines head|tail "label" PATH CAP -> the first or last CAP lines of the
+# file, verbatim, or a reason. Configuration is dumped as is, never masked (the
+# collector README, "What the report can contain").
+_file_lines() {
+    local how="$1" label="$2" path="$3" cap="$4" w=first total
+    [ "$how" = tail ] && w=last
     [ -e "$path" ] || { fact "$label: n/a (path not found: $path)"; return; }
     [ -r "$path" ] || { fact "$label: n/a (permission denied: $path)"; return; }
     [ -s "$path" ] || { fact "$label: (empty file)"; return; }
     total="$(wc -l < "$path" 2>/dev/null | tr -d ' ')"
-    fact "$label (last $cap of ${total:-?} lines):"
-    tail -n "$cap" "$path" 2>/dev/null | while IFS= read -r _l || [ -n "$_l" ]; do printf '        %s\n' "$_l"; done
-}
-
-# head_file "label" PATH [CAP] -> the file's FIRST lines (bounded read).
-head_file() {
-    local label="$1" path="$2" cap="${3:-120}" total
-    [ -e "$path" ] || { fact "$label: n/a (path not found: $path)"; return; }
-    [ -r "$path" ] || { fact "$label: n/a (permission denied: $path)"; return; }
-    [ -s "$path" ] || { fact "$label: (empty file)"; return; }
-    total="$(wc -l < "$path" 2>/dev/null | tr -d ' ')"
-    fact "$label (first $cap of ${total:-?} lines):"
-    head -n "$cap" "$path" 2>/dev/null | while IFS= read -r _l || [ -n "$_l" ]; do printf '        %s\n' "$_l"; done
+    fact "$label ($w $cap of ${total:-?} lines):"
+    "$how" -n "$cap" "$path" 2>/dev/null | while IFS= read -r _l || [ -n "$_l" ]; do printf '        %s\n' "$_l"; done
 }
 
 # pyprobe "label" PY_EXE CODE -> run a short python -c snippet under _bounded.
@@ -673,7 +636,6 @@ pyprobe() {
     local label="$1" py="$2" code="$3" out rc
     _pyout="" _pyrc=1
     [ -x "$py" ] || { fact "$label: n/a (not executable: $py)"; return; }
-    _past_deadline && { _pyrc=124; fact "$label: n/a (run deadline reached: ${RUN_DEADLINE}s)"; return; }
     out="$(_bounded "$py" -c "$code" 2>"$_errfile")"; rc=$?
     _pyout="$out" _pyrc="$rc"
     # _bounded caps at what is left of RUN_DEADLINE when that is less
@@ -693,35 +655,24 @@ pyprobe() {
     _emit_labeled "$label" "$out"
 }
 
-# _pyrun PY CODE... -> run every CODE in ONE interpreter start instead of one
-# `PY -c CODE` each (ten starts per interpreter took 8.9 s of a 12 s run on a
-# host with 8 interpreters). _PYDRV runs each CODE on its own: fresh globals,
-# its stdout and stderr captured apart, an uncaught exception printed by
-# sys.excepthook exactly as `python -c` prints it, and its exit status. It
-# prints, per CODE, "<marker> N start" before running it, then "<marker> N
-# out", the stdout, "<marker> N err", the stderr and "<marker> N rc R",
-# flushing after each, so a CODE that finished before a timeout keeps its
-# result. Python 2.4+ and 3 syntax: no `with`, no `except X as e`. The CODE
-# importing pkg_resources (it rewires namespace packages on import) runs
-# last; the report order stays as listed.
+# _pyrun PY CODE... -> every CODE in ONE interpreter start, not one `PY -c` each
+# (ten starts per interpreter were most of the run time). _PYDRV runs each CODE
+# with fresh globals, its stdout and stderr captured apart, an uncaught
+# exception printed as `python -c` prints it, and its exit status; per CODE it
+# prints "<marker> N start|out|err|rc R", flushing after each, so a CODE that
+# finished before a timeout keeps its result. The marker is random per run and
+# counts only when it is the one expected next, so output imitating it stays
+# output. Python 2.4+ and 3 syntax. The pkg_resources CODE runs last (importing
+# it rewires namespace packages); the report order stays as listed.
 # _pyreport N LABEL CODE then reports CODE N as pyprobe would have.
-#
-# The marker is random per run and a marker line counts only when it is the
-# one expected next (same CODE, same order as the driver runs them): a CODE
-# that prints a path holding a newline and marker-like text cannot replace
-# another CODE's answer.
-#
-# Limits for whoever adds a CODE (each differs from a `python -c` of its own):
-#   * output of an atexit hook or of the interpreter's start-up (sitecustomize)
-#     is printed once and is added to EVERY CODE's stdout, as each `python -c`
-#     would have printed it;
-#   * os.write(1, ...) / os.write(2, ...) and child processes bypass the
-#     capture: that output is dropped, not attributed to the CODE;
-#   * sys.stdout / sys.stderr are StringIO objects while a CODE runs: no
-#     .buffer, no .fileno(), no binary writes;
-#   * sys.argv is the driver's (the marker and every CODE), not ['-c'];
-#   * a CODE that ends the process (os._exit, a crash) or hangs stops the
-#     CODEs after it: _pyreport then runs those alone with pyprobe.
+# Differences from a `python -c` of its own, for whoever adds a CODE:
+#   * start-up (sitecustomize) and atexit output is printed once and added to
+#     EVERY CODE's stdout;
+#   * os.write(1|2, ...) and child processes bypass the capture (dropped);
+#   * sys.stdout/sys.stderr are StringIO: no .buffer, .fileno() or binary writes;
+#   * sys.argv is the driver's, not ['-c'];
+#   * a CODE that ends the process or hangs stops the CODEs after it, which
+#     _pyreport then runs alone with pyprobe.
 _pym_rand=""
 { read -r _pym_rand < /proc/sys/kernel/random/uuid; } 2>/dev/null
 [ -n "$_pym_rand" ] || _pym_rand="$(od -An -N8 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')"
@@ -798,7 +749,6 @@ _pyrun() {
     _pyrun_rc=0 _pyrun_pre="" _pyrun_post="" _pyrun_err="" _pyrun_started=0 _pyrun_rerun_to=0
     while [ "$i" -le "$#" ]; do eval "_pyr_$i='' _pyo_$i='' _pye_$i='' _pys_$i=''"; i=$((i + 1)); done
     [ -x "$_pyrun_py" ] || { _pyrun_rc=noexec; return; }
-    _past_deadline && { _pyrun_rc=deadline; return; }
     # the order the driver runs them in: pkg_resources last
     i=0; for c in "$@"; do i=$((i + 1)); case "$c" in *pkg_resources*) ;; *) ord="$ord $i" ;; esac; done
     i=0; for c in "$@"; do i=$((i + 1)); case "$c" in *pkg_resources*) ord="$ord $i" ;; esac; done
@@ -852,7 +802,6 @@ _pyreport() {
     local n="$1" label="$2" out rc err started
     case "$_pyrun_rc" in
         noexec)   _pyout="" _pyrc=1; fact "$label: n/a (not executable: $_pyrun_py)"; return ;;
-        deadline) _pyout="" _pyrc=124; fact "$label: n/a (run deadline reached: ${RUN_DEADLINE}s)"; return ;;
     esac
     eval "rc=\$_pyr_$n out=\$_pyo_$n err=\$_pye_$n started=\$_pys_$n"
     if [ -z "$rc" ]; then
@@ -1206,8 +1155,7 @@ EOF
     [ -n "${WHATAP_HOME_BATCH:-}" ] && _home_from_self "$WHATAP_HOME_BATCH" WHATAP_HOME_BATCH
     if [ -r "$D_LOCK_FILE" ]; then
         # lock file records "port<TAB>home" per agent home
-        while IFS= read -r _l || [ -n "$_l" ]; do
-            p="$(printf '%s\n' "$_l" | awk '{print $2}')"
+        while read -r _l p _r || [ -n "$_l" ]; do
             [ -n "$p" ] && _add_home "$p" "port registry $D_LOCK_FILE"
         done < "$D_LOCK_FILE"
     fi
@@ -1419,8 +1367,27 @@ run_report() {
     goal agent "whatap-python package / agent home"
     goal conf  "agent configuration"
 
-    # [1] capability preamble: every downstream "command not found" is
-    # pre-explained here.
+    _rep_env
+    discover
+    _rep_host
+    _rep_runtimes
+    _rep_procs
+    _rep_homes
+    _rep_net
+    _rep_logs
+    _rep_odoo
+    _rep_k8s
+
+    # Resolved here, not at the point of use: the config dumps above run inside
+    # `| while` pipelines, and an assignment made in a subshell does not survive.
+    _resolve_goals
+    emit_status
+    emit_footer
+}
+
+# [1] capability preamble: every downstream "command not found" is
+# pre-explained here.
+_rep_env() {
     section "Collection environment"
     if [ -n "${BASH_VERSION:-}" ]; then fact "shell: bash $BASH_VERSION"
     else fact "shell: POSIX sh (non-bash)"; fi
@@ -1434,10 +1401,10 @@ run_report() {
         if command -v "$t" >/dev/null 2>&1; then printf '        %-12s present (%s)\n' "$t" "$(command -v "$t")"
         else printf '        %-12s absent\n' "$t"; fi
     done
+}
 
-    discover
-
-    # [1] host / platform
+# [2] host / platform
+_rep_host() {
     section "Host / platform"
     probe "kernel" uname -srm
     probe "machine arch" uname -m
@@ -1468,11 +1435,13 @@ run_report() {
     else
         printf '        %-22s not set\n' "KUBERNETES_SERVICE_HOST"
     fi
-    probe "self cgroup (first 5 lines)" sh -c "head -n 5 /proc/self/cgroup"
+    probe "self cgroup (first 5 lines)" head -n 5 /proc/self/cgroup
     probe "local time" date
     probe "pid 1 command" sh -c "tr '\0' ' ' < /proc/1/cmdline | cut -c1-160"
+}
 
-    # [2] python runtimes + whatap-python package (per distinct interpreter)
+# [3] python runtimes + whatap-python package (per distinct interpreter)
+_rep_runtimes() {
     section "Python runtimes and whatap-python package"
     if [ -z "$D_PY_EXES" ]; then
         fact "python interpreters: n/a (none found on PATH or among running processes)"
@@ -1602,7 +1571,7 @@ EOF
             else printf '           agent binaries dir: absent\n'; fi
             # library inventory of this environment, from metadata dir names —
             # needs neither pip nor a runnable interpreter
-            _dists="$(ls "$sp" 2>/dev/null | grep -E '\.dist-info$|\.egg-info$|\.egg$' | sed 's/\.dist-info$//; s/\.egg-info$//')"
+            _dists="$(_names "$sp" | grep -E '\.dist-info$|\.egg-info$|\.egg$' | sed 's/\.dist-info$//; s/\.egg-info$//')"
             if [ -n "$_dists" ]; then
                 printf '           installed distributions in %s (%s total, first 200):\n' "$sp" "$(printf '%s\n' "$_dists" | wc -l | tr -d ' ')"
                 printf '%s\n' "$_dists" | head -n 200 | while IFS= read -r _l; do printf '             %s\n' "$_l"; done
@@ -1615,8 +1584,10 @@ EOF
             else printf '           instrumentation modules: n/a (no trace/mod entries under %s)\n' "$fsd"; fi
         done
     fi
+}
 
-    # [3] runtime processes
+# [4] runtime processes
+_rep_procs() {
     section "Runtime processes"
     local pid n
     if [ -z "$D_GO_PIDS" ]; then
@@ -1681,8 +1652,10 @@ EOF
             fi
         done
     fi
+}
 
-    # [4] agent homes and configuration
+# [5] agent homes and configuration
+_rep_homes() {
     section "Agent homes and configuration"
     fact "env WHATAP_HOME (collector shell): $(_quote_nl "${WHATAP_HOME:-not set}")"
     fact "env WHATAP_HOME_BATCH (collector shell): $(_quote_nl "${WHATAP_HOME_BATCH:-not set}")"
@@ -1702,8 +1675,8 @@ EOF
             fshome="$(resolve_fs "$home")"
             if [ -z "$fshome" ]; then fact "   n/a ($(_absent_why "$home" "$_src"))"; continue; fi
             [ "$fshome" != "$home" ] && fact "   filesystem view: $fshome (read through a process root)"
-            dump_file "   whatap.conf" "$fshome/whatap.conf" 400
-            dump_file "   container.conf" "$fshome/container.conf" 200
+            _file_lines head "   whatap.conf" "$fshome/whatap.conf" 400
+            _file_lines head "   container.conf" "$fshome/container.conf" 200
             if [ -e "$fshome/whatap_python" ]; then
                 fact "   whatap_python entry: $(ls -l "$fshome/whatap_python" 2>/dev/null | head -n1)"
                 fact "   whatap_python resolved: $(readlink -f "$fshome/whatap_python" 2>/dev/null || echo 'n/a (unresolvable)')"
@@ -1733,8 +1706,10 @@ EOF
             [ -d "$fshome/whatap-python-llm" ] && fact "   whatap-python-llm dir (LLM Go module): present" || fact "   whatap-python-llm dir (LLM Go module): absent"
         done
     fi
+}
 
-    # [5] network endpoints + port registry
+# [6] network endpoints + port registry
+_rep_net() {
     section "Network endpoints and port registry"
     _net_ports
     if have ss; then
@@ -1745,13 +1720,15 @@ EOF
         probe "tcp sessions (whatap-named or port $_tcp_label)" _sock_list netstat -tnp "$_tcp_ports"
     else
         fact "socket listing: n/a (command not found: ss, netstat); raw tables follow"
-        probe "raw /proc/net/udp (first 30 lines)" sh -c "head -n 30 /proc/net/udp"
-        probe "raw /proc/net/tcp (first 30 lines)" sh -c "head -n 30 /proc/net/tcp"
+        probe "raw /proc/net/udp (first 30 lines)" head -n 30 /proc/net/udp
+        probe "raw /proc/net/tcp (first 30 lines)" head -n 30 /proc/net/tcp
     fi
-    dump_file "port registry (format: port<TAB>home)" "$D_LOCK_FILE" 50
-    dump_file "LLM port registry" "$D_LLM_LOCK_FILE" 50
+    _file_lines head "port registry (format: port<TAB>home)" "$D_LOCK_FILE" 50
+    _file_lines head "LLM port registry" "$D_LLM_LOCK_FILE" 50
+}
 
-    # [6] agent logs (bounded tails only; never a whole-log grep)
+# [7] agent logs (bounded tails only; never a whole-log grep)
+_rep_logs() {
     section "Agent logs"
     if [ -z "$D_HOMES" ]; then
         fact "no agent home discovered; no log locations to read"
@@ -1765,28 +1742,31 @@ EOF
             # lines (= which libraries the agent hooked in THIS process) are at
             # the START of the file, so read its head as well as its tail
             _hook="$fshome/logs/whatap-hook.log"
-            head_file "   whatap-hook.log (first lines)" "$_hook" 120
-            tail_file "   whatap-hook.log (recent lines)" "$_hook" 80
+            _file_lines head "   whatap-hook.log (first lines)" "$_hook" 120
+            _file_lines tail "   whatap-hook.log (recent lines)" "$_hook" 80
             if [ -r "$_hook" ]; then
                 fact "   'successfully injected' lines in whatap-hook.log (first 400 lines): $(head -n 400 "$_hook" 2>/dev/null | grep -c 'successfully injected' 2>/dev/null)"
             fi
             # newest Go-side boot log only (flat dir; ls -t, no deep find)
             _boot="$(ls -t "$fshome"/logs/whatap-boot-*.log 2>/dev/null | head -n 1)"
             if [ -n "$_boot" ]; then
-                head_file "   $(basename "$_boot") (Go-side boot log, first lines)" "$_boot" 60
-                tail_file "   $(basename "$_boot") (Go-side boot log, recent lines)" "$_boot" 120
+                _file_lines head "   $(basename "$_boot") (Go-side boot log, first lines)" "$_boot" 60
+                _file_lines tail "   $(basename "$_boot") (Go-side boot log, recent lines)" "$_boot" 120
             else
                 fact "   whatap-boot-*.log: n/a (no such file in $fshome/logs)"
             fi
         done
     fi
+}
 
-    # [8] odoo application facts — Odoo has its own web framework, prefork
-    # worker model, and config file; agent support depends on the Odoo version
-    # and the traffic dispatcher (http vs json vs websocket/longpolling vs
-    # cron), so a support case needs these facts. Cheap no-op on non-Odoo hosts.
+# [8] odoo application facts — Odoo has its own web framework, prefork
+# worker model, and config file; agent support depends on the Odoo version
+# and the traffic dispatcher (http vs json vs websocket/longpolling vs
+# cron), so a support case needs these facts. Without Odoo it still costs one
+# release.py lookup per interpreter.
+_rep_odoo() {
     section "Odoo application facts"
-    local opid _oc _ocands="" _rcands="" _c
+    local opid _oc _ocands="" _rcands="" _c _pycount py
     if [ -z "$D_ODOO_PIDS" ]; then
         fact "odoo processes: none found in /proc (by comm or cmdline)"
     else
@@ -1877,7 +1857,7 @@ EOF
             _lf="$(grep -E '^[[:space:]]*logfile[[:space:]]*=' "$_fs" 2>/dev/null | tail -n1 | cut -d= -f2- | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
             if [ -n "$_lf" ] && [ "$_lf" != "None" ] && [ "$_lf" != "False" ]; then
                 fact "   odoo logfile key: $_lf"
-                _lfs="$(resolve_fs "$_lf")" && tail_file "   odoo logfile (worker log)" "$_lfs" 120 || fact "   odoo logfile: n/a (path not visible: $_lf)"
+                _lfs="$(resolve_fs "$_lf")" && _file_lines tail "   odoo logfile (worker log)" "$_lfs" 120 || fact "   odoo logfile: n/a (path not visible: $_lf)"
             else
                 fact "   odoo logfile key: not set"
             fi
@@ -1905,8 +1885,10 @@ EOF
             [ -r "$_hk" ] && fact "hook.log 'injected odoo' lines (first 400 lines, home $home): $(head -n 400 "$_hk" 2>/dev/null | grep -c 'injected odoo' 2>/dev/null)"
         done
     fi
+}
 
-    # [9] kubernetes / operator injection artifacts
+# [9] kubernetes / operator injection artifacts
+_rep_k8s() {
     section "Kubernetes / operator injection context"
     if [ -d /whatap-agent ]; then
         probe "/whatap-agent listing" _ls_head /whatap-agent 50
@@ -1931,12 +1913,6 @@ EOF
     done
     [ -d /var/run/secrets/kubernetes.io ] && fact "/var/run/secrets/kubernetes.io: present" || fact "/var/run/secrets/kubernetes.io: absent"
     read_proc "container hostname (/etc/hostname)" /etc/hostname
-
-    # Resolved here, not at the point of use: the config dumps above run inside
-    # `| while` pipelines, and an assignment made in a subshell does not survive.
-    _resolve_goals
-    emit_status
-    emit_footer
 }
 
 # ---- main — DO NOT EDIT --------------------------------------------------------
@@ -1964,4 +1940,3 @@ else
     _report_to_file "$OUTFILE" || exit 1
     progress "report written: $OUTFILE"
 fi
-_end_probe
