@@ -46,7 +46,14 @@ COLLECTOR_NAME="whatap-apmpython"
 # 0.7.4  Readability refactor; report unchanged.
 # 0.7.5  A directory this uid can read but not enter lists its names again
 #        (the refactor's _names dropped them; ls did not).
-VERSION="0.7.5"
+# 0.8.0  Only candidates count (decision 1): with no whatap_python process on
+#        the host, a process whose environ this uid cannot read and whose
+#        command line does not name whatap is not counted as an unread input,
+#        and the na reason names it. A stock distribution's root python
+#        daemons no longer make a non-root run INCOMPLETE. conf is missed, not
+#        na, when homes were found without a whatap.conf while a candidate's
+#        environ/cwd was unread (its home is unknown) (2026-09-26).
+VERSION="0.8.0"
 DOMAIN="apm"
 TARGET="host/$(hostname 2>/dev/null || echo unknown)"
 
@@ -891,6 +898,9 @@ _proc_table() {
 #   D_HOMES     distinct WHATAP_HOME candidates with their discovery source
 #   D_UNREAD    pids of candidate processes whose environ or cwd this uid could
 #               not read (their WHATAP_HOME is unknown, not absent)
+#   D_UNCOUNTED pids of unreadable python processes that are not candidates:
+#               no whatap in the command line and no whatap_python process on
+#               the host (a stock distro runs root python daemons)
 #   D_HIDEPID   non-empty when /proc hides other users' processes from this uid
 D_PY_EXES=""
 D_GO_PIDS=""
@@ -899,6 +909,7 @@ D_ODOO_PIDS=""      # odoo processes (setproctitle may rename comm to odoo*)
 D_HOMES=""          # newline-joined "path|source" records
 D_PKG_DIRS=""       # newline-joined whatap package dirs seen in process environ
 D_UNREAD=""
+D_UNCOUNTED=""
 D_HIDEPID=""
 D_PY_LIVE=""        # interpreter paths of running processes, newline-joined
 # Interpreters detailed and probed per run (set in discover). APM_INTERP_CAP
@@ -1072,7 +1083,7 @@ _env_pick() {
 discover() {
     progress "discovery: interpreters, processes, agent homes"
     _cap_from APM_INTERP_CAP "${APM_INTERP_CAP:-}" 8; D_PY_CAP="$_cap" D_CAP_NOTE="$_cap_note"
-    local c p pid comm exe a0 cmd cwd envh _b _py _mk _pym="" _pyr="" _am="" _ar="" _d _o
+    local c p pid comm exe a0 cmd cwd envh _b _py _mk _pym="" _pyr="" _am="" _ar="" _unmk="" _d _o
     _env=""
 
     case "$(id -u 2>/dev/null)" in
@@ -1106,7 +1117,9 @@ discover() {
         # carries WHATAP_* or the bootstrap on PYTHONPATH
         _mk=0
         case "$cmd" in *whatap*) _mk=1 ;; esac
-        if _read_proc_env "$pid"; then
+        if ! _read_proc_env "$pid"; then
+            [ "$_mk" = 1 ] || _unmk="$_unmk $pid"
+        else
             _env_pick WHATAP_HOME PYTHONPATH
             [ -n "$_ev_WHATAP_HOME" ] && _home_from_pid "$pid" "$_ev_WHATAP_HOME" "environ of python pid $pid"
             # whatap package dir derived from the process's PYTHONPATH bootstrap
@@ -1175,6 +1188,16 @@ EOF
             [ -n "$_ev_WHATAP_HOME" ] && _home_from_pid "$pid" "$_ev_WHATAP_HOME" "environ of whatap_python pid $pid"
         fi
     done
+    # with no whatap_python process on the host, an unreadable python process
+    # whose command line does not name whatap is not a candidate
+    if [ -z "$D_GO_PIDS" ] && [ -n "$_unmk" ]; then
+        _o=""
+        for pid in $D_UNREAD; do
+            case " $_unmk " in *" $pid "*) D_UNCOUNTED="$D_UNCOUNTED $pid" ;; *) _o="$_o $pid" ;; esac
+        done
+        D_UNREAD="$_o"
+        D_UNCOUNTED="$(printf '%s\n' $D_UNCOUNTED | sort -un | tr '\n' ' ' | sed 's/ $//')"
+    fi
     D_UNREAD="$(printf '%s\n' $D_UNREAD | sort -un | tr '\n' ' ' | sed 's/ $//')"
     # operator auto-injection default mount
     [ -d /whatap-agent ] && _add_home "/whatap-agent" "operator injection volume /whatap-agent"
@@ -1190,6 +1213,13 @@ _scan_gaps() {
     fi
     [ -n "$D_HIDEPID" ] && g="${g:+$g; }$D_HIDEPID"
     printf '%s' "$g"
+}
+
+# _uncounted -> "; environ of N process(es) ... not counted", or nothing
+_uncounted() {
+    [ -n "$D_UNCOUNTED" ] || return 0
+    printf '; environ of %s process(es) not readable by this uid and not counted (no whatap in the command line, no whatap_python process; pids: %s)' \
+        "$(echo $D_UNCOUNTED | wc -w | tr -d ' ')" "$(echo $D_UNCOUNTED | cut -d' ' -f1-10)"
 }
 
 
@@ -1318,7 +1348,7 @@ _sock_list() {
 # it was read: an unreadable environ/cwd, hidepid, a blocked home path or a
 # failed interpreter probe makes it `missed`.
 _resolve_goals() {
-    local h src fs why seen=0 homes_seen=0 blocked="" absent="" unres="" gaps agaps pr n ph
+    local h src fs why seen=0 homes_seen=0 blocked="" absent="" unres="" gaps agaps pr n ph pid
     while IFS='|' read -r h src; do
         [ -n "$h" ] || continue
         if ! fs="$(resolve_fs "$h")"; then
@@ -1356,14 +1386,16 @@ EOF
     elif [ -n "$blocked" ] || [ -n "$agaps" ]; then
         missed agent "no whatap home or package found in what this uid could read: ${blocked:+$blocked; }$agaps$ph"
     else
-        n="$(echo $D_APP_PIDS | wc -w | tr -d ' ')"
-        na agent "no whatap home or package in the collector env, port registry $D_LOCK_FILE, /whatap-agent, the environ of $n python process(es) (all readable); $pr${absent:+; home candidate(s): $absent}"
+        n=0
+        for pid in $D_APP_PIDS; do case " $D_UNCOUNTED " in *" $pid "*) ;; *) n=$((n + 1)) ;; esac; done
+        na agent "no whatap home or package in the collector env, port registry $D_LOCK_FILE, /whatap-agent, the environ of $n python process(es) (every candidate readable); $pr${absent:+; home candidate(s): $absent}$(_uncounted)"
     fi
 
     if [ "$seen" = 1 ]; then got conf
     elif [ -n "$blocked" ]; then missed conf "whatap.conf not readable: $blocked$ph"
     elif [ -n "$D_ODD$unres" ] || { [ -z "$D_HOMES" ] && [ -n "$gaps" ]; }; then missed conf "no agent home found in what this uid could read: $gaps$ph"
-    elif [ -z "$D_HOMES" ]; then na conf "no agent home found to hold a whatap.conf (every source read)"
+    elif [ -n "$gaps" ]; then missed conf "no whatap.conf in any agent home found ($absent), and the home of other candidates is unknown: $gaps$ph"
+    elif [ -z "$D_HOMES" ]; then na conf "no agent home found to hold a whatap.conf (every source read)$(_uncounted)"
     else na conf "no whatap.conf in any agent home: $absent"; fi
 }
 

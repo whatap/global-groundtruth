@@ -98,10 +98,20 @@ Its absence is `na` only when every input was read. When the run cannot read
 the `environ`/`cwd` of a candidate process (other users' processes as
 non-root), `/proc` is mounted with `hidepid`, a home path is behind a
 directory it may not search, or an interpreter's package lookup fails, the
-absence is `missed` and names those pids or paths. `conf` is obtained when a
+absence is `missed` and names those pids or paths. A process whose environ
+the run cannot read counts as an unread input only when its command line
+names whatap or a `whatap_python` process runs on the host. So the root
+python daemons of a stock distribution (`networkd-dispatcher`,
+`unattended-upgrades`) alone no longer make a non-root run `missed` on a host
+without the agent; their count and pids are named in the `na` reason. An app
+whose whatap marker is only in its environ (the bootstrap on `PYTHONPATH`, a
+`WHATAP_*` variable) and whose `whatap_python` process has exited is then
+seen only by a root run. `conf` is obtained when a
 `whatap.conf` in an agent home is readable; a home whose path does not exist
 gives `na` with `path not found`, a home or file the run may not read gives
-`missed` with `permission denied`.
+`missed` with `permission denied`, and no `whatap.conf` in the homes found
+while a candidate's `environ`/`cwd` was unread is `missed` (that candidate's
+home is unknown).
 
 ## What the report can contain
 
