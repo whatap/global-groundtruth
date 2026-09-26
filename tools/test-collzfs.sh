@@ -343,5 +343,70 @@ done
 hasnt "and none for a path that is not there" "$out" "df -i $H13/db"
 chk "one df -i per distinct present path" "4" "$(printf '%s\n' "$out" | grep -c '^    df -i ')"
 
+echo "== 14. 0.7.0: zpool list -v is asked once, for the raw lines, the views and the bundle =="
+S14="$ROOT/stub14"; stub_clone "$S" "$S14"; ZC14="$ROOT/zcalls14"; : >| "$ZC14"
+p14="$(type -P gzip 2>/dev/null)" && [ -n "$p14" ] && ln -sf "$p14" "$S14/gzip"   # tar -z
+stub_write "$S14/zpool" <<STUB
+#!/bin/sh
+echo "zpool \$*" >> "$ZC14"
+case "\$*" in
+  "list -H -o name") echo tank ;;
+  "list -v")
+    echo "NAME        SIZE  ALLOC   FREE  CKPOINT  EXPANDSZ   FRAG    CAP  DEDUP    HEALTH  ALTROOT"
+    echo "tank       7.27T  5.10T  2.17T        -         -    41%    70%  1.00x    ONLINE  -"
+    echo "  raidz2-0 7.27T  5.00T  2.27T        -         -    42%  68.7%      -    ONLINE"
+    echo "    sda    1.82T      -      -        -         -      -      -      -    ONLINE"
+    echo "    sdb    1.82T      -      -        -         -      -      -      -    ONLINE" ;;
+esac
+exit 0
+STUB
+out="$(PATH="$S14" "$C" --stdout --no-filesizes </dev/null 2>/dev/null)"
+chk "--stdout: one zpool list -v" "1" "$(grep -cx 'zpool list -v' "$ZC14")"
+has "the raw lines are printed" "$out" "zpool list -v (raw):"
+has "and the class view is derived from the same output" "$out" "raidz2-0"
+B14="$ROOT/b14"; mkdir -p "$B14"; : >| "$ZC14"
+( cd "$B14" && PATH="$S14" "$C" --bundle --no-filesizes --out . </dev/null >/dev/null 2>&1 )
+chk "--bundle: still one zpool list -v" "1" "$(grep -cx 'zpool list -v' "$ZC14")"
+t14="$(ls "$B14"/*.tar.gz 2>/dev/null | head -1)"
+if [ -n "$t14" ]; then
+  f14="$(tar -xOzf "$t14" --wildcards '*/zfs/zpool-list-v.txt' 2>/dev/null)"
+  has "and zpool-list-v.txt holds the report's answer" "$f14" "  raidz2-0 7.27T"
+else bad "a bundle is written" "one .tar.gz" "none"; fi
+
+echo "== 15. 0.7.0: a feature check or unit journal cut by the run deadline says so =="
+# zpool iostat -r and journalctl never answer; systemctl says zfs-zed is loaded.
+S15="$ROOT/stub15"; stub_clone "$S" "$S15"
+stub_write "$S15/zpool" <<'STUB'
+#!/bin/sh
+case "$*" in
+  "list -H -o name") echo tank ;;
+  "iostat -r") exec sleep 600 ;;
+esac
+exit 0
+STUB
+stub_write "$S15/journalctl" <<'STUB'
+#!/bin/sh
+exec sleep 600
+STUB
+stub_write "$S15/systemctl" <<'STUB'
+#!/bin/sh
+case "$*" in
+  show*) for a in "$@"; do case "$a" in *.service|*.target)
+           printf 'Id=%s\n' "$a"; case "$a" in zfs-zed.service) echo LoadState=loaded ;; *) echo LoadState=not-found ;; esac; echo ;;
+         esac; done ;;
+esac
+exit 0
+STUB
+t0=$(date +%s)
+out="$(RUN_DEADLINE=6 CMD_TIMEOUT=30 PATH="$S15" "$C" --stdout --no-filesizes </dev/null 2>/dev/null)"
+t1=$(date +%s)
+has "the feature check cut by the deadline says so" "$out" "zpool iostat -r (request-size histogram): n/a (run deadline reached: 6s)"
+has "and so does the unit journal" "$out" "zfs-zed.service: n/a (run deadline reached: 6s)"
+hasnt "neither says 'timed out: 30s'" "$out" "(timed out: 30s)"
+[ $((t1 - t0)) -le 40 ] && ok "and the run ends ($((t1 - t0))s)" || bad "the run ends" "<= 40s" "$((t1 - t0))s"
+out="$(CMD_TIMEOUT=2 PATH="$S15" "$C" --stdout --no-filesizes </dev/null 2>/dev/null)"
+has "its own cap is still 'timed out'" "$out" "zpool iostat -r (request-size histogram): n/a (timed out: 2s)"
+has "for the journal too" "$out" "zfs-zed.service: n/a (timed out: 2s)"
+
 echo; echo "PASS=$PASS FAIL=$FAIL SKIP=$SKIP"
 [ "$FAIL" -eq 0 ]

@@ -44,6 +44,13 @@
 export LC_ALL=C
 
 # ---- collector metadata -----------------------------------------------------
+# 0.7.0  zpool list -v runs once: the raw probe's output feeds the derived
+#        views of sections C and H and the bundle's zpool-list-v.txt (it was
+#        run a second time, capped at 20s, for the views, and a third time
+#        for the bundle). Report unchanged when the call answers; the views
+#        now follow the probe's CMD_TIMEOUT cap, not a fixed 20s. The zpool
+#        feature checks (section A) and the zfs-unit journal (L) say "run
+#        deadline reached" when the deadline cut them, not "timed out".
 # 0.6.4  A zpool status -vt that succeeds with no output (no pool imported) is
 #        one "empty output" line again, not a fallback to -v and -t (0.6.3).
 # 0.6.3  Readability refactor; report unchanged.
@@ -52,7 +59,7 @@ export LC_ALL=C
 #        df -i of every WhaTap path is in the report and df-i.txt in the
 #        bundle, so the file count is there without a walk.
 COLLECTOR_NAME="whatap-collzfs"
-VERSION="0.6.4"
+VERSION="0.7.0"
 DOMAIN="collection-server"
 TARGET="collection-server-zfs/$(hostname 2>/dev/null || echo unknown)"   # refined after pool discovery
 
@@ -673,12 +680,17 @@ _skip_why() {
     esac
 }
 
+# PROBE_OUT / PROBE_RC: the last probe's stdout and exit status (127 when the
+# command was not run), so a caller that also parses the output asks once.
+PROBE_OUT=""; PROBE_RC=127
 probe() {
     local label="$1"; shift
+    PROBE_OUT=""; PROBE_RC=127
     [ -n "$(_cmd_kind "$1")" ] || { fact "$label: n/a (command not found: $1)"; return; }
     _hung "$1" && { fact "$label: n/a ($(_skip_why "$1"))"; return; }
     local out rc
     out="$(_bounded "$@" 2>"$_errfile")"; rc=$?
+    PROBE_OUT="$out"; PROBE_RC="$rc"
     if [ "$rc" -eq 124 ]; then
         if _past_deadline; then fact "$label: n/a (run deadline reached: ${RUN_DEADLINE}s)"
         else fact "$label: n/a (timed out: ${CMD_TIMEOUT}s)"; fi
@@ -690,6 +702,13 @@ probe() {
     fi
     [ -z "$out" ] && { fact "$label: n/a (empty output)"; return; }
     _emit_labeled "$label" "$out"
+}
+
+# _why_124 -> why a bounded call returned 124: the run deadline, or its own cap
+# (the same two wordings as probe)
+_why_124() {
+    if _past_deadline; then printf 'run deadline reached: %ss' "$RUN_DEADLINE"
+    else printf 'timed out: %ss' "$CMD_TIMEOUT"; fi
 }
 
 # probe_t SECS "label" CMD... -> probe capped at SECS (bash restores the
@@ -1061,8 +1080,9 @@ resolve_yardbase() {
 # Derived views (re-projections of command output — no interpretation added)
 # =============================================================================
 
-# `zpool list -v`, read once in section C for both views below (and H).
-ZLIST_V=""
+# `zpool list -v`, read once in section C (the raw probe) for both views
+# below, H and the bundle's zpool-list-v.txt. ZLIST_V_RC: its exit status.
+ZLIST_V=""; ZLIST_V_RC=""
 
 # Per-top-level-vdev usage grouped by allocation class, from `zpool list -v` on
 # stdin. The raw output is emitted next to this, so nothing is lost if a future
@@ -1356,7 +1376,7 @@ _rep_a() {
             run_bounded "$CMD_TIMEOUT" zpool ${_o%%|*} >/dev/null 2>&1; _rc=$?
             case "$_rc" in
                 0)   fact "zpool ${_o%%|*} (${_o#*|}): supported" ;;
-                124) fact "zpool ${_o%%|*} (${_o#*|}): n/a (timed out: ${CMD_TIMEOUT}s)" ;;
+                124) fact "zpool ${_o%%|*} (${_o#*|}): n/a ($(_why_124))" ;;
                 *)   fact "zpool ${_o%%|*} (${_o#*|}): not supported by this zpool (exit $_rc)" ;;
             esac
         done
@@ -1473,8 +1493,8 @@ _rep_b() {
 _rep_c() {
     section "C. Pool topology & allocation classes"
     probe "zpool list -v (raw)" zpool list -v
+    ZLIST_V="$PROBE_OUT"; ZLIST_V_RC="$PROBE_RC"
     subsection "per-top-level-vdev usage by allocation class (derived from zpool list -v)"
-    ZLIST_V="$(run_bounded 20 zpool list -v)"
     local cv; cv="$(printf '%s\n' "$ZLIST_V" | zpool_class_view)"
     if [ -n "$cv" ]; then printf '%s\n' "$cv" | while IFS= read -r _l; do blk "$_l"; done
     elif _hung zpool; then fact "n/a ($(_skip_why zpool))"
@@ -1794,7 +1814,7 @@ _rep_l() {
             unit_loaded "$u2.service" || continue
             local jo
             jo="$(_bounded journalctl -u "$u2.service" -p warning --since "${OPT_HOURS} hours ago" -n 30 --no-pager 2>/dev/null)"
-            if [ $? -eq 124 ]; then fact "$u2.service: n/a (timed out: ${CMD_TIMEOUT}s)"
+            if [ $? -eq 124 ]; then fact "$u2.service: n/a ($(_why_124))"
             elif [ -n "$jo" ]; then fact "$u2.service (last 30 at warning+):"; printf '%s\n' "$jo" | while IFS= read -r _l; do blk "$_l"; done
             else fact "$u2.service: no warning+ entry in the last ${OPT_HOURS}h"; fi
         done
@@ -2160,7 +2180,9 @@ zevents_split() {
 bundle_zfs() {
     local d="$1" p; mkdir -p "$d" 2>/dev/null
     if have zpool; then
-        run_bounded 30 zpool list -v          > "$d/zpool-list-v.txt"
+        # the report's own call, when it answered; asked again only when it did not
+        if [ "$ZLIST_V_RC" = 0 ] && [ -n "$ZLIST_V" ]; then printf '%s\n' "$ZLIST_V" > "$d/zpool-list-v.txt"
+        else run_bounded 30 zpool list -v     > "$d/zpool-list-v.txt"; fi
         run_bounded 30 zpool status -v        > "$d/zpool-status-v.txt"
         run_bounded 30 zpool status -t        > "$d/zpool-status-t.txt"
         run_bounded 60 zpool status -D        > "$d/zpool-status-D.txt"
