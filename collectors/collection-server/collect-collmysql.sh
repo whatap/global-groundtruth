@@ -25,6 +25,9 @@
 export LC_ALL=C
 
 # ---- collector metadata -----------------------------------------------------
+# 0.8.3  @@log_bin, @@log_bin_basename and @@datadir are asked for once (the
+#        value shown is the value used), and one ps serves both the login
+#        reason and section A. Report unchanged.
 # 0.8.2  Readability refactor; report unchanged.
 # 0.8.1  --connect-expired-password passes through. An empty line or end of
 #        input at the -p prompt says so instead of "none given", next to the
@@ -37,7 +40,7 @@ export LC_ALL=C
 #        SHOW BINARY LOGS, a failed or capped decode, a NULL log_bin_basename and
 #        no local mysqld without arguments are gaps with reasons. Needs bash.
 COLLECTOR_NAME="whatap-collmysql"
-VERSION="0.8.2"
+VERSION="0.8.3"
 DOMAIN="collection-server"
 TARGET="collection-server-mysql/$(hostname 2>/dev/null || echo unknown)"
 
@@ -844,11 +847,25 @@ mysql_vertical() {
     _bounded "$MYSQL_BIN" "${MYSQL_ARGV[@]}" -e "$1\G" 2>"$_errfile"
 }
 
-# sql "label" "SQL" -> rows as facts, or a classified reason
+# sql "label" "SQL" [VAR] -> rows as facts, or a classified reason. VAR, when
+# given, also receives what mysql_val would return for the same SQL (the last
+# field of the first row, empty without a login), so a value the report shows
+# and later uses is asked for once.
 sql() {
-    local label="$1" q="$2" out rc
-    if [ "$MYSQL_OK" != 1 ]; then fact "$label: n/a ($MYSQL_WHY)"; return; fi
+    local label="$1" q="$2" var="${3:-}" out rc _l
+    if [ "$MYSQL_OK" != 1 ]; then
+        [ -n "$var" ] && printf -v "$var" '%s' ""
+        fact "$label: n/a ($MYSQL_WHY)"; return
+    fi
     out="$(mysql_q "$q")"; rc=$?
+    if [ -n "$var" ]; then
+        # awk '{print $NF}' of the first line: a line with no field is kept whole
+        _l="${out%%$'\n'*}"
+        # shellcheck disable=SC2086
+        set -f; set -- $_l; set +f
+        [ "$#" -gt 0 ] && eval "_l=\${$#}"
+        printf -v "$var" '%s' "$_l"
+    fi
     [ "$rc" -eq 124 ] && { fact "$label: n/a (timed out: ${CMD_TIMEOUT}s)"; return; }
     [ "$rc" -ne 0 ] && { fact "$label: n/a ($(_classify_err))"; return; }
     [ -z "$out" ] && { fact "$label: none"; return; }
@@ -923,10 +940,15 @@ run_report() {
     elif [ -n "$_PW_WHY" ]; then fact "password: n/a ($_PW_WHY)"
     else fact "password: none given to this collector"; fi
     fact "mysql connection: $MYSQL_WHY"
+    # One process list answers both whether a mysqld runs here (the login
+    # reason below) and section A's process line. Not pgrep -f: it would match
+    # this run's timeout wrapper.
+    _PS_OUT=""; _PS_RC=127
+    if have ps; then _PS_OUT="$(_bounded ps -eo pid,user,args 2>/dev/null)"; _PS_RC=$?; fi
     if [ "$MYSQL_OK" = 1 ]; then got login
     elif [ -z "$MYSQL_BIN" ]; then missed login "command not found: mysql or mariadb client"
     elif [ -z "$MYSQL_ARGS" ] && [ -z "$DEFAULTS_FILE$EXTRA_FILE" ] && [ -z "$_PW_WHY" ] \
-         && ! (_bounded ps -eo args 2>/dev/null | grep -qE "[m]ysqld|[m]ariadbd"); then
+         && ! printf '%s\n' "$_PS_OUT" | grep -qE '^ *[0-9]+ +[^ ]+ .*(mysqld|mariadbd)'; then
         # The backend's MySQL is often on another host. No local server and no
         # connection arguments is therefore a run that asked nowhere, not an
         # answer: --mysql-args would obtain it.
@@ -953,12 +975,19 @@ run_report() {
     sql "read_only"      "SELECT @@read_only"
     sql "super_read_only" "SELECT @@super_read_only"
     sql "port / socket"  "SELECT @@port, @@socket"
-    sql "datadir"        "SELECT @@datadir"
-    # Not pgrep -f: it would match this run's timeout wrapper. A missing ps is
-    # an error, not "empty output"; no match is empty output.
-    probe "local mysqld process" sh -c \
-        "command -v ps >/dev/null || { echo 'command not found: ps' >&2; exit 3; }; \
-         ps -eo pid,user,args 2>/dev/null | grep -E '[m]ysqld|[m]ariadbd' | grep -v timeout; true"
+    sql "datadir"        "SELECT @@datadir" DATADIR
+    # From the process list taken for the login reason. A missing ps is an
+    # error, not "empty output"; no match is empty output.
+    if [ "$_PS_RC" = 127 ] && ! have ps; then
+        fact "local mysqld process: n/a (error: command not found: ps)"
+    elif [ "$_PS_RC" = 124 ]; then
+        if _past_deadline; then fact "local mysqld process: n/a (run deadline reached: ${RUN_DEADLINE}s)"
+        else fact "local mysqld process: n/a (timed out: ${CMD_TIMEOUT}s)"; fi
+    else
+        _l="$(printf '%s\n' "$_PS_OUT" | grep -E '[m]ysqld|[m]ariadbd' | grep -v timeout)"
+        if [ -n "$_l" ]; then _emit_labeled "local mysqld process" "$_l"
+        else fact "local mysqld process: n/a (empty output)"; fi
+    fi
     probe "listening sockets" sh -c \
         "command -v ss >/dev/null || command -v netstat >/dev/null || { echo 'command not found: ss, netstat' >&2; exit 3; }; \
          { ss -lntp 2>/dev/null || netstat -lntp 2>/dev/null; } | grep -E ':3306|:33060'; true"
@@ -986,8 +1015,8 @@ run_report() {
     sql  "semi-sync"           "SHOW STATUS LIKE 'Rpl_semi_sync%_status'"
 
     section "C. Binary log inventory and retention"
-    sql "log_bin"                     "SELECT @@log_bin"
-    sql "log_bin_basename"            "SELECT @@log_bin_basename"
+    sql "log_bin"                     "SELECT @@log_bin" LOG_BIN
+    sql "log_bin_basename"            "SELECT @@log_bin_basename" BINLOG_BASE
     sql "log_bin_index"               "SELECT @@log_bin_index"
     sql "max_binlog_size"             "SELECT @@max_binlog_size"
     sql "binlog_expire_logs_seconds"  "SHOW VARIABLES LIKE 'binlog_expire_logs_seconds'"
@@ -1025,8 +1054,6 @@ run_report() {
     # Growth comes from file mtimes (no second sample). A NULL or bare-name
     # log_bin_basename leaves no directory, not dirname's ".".
     BINLOG_DIR=""
-    LOG_BIN="$(mysql_val "SELECT @@log_bin" 2>/dev/null)"
-    BINLOG_BASE="$(mysql_val "SELECT @@log_bin_basename" 2>/dev/null)"
     case "$BINLOG_BASE" in
         /*) BINLOG_DIR="$(dirname "$BINLOG_BASE" 2>/dev/null)" ;;
     esac
@@ -1046,7 +1073,6 @@ run_report() {
     section "D. Storage and I/O"
     probe "df -hT" df -hT
     probe "mount points" sh -c "findmnt -o TARGET,SOURCE,FSTYPE,OPTIONS 2>/dev/null || mount"
-    DATADIR="$(mysql_val "SELECT @@datadir" 2>/dev/null)"
     if [ -n "$DATADIR" ] && [ -d "$DATADIR" ]; then
         fact "datadir: $DATADIR"
         probe "datadir filesystem" sh -c 'df -hT "$1" 2>/dev/null | tail -n +2' sh "$DATADIR"
