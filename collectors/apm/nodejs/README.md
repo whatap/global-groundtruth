@@ -53,7 +53,9 @@ docker exec -i <container> sh -s -- --stdout --quiet \
 ```
 
 Paste or attach the entire output. No arguments prints usage; nothing runs by
-accident. Progress is narrated on stderr (`--quiet` silences it).
+accident. Progress is narrated on stderr (`--quiet` silences it). `--out DIR`
+writes the `--file` report into DIR (created when missing; an unwritable one
+ends the run before anything is collected).
 
 Container notes:
 

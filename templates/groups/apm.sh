@@ -21,16 +21,22 @@
 # What the blocks rely on the members to define (before any call, at run time):
 #   from the skeleton blocks: fact, _tmp, _bounded, _cmd_kind, _past_deadline,
 #     _nl, CMD_TIMEOUT, RUN_DEADLINE
-#   probe helpers:   _errfile (set by the member's _init_probe)
-#   path helpers:    D_HOMES, D_UNREAD (the discovery records)
-#   environ readers: D_UNREAD, and the _ev_<NAME> variables it sets
-#   numbers:         _pl, _plab, _pbad (the caller's port accumulators)
+#   probe helpers:    _errfile (set by the member's _init_probe)
+#   path helpers:     D_HOMES, D_UNREAD (the discovery records)
+#   environ readers:  D_UNREAD, and the _ev_<NAME> variables it sets
+#   numbers:          _pl, _plab, _pbad (the caller's port accumulators)
+#   output directory: OPT_OUT, OPT_STDOUT (the CLI harness), warn, _bounded
 # Shell: bash 3.2+ and POSIX sh/dash (no [[, arrays, ${v//}, process
 # substitution).
 # -----------------------------------------------------------------------------
 
 # ---- apm: probe helpers — DO NOT EDIT ---------------------------------------
 # members: apmjava apmnodejs apmphp apmpython
+# _classify_err -> the reason a probe failed, from _errfile. An unknown error is
+# its first line; a line over 100 bytes keeps both ends, the first 45 and the
+# last 52 bytes: the kind of error is at the start ("PHP Fatal error: ...",
+# "Error: Cannot find module"), and after a long path the message is at the
+# end ("<long path>: No module named pip").
 _classify_err() {
     local txt=""
     [ -f "$_errfile" ] && txt="$(cat "$_errfile" 2>/dev/null)"
@@ -38,7 +44,7 @@ _classify_err() {
         *[Pp]"ermission denied"*|*"peration not permitted"*) echo "permission denied"; return ;;
         *"o such file"*|*"annot access"*|*"oes not exist"*)   echo "path not found";    return ;;
     esac
-    if [ -n "$txt" ]; then printf 'error: %s' "$(printf '%s' "$txt" | head -n1 | cut -c1-100)"
+    if [ -n "$txt" ]; then printf 'error: %s' "$(printf '%s\n' "$txt" | awk 'NR == 1 { if (length($0) > 100) $0 = substr($0, 1, 45) "..." substr($0, length($0) - 51); print; exit }')"
     else echo "nonzero exit"; fi
 }
 
@@ -327,3 +333,26 @@ _ports_add() {
 # _uniq_ports PORT... -> the distinct ports, space-joined (validated numbers only)
 _uniq_ports() { [ "$#" -gt 0 ] || return 0; printf '%s\n' "$@" | sort -un | tr '\n' ' ' | sed 's/ $//'; }
 # ---- end apm: numbers
+
+# ---- apm: output directory — DO NOT EDIT ------------------------------------
+# members: apmjava apmnodejs apmphp apmpython
+# _out_check -> for --file, makes sure the --out directory (OPT_OUT, default:
+# the working directory) exists and this uid can write into it, before anything
+# is collected: an unwritable directory fails at once, not after a full run.
+# With --stdout the report goes to stdout, and an --out given is named as not
+# used. Fails (the reason on the operator stream) when the report cannot be
+# written; the message is the one collserver gives.
+_out_check() {
+    local d="${OPT_OUT:-.}"
+    if [ "$OPT_STDOUT" = 1 ]; then
+        [ -n "$OPT_OUT" ] && warn "--out $OPT_OUT is not used: the report goes to stdout (--out is for --file)"
+        return 0
+    fi
+    [ -d "$d" ] || _bounded mkdir -p -- "$d" 2>/dev/null
+    if [ ! -d "$d" ] || [ ! -w "$d" ] || [ ! -x "$d" ]; then
+        warn "the report was not written: output directory $d is not writable by uid $(id -u 2>/dev/null || echo '?')"
+        return 1
+    fi
+    return 0
+}
+# ---- end apm: output directory

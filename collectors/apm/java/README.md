@@ -106,8 +106,11 @@ compiled for a class-file version above the target's — `WeaveMain` logs
 `weaving-class-ver(N) is higher then target-class-ver(M)` and the module does
 not apply. A jar file name does not carry any of that.
 
-`--library PATTERN` produces those inputs for the named library — repeatable,
-`--library-all` for every enumerated jar (cap 40):
+`--library PATTERN` produces those inputs for the named library — repeatable;
+PATTERN is a literal, case-insensitive substring of the jar's path (no
+wildcards: a `*` inside a pattern is that character),
+`--library '*'` for every enumerated jar (cap 40; `--library-all`, its name
+before 0.13.0, is refused with exit 2 naming it):
 
 | input the module author needs | how the pack supplies it |
 |---|---|
@@ -150,8 +153,8 @@ parts of this collector carry the answer:
 | which classes are the application's own, as opposed to its libraries | `--appclasses` | N: every class under `WEB-INF/classes`, `BOOT-INF/classes` and directory classpath entries, as a package histogram, a name-pattern index, and the class list |
 | which of them actually run when a request is served | `--threads=N` | L: N thread dumps **plus a frame-frequency count over them**, split into JDK frames, WhaTap frames, and everything else, so the application frames that recur in every dump are on one screen |
 | the same, from a dump the field already holds (WhaTap console thread dump, a jstack file, `kill -3` output) | `--dump-file PATH` | L: the file enters the same frame count and the thread-level counts (states, name shapes, dotted class-like names inside thread names, other APM agents' frames and threads) without pausing any JVM. With `--appclasses`, section N adds the join: which classes of the index appear as frames in the counted dumps, **0 stated as 0** when the dump was taken while no application code was on any stack |
-| which of the indexed classes implement or call a given type (the Interfaces column of the console, from the artifact) | `--class-refs FQCN` | N: a byte scan of the same class files for the type in internal form. A class file carries every type it implements, extends, calls or references as a constant-pool entry, so the list is "names it", not "implements it" |
-| what the exact signature of the chosen method is | `--class FQCN` | M: `javap -p -s`, whose `descriptor:` line is the string `hook_service_patterns` needs to separate overloads |
+| which of the indexed classes implement or call a given type (the Interfaces column of the console, from the artifact) | `--class-refs FQCN` (turns `--appclasses` on) | N: a byte scan of the same class files for the type in internal form. A class file carries every type it implements, extends, calls or references as a constant-pool entry, so the list is "names it", not "implements it" |
+| what the exact signature of the chosen method is | `--class FQCN` (with `--library`) | M: `javap -p -s`, whose `descriptor:` line is the string `hook_service_patterns` needs to separate overloads |
 
 The name-pattern index in section N matches a fixed list of name fragments
 (`Controller`, `Action`, `Servlet`, `Service`, `Facade`, `Job`, ...). The list
@@ -185,7 +188,14 @@ docker exec -i <container> sh -s -- --stdout --quiet \
 ```
 
 Paste or attach the entire output. No arguments prints usage; nothing runs by
-accident. Progress is narrated on stderr (`--quiet` silences it).
+accident. Progress is narrated on stderr (`--quiet` silences it). `--out DIR`
+writes the `--file` report into DIR (created when missing; an unwritable one
+ends the run before anything is collected).
+
+`--class` reads member signatures from the jars `--library` details, so
+`--class` without `--library` is named on stderr as not used. `--class-refs`
+searches the class roots the `--appclasses` index reads and turns it on; the
+environment section says `--appclasses=1 (turned on by --class-refs)`.
 
 When the agent developer needs the detail of a specific library (a new weaving
 module, an unexplained version) or of a specific class (a non-servlet entry
@@ -193,7 +203,7 @@ point), the same script answers it in one more run:
 
 ```sh
 ./collect-apmjava.sh --file --library acme-gateway --class com.acme.gateway.MessageDispatcher
-./collect-apmjava.sh --file --library-all          # when the library is not yet known
+./collect-apmjava.sh --file --library '*'          # when the library is not yet known
 ./collect-apmjava.sh --file --threads              # thread dump: which method the entry really is
 ```
 
@@ -226,7 +236,7 @@ Container notes:
 | 11 | J. Network endpoints | the `whatap.server.host`/`port` values reaching each JVM through `-D`, env or its config file (source named); the TCP sessions owned by the JVM processes (matched on the pid `ss -p` / `netstat -p` prints; as non-root these name the owner only of this uid's sockets, so another user's JVM is reported as `owner not visible to uid N` rather than as having no session); the TCP sessions to the configured server port(s) and to 6600 (the assumed default, which other WhaTap agents on the host use too) from any owner, where the process column is empty for a socket whose owner the uid cannot see; DNS resolvers, proxy variables |
 | 12 | K. Kubernetes / operator injection context | `/whatap-agent` listing, `WHATAP_JAVA_AGENT_PATH`, `JAVA_TOOL_OPTIONS`, `POD_NAME`/`NODE_NAME`/`NODE_IP`/`OKIND`/`WHATAP_MICRO_ENABLED`, k8s markers |
 | 13 | L. Tier 2 artifacts (opt-in) | `--threads[=N]`: N `jstack -l` dumps per attached JVM (cap 3 JVMs, 5000 lines per dump), falling back to `jcmd Thread.print -l` and then to SIGQUIT (whose output goes to the fd 1 target shown in section D), **followed by a frame-frequency count over the dumps just taken** — every `at <class>.<method>` line, counted and sorted, in three buckets defined by the package prefixes printed with them (JDK/vendor, `whatap.`, everything else). `--dump-file PATH` (repeatable) adds a dump taken elsewhere to the same counts without contacting any JVM. After the frame buckets: thread header count, thread states counted, thread name shapes (digit runs collapsed), dotted class-like names carried inside thread names with their package roots, and the frames and thread names of other APM agents on the same JVM against a fixed prefix list printed verbatim. `--jcmd`: `VM.command_line`, `VM.system_properties`, `VM.flags`, `VM.version` — for every WhaTap-attached JVM **and** every JVM whose options are absent from `/proc` (cap 3), since for the latter this is the only verbatim record of what it runs. When none of the flags is given the section states that no attach, signal or pause was applied |
-| 14 | M. Library detail pack (opt-in) | `--library PAT` / `--library-all`: for every enumerated jar that matches, a byte-identical copy being named rather than detailed twice (several deployment units of one application carry the same jar, and detailing each copy spends the 40-jar cap on identical content), and the package histogram left out for a jar whose class names section N already prints — Maven coordinates from `META-INF/maven/*/pom.properties`, manifest version attributes, **class-file major version** (the number a weaving module has to be compiled against), package map (shading shows here), class count, multi-release/module/service entries; `--class FQCN` adds `javap -p -s` member signatures, JVM descriptor included. Libraries packed inside an executable jar are extracted (bounded at 80 MB) and reported with an `origin:` entry line instead of a path; `--class` also resolves application classes out of `BOOT-INF/classes` |
+| 14 | M. Library detail pack (opt-in) | `--library PAT` / `--library '*'`: for every enumerated jar that matches, a byte-identical copy being named rather than detailed twice (several deployment units of one application carry the same jar, and detailing each copy spends the 40-jar cap on identical content), and the package histogram left out for a jar whose class names section N already prints — Maven coordinates from `META-INF/maven/*/pom.properties`, manifest version attributes, **class-file major version** (the number a weaving module has to be compiled against), package map (shading shows here), class count, multi-release/module/service entries; `--class FQCN` adds `javap -p -s` member signatures, JVM descriptor included. Libraries packed inside an executable jar are extracted (bounded at 80 MB) and reported with an `origin:` entry line instead of a path; `--class` also resolves application classes out of `BOOT-INF/classes` |
 | 15 | N. Application class index (opt-in) | `--appclasses`: the classes the application itself ships, from every class root section F enumerated — directory classpath entries (a relative one resolved through the JVM's own working directory), the JVM's working directory itself when it carries `BOOT-INF/classes`, `WEB-INF/classes`, `classes` or a top-level class file, every configured Tomcat `appBase` and `docBase` rather than `<instance>/webapps` alone, a Jetty base's `webapps`, `WEB-INF/classes` of deployment units, `WEB-INF/classes` directories found under `jeus.home`/`domain.home`/`com.sun.aas.instanceRoot` (GlassFish, Payara) (depth 10; the WebLogic staging area depth 7; each search stops descending at every `WEB-INF`, visits at most 20000 directories and runs under the per-command cap, and the report states those bounds and marks the result partial when one was hit; first 12), a WebLogic domain located from `-Dweblogic.Name` plus the process working directory or its `DOMAIN_HOME` (the stock start scripts set no `domain.home`): `servers/<name>/tmp/_WL_user/**/WEB-INF/classes` and the `<source-path>` entries of `config/config.xml`, and `WEB-INF/classes`/`BOOT-INF/classes` read in place inside a war/ear/executable jar (cap 12 roots, 20000 class files per root). A `BOOT-INF/classes` or `WEB-INF/classes` segment at the head of a path inside a root is a layout artifact and is not printed as part of the class name. Reported as a class count, a package histogram, a name-pattern index over a fixed pattern list printed with it, a count of the classes matching none of those patterns, and the class list (first 2000). A class root that yields no class file also reports the jar count of its sibling `lib` directory, because a deployment unit can ship the application's own code as jars rather than as class files (name those jars with `--library` to get their class lists from section M). Then the join with section L: the frames of every counted dump whose class is in this index, with a stated 0 when there is none. Libraries are section F; this section is the application's own code |
 
 ## Collection status
@@ -299,7 +309,7 @@ host, 0.12.0 took 4–7s at about 720 on the same host. `-version` is executed
 only against discovered binaries named `java`, never against a running
 process.
 
-The library detail pack (`--library` / `--library-all` / `--class`) is off by
+The library detail pack (`--library` / `--class`) is off by
 default because it is targeted, not because it is risky: it reads jar central
 directories and single entries, extracts a packed library to a file under the
 run's private directory only when one is requested, and never touches the

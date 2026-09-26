@@ -44,6 +44,17 @@ A **per-language script** run **in-host or in-container** next to the target
 process — one command, paste the output (CONTRACT rule 3). In containers, it is
 run via `kubectl exec` / `docker exec` into the app container.
 
+## Options the Linux collectors share
+
+All four shell collectors (java, python, nodejs, php) take `--file`,
+`--stdout`, `--quiet`, `--help` and `--out DIR` (the directory of the
+`--file` report, default `.`; created when missing, and an unwritable one
+ends the run with `the report was not written: output directory DIR is not
+writable by uid N` before anything is collected, as collserver does).
+The `--out` check is the group block `apm: output directory`
+([templates/groups/apm.sh](../../templates/groups/apm.sh)). An option that
+takes a value and is given none ends the run with exit 2.
+
 ## Behaviour the Linux python / nodejs / php collectors share
 
 Same situation, same outcome and the same words in all three:

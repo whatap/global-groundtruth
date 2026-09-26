@@ -29,8 +29,11 @@ docker exec -i <container> sh -s -- --stdout --quiet \
 
 Paste or attach the entire output. No arguments prints usage; nothing runs by
 accident. Progress is narrated on stderr (`--quiet` silences it).
-`--pip` also runs `python -m pip list` in each detailed interpreter (one
-more start each); the default library inventory needs no pip.
+`--out DIR` writes the `--file` report into DIR (created when missing; an
+unwritable one ends the run before anything is collected). Every run also
+runs `python -m pip list` in each detailed interpreter (one more start each);
+`--pip`, the opt-in of 0.9.x, is refused with exit 2. `APM_INTERP_CAP=<n>`
+raises the interpreter detail cap (8).
 
 Container notes (all verified against real images):
 
@@ -54,7 +57,7 @@ Container notes (all verified against real images):
 | --- | --- | --- |
 | 1 | Collection environment | which tools were available to this collection |
 | 2 | Host / platform | OS, arch (amd64/arm64), container markers, cgroup CPU/memory limits (container-vs-host metric questions) |
-| 3 | Python runtimes and whatap-python package | every interpreter (those of whatap-marked processes first, so the detail cap of 8 does not fill with unrelated ones) (multiple versions and **virtualenvs are kept distinct** — identity is the invocation path, not the resolved binary), whatap-python version/location per interpreter, the `whatap_python-*` metadata dirs next to the package (`.dist-info` = wheel install, `.egg-info`/`.egg` = setup.py-era install), `sys.prefix` / `base_prefix` (they differ inside a virtualenv), setuptools / `pkg_resources` import facts (Python 3.12 install issues), bundled Go module binaries per arch, `bootstrap/sitecustomize.py`, console scripts on PATH, **application library inventory** — the `.dist-info`/`.egg-info`/`.egg`/`.egg-link` names in every `sys.path` directory of each interpreter (see "Library inventory" below; `pip list` only with `--pip`), plus a no-exec fallback (the same names next to each whatap package dir seen in process environ), plus the **instrumentation surface of the installed agent** (`trace/mod` tree, grouped: application/database/httpc/amqp/...) which differs across agent versions |
+| 3 | Python runtimes and whatap-python package | every interpreter (those of whatap-marked processes first, so the detail cap of 8 does not fill with unrelated ones) (multiple versions and **virtualenvs are kept distinct** — identity is the invocation path, not the resolved binary), whatap-python version/location per interpreter, the `whatap_python-*` metadata dirs next to the package (`.dist-info` = wheel install, `.egg-info`/`.egg` = setup.py-era install), `sys.prefix` / `base_prefix` (they differ inside a virtualenv), setuptools / `pkg_resources` import facts (Python 3.12 install issues), bundled Go module binaries per arch, `bootstrap/sitecustomize.py`, console scripts on PATH, **application library inventory** — the `.dist-info`/`.egg-info`/`.egg`/`.egg-link` names in every `sys.path` directory of each interpreter (see "Library inventory" below; then `pip list` per interpreter), plus a no-exec fallback (the same names next to each whatap package dir seen in process environ), plus the **instrumentation surface of the installed agent** (`trace/mod` tree, grouped: application/database/httpc/amqp/...) which differs across agent versions |
 | 4 | Runtime processes | Go common module (`whatap_python`) processes with cwd/env; python app processes (matched by comm, argv0 or `/proc/<pid>/exe`, see below; whatap-marked ones first) with argv0, `PYTHONPATH contains whatap/bootstrap`, `VIRTUAL_ENV`, `WHATAP_*`, `OTEL_*` (co-instrumentation); **libraries the process actually loaded** — C-extension packages and the real `site-packages` path from `/proc/<pid>/maps` (pure-Python imports do not appear there) |
 | 5 | Agent homes and configuration | every `WHATAP_HOME` candidate (env, port registry `/tmp/whatap-python.lock`, process cwd/environ, `/whatap-agent`), and per home: `whatap.conf` / `container.conf` verbatim, `whatap_python` symlink resolution, pid-file liveness, `security.conf` / `paramkey.txt` presence and size, `logs/` inventory, `run/`, LLM module dir. A home that cannot be read says `path not found` or `permission denied` |
 | 6 | Network endpoints and port registry | UDP sockets on 66xx plus the `net_udp_port` of the readable `whatap.conf` files and the port registry, TCP sessions on 6600 plus the `whatap.server.port` named there (each port labelled by its source), plus every socket of a whatap-named process; port registry contents |
@@ -80,7 +83,8 @@ the combined script at all, every snippet is run on its own; when the cap
 stops it before any snippet started, every snippet says `timed out`, as each
 `python -c` would have. The marker lines that separate the snippets are random
 per run and read in order, so output that imitates one stays output. `pip list`
-(`--pip` only) stays a call of its own.
+stays a call of its own, and is not started in an interpreter whose lookups
+did not answer within the cap.
 
 ## Library inventory
 
@@ -92,7 +96,7 @@ are the entries `pip list` reads, so the names and versions agree; on the
 validation host (Ubuntu 24.04 `/usr/bin/python3`, 2026-09-26) both gave the
 same 66 name/version pairs, and the directory listing also showed a
 version-less duplicate `cryptography.egg-info` from the distribution package.
-What `pip list` adds (`--pip`):
+What `pip list` adds (it runs in every run since 0.10.0):
 
 - the version of an `.egg-info` entry whose name carries none (read from its
   `PKG-INFO`), and names normalised from the metadata instead of the
@@ -107,8 +111,10 @@ through `easy-install.pth`) is listed with its `<name>.egg-info`. A PEP 660
 editable install has an ordinary `.dist-info`. The empty `sys.path` entry
 (the collector's working directory) is not listed.
 
-`--pip` declares the goal `pip`: an interpreter whose `pip list` gave no
-list (no pip module, an error, a timeout) makes it `missed`.
+`pip list` declares no goal: the directory listing above already gives the
+inventory, so an interpreter whose `pip list` gave no list (no pip module, an
+error, a timeout) is a fact line with its reason, and the run stays COMPLETE
+on that account. (0.9.x declared the goal `pip` when `--pip` was given.)
 
 ## How python processes are found
 
@@ -159,8 +165,8 @@ can arrive from:
 - Command lines of python, `whatap_python` and odoo processes and of pid 1
   (first 300 characters): an argument such as `--db_password=...` appears as
   given.
-- The installed-distribution names (package names and versions), and with
-  `--pip` the `pip list` output.
+- The installed-distribution names (package names and versions), and the
+  `pip list` output.
 - `odoo.conf`, verbatim, **except** the `db_password` and `admin_passwd` lines,
   which are not collected (the report states how many were left out); the tail
   of the odoo `logfile`.
@@ -180,7 +186,9 @@ Tier 0 only: read-only, bounded reads (`tail -n`, line-capped dumps, capped
 process/interpreter detail), every external command capped at 15 s and the
 whole run at `RUN_DEADLINE` (300 s). Each detailed interpreter (cap 8) is
 started once for all twelve lookups (a lookup cut off by a hang is re-run on
-its own, see above), and once more for `-m pip list` with `--pip`. The kernel
+its own, see above), and once more for `-m pip list` (on the validation host, 8 detailed
+interpreters, 2026-09-26: a default run took 5.1–5.4 s with 0.9.1 and
+6.7–7.1 s with 0.10.0, the same as 0.9.1 with `--pip`, 6.9–7.3 s). The kernel
 and machine come from one `uname -srm`. No `--bundle` tier yet;
 copy the bundle plumbing from `collect-collserver.sh` if the domain team
 needs raw log artifacts.

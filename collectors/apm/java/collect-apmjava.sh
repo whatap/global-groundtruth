@@ -75,7 +75,21 @@ export LC_ALL=C
 COLLECTOR_NAME="whatap-apmjava"
 # 0.12.6  Shared helpers moved into the apm group block; report unchanged.
 #         The apm: blocks are copies of templates/groups/apm.sh.
-VERSION="0.12.6"
+# 0.13.0  Fewer options (user decision, 2026-09-26): --library '*' details
+#         every enumerated jar (cap 40) and --library-all is refused with exit
+#         2 naming it. --class-refs turns on --appclasses (it searches the class
+#         roots that index reads; alone it did nothing), and [1] says so.
+#         --class without --library is named on the operator stream, not
+#         silently ignored. Report: [1] loses the field --library-all=N
+#         ("library detail flags: --library=<patterns, * for all>
+#         --class=..."), and M says "not requested (--library absent)" and
+#         "patterns requested: * (every enumerated jar)". --out DIR puts the
+#         --file report in DIR. An option missing its value (last, empty after
+#         =, or followed by another option) ends the run with exit 2 under
+#         every shell; --threads=N takes a whole number 1..999999 only.
+#         --library patterns are matched with globbing off. A
+#         probe error line over 100 bytes keeps its start and its end.
+VERSION="0.13.0"
 DOMAIN="apm"
 TARGET="host/$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || echo unknown)"
 
@@ -83,12 +97,14 @@ TARGET="host/$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null
 OPT_FILE=0        # write the report to a .txt file
 OPT_STDOUT=0      # print the report to stdout
 OPT_QUIET=0       # suppress progress narration on stderr
+OPT_OUT=""        # --out DIR: directory of the --file report (empty = .)
 OPT_THREADS=0     # Tier 2: thread dumps of the target JVMs (0 = off)
 OPT_JCMD=0        # Tier 2: jcmd VM.command_line / VM.system_properties / VM.flags
 OPT_LIBS=""       # --library PATTERN (repeatable): library detail pack
-OPT_LIBALL=0      # --library-all: detail every enumerated jar (capped)
+OPT_LIBALL=0      # --library '*': detail every enumerated jar (capped)
 OPT_CLASSES=""    # --class FQCN (repeatable): member signatures via javap
 OPT_APPCLASSES=0  # --appclasses: application class index (section N)
+OPT_APPIMPLIED=0  # 1 when --class-refs turned --appclasses on
 OPT_DUMPS=""      # --dump-file: thread dump files taken elsewhere (section L)
 OPT_REFS=""       # --class-refs: types to look for in the class constant pools
 
@@ -106,18 +122,20 @@ explicit action flag so nothing starts by accident.
   $(basename "$0") --file      write the facts report -> ./$COLLECTOR_NAME-<host>-<UTC>.txt
   $(basename "$0") --stdout    print the facts report to stdout
   $(basename "$0") --quiet ..  silence progress on stderr (add to --file / --stdout)
+  $(basename "$0") --out DIR   output directory for --file (default: .)
 
 Library detail pack (off by default; read-only, no contact with the JVM) —
 for the case where a new weaving module has to be written for a library:
   --library PAT  detail every enumerated jar whose name or path contains PAT
-                 (case-insensitive, repeatable): Maven coordinates, manifest
+                 (a literal, case-insensitive substring, no wildcards;
+                 repeatable): Maven coordinates, manifest
                  versions, class-file version, package map. With --appclasses
                  the classes of those jars also enter the section N index, for
-                 an application that ships its own code as jars
-  --library-all  detail every enumerated jar (cap 40)
-  --class FQCN   member signatures of that class via javap -p -s (the JVM
-                 descriptor of every member included), from each detailed jar
-                 that contains it (repeatable)
+                 an application that ships its own code as jars.
+                 --library '*' (a '*' alone) details every enumerated jar (cap 40)
+  --class FQCN   with --library: member signatures of that class via javap
+                 -p -s (the JVM descriptor of every member included), from
+                 each detailed jar that contains it (repeatable)
 
 Application class index (off by default; read-only, no contact with the JVM) —
 for the case where the transaction entry point of an application no weaving
@@ -128,7 +146,7 @@ module covers has to be located without access to the customer's source:
                  webapp directories each server product configures: package
                  histogram, a name-pattern index, and the class list
 
-  --class-refs T  with --appclasses: list the indexed classes whose bytecode
+  --class-refs T  turns on --appclasses: list the indexed classes whose bytecode
                  names type T (e.g. org.quartz.Job, javax.servlet.Filter;
                  repeatable). The constant pool carries the type whether the
                  class implements, extends, calls or merely references it, so
@@ -152,32 +170,59 @@ Tier 2 (off by default; each announces its impact on stderr before running):
 EOF
 }
 
+# _optval OPTION VALUE [ARGC] -> exit 2 when OPTION, which takes a value, has
+# none: VALUE is empty (`--out=`, or OPTION last, ARGC < 2: a `shift` past the
+# end stops dash with its own message) or starts with `-` (`--out --stdout`
+# would otherwise take the next option as the value)
+_optval() {
+    case "${3:-2}:$2" in
+        [01]:*|*:|*:-*) printf 'missing value for %s\n' "$1" >&2; usage >&2; exit 2 ;;
+    esac
+}
+
+# _optnum OPTION VALUE -> exit 2 unless VALUE is a whole number 1..999999
+# without a leading zero (the range the environment caps take)
+_optnum() {
+    case "$2" in
+        ''|*[!0-9]*|0*) ;;
+        *) [ "${#2}" -le 6 ] && return 0 ;;
+    esac
+    printf 'invalid value for %s: "%s" (a whole number 1..999999)\n' "$1" "$2" >&2; exit 2
+}
+
+# _addlib PAT -> one --library pattern; '*' is every enumerated jar
+_addlib() { if [ "$1" = '*' ]; then OPT_LIBALL=1; else OPT_LIBS="$OPT_LIBS $1"; fi; }
+
 ARGC=$#
 while [ $# -gt 0 ]; do
     case "$1" in
         --file)      OPT_FILE=1 ;;
         --stdout)    OPT_STDOUT=1 ;;
         --quiet)     OPT_QUIET=1 ;;
+        --out)       _optval "$1" "${2-}" $#; OPT_OUT="$2"; shift ;;
+        --out=*)     _optval --out "${1#*=}"; OPT_OUT="${1#*=}" ;;
         --threads)   OPT_THREADS=1 ;;
-        --threads=*) OPT_THREADS="${1#*=}" ;;
+        --threads=*) _optnum --threads "${1#*=}"; OPT_THREADS="${1#*=}" ;;
         --jcmd)      OPT_JCMD=1 ;;
-        --library)      shift; OPT_LIBS="$OPT_LIBS $1" ;;
-        --library=*)    OPT_LIBS="$OPT_LIBS ${1#*=}" ;;
-        --library-all)  OPT_LIBALL=1 ;;
-        --class)        shift; OPT_CLASSES="$OPT_CLASSES $1" ;;
-        --class=*)      OPT_CLASSES="$OPT_CLASSES ${1#*=}" ;;
+        --library)      _optval "$1" "${2-}" $#; shift; _addlib "$1" ;;
+        --library=*)    _optval --library "${1#*=}"; _addlib "${1#*=}" ;;
+        --library-all)  printf "%s\n" "--library-all is no longer an option: use --library '*' (every enumerated jar, cap 40)" >&2; exit 2 ;;
+        --class)        _optval "$1" "${2-}" $#; shift; OPT_CLASSES="$OPT_CLASSES $1" ;;
+        --class=*)      _optval --class "${1#*=}"; OPT_CLASSES="$OPT_CLASSES ${1#*=}" ;;
         --appclasses)   OPT_APPCLASSES=1 ;;
-        --class-refs)   shift; OPT_REFS="$OPT_REFS $1" ;;
-        --class-refs=*) OPT_REFS="$OPT_REFS ${1#*=}" ;;
-        --dump-file)    shift; OPT_DUMPS="$OPT_DUMPS
+        --class-refs)   _optval "$1" "${2-}" $#; shift; OPT_REFS="$OPT_REFS $1" ;;
+        --class-refs=*) _optval --class-refs "${1#*=}"; OPT_REFS="$OPT_REFS ${1#*=}" ;;
+        --dump-file)    _optval "$1" "${2-}" $#; shift; OPT_DUMPS="$OPT_DUMPS
 $1" ;;
-        --dump-file=*)  OPT_DUMPS="$OPT_DUMPS
+        --dump-file=*)  _optval --dump-file "${1#*=}"; OPT_DUMPS="$OPT_DUMPS
 ${1#*=}" ;;
         -h|--help)   usage; exit 0 ;;
         *) printf 'unknown argument: %s\n' "$1" >&2; usage >&2; exit 2 ;;
     esac
     shift
 done
+# --class-refs searches the class roots the --appclasses index reads
+if [ -n "$OPT_REFS" ] && [ "$OPT_APPCLASSES" = 0 ]; then OPT_APPCLASSES=1 OPT_APPIMPLIED=1; fi
 
 # ---- emit helpers — DO NOT EDIT ---------------------------------------------
 # The report shape (../../docs/output-format.md): header, numbered sections,
@@ -652,6 +697,11 @@ _flag_text() {
 
 # ---- apm: probe helpers — DO NOT EDIT ---------------------------------------
 # members: apmjava apmnodejs apmphp apmpython
+# _classify_err -> the reason a probe failed, from _errfile. An unknown error is
+# its first line; a line over 100 bytes keeps both ends, the first 45 and the
+# last 52 bytes: the kind of error is at the start ("PHP Fatal error: ...",
+# "Error: Cannot find module"), and after a long path the message is at the
+# end ("<long path>: No module named pip").
 _classify_err() {
     local txt=""
     [ -f "$_errfile" ] && txt="$(cat "$_errfile" 2>/dev/null)"
@@ -659,7 +709,7 @@ _classify_err() {
         *[Pp]"ermission denied"*|*"peration not permitted"*) echo "permission denied"; return ;;
         *"o such file"*|*"annot access"*|*"oes not exist"*)   echo "path not found";    return ;;
     esac
-    if [ -n "$txt" ]; then printf 'error: %s' "$(printf '%s' "$txt" | head -n1 | cut -c1-100)"
+    if [ -n "$txt" ]; then printf 'error: %s' "$(printf '%s\n' "$txt" | awk 'NR == 1 { if (length($0) > 100) $0 = substr($0, 1, 45) "..." substr($0, length($0) - 51); print; exit }')"
     else echo "nonzero exit"; fi
 }
 
@@ -717,6 +767,29 @@ _names() {
     return 0
 }
 # ---- end apm: probe helpers
+
+# ---- apm: output directory — DO NOT EDIT ------------------------------------
+# members: apmjava apmnodejs apmphp apmpython
+# _out_check -> for --file, makes sure the --out directory (OPT_OUT, default:
+# the working directory) exists and this uid can write into it, before anything
+# is collected: an unwritable directory fails at once, not after a full run.
+# With --stdout the report goes to stdout, and an --out given is named as not
+# used. Fails (the reason on the operator stream) when the report cannot be
+# written; the message is the one collserver gives.
+_out_check() {
+    local d="${OPT_OUT:-.}"
+    if [ "$OPT_STDOUT" = 1 ]; then
+        [ -n "$OPT_OUT" ] && warn "--out $OPT_OUT is not used: the report goes to stdout (--out is for --file)"
+        return 0
+    fi
+    [ -d "$d" ] || _bounded mkdir -p -- "$d" 2>/dev/null
+    if [ ! -d "$d" ] || [ ! -w "$d" ] || [ ! -x "$d" ]; then
+        warn "the report was not written: output directory $d is not writable by uid $(id -u 2>/dev/null || echo '?')"
+        return 1
+    fi
+    return 0
+}
+# ---- end apm: output directory
 
 # _fsize PATH -> size in bytes from the inode (ls -Ln), without reading the
 # file: an agent or server log can be gigabytes, and counting its lines is a
@@ -986,18 +1059,23 @@ _in_libroots() {
     grep -qxF "libjar|$1" "$_LIBROOTS" 2>/dev/null
 }
 
-# _lib_match NAME -> success when NAME matches a --library pattern (or when
-# --library-all was given). Case-insensitive substring match.
+# _lib_match NAME -> success when NAME (a jar's path) contains a --library
+# pattern, or when --library '*' was given. Case-insensitive, literal
+# substring: a pattern has no wildcards (a '*' or '?' in it is that character;
+# only '*' alone means every jar), and whitespace separates patterns. The list
+# is split with globbing off, so a pattern is never expanded against the cwd.
 _lib_match() {
     [ "$OPT_LIBALL" = 1 ] && return 0
     [ -n "$OPT_LIBS" ] || return 1
-    local n p
+    local n p r=1
     n="$(printf '%s' "$1" | tr 'A-Z' 'a-z')"
+    set -f
     for p in $OPT_LIBS; do
         p="$(printf '%s' "$p" | tr 'A-Z' 'a-z')"
-        case "$n" in *"$p"*) return 0 ;; esac
+        case "$n" in *"$p"*) r=0; break ;; esac
     done
-    return 1
+    set +f
+    return "$r"
 }
 
 # class_file_version "indent" JAR -> the class-file major version carried by
@@ -2227,8 +2305,10 @@ _rep_env() {
     done
     fact "per-command cap: ${CMD_TIMEOUT}s; run deadline: ${RUN_DEADLINE}s"
     fact "Tier 2 flags: --threads=$OPT_THREADS  --jcmd=$OPT_JCMD (0 = not requested)"
-    fact "library detail flags: --library=${OPT_LIBS:-none}  --library-all=$OPT_LIBALL  --class=${OPT_CLASSES:-none}"
-    fact "application class flags: --appclasses=$OPT_APPCLASSES  --class-refs=${OPT_REFS:-none}"
+    _libshow="$OPT_LIBS"; [ "$OPT_LIBALL" = 1 ] && _libshow="$_libshow *"
+    fact "library detail flags: --library=${_libshow:-none}  --class=${OPT_CLASSES:-none}"
+    _appshow="$OPT_APPCLASSES"; [ "$OPT_APPIMPLIED" = 1 ] && _appshow="1 (turned on by --class-refs)"
+    fact "application class flags: --appclasses=$_appshow  --class-refs=${OPT_REFS:-none}"
     fact "supplied dump files (--dump-file): $(printf '%s\n' "$OPT_DUMPS" | grep -c .)"
 }
 
@@ -3418,12 +3498,12 @@ EOF_DUMPS
 _rep_libpack() {
     section "M. Library detail pack (opt-in)"
     if [ "$OPT_LIBALL" = 0 ] && [ -z "$OPT_LIBS" ]; then
-        fact "not requested (--library / --library-all absent)"
+        fact "not requested (--library absent)"
     elif [ ! -s "$_PATHSINK" ]; then
         fact "no locatable jar was enumerated in section F; nothing to detail"
     else
         [ -n "$OPT_LIBS" ] && fact "patterns requested:$OPT_LIBS"
-        [ "$OPT_LIBALL" = 1 ] && fact "patterns requested: --library-all (every enumerated jar)"
+        [ "$OPT_LIBALL" = 1 ] && fact "patterns requested: * (every enumerated jar)"
         [ -n "$OPT_CLASSES" ] && fact "member signatures requested for:$OPT_CLASSES"
         _dn=0
         true > "$(_tmp jarsha)" 2>/dev/null
@@ -3820,8 +3900,13 @@ if [ "$OPT_FILE" = 0 ] && [ "$OPT_STDOUT" = 0 ]; then
     exit 2
 fi
 
+# a combination that collects nothing is named, not silently ignored
+[ -n "$OPT_CLASSES" ] && [ -z "$OPT_LIBS" ] && [ "$OPT_LIBALL" = 0 ] \
+    && warn "--class is not used without --library: member signatures are read from the jars --library details (--library '*' for every jar)"
+
 _run_init
 _init_probe
+_out_check || exit 1
 if [ "$OPT_STDOUT" = 1 ]; then
     progress "collecting facts (read-only) -> stdout"
     run_report
@@ -3829,7 +3914,7 @@ if [ "$OPT_STDOUT" = 1 ]; then
 else
     HOST="$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || echo unknown)"
     TS="$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null || echo unknown)"
-    OUTFILE="./$COLLECTOR_NAME-$HOST-$TS.txt"
+    OUTFILE="${OPT_OUT:-.}/$COLLECTOR_NAME-$HOST-$TS.txt"
     progress "collecting facts (read-only) -> writing $OUTFILE"
     _report_to_file "$OUTFILE" || exit 1
     progress "report written: $OUTFILE"

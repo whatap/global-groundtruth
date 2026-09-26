@@ -56,6 +56,10 @@ export LC_ALL=C
 
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-apmphp"
+# 0.7.0  --out DIR puts the --file report in DIR (an unwritable one ends the
+#        run before collecting); the help names APM_INTERP_CAP. A probe
+#        error line over 100 bytes keeps its start and its end; report
+#        otherwise unchanged.
 # 0.6.1  Shared helpers moved into the apm group block; report unchanged.
 #        The apm: blocks are copies of templates/groups/apm.sh.
 # 0.6.0  Section 4 reuses the `php-fpm -v` of section 3 also when section 3
@@ -70,7 +74,7 @@ COLLECTOR_NAME="whatap-apmphp"
 # 0.5.2  A directory this uid can read but not enter lists its names again
 #        (the refactor's _names dropped them; ls did not).
 # 0.5.1  Readability refactor; report unchanged.
-VERSION="0.6.1"
+VERSION="0.7.0"
 DOMAIN="apm"
 TARGET="host/$(hostname 2>/dev/null || echo unknown)"
 
@@ -78,6 +82,7 @@ TARGET="host/$(hostname 2>/dev/null || echo unknown)"
 OPT_FILE=0        # write the report to a .txt file
 OPT_STDOUT=0      # print the report to stdout
 OPT_QUIET=0       # suppress progress narration on stderr
+OPT_OUT=""        # --out DIR: directory of the --file report (empty = .)
 
 usage() {
     cat <<EOF
@@ -93,7 +98,21 @@ explicit action flag so nothing starts by accident.
   $(basename "$0") --file     write the facts report -> ./$COLLECTOR_NAME-<host>-<UTC>.txt
   $(basename "$0") --stdout   print the facts report to stdout
   $(basename "$0") --quiet .. silence progress on stderr (add to --file / --stdout)
+  $(basename "$0") --out DIR  output directory for --file (default: .)
+
+Environment:
+  APM_INTERP_CAP=N  php binaries detailed per run (default 10, 1..999999)
 EOF
+}
+
+# _optval OPTION VALUE [ARGC] -> exit 2 when OPTION, which takes a value, has
+# none: VALUE is empty (`--out=`, or OPTION last, ARGC < 2: a `shift` past the
+# end stops dash with its own message) or starts with `-` (`--out --stdout`
+# would otherwise take the next option as the value)
+_optval() {
+    case "${3:-2}:$2" in
+        [01]:*|*:|*:-*) printf 'missing value for %s\n' "$1" >&2; usage >&2; exit 2 ;;
+    esac
 }
 
 ARGC=$#
@@ -102,6 +121,8 @@ while [ $# -gt 0 ]; do
         --file)    OPT_FILE=1 ;;
         --stdout)  OPT_STDOUT=1 ;;
         --quiet)   OPT_QUIET=1 ;;
+        --out)     _optval "$1" "${2-}" $#; OPT_OUT="$2"; shift ;;
+        --out=*)   _optval --out "${1#*=}"; OPT_OUT="${1#*=}" ;;
         -h|--help) usage; exit 0 ;;
         *) printf 'unknown argument: %s\n' "$1" >&2; usage >&2; exit 2 ;;
     esac
@@ -568,6 +589,11 @@ _init_probe() { _errfile="$(_tmp probe.err)"; _infofile="$(_tmp probe.info)"; }
 
 # ---- apm: probe helpers — DO NOT EDIT ---------------------------------------
 # members: apmjava apmnodejs apmphp apmpython
+# _classify_err -> the reason a probe failed, from _errfile. An unknown error is
+# its first line; a line over 100 bytes keeps both ends, the first 45 and the
+# last 52 bytes: the kind of error is at the start ("PHP Fatal error: ...",
+# "Error: Cannot find module"), and after a long path the message is at the
+# end ("<long path>: No module named pip").
 _classify_err() {
     local txt=""
     [ -f "$_errfile" ] && txt="$(cat "$_errfile" 2>/dev/null)"
@@ -575,7 +601,7 @@ _classify_err() {
         *[Pp]"ermission denied"*|*"peration not permitted"*) echo "permission denied"; return ;;
         *"o such file"*|*"annot access"*|*"oes not exist"*)   echo "path not found";    return ;;
     esac
-    if [ -n "$txt" ]; then printf 'error: %s' "$(printf '%s' "$txt" | head -n1 | cut -c1-100)"
+    if [ -n "$txt" ]; then printf 'error: %s' "$(printf '%s\n' "$txt" | awk 'NR == 1 { if (length($0) > 100) $0 = substr($0, 1, 45) "..." substr($0, length($0) - 51); print; exit }')"
     else echo "nonzero exit"; fi
 }
 
@@ -1231,6 +1257,29 @@ _ports_add() {
 # _uniq_ports PORT... -> the distinct ports, space-joined (validated numbers only)
 _uniq_ports() { [ "$#" -gt 0 ] || return 0; printf '%s\n' "$@" | sort -un | tr '\n' ' ' | sed 's/ $//'; }
 # ---- end apm: numbers
+
+# ---- apm: output directory — DO NOT EDIT ------------------------------------
+# members: apmjava apmnodejs apmphp apmpython
+# _out_check -> for --file, makes sure the --out directory (OPT_OUT, default:
+# the working directory) exists and this uid can write into it, before anything
+# is collected: an unwritable directory fails at once, not after a full run.
+# With --stdout the report goes to stdout, and an --out given is named as not
+# used. Fails (the reason on the operator stream) when the report cannot be
+# written; the message is the one collserver gives.
+_out_check() {
+    local d="${OPT_OUT:-.}"
+    if [ "$OPT_STDOUT" = 1 ]; then
+        [ -n "$OPT_OUT" ] && warn "--out $OPT_OUT is not used: the report goes to stdout (--out is for --file)"
+        return 0
+    fi
+    [ -d "$d" ] || _bounded mkdir -p -- "$d" 2>/dev/null
+    if [ ! -d "$d" ] || [ ! -w "$d" ] || [ ! -x "$d" ]; then
+        warn "the report was not written: output directory $d is not writable by uid $(id -u 2>/dev/null || echo '?')"
+        return 1
+    fi
+    return 0
+}
+# ---- end apm: output directory
 
 # _cap_from NAME VALUE DEFAULT -> sets _cap to VALUE when it is 1..999999, else
 # to DEFAULT, and _cap_note to why VALUE was ignored (empty when unset or used)
@@ -2099,6 +2148,7 @@ fi
 
 _run_init
 _init_probe
+_out_check || exit 1
 if [ "$OPT_STDOUT" = 1 ]; then
     progress "collecting facts (read-only) -> stdout"
     run_report
@@ -2106,7 +2156,7 @@ if [ "$OPT_STDOUT" = 1 ]; then
 else
     HOST="$(hostname 2>/dev/null || echo unknown)"
     TS="$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null || echo unknown)"
-    OUTFILE="./$COLLECTOR_NAME-$HOST-$TS.txt"
+    OUTFILE="${OPT_OUT:-.}/$COLLECTOR_NAME-$HOST-$TS.txt"
     progress "collecting facts (read-only) -> writing $OUTFILE"
     _report_to_file "$OUTFILE" || exit 1
     progress "report written: $OUTFILE"
