@@ -216,6 +216,38 @@ for sh in bash dash; do
         '[ "$(PATH="$T/nodate-ns:$PATH" LIB="$T/lib.sh" dash "$T/tl.sh" 2>&1 | sed -n "s/^ms_date=//p")" = 0 ]'
 done
 
+# A TERM to a run that is between two short bounded calls: a flag set around
+# the fork skipped the cleanup when the signal landed inside it (6 of 70 bash
+# runs leaked the directory, 2026-09-26).
+cat > "$T/loop.sh" <<'EOF'
+set -- --stdout
+. "$LIB"
+exec 3>&2
+_run_init
+f() { :; }
+echo "$_tmp_dir" > "$OUT"
+while :; do _bounded f; done
+EOF
+for sh in bash dash; do
+    command -v "$sh" >/dev/null 2>&1 || continue
+    leak=0; n=0
+    for dl in 0.3 0.45 0.6 0.75 0.9 1.05 1.2 1.35; do
+        rm -f "$T/loop.dir"
+        LIB="$T/lib.sh" OUT="$T/loop.dir" "$sh" "$T/loop.sh" >/dev/null 2>&1 &
+        lp=$!; sleep "$dl"; kill -TERM "$lp" 2>/dev/null; wait "$lp" 2>/dev/null
+        d="$(cat "$T/loop.dir" 2>/dev/null)"; n=$((n + 1))
+        [ -n "$d" ] && [ -e "$d" ] && { leak=$((leak + 1)); rm -rf "$d"; }
+    done
+    check "$sh: a TERM between short bounded calls leaves no directory ($n runs)" '[ "$leak" = 0 ]' "leaked $leak of $n"
+done
+# dash: a bounded function used to cost ~1s on 10-15% of calls
+if command -v dash >/dev/null 2>&1; then
+    t0=$(date +%s)
+    LIB="$T/lib.sh" dash -c '. "$LIB"; exec 3>&2; _run_init; f() { :; }; i=0; while [ $i -lt 40 ]; do _bounded f; i=$((i + 1)); done' >/dev/null 2>&1
+    took=$(( $(date +%s) - t0 ))
+    check "dash: 40 bounded functions take under 5s" '[ "$took" -lt 5 ]' "took ${took}s"
+fi
+
 echo "== 1b. Ctrl-C leaves nothing behind =="
 cat > "$T/intr.sh" <<'EOF'
 set -- --stdout

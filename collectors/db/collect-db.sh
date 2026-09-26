@@ -297,13 +297,16 @@ _cmd_kind() {
     esac
 }
 
-# _in_child=1 in the background jobs _bounded_in forks. They inherit the traps,
-# and bash can deliver the watchdog's TERM before the job has reset them, so a
-# killed watchdog ran this cleanup and removed the whole run's directory mid-run
-# (found 2026-09-25: lost within 1 to 176 `_bounded true` calls under bash).
-_in_child=0
+# Only the process that ran _run_init removes the directory. The background
+# jobs _bounded_in forks inherit the traps, and a job killed before it reset
+# them ran this cleanup mid-run (lost within 1..176 `_bounded true` calls under
+# bash, 2026-09-25). A flag set around the fork left a window in which a Ctrl-C
+# to the run itself skipped the cleanup, so the process is identified instead.
+_owner_pid=""
 _run_cleanup() {
-    [ "$_in_child" = 1 ] && return 0
+    local me
+    if [ -n "${BASHPID:-}" ]; then me="$BASHPID"; else me="$(exec sh -c 'echo "$PPID"')"; fi
+    [ "$me" = "$_owner_pid" ] || return 0
     case "$_tmp_dir" in */ggt.*) rm -rf "$_tmp_dir" 2>/dev/null ;; esac
     _tmp_dir=""
 }
@@ -323,6 +326,7 @@ _cap_or() {
 # once in main, before anything creates a temp file.
 _run_init() {
     _run_t0="$(date +%s 2>/dev/null)"
+    _owner_pid="$$"
     _load0="$(_host_load)"
     # 16+ digits: a date that drops %N silently prints bare seconds (10 digits)
     [ -z "${EPOCHREALTIME:-}" ] && case "$(date +%s%N 2>/dev/null)" in *[!0-9]*|'') ;; ????????????????*) _ms_date=1 ;; esac
@@ -386,8 +390,9 @@ _ms=0
 _now_ms() {
     local t="${EPOCHREALTIME:-}" f
     if [ -n "$t" ]; then
-        f="${t#*.}000"; f="${f%"${f#???}"}"
-        _ms="${t%.*}$f"
+        # the locale's radix: EPOCHREALTIME can read 1790000000,123456
+        f="${t#*[.,]}000"; f="${f%"${f#???}"}"
+        _ms="${t%[.,]*}$f"
     elif [ "$_ms_date" = 1 ]; then
         t="$(date +%s%N 2>/dev/null)"; _ms="${t%??????}"
     else
@@ -462,7 +467,6 @@ _bounded_in() {
         # stdin through fd 4 when it is passed on: POSIX gives an async list
         # /dev/null as stdin before its own redirections, so a plain 0<&0
         # hands dash /dev/null.
-        _in_child=1
         set -m 2>/dev/null
         if [ -n "$in" ];                   then "$@" < "$in" &
         elif [ "$_stdin_script" = 1 ];     then "$@" < /dev/null &
@@ -477,9 +481,10 @@ _bounded_in() {
           sleep 2
           kill -KILL -- "-$p" 2>/dev/null; _kill_tree KILL "$p" ) >/dev/null 2>&1 &
         w=$!
-        _in_child=0
         wait "$p"; rc=$?
-        kill "$w" 2>/dev/null; wait "$w" 2>/dev/null
+        # KILL: a TERM can reach the watchdog before dash has reset the traps it
+        # inherited and be lost, and it then ran a full 1s round (p90 ~1s a call)
+        kill -KILL "$w" 2>/dev/null; wait "$w" 2>/dev/null
     fi
     _now_ms; d=$((_ms - m0))
     case "$rc" in 124|137|143) [ "$((d / 1000))" -ge "$t" ] && rc=124 ;; esac
