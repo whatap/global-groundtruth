@@ -38,10 +38,9 @@ export LC_ALL=C
 
 # ---- collector metadata -----------------------------------------------------
 COLLECTOR_NAME="whatap-k8s"
-# 0.8.3  Only a first re-run that also times out stops the re-runs. Once a
-#        probe run alone has answered, the pod still answers, so a later
-#        hang is that probe's own and the ones after it are still run
-#        (two separate hangs lost the last answer in 0.8.2; 2026-09-25).
+# 0.8.6  --apm-exec reads the runtime versions without JAVA_TOOL_OPTIONS and the
+#        other agent variables: the JVM loaded the WhaTap agent, which wrote a
+#        Start block to the app's whatap.log on every run.
 # 0.8.4  A CMD_TIMEOUT from the environment is used (it was overwritten by a
 #        fixed value after _run_init had checked it) (2026-09-26).
 # 0.8.5  Readability refactor; report unchanged. Fewer API calls, same
@@ -49,7 +48,7 @@ COLLECTOR_NAME="whatap-k8s"
 #        (14 -> 1 per pod), the operator deployment and operator pod list reads
 #        of section D are merged, and section A counts namespaces from the list
 #        section J prints (3 --apm-target, lab cluster: 111 s -> 75 s).
-VERSION="0.8.5"
+VERSION="0.8.6"
 DOMAIN="k8s"
 TARGET="k8s-cluster/unresolved"      # refined after CLI/context/namespace discovery
 
@@ -2241,8 +2240,11 @@ _rep_apm() {
                         'H=${WHATAP_HOME:-/whatap-agent}; ls -la "$H/logs" 2>&1 | head -n 20; for f in "$H"/logs/*.log; do [ -f "$f" ] && { echo "== $f"; tail -n 40 "$f"; }; done; :'
                     pod_exec_probe_ns "$tns" "agent port registry (/tmp/whatap-*.lock)" "$xp" "$xc" \
                         'ls -la /tmp/whatap-*.lock 2>/dev/null && cat /tmp/whatap-*.lock 2>/dev/null; :'
+                    # without the agent variables: with JAVA_TOOL_OPTIONS the JVM loads the
+                    # WhaTap agent, which writes a Start block to the app's whatap.log on
+                    # every probe (the variables themselves are read from /proc/1/environ)
                     pod_exec_probe_ns "$tns" "language runtime version" "$xp" "$xc" \
-                        'node -v 2>&1; python3 -V 2>&1; java -version 2>&1 | head -n 3; :'
+                        'unset JAVA_TOOL_OPTIONS JDK_JAVA_OPTIONS _JAVA_OPTIONS NODE_OPTIONS PYTHONPATH; node -v 2>&1; python3 -V 2>&1; java -version 2>&1 | head -n 3; :'
                     pod_exec_probe_ns "$tns" "application module tree (whatap present in app node_modules?)" "$xp" "$xc" \
                         'ls -d ./node_modules/whatap /app/node_modules/whatap /usr/src/app/node_modules/whatap 2>/dev/null; :'
                 done
