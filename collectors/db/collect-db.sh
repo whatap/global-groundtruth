@@ -48,7 +48,9 @@ COLLECTOR_NAME="whatap-db"
 #        unchanged. The --sql terminal prompt waits no longer than what is
 #        left of RUN_DEADLINE; a prompt nobody answers skips that instance
 #        with the reason in the sql goal (2026-09-25).
-VERSION="0.5.0"
+# 0.5.1  A CMD_TIMEOUT from the environment is used (it was overwritten by a
+#        fixed value after _run_init had checked it) (2026-09-26).
+VERSION="0.5.1"
 DOMAIN="db"
 TARGET="db-host/$(hostname 2>/dev/null || echo unknown)"
 
@@ -681,7 +683,7 @@ have() { command -v "$1" >/dev/null 2>&1; }
 
 _errfile=""
 _timeout_bin=""
-CMD_TIMEOUT=20
+CMD_TIMEOUT="${CMD_TIMEOUT:-20}"
 NET_TIMEOUT=5
 _init_probe() {
     _errfile="$(_tmp probe.err)"

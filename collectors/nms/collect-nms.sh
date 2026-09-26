@@ -46,7 +46,7 @@ export LC_ALL=C
 
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-nms"
-VERSION="0.6.0"
+VERSION="0.6.1"
 DOMAIN="nms"
 TARGET="host/$(hostname 2>/dev/null || echo unknown)"
 
@@ -665,7 +665,7 @@ have() { command -v "$1" >/dev/null 2>&1; }
 
 _errfile=""
 _timeout_bin=""
-CMD_TIMEOUT=20
+CMD_TIMEOUT="${CMD_TIMEOUT:-20}"
 _init_probe() {
     _errfile="$(_tmp probe.err)"
     have timeout && _timeout_bin="$(command -v timeout)"

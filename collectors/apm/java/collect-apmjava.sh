@@ -101,7 +101,7 @@ export LC_ALL=C
 
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-apmjava"
-VERSION="0.12.0"
+VERSION="0.12.1"
 DOMAIN="apm"
 TARGET="host/$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || echo unknown)"
 
@@ -768,7 +768,7 @@ have() { command -v "$1" >/dev/null 2>&1; }
 
 _errfile=""
 _timeout_bin=""
-CMD_TIMEOUT=15
+CMD_TIMEOUT="${CMD_TIMEOUT:-15}"
 # Call after _run_init: the error file lives in the run's private directory.
 _init_probe() { _errfile="$(_tmp probe.err)"; }
 _end_probe() { :; }   # _run_cleanup removes the directory

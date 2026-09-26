@@ -666,7 +666,7 @@ _timeout_bin=""
 # whole run: dozens of hanging probes x 20s is minutes on a sick host, so lower
 # this, or probe reachability once and skip what depends on it, if your
 # collector has many network-dependent probes. Guideline 2.
-CMD_TIMEOUT=20
+CMD_TIMEOUT="${CMD_TIMEOUT:-20}"
 # Call after _run_init: the error file lives in the run's private directory.
 _init_probe() { _errfile="$(_tmp probe.err)"; }
 _end_probe() { :; }   # _run_cleanup removes the directory

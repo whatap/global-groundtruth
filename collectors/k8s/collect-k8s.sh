@@ -74,7 +74,9 @@ COLLECTOR_NAME="whatap-k8s"
 #        probe run alone has answered, the pod still answers, so a later
 #        hang is that probe's own and the ones after it are still run
 #        (two separate hangs lost the last answer in 0.8.2; 2026-09-25).
-VERSION="0.8.3"
+# 0.8.4  A CMD_TIMEOUT from the environment is used (it was overwritten by a
+#        fixed value after _run_init had checked it) (2026-09-26).
+VERSION="0.8.4"
 DOMAIN="k8s"
 TARGET="k8s-cluster/unresolved"      # refined after CLI/context/namespace discovery
 
@@ -185,7 +187,7 @@ have() { command -v "$1" >/dev/null 2>&1; }
 _errfile=""
 _init_errfile() { _errfile="$(_tmp probe.err)"; }
 _timeout_bin=""
-CMD_TIMEOUT=20
+CMD_TIMEOUT="${CMD_TIMEOUT:-20}"
 
 # _cutw N -> each line cut to N characters at a word boundary, marked "..."
 _cutw() {

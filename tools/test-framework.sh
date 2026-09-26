@@ -297,6 +297,11 @@ printf 'y() { printf a | _bounded cat; }\nz() { _bounded true || _bounded false;
 check "validate: a pipe into _bounded fails, and names the line" '"$V" "$T/collect-pipetest.sh" 2>&1 | grep -q "a pipe into _bounded (line [0-9]*)"'
 check "validate: || _bounded is not taken for a pipe" '[ "$("$V" "$T/collect-pipetest.sh" 2>&1 | grep -c "a pipe into _bounded (line [0-9]*)")" = 1 ] && ! "$V" "$T/collect-pipetest.sh" 2>&1 | grep -q "line [0-9]* [0-9]"'
 
+sed -e 's/^COLLECTOR_NAME=.*/COLLECTOR_NAME="whatap-cttest"/' -e 's/^CMD_TIMEOUT=.*/CMD_TIMEOUT=20/' "$SK" > "$T/collect-cttest.sh"
+check "validate: a fixed CMD_TIMEOUT=N is refused" '"$V" "$T/collect-cttest.sh" 2>&1 | grep -q "CMD_TIMEOUT is set to a fixed number"'
+out="$(CMD_TIMEOUT=7 sh -c 'set -- --stdout; . "$0" >/dev/null 2>&1; echo "ct=$CMD_TIMEOUT"' "$T/lib.sh")"
+check "the skeleton keeps a CMD_TIMEOUT from the environment" '[ "$out" = ct=7 ]' "$out"
+
 # ---- 4. every collector, for real -------------------------------------------
 echo "== 4. every shell collector, run here =="
 if [ "$QUICK" = 1 ]; then

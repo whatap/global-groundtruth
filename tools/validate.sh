@@ -310,6 +310,10 @@ for f in "${targets[@]}"; do
             # JVM under bash -s and said "none" (2026-09-25). Use _bounded_in.
             _pb="$(grep -nE '(^|[^|])\|&?[[:space:]]*_bounded([[:space:]]|$)' "$f" | grep -vE '^[0-9]+:[[:space:]]*#' | head -n 3 | cut -d: -f1 | tr '\n' ' ')"
             [ -n "$_pb" ] && problems+=("a pipe into _bounded (line ${_pb% }): its stdin is /dev/null under sh -s; write the input to _tmp and use _bounded_in")
+            # A fixed top-level CMD_TIMEOUT=N overwrites the value _run_init checked
+            # from the environment, so the operator's cap is silently ignored.
+            _ct="$(grep -nE '^CMD_TIMEOUT=[0-9]' "$f" | head -n 1 | cut -d: -f1)"
+            [ -n "$_ct" ] && problems+=("CMD_TIMEOUT is set to a fixed number at line $_ct: use CMD_TIMEOUT=\"\${CMD_TIMEOUT:-N}\" so the environment's value is kept")
             case "$bn" in collector-skeleton.sh) ;; *)
                 grep -qE '^_run_init$' "$f" \
                     || problems+=("main never calls _run_init: no deadline, no private temp directory, no cleanup") ;;
