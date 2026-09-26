@@ -23,7 +23,8 @@
 #                                      J (request-size histograms), N (zdb -Lbbbs)
 #   * append / txg behaviour        -> B (zfs_txg_timeout, dirty-data throttle),
 #                                      H (txgs ring buffer, ZIL kstats), I (per-
-#                                      dataset objset write counters)
+#                                      dataset objset write counters), O (every
+#                                      txg of a time window, --window)
 #   * free-space fragmentation      -> C/D (FRAG, CAP per vdev and per pool),
 #                                      B (metaslab_* parameters), N (zdb -mm)
 #   * rewrite / send-receive path   -> A (whether the rewrite subcommand exists),
@@ -31,7 +32,8 @@
 #
 # Tier 0 (the default report) reads kstats, properties and since-boot iostat
 # only: no pool traversal, no tree walk, no device wake-up. What costs wall-clock
-# (--sample) or pool I/O (--zdb, --filesizes) is opt-in and announced first.
+# beyond the default 15s window (--window) or pool I/O (--zdb, --filesizes) is
+# opt-in and announced first.
 #
 # Rules: ../../CONTRACT.md and ../../docs/collector-engineering.md. No `set -e`:
 # the report always reaches its footer.
@@ -44,6 +46,20 @@
 export LC_ALL=C
 
 # ---- collector metadata -----------------------------------------------------
+# 0.8.0  A time window runs in every run (15s; --window=DUR[@START] sets its
+#        length and start) and replaces --sample. Section O keeps every txg of
+#        the window (the txgs ring re-read before it
+#        wraps, merged by txg number, gaps counted); the start, end and delta
+#        of dmu_tx, arcstats and each objset-* kstat; zpool iostat -vlq and
+#        iostat -x started together at the same interval, with timestamps;
+#        zpool iostat -r / -w for the window; arcstat when present. J's
+#        "interval sample (--sample)" subsection is gone, and [1]'s tiers
+#        line reads "... filesizes=off window=off" (no sample=). Removed
+#        options exit 2 naming the replacement: --sample, --window-start,
+#        --no-filesizes, and --filesizes-secs, --event-days, --hours, which are
+#        now FILESIZES_SECS, EVENT_DAYS and JOURNAL_HOURS in the environment
+#        (defaults 300, 30, 24). H's per-pool kstat paths no
+#        longer carry a double slash (yard//zil).
 # 0.7.0  zpool list -v runs once: the raw probe's output feeds the derived
 #        views of sections C and H and the bundle's zpool-list-v.txt (it was
 #        run a second time, capped at 20s, for the views, and a third time
@@ -59,7 +75,7 @@ export LC_ALL=C
 #        df -i of every WhaTap path is in the report and df-i.txt in the
 #        bundle, so the file count is there without a walk.
 COLLECTOR_NAME="whatap-collzfs"
-VERSION="0.7.0"
+VERSION="0.8.0"
 DOMAIN="collection-server"
 TARGET="collection-server-zfs/$(hostname 2>/dev/null || echo unknown)"   # refined after pool discovery
 
@@ -70,26 +86,32 @@ OPT_BUNDLE=0
 OPT_QUIET=0          # suppress progress narration on stderr
 OPT_OUT="."
 OPT_HOME=""
-OPT_HOURS=24         # journal window
-OPT_SAMPLE=0         # Tier 1: interval iostat/arcstat samples
-SAMPLE_SECS=10
-# Block-layer sampling bucket, in seconds. `iostat -x` without an interval is
-# the since-boot average; --sample keeps every bucket, so a peak one window
-# would average away stays visible.
-IOSTAT_BUCKET=5
+# journal window in hours: JOURNAL_HOURS in the environment (checked in main)
+OPT_HOURS="${JOURNAL_HOURS:-24}"
 OPT_ZDB=0            # Tier 2: zdb -C / -Lbbbs / -mm
 # File-size histogram: Tier 2. A metadata walk of a yard with ~10^8 files loads
 # the special vdev and the ARC and does not finish in the bound; df -i gives the
 # file count and --zdb the block sizes. --filesizes=PATH walks a narrow sample.
 OPT_FILESIZES=0
 FILESIZES_PATH=""
-FILESIZES_SECS=300   # bound on the tree walk; a partial result is labelled as such
+# bound on the tree walk, from the environment like RUN_DEADLINE and
+# CMD_TIMEOUT (checked in main); a partial result is labelled as such
+FILESIZES_SECS="${FILESIZES_SECS:-300}"
 # zpool events detail window, in days (0 = everything). With a large
 # zfs_zevent_len_max, `zpool events -v` of the whole ring buffer is hundreds of
 # MB; the tally (when a class started and stopped) always covers all of it.
-OPT_EVENT_DAYS=30
+# EVENT_DAYS in the environment (checked in main)
+OPT_EVENT_DAYS="${EVENT_DAYS:-30}"
+# The time window (section O) runs in every run: kstat file reads and interval
+# samples, no pool load, only wall-clock. WIN_DEFAULT seconds unless
+# --window=DUR[@START] sets it. WIN_SPEC is DUR, WIN_START_SPEC is START.
+WIN_DEFAULT=15
+WIN_SPEC=""
+WIN_START_SPEC=""
+WIN_GIVEN=0          # 1 when --window was on the command line, even empty
+WIN_SECS=0
 # RUN_DEADLINE as the caller gave it (empty when not given), read before the run
-# helpers default it: the file-size walk, --sample, --zdb and the bundle's
+# helpers default it: the file-size walk, --window, --zdb and the bundle's
 # event dump each need more than the default, and a caller's value wins.
 _RUN_DEADLINE_ENV="${RUN_DEADLINE:-}"
 
@@ -106,7 +128,6 @@ explicit action flag (--file / --stdout / --bundle) so nothing starts by acciden
   collect-collzfs.sh --quiet ...            silence progress on stderr (for automation)
   collect-collzfs.sh --home DIR             force WHATAP_HOME (else auto-resolved)
   collect-collzfs.sh --out DIR              output directory (default: .)
-  collect-collzfs.sh --hours N              journal window in hours (default: 24)
 
   Tier 0 always includes the cumulative-since-boot zpool iostat histograms
   (-r request size, -w latency), which are instant kstat reads, and df -i
@@ -116,18 +137,7 @@ explicit action flag (--file / --stdout / --bundle) so nothing starts by acciden
   the WHOLE ring buffer, because what the buffer answers is when a class started
   and when it stopped. The per-event detail is kept only for a recent window,
   because the full -v dump of a deep buffer is hundreds of MB.
-  collect-collzfs.sh --event-days N         detail window in days (default: 30)
-                                            0 keeps the detail for everything
-
-  Tier 1 sampling (read-only; costs wall-clock, not disk load):
-  collect-collzfs.sh --file --sample[=SEC]  add interval samples of zpool iostat
-                                            -lqv / -r / -w, arcstat, and iostat -x
-                                            in 5s buckets over 3 x SEC seconds
-                                            (default SEC=10; adds about 9 x SEC seconds)
-                                            Without this, every block-layer number
-                                            (%util, await, aqu-sz) is the average
-                                            since boot and cannot answer "is the
-                                            device busy now".
+  The detail window is EVENT_DAYS in the environment (below).
 
   File-size histogram (Tier 2, opt-in). It walks the whole tree reading metadata
   (find -printf '%s'), which on a yard of 10^8 files is load on the device that
@@ -136,17 +146,52 @@ explicit action flag (--file / --stdout / --bundle) so nothing starts by acciden
   distribution from --zdb. A walk that hits its bound is labelled PARTIAL.
   collect-collzfs.sh --filesizes            walk yardbase
   collect-collzfs.sh --filesizes=PATH       walk PATH instead (a narrow sample)
-  collect-collzfs.sh --filesizes-secs N     bound on the walk (default: 300)
+                                            bound: FILESIZES_SECS in the
+                                            environment (default 300 seconds)
+
+  Time window (section O). Every run includes one, 15 seconds long by default:
+  kstat file reads and interval samples, no pool load, only wall-clock. It
+  answers "is the device busy now"; every other interval number (%util,
+  await, aqu-sz, vdev latency) is an average since boot or import. Over the
+  window it collects:
+    every txg from /proc/spl/kstat/zfs/<pool>/txgs (the ring of the last
+    zfs_txg_history txgs, re-read before it wraps, merged by txg number; a
+    txg that left the ring unseen is counted as a gap); start, end and delta
+    of dmu_tx, arcstats and each dataset's objset-* counters; zpool iostat
+    -vlq and iostat -x started together at the same interval, with
+    timestamps; zpool iostat -r / -w for the window; arcstat when present.
+  No tunable is changed. The window runs first; the rest of the report is
+  collected after it. Ctrl-C ends the window early; the report keeps what
+  was collected.
+  collect-collzfs.sh --file --window=DUR    a window of DUR instead of 15s:
+                                            N (seconds), Ns, Nm or Nh, 10s .. 24h
+  collect-collzfs.sh --file --window=DUR@START
+                                            wait until START, then collect for DUR.
+                                            START is local time on this host:
+                                            HH:MM[:SS] (the next one) or
+                                            YYYY-MM-DDTHH:MM[:SS] (within 24h).
+                                            Keep the session open (nohup, tmux).
 
   Tier 2 (opt-in, adds pool or disk load — announced on stderr before running):
   collect-collzfs.sh --file --zdb           zdb -C, -Lbbbs, -mm per pool: block/psize
                                             histograms, measured compression, metaslab
                                             free-space histograms. Traverses pool
                                             metadata — minutes on a large pool.
+
+  Environment (whole numbers; another value is ignored with a warning):
+    CMD_TIMEOUT=N      cap on each external command, seconds (default 20)
+    RUN_DEADLINE=N     cap on the whole run, seconds (default 300, raised for
+                       the window, --zdb, --filesizes and --bundle unless set)
+    FILESIZES_SECS=N   cap on the --filesizes walk, seconds (default 300)
+    EVENT_DAYS=N       zpool events detail window, days (default 30; 0 = all)
+    JOURNAL_HOURS=N    zfs unit journal window, hours (default 24)
 EOF
 }
 
 ARGC=$#              # 0 args -> usage (handled in main, below)
+# _removed MESSAGE -> an option that no longer exists: exit 2, naming what
+# replaced it (fd 3 is not open yet, so stderr)
+_removed() { printf '!! %s\n' "$1" >&2; exit 2; }
 while [ $# -gt 0 ]; do
     case "$1" in
         --file) OPT_FILE=1 ;;
@@ -157,18 +202,23 @@ while [ $# -gt 0 ]; do
         --out=*) OPT_OUT="${1#*=}" ;;
         --home) OPT_HOME="$2"; shift ;;
         --home=*) OPT_HOME="${1#*=}" ;;
-        --hours) OPT_HOURS="$2"; shift ;;
-        --hours=*) OPT_HOURS="${1#*=}" ;;
-        --sample) OPT_SAMPLE=1 ;;
-        --sample=*) OPT_SAMPLE=1; SAMPLE_SECS="${1#*=}" ;;
+        --hours|--hours=*)
+            _removed "--hours was removed: set JOURNAL_HOURS=N in the environment (default 24)" ;;
+        --sample|--sample=*)
+            _removed "--sample was merged into --window: use --window=30s (or --window=DUR for a longer span)" ;;
         --zdb) OPT_ZDB=1 ;;
         --filesizes) OPT_FILESIZES=1 ;;
         --filesizes=*) OPT_FILESIZES=1; FILESIZES_PATH="${1#*=}" ;;
-        --no-filesizes) OPT_FILESIZES=0 ;;
-        --filesizes-secs) FILESIZES_SECS="$2"; shift ;;
-        --filesizes-secs=*) FILESIZES_SECS="${1#*=}" ;;
-        --event-days) OPT_EVENT_DAYS="$2"; shift ;;
-        --event-days=*) OPT_EVENT_DAYS="${1#*=}" ;;
+        --no-filesizes)
+            _removed "--no-filesizes was removed: the file-size walk runs only when --filesizes is given" ;;
+        --filesizes-secs|--filesizes-secs=*)
+            _removed "--filesizes-secs was removed: set FILESIZES_SECS=N in the environment (default 300)" ;;
+        --event-days|--event-days=*)
+            _removed "--event-days was removed: set EVENT_DAYS=N in the environment (default 30; 0 keeps everything)" ;;
+        --window) WIN_GIVEN=1; WIN_SPEC="${2:-}"; [ $# -gt 1 ] && shift ;;
+        --window=*) WIN_GIVEN=1; WIN_SPEC="${1#*=}" ;;
+        --window-start|--window-start=*)
+            _removed "--window-start was merged into --window: use --window=DUR@HH:MM or --window=DUR@YYYY-MM-DDTHH:MM" ;;
         -h|--help) usage; exit 0 ;;
         *) printf 'unknown argument: %s\n' "$1" >&2; usage >&2; exit 2 ;;
     esac
@@ -1253,7 +1303,7 @@ filesize_histogram() {
     if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
         printf '(PARTIAL: the walk hit the %ss bound and was stopped. The buckets below\n' "$FILESIZES_SECS"
         printf ' cover only the files reached by then, in directory order, not the whole tree.)\n'
-        warn "file-size histogram is partial: the walk hit the ${FILESIZES_SECS}s bound; --filesizes-secs N raises it"
+        warn "file-size histogram is partial: the walk hit the ${FILESIZES_SECS}s bound; FILESIZES_SECS=N in the environment raises it"
     elif [ "$rc" -ne 0 ]; then
         # find exits 1 when it could not descend into part of the tree. The
         # buckets then leave those subtrees out, and must say so.
@@ -1328,7 +1378,15 @@ _rep_env() {
     elif [ "$ZSNAP_RC" -eq 124 ]; then fact "snapshots discovered: n/a ($( _hung zfs && _skip_why zfs || echo "zfs list -t snapshot did not answer within ${ZSNAP_CAP}s"))"
     elif [ "$ZSNAP_RC" -ne 0 ]; then fact "snapshots discovered: n/a (zfs list -t snapshot exit $ZSNAP_RC${ZSNAP_ERR:+: $ZSNAP_ERR})"
     else fact "snapshots discovered: ${SNAP_COUNT:-0}"; fi
-    fact "tiers in this run: Tier0=always sample=$( [ "$OPT_SAMPLE" = 1 ] && echo "on(${SAMPLE_SECS}s)" || echo off ) zdb=$( [ "$OPT_ZDB" = 1 ] && echo on || echo off ) filesizes=$( [ "$OPT_FILESIZES" = 1 ] && echo on || echo off )"
+    fact "tiers in this run: Tier0=always zdb=$( [ "$OPT_ZDB" = 1 ] && echo on || echo off ) filesizes=$( [ "$OPT_FILESIZES" = 1 ] && echo on || echo off ) window=$(_win_tier)"
+}
+
+# _win_tier -> the window's part of the tiers line: its length and start, or
+# why it did not run (it runs only where ZFS is present, before the report)
+_win_tier() {
+    if [ "$ZFS_ON_HOST" != 1 ]; then printf 'n/a (no ZFS on this host)'
+    elif [ "$WIN_RAN" != 1 ] && [ -n "$WIN_SKIP" ]; then printf 'not run (see section O)'
+    else printf '%ss%s%s' "$WIN_SECS" "$( [ "$WIN_GIVEN" = 1 ] || echo ' (default)' )" "${WIN_START_SPEC:+ from $WIN_START_SPEC}"; fi
 }
 
 # -- A. ZFS software & kernel module --------------------------------------
@@ -1651,8 +1709,9 @@ _rep_h() {
     section "H. Write path: transaction groups & ZIL"
     local kd pn
     for kd in "$KSTAT_DIR"/*/; do
+        kd="${kd%/}"   # the glob's trailing slash would print as <pool>//zil
         [ -d "$kd" ] || continue
-        pn="$(basename "$kd")"
+        pn="${kd##*/}"
         subsection "pool $pn"
         read_kstat_tail "txgs (column header + last 150 records)" "$kd/txgs" 150
         read_proc "dmu_tx_assign (transaction assign histogram)" "$kd/dmu_tx_assign"
@@ -1693,10 +1752,9 @@ _rep_i() {
 
 # -- J. I/O request size & latency distribution ---------------------------
 _rep_j() {
-    local kd pn
     # zpool iostat without an interval is the since-boot kstat values (instant,
     # load-free): -r the request-size histogram, -w the latency histogram.
-    # --sample adds interval samples of current behaviour.
+    # Interval values over a span of time are --window's (section O).
     section "J. I/O request size & latency distribution"
     subsection "cumulative since boot (instant kstat read)"
     probe "zpool iostat -v" zpool iostat -v
@@ -1706,44 +1764,6 @@ _rep_j() {
         "zpool iostat -r 2>/dev/null | head -n 400 || true"
     probe_pipe "zpool iostat -w (latency histogram, first 400 lines)" zpool \
         "zpool iostat -w 2>/dev/null | head -n 400 || true"
-    subsection "interval sample (--sample)"
-    if [ "$OPT_SAMPLE" = 1 ]; then
-        local st=$((SAMPLE_SECS * 3 + 30))
-        progress "sampling zpool iostat -lqv over ${SAMPLE_SECS}s ..."
-        probe_pipe_t "$st" "zpool iostat -lqv ${SAMPLE_SECS} 2 (second block is the interval)" zpool \
-            "zpool iostat -lqv ${SAMPLE_SECS} 2 2>/dev/null || true"
-        progress "sampling zpool iostat -r over ${SAMPLE_SECS}s ..."
-        probe_pipe_t "$st" "zpool iostat -r ${SAMPLE_SECS} 2 (first 500 lines)" zpool \
-            "zpool iostat -r ${SAMPLE_SECS} 2 2>/dev/null | head -n 500 || true"
-        progress "sampling zpool iostat -w over ${SAMPLE_SECS}s ..."
-        probe_pipe_t "$st" "zpool iostat -w ${SAMPLE_SECS} 2 (first 500 lines)" zpool \
-            "zpool iostat -w ${SAMPLE_SECS} 2 2>/dev/null | head -n 500 || true"
-        progress "sampling arcstat over ${SAMPLE_SECS}s ..."
-        probe_pipe_t "$st" "arcstat 1 ${SAMPLE_SECS}" arcstat "arcstat 1 ${SAMPLE_SECS} 2>/dev/null || true"
-        # Block layer, bucketed: the since-boot `iostat -x` (section K) says
-        # nothing about now. The first block printed is the since-boot one.
-        local ic=$(( SAMPLE_SECS * 3 / IOSTAT_BUCKET + 1 ))
-        [ "$ic" -lt 2 ] && ic=2
-        progress "sampling iostat -x in ${IOSTAT_BUCKET}s buckets over $(( (ic - 1) * IOSTAT_BUCKET ))s ..."
-        probe_pipe_t $(( ic * IOSTAT_BUCKET + 30 )) \
-            "iostat -x ${IOSTAT_BUCKET} ${ic} (first block is since boot; the rest are ${IOSTAT_BUCKET}s intervals)" \
-            iostat "iostat -x ${IOSTAT_BUCKET} ${ic} 2>/dev/null || true"
-        progress "sampling txgs delta over ${SAMPLE_SECS}s ..."
-        for kd in "$KSTAT_DIR"/*/; do
-            [ -d "$kd" ] || continue
-            pn="$(basename "$kd")"
-            [ -r "$kd/txgs" ] || continue
-            local before after
-            before="$(wc -l < "$kd/txgs" 2>/dev/null | tr -d ' ')"
-            if have sleep; then sleep "$SAMPLE_SECS"; fi
-            after="$(tail -n 20 "$kd/txgs" 2>/dev/null)"
-            fact "pool $pn: txgs records before sample=$before; last 20 records after a ${SAMPLE_SECS}s wait:"
-            printf '%s\n' "$after" | while IFS= read -r _l; do blk "$_l"; done
-            break   # one pool's wait is enough; the ring buffer is per pool but the wait is shared
-        done
-    else
-        fact "n/a (not applicable: --sample not given)"
-    fi
 }
 
 # -- K. Underlying block devices ------------------------------------------
@@ -1910,6 +1930,8 @@ run_report() {
         # status says so.
         na zfs "no zfs or zpool command and no $KSTAT_DIR on this host"
         na pools "no zfs or zpool command and no $KSTAT_DIR on this host"
+        goal window "$WIN_GOAL"
+        na window "no zfs or zpool command and no $KSTAT_DIR on this host"
         emit_status
         emit_footer
         return
@@ -1932,6 +1954,7 @@ run_report() {
     report_whatap_paths
 
     _rep_n
+    _rep_o
     got zfs
     _resolve_pools
     _resolve_datasets
@@ -2175,6 +2198,735 @@ zevents_split() {
 }
 
 # =============================================================================
+# Write-path window (--window; Tier 1: wall-clock, kstat file reads only)
+# =============================================================================
+# <pool>/txgs is a ring of the last zfs_txg_history txgs (OpenZFS
+# spa_stats.c: a row is added when the previous txg starts to quiesce and the
+# oldest is dropped past zfs_txg_history). A window longer than the span the
+# ring covers is therefore read more than once. The reads are merged by txg
+# number: a row is kept once, at its first completed ('C') sighting, or at its
+# last sighting when it left the ring before it completed. A txg number that
+# is in neither of two consecutive reads left the ring unseen: a gap, counted
+# and listed, never filled in. The next read comes after half the span the
+# ring covered at the last read (birth of the oldest row to the newest),
+# clamped to [WIN_IV_MIN, WIN_IV_MAX], so at a steady txg rate every txg is in
+# two reads. Nothing is written: a write to txgs clears it, and no tunable is
+# changed (zfs_txg_history is the operator's to raise).
+#
+# A read whose place in the ring was dropped between two read() calls fails
+# with EIO (spl-procfs-list.c); it is asked once more at once.
+WIN_IV_MIN=2
+WIN_IV_MAX=300
+WIN_ROW_CAP=20000       # merged rows kept per pool
+WIN_RESERVE=120         # seconds of the run deadline left for the report
+WIN_IOSTAT_LINES=6000   # zpool iostat -v lines printed in the report
+WIN_START_EPOCH=""
+WIN_DIR=""
+WIN_RAN=0               # 1 once the window started
+WIN_SIG=""              # INT / TERM / HUP that ended the wait or the window
+WIN_T0="" WIN_T1=""     # epoch at start and end of the window
+WIN_CUT=""              # set when the run deadline ended the window early
+WIN_SKIP=""             # why no window ran
+WIN_IO_IV=0 WIN_IO_N=0
+WIN_IO_GRACE=5          # seconds the interval jobs get after the window ends
+WIN_PLAN=0              # the window's planned length, after a deadline cut
+WIN_IV_LO="" WIN_IV_HI=""   # the read intervals actually slept
+_win_sp=""
+
+# ---- interval jobs of the window (zpool iostat, iostat -x, histograms, arcstat)
+# zpool iostat and iostat -x measure the same writes at two layers (vdev queue
+# vs block device). Sampled one after the other they describe different
+# seconds, so they start together, as two bounded background jobs with the
+# same interval and count, each with its own timestamps (zpool -T d, iostat -t
+# with S_TIME_FORMAT=ISO) and a start time taken just before each fork.
+# Each job's stdout, stderr and exit status stay in its own files, so a job
+# that is capped or stopped early keeps what it wrote.
+IOSTAT_FL=""         # the iostat -x flags this sysstat takes (_iostat_flags)
+IOSTAT_FL_NOTE=""    # what was dropped, and so what the output lacks
+
+# _iostat_flags -> IOSTAT_FL: "-x -N -t" when this iostat takes -N (device-mapper
+# names) and -t (timestamps), else fewer; asked once, of the since-boot report
+_iostat_flags() {
+    [ -n "$IOSTAT_FL" ] && return 0
+    if _bounded iostat -x -N -t >/dev/null 2>&1; then IOSTAT_FL="-x -N -t"
+    elif _bounded iostat -x -t >/dev/null 2>&1; then
+        IOSTAT_FL="-x -t"; IOSTAT_FL_NOTE="this iostat refused -N; device-mapper devices keep their dm-N names"
+    else
+        IOSTAT_FL="-x"; IOSTAT_FL_NOTE="this iostat refused -N and -t; its blocks carry no timestamp (align them from the start time)"
+    fi
+}
+
+# _bg_start DIR NAME CAP CMD... -> CMD in the background under _bounded, capped
+# at CAP: DIR/NAME.txt (stdout), .err, .rc (exit status, once it ended),
+# .t0 (ms since the epoch, just before the fork), .pid
+_bg_start() {
+    local d="$1" n="$2" c="$3"
+    shift 3
+    rm -f "$d/$n.rc" "$d/$n.stop" 2>/dev/null
+    _now_ms; printf '%s\n' "$_ms" > "$d/$n.t0"
+    ( [ "$1" = iostat ] && export S_TIME_FORMAT=ISO
+      CMD_TIMEOUT="$c" _bounded "$@" > "$d/$n.txt" 2> "$d/$n.err"
+      echo $? > "$d/$n.rc" ) &
+    echo "$!" > "$d/$n.pid"
+}
+
+# _bg_end DIR NAME GRACE WHY -> wait up to GRACE seconds for the job; one still
+# running then is stopped, and WHY (why it was stopped) goes to DIR/NAME.stop
+_bg_end() {
+    local d="$1" n="$2" g="$3" p k=0
+    p="$(cat "$d/$n.pid" 2>/dev/null)"
+    [ -n "$p" ] || return 0
+    while kill -0 "$p" 2>/dev/null && [ "$k" -lt "$g" ]; do _win_sleep 1; k=$((k + 1)); done
+    if kill -0 "$p" 2>/dev/null; then
+        _kill_tree TERM "$p"
+        printf 'stopped at %s: %s\n' "$(_win_local "$(date +%s)")" "$4" > "$d/$n.stop"
+    fi
+    wait "$p" 2>/dev/null
+    rm -f "$d/$n.pid"
+}
+
+# _ms_local MS -> "YYYY-MM-DD HH:MM:SS.mmm TZ"
+_ms_local() {
+    local s=$(( $1 / 1000 )) m=$(( $1 % 1000 ))
+    printf '%s.%03d %s' "$(date -d "@$s" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || printf 'epoch %s' "$s")" "$m" "$(date -d "@$s" +%Z 2>/dev/null)"
+}
+
+# _bg_emit DIR NAME LABEL LINES -> the job's start, how it ended and its output
+# (first LINES lines) as facts. BG_WHY: why it did not deliver, or empty.
+BG_WHY=""
+_bg_emit() {
+    local d="$1" n="$2" lab="$3" cap="$4" rc t0 st c short
+    BG_WHY=""
+    short="${lab%% (*}"
+    t0="$(cat "$d/$n.t0" 2>/dev/null)"; rc="$(cat "$d/$n.rc" 2>/dev/null)"
+    if [ -f "$d/$n.stop" ]; then st="$(cat "$d/$n.stop") (output up to then below)"; BG_WHY="$short: $(cat "$d/$n.stop")"
+    elif [ "$rc" = 124 ]; then st="capped by its bound (output up to the cap below)"; BG_WHY="$short: capped by its bound"
+    elif [ "$rc" = 0 ]; then st="exit 0"
+    elif [ -z "$rc" ]; then st="no exit status recorded (output up to then below)"; BG_WHY="$short: no exit status"
+    else st="exit $rc$( [ -s "$d/$n.err" ] && printf ': %s' "$(head -n1 "$d/$n.err" | cut -c1-120)")"; BG_WHY="$short: $st"; fi
+    fact "$lab"
+    fact "  started $( [ -n "$t0" ] && _ms_local "$t0" || echo n/a ); $st"
+    if [ -s "$d/$n.txt" ]; then
+        c="$(wc -l < "$d/$n.txt" | tr -d ' ')"
+        [ "$c" -gt "$cap" ] && fact "  (first $cap of $c lines; all of them in the bundle)"
+        head -n "$cap" "$d/$n.txt" | while IFS= read -r l; do blk "$l"; done
+    else
+        fact "  n/a (no output)"
+        [ -n "$BG_WHY" ] || BG_WHY="$short: no output"
+    fi
+}
+
+# _pair_start DIR IV N CAP -> zpool iostat -T d -vlq IV N and iostat -x IV N,
+# started back to back (zpool first); PAIR_WHY names a tool that was not run
+PAIR_WHY=""
+_pair_start() {
+    local d="$1" iv="$2" n="$3" cap="$4"
+    PAIR_WHY=""
+    mkdir -p "$d" 2>/dev/null
+    have iostat && _iostat_flags
+    if ! have zpool; then PAIR_WHY="zpool iostat: command not found"
+    elif _hung zpool; then PAIR_WHY="zpool iostat: $(_skip_why zpool)"
+    else _bg_start "$d" zpool "$cap" zpool iostat -T d -vlq "$iv" "$n"; fi
+    if have iostat; then
+        # shellcheck disable=SC2086  # IOSTAT_FL is a list of flags
+        _bg_start "$d" iostat "$cap" iostat $IOSTAT_FL "$iv" "$n"
+    else PAIR_WHY="${PAIR_WHY:+$PAIR_WHY; }iostat -x: command not found (sysstat)"; fi
+}
+
+# _pair_kill DIR -> stop every job still running under DIR
+_pair_kill() {
+    local f p
+    for f in "$1"/*.pid; do
+        [ -f "$f" ] || continue
+        p="$(cat "$f" 2>/dev/null)"
+        [ -n "$p" ] && _kill_tree TERM "$p"
+    done
+}
+
+# _pair_emit DIR IV N LINES -> both jobs' facts and the start offset between
+# them; PAIR_WHY collects what did not deliver
+_pair_emit() {
+    local d="$1" iv="$2" n="$3" cap="$4" a b
+    fact "interval ${iv}s, $n blocks each; the first block of each is cumulative (zpool: since pool import; iostat: since boot)"
+    a="$(cat "$d/zpool.t0" 2>/dev/null)"; b="$(cat "$d/iostat.t0" 2>/dev/null)"
+    [ -n "$a" ] && [ -n "$b" ] && fact "start offset: iostat -x started $((b - a)) ms after zpool iostat"
+    if [ -f "$d/zpool.t0" ]; then
+        _bg_emit "$d" zpool "zpool iostat -T d -vlq $iv $n (per vdev: operations, bandwidth, total_wait, disk_wait, syncq/asyncq_wait, queue depths):" "$cap"
+        [ -n "$BG_WHY" ] && PAIR_WHY="${PAIR_WHY:+$PAIR_WHY; }$BG_WHY"
+    fi
+    if [ -f "$d/iostat.t0" ]; then
+        [ -n "$IOSTAT_FL_NOTE" ] && fact "iostat flags: $IOSTAT_FL ($IOSTAT_FL_NOTE)"
+        _bg_emit "$d" iostat "iostat $IOSTAT_FL $iv $n (per device: r/s w/s rkB/s wkB/s r_await w_await aqu-sz %util):" "$cap"
+        [ -n "$BG_WHY" ] && PAIR_WHY="${PAIR_WHY:+$PAIR_WHY; }$BG_WHY"
+    fi
+    [ -n "$PAIR_WHY" ] && fact "not delivered: $PAIR_WHY"
+}
+
+# _win_secs DUR -> seconds for N, Ns, Nm or Nh (10 .. 86400); 1 when not one
+_win_secs() {
+    local v="$1" n u
+    case "$v" in
+        *s) u=1;    n="${v%s}" ;;
+        *m) u=60;   n="${v%m}" ;;
+        *h) u=3600; n="${v%h}" ;;
+        *)  u=1;    n="$v" ;;
+    esac
+    case "$n" in ''|*[!0-9]*|0*) return 1 ;; esac
+    [ "${#n}" -le 6 ] || return 1
+    n=$((n * u))
+    [ "$n" -ge 10 ] && [ "$n" -le 86400 ] || return 1
+    printf '%s' "$n"
+}
+
+# _win_local EPOCH -> "YYYY-MM-DD HH:MM:SS TZ (UTC ...Z)"
+_win_local() {
+    printf '%s (%s)' "$(date -d "@$1" '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null || printf 'epoch %s' "$1")" "$(_epoch_iso "$1")"
+}
+
+# _win_hms SECS -> 1h02m03s
+_win_hms() {
+    local s="$1"
+    if [ "$s" -ge 3600 ]; then printf '%dh%02dm%02ds' $((s / 3600)) $((s % 3600 / 60)) $((s % 60))
+    elif [ "$s" -ge 60 ]; then printf '%dm%02ds' $((s / 60)) $((s % 60))
+    else printf '%ds' "$s"; fi
+}
+
+# _win_start_epoch -> WIN_START_EPOCH from WIN_START_SPEC, local time: HH:MM[:SS]
+# is its next occurrence, YYYY-MM-DDTHH:MM[:SS] must lie within the next 24h.
+# 1 (with a warn) when it cannot be read or is out of range.
+_win_start_epoch() {
+    local s="$WIN_START_SPEC" now t t2
+    now="$(date +%s 2>/dev/null)"
+    case "$s" in
+        [0-2][0-9]:[0-5][0-9]|[0-2][0-9]:[0-5][0-9]:[0-5][0-9])
+            t="$(date -d "$(date +%Y-%m-%d) $s" +%s 2>/dev/null)"
+            case "$t" in
+                ''|*[!0-9]*) ;;
+                *) if [ "$t" -le "$now" ]; then
+                       # tomorrow's calendar date, so a DST change tonight is
+                       # resolved by date(1); +86400 only where date has no -d tomorrow
+                       t2="$(date -d "$(date -d tomorrow +%Y-%m-%d 2>/dev/null) $s" +%s 2>/dev/null)"
+                       case "$t2" in ''|*[!0-9]*) t=$((t + 86400)) ;; *) t="$t2" ;; esac
+                   fi ;;
+            esac ;;
+        [0-9][0-9][0-9][0-9]-[0-1][0-9]-[0-3][0-9]T[0-2][0-9]:[0-5][0-9]|[0-9][0-9][0-9][0-9]-[0-1][0-9]-[0-3][0-9]T[0-2][0-9]:[0-5][0-9]:[0-5][0-9])
+            t="$(date -d "$(printf '%s' "$s" | tr 'T' ' ')" +%s 2>/dev/null)" ;;
+        *)  warn "--window=DUR@START: START is HH:MM[:SS] or YYYY-MM-DDTHH:MM[:SS] (local time); got '$s'"
+            return 1 ;;
+    esac
+    case "$t" in
+        ''|*[!0-9]*) warn "--window=DUR@$s: date cannot convert '$s' on this host"; return 1 ;;
+    esac
+    if [ "$t" -le "$now" ]; then
+        warn "--window=DUR@$s: $s is in the past ($(_win_local "$t"))"; return 1
+    fi
+    if [ $((t - now)) -gt 86400 ]; then
+        warn "--window=DUR@$s: $s is more than 24h away ($(_win_local "$t"))"; return 1
+    fi
+    WIN_START_EPOCH="$t"
+}
+
+# _win_cat SRC DST -> one bounded read of SRC into DST; its exit status
+_win_cat() { CMD_TIMEOUT=10 _bounded cat "$1" > "$2" 2>/dev/null; }
+
+# _win_param NAME -> the zfs module parameter's value, or n/a with the reason
+_win_param() {
+    local f="/sys/module/zfs/parameters/$1" v=""
+    if [ ! -e "$f" ]; then printf 'n/a (path not found: %s)' "$f"
+    elif { IFS= read -r v < "$f"; } 2>/dev/null; then printf '%s' "$v"
+    else printf 'n/a (not readable: %s)' "$f"; fi
+}
+
+# _win_on_sig SIG -> the first INT / TERM / HUP ends the wait or the window;
+# the loop sees WIN_SIG and the report is still written
+_win_on_sig() {
+    if [ -n "$WIN_SIG" ]; then
+        # a second one aborts, as outside the window
+        [ -n "$WIN_DIR" ] && _pair_kill "$WIN_DIR/io"
+        [ -n "$_win_sp" ] && kill "$_win_sp" 2>/dev/null
+        _run_cleanup
+        case "$1" in HUP) exit 129 ;; INT) exit 130 ;; *) exit 143 ;; esac
+    fi
+    WIN_SIG="$1"
+    [ -n "$_win_sp" ] && kill "$_win_sp" 2>/dev/null
+}
+# the run helpers' traps, as _run_init set them
+_win_restore_traps() {
+    trap '_run_cleanup; exit 129' HUP
+    trap '_run_cleanup; exit 130' INT
+    trap '_run_cleanup; exit 143' TERM
+}
+
+# _win_sleep SECS -> a sleep a trapped signal ends at once
+_win_sleep() {
+    [ "$1" -gt 0 ] 2>/dev/null || return 0
+    sleep "$1" & _win_sp=$!
+    wait "$_win_sp" 2>/dev/null
+    kill "$_win_sp" 2>/dev/null; _win_sp=""
+}
+
+# _win_snap PHASE -> $WIN_DIR/PHASE: epoch, the two txg parameters, dmu_tx,
+# arcstats and every pool's objset-* kstats
+_win_snap() {
+    local d="$WIN_DIR/$1" kd pn f
+    mkdir -p "$d/pools" 2>/dev/null
+    date +%s > "$d/epoch" 2>/dev/null
+    printf 'zfs_txg_history\t%s\nzfs_txg_timeout\t%s\n' \
+        "$(_win_param zfs_txg_history)" "$(_win_param zfs_txg_timeout)" > "$d/params" 2>/dev/null
+    [ -e "$KSTAT_DIR/dmu_tx" ] && { _win_cat "$KSTAT_DIR/dmu_tx" "$d/dmu_tx" || rm -f "$d/dmu_tx"; }
+    [ -e "$KSTAT_DIR/arcstats" ] && { _win_cat "$KSTAT_DIR/arcstats" "$d/arcstats" || rm -f "$d/arcstats"; }
+    for kd in "$KSTAT_DIR"/*/; do
+        kd="${kd%/}"
+        [ -e "$kd/txgs" ] || continue
+        pn="${kd##*/}"
+        mkdir -p "$d/pools/$pn" 2>/dev/null
+        for f in "$kd"/objset-*; do
+            [ -f "$f" ] || continue
+            _win_cat "$f" "$d/pools/$pn/${f##*/}" || rm -f "$d/pools/$pn/${f##*/}"
+        done
+    done
+}
+
+# One read of a pool's txgs merged into $p/rows. prev: the previous read;
+# the state line carries the running values between reads:
+#   first last kept over gap part reads fails span_s rmin rmax openend empty
+# first = the txg open at the first read (the window's first txg), last = the
+# highest txg merged so far.
+# shellcheck disable=SC2016  # an awk program, expanded by awk
+_WIN_MERGE_AWK='
+function keep(line) { if (kept < cap) { print line >> rowsf; kept++ } else over++ }
+FILENAME == prevf { if ($1 ~ /^[0-9]+$/) { pr[$1 + 0] = $0; if (pmax == "" || $1 + 0 > pmax) pmax = $1 + 0 }; next }
+$1 ~ /^[0-9]+$/ {
+    t = $1 + 0; r[t] = $0; s[t] = $3; n++
+    if (rmin == "" || t < rmin) { rmin = t; bmin = $2 }
+    if (rmax == "" || t > rmax) { rmax = t; bmax = $2 }
+}
+END {
+    empty = 0; span = 0
+    if (n == 0) empty = 1
+    else {
+        if (first == "") { first = rmax; last = rmax - 1 }
+        if (rmin > last + 1) {
+            g0 = ""; ng = 0
+            for (t = last + 1; t < rmin; t++) {
+                if (t in pr) { keep(pr[t]); part++; continue }
+                if (g0 == "") g0 = t
+                g1 = t; ng++
+            }
+            if (ng) { printf "%s\t%s\t%d\t%s\n", g0, g1, ng, now >> gapf; gap += ng }
+            last = rmin - 1
+        }
+        for (t = last + 1; t <= rmax; t++) {
+            if (!(t in r) || s[t] != "C") break
+            keep(r[t]); last = t
+        }
+        if (final) for (t = last + 1; t <= rmax; t++) if (t in r) { keep(r[t]); openend++; last = t }
+        span = (bmax - bmin) / 1e9
+    }
+    printf "%s %s %d %d %d %d %d %d %.3f %s %s %d %d\n", (first == "" ? "-" : first), (last == "" ? "-" : last), \
+        kept, over, gap, part, reads + 1, fails, span, (rmin == "" ? "-" : rmin), (rmax == "" ? "-" : rmax), openend, empty
+}'
+
+# _win_state FILE -> the state line into w_first .. w_empty (fields as above)
+_win_state() {
+    w_first=- w_last=- w_kept=0 w_over=0 w_gap=0 w_part=0 w_reads=0 w_fails=0 w_span=0 w_rmin=- w_rmax=- w_open=0 w_empty=1
+    { read -r w_first w_last w_kept w_over w_gap w_part w_reads w_fails w_span w_rmin w_rmax w_open w_empty < "$1"; } 2>/dev/null
+}
+
+# _win_read POOL FINAL -> one read of POOL's txgs, merged; the reads log gets
+# a line (epoch, rows, oldest, newest, span, gaps so far) or the failure
+_win_merge() {
+    local p="$1" prevf="$2" curf="$3" fin="$4" now="$5" st
+    _win_state "$p/state"
+    [ -s "$p/rows" ] || head -n 1 "$curf" > "$p/rows" 2>/dev/null
+    st="$(awk -v prevf="$prevf" -v rowsf="$p/rows" -v gapf="$p/gaps.tsv" -v cap="$WIN_ROW_CAP" \
+        -v first="${w_first#-}" -v last="${w_last#-}" \
+        -v kept="$w_kept" -v over="$w_over" -v gap="$w_gap" -v part="$w_part" -v reads="$w_reads" -v fails="$w_fails" \
+        -v openend=0 -v final="$fin" -v now="$now" "$_WIN_MERGE_AWK" "$prevf" "$curf" 2>/dev/null)"
+    [ -n "$st" ] || return 1
+    printf '%s\n' "$st" > "$p/state"
+    _win_state "$p/state"
+}
+
+# _win_read POOL FINAL -> one read of POOL's txgs, merged; the reads log gets
+# a line (epoch, rows, oldest, newest, span, gaps so far) or the failure. A
+# txgs that is gone (pool exported) ends the pool: the last good read is
+# merged as the final one, and $p/gone holds the failed read's time and the
+# last good read's time.
+_win_read() {
+    local pn="$1" fin="$2" p="$WIN_DIR/txg/$1" rc now lg
+    [ -f "$p/gone" ] && return 0
+    _win_cat "$KSTAT_DIR/$pn/txgs" "$p/cur"; rc=$?
+    [ "$rc" -ne 0 ] && { _win_cat "$KSTAT_DIR/$pn/txgs" "$p/cur"; rc=$?; }
+    now="$(date +%s 2>/dev/null)"
+    if [ "$rc" -ne 0 ]; then
+        if [ ! -e "$KSTAT_DIR/$pn/txgs" ]; then
+            lg="$(awk -F'\t' '$2 ~ /^[0-9]+$/ { e = $1 } END { print e }' "$p/reads.tsv" 2>/dev/null)"
+            printf '%s\tpath not found: %s\n' "$now" "$KSTAT_DIR/$pn/txgs" >> "$p/reads.tsv"
+            printf '%s\t%s\n' "$now" "$lg" > "$p/gone"
+            # the last good read's still-open rows, kept as last seen
+            [ -s "$p/prev" ] && _win_merge "$p" /dev/null "$p/prev" 1 "$now"
+        else
+            printf '%s\tread failed (exit %s, asked twice)\n' "$now" "$rc" >> "$p/reads.tsv"
+        fi
+        _win_state "$p/state"
+        printf '%s %s %s %s %s %s %s %s %s %s %s %s %s\n' "$w_first" "$w_last" "$w_kept" "$w_over" "$w_gap" "$w_part" \
+            "$( [ -f "$p/gone" ] && [ -s "$p/prev" ] && echo "$w_reads" || echo $((w_reads + 1)) )" "$((w_fails + 1))" \
+            "$w_span" "$w_rmin" "$w_rmax" "$w_open" "$w_empty" > "$p/state"
+        return 0
+    fi
+    _win_merge "$p" "$p/prev" "$p/cur" "$fin" "$now" || return 0
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$now" "$(( $(wc -l < "$p/cur") - 1 ))" "$w_rmin" "$w_rmax" "$w_span" "$w_gap" >> "$p/reads.tsv"
+    cat "$p/cur" > "$p/prev" 2>/dev/null
+}
+
+# _win_iv -> seconds to the next read: half the shortest span any pool's ring
+# covered at its last read, clamped to [WIN_IV_MIN, WIN_IV_MAX]
+_win_iv() {
+    local f iv="" h
+    for f in "$WIN_DIR"/txg/*/state; do
+        [ -f "$f" ] || continue
+        [ -f "${f%/state}/gone" ] && continue
+        _win_state "$f"
+        [ "$w_empty" = 0 ] || continue
+        h="${w_span%.*}"; h=$(( ${h:-0} / 2 ))
+        { [ -z "$iv" ] || [ "$h" -lt "$iv" ]; } && iv="$h"
+    done
+    [ -z "$iv" ] && iv="$WIN_IV_MAX"
+    [ "$iv" -lt "$WIN_IV_MIN" ] && iv="$WIN_IV_MIN"
+    [ "$iv" -gt "$WIN_IV_MAX" ] && iv="$WIN_IV_MAX"
+    printf '%s' "$iv"
+}
+
+# window_run -> the window, before the report: waits for its START, then
+# reads counters, every pool's txgs until the end, and counters again. Its
+# files are in WIN_DIR; section O prints them and the bundle copies them.
+window_run() {
+    local e0 end left iv pn lastp=0 io_cap k n
+    WIN_DIR="$(_tmp win)"
+    case "$WIN_DIR" in /dev/null) WIN_SKIP="no private temp directory could be made under ${TMPDIR:-/tmp}"; return ;; esac
+    [ -d "$KSTAT_DIR" ] || { WIN_SKIP="path not found: $KSTAT_DIR"; return; }
+    k=""; for n in "$KSTAT_DIR"/*/txgs; do [ -e "$n" ] && { k=1; break; }; done
+    [ -n "$k" ] || { WIN_SKIP=nopool; return; }
+    # a caller's RUN_DEADLINE that leaves the (default) window no time
+    left=$((RUN_DEADLINE - WIN_RESERVE - $(_elapsed)))
+    [ -n "$WIN_START_EPOCH" ] && left=$((left - WIN_START_EPOCH + $(date +%s)))
+    if [ "$left" -lt 1 ]; then
+        WIN_SKIP="RUN_DEADLINE=$RUN_DEADLINE leaves no time for the ${WIN_SECS}s window (${WIN_RESERVE}s are kept for the report)"
+        warn "window: not run: $WIN_SKIP"
+        return
+    fi
+    mkdir -p "$WIN_DIR/txg" 2>/dev/null || { WIN_SKIP="cannot create $WIN_DIR"; return; }
+    trap '_win_on_sig INT' INT
+    trap '_win_on_sig TERM' TERM
+    trap '_win_on_sig HUP' HUP
+    if [ -n "$WIN_START_EPOCH" ]; then
+        warn "--window: waiting until $(_win_local "$WIN_START_EPOCH"), in $(_win_hms $((WIN_START_EPOCH - $(date +%s)))), then collecting for $(_win_hms "$WIN_SECS"); keep this session open"
+        while [ -z "$WIN_SIG" ]; do
+            left=$((WIN_START_EPOCH - $(date +%s)))
+            [ "$left" -le 0 ] && break
+            if [ $(( $(_elapsed) - lastp )) -ge 600 ]; then progress "window: starts in $(_win_hms "$left")"; lastp="$(_elapsed)"; fi
+            [ "$left" -gt 60 ] && left=60
+            _win_sleep "$left"
+        done
+        if [ -n "$WIN_SIG" ]; then
+            warn "window: SIG$WIN_SIG while waiting for the start; the report is written without it"
+            _win_restore_traps; return
+        fi
+    fi
+    WIN_RAN=1
+    WIN_T0="$(date +%s)"
+    e0="$(_elapsed)"; end=$((e0 + WIN_SECS))
+    if [ "$end" -gt $((RUN_DEADLINE - WIN_RESERVE)) ]; then
+        end=$((RUN_DEADLINE - WIN_RESERVE)); WIN_CUT=1
+        [ "$end" -lt "$e0" ] && end="$e0"
+        warn "window: the run deadline (${RUN_DEADLINE}s) cuts the window to $((end - e0))s of ${WIN_SECS}s"
+    fi
+    WIN_PLAN=$((end - e0))
+    progress "window: $(_win_hms $((end - e0))) from $(_win_local "$WIN_T0")"
+    # The interval jobs, started together: zpool iostat -vlq and iostat -x at
+    # the same interval (about 120 blocks each: a 30s window gets 1s blocks),
+    # zpool iostat -r / -w with one block for the whole window, and arcstat
+    # at the same interval when it is installed. They start first, at the
+    # window's start, and their count covers at most the window
+    # ((N - 1) x I <= its length), so they end with it whatever I is.
+    WIN_IO_IV=$(( (end - e0) / 120 ))
+    [ "$WIN_IO_IV" -lt 1 ] && WIN_IO_IV=1
+    [ "$WIN_IO_IV" -gt 60 ] && WIN_IO_IV=60
+    WIN_IO_N=$(( (end - e0) / WIN_IO_IV + 1 ))
+    io_cap=$(( end - e0 + WIN_IO_IV + 30 ))
+    _pair_start "$WIN_DIR/io" "$WIN_IO_IV" "$WIN_IO_N" "$io_cap"
+    if have zpool && ! _hung zpool && [ "$WIN_PLAN" -gt 0 ]; then
+        _bg_start "$WIN_DIR/io" hist-r "$io_cap" zpool iostat -T d -r "$WIN_PLAN" 2
+        _bg_start "$WIN_DIR/io" hist-w "$io_cap" zpool iostat -T d -w "$WIN_PLAN" 2
+    fi
+    have arcstat && _bg_start "$WIN_DIR/io" arcstat "$io_cap" arcstat "$WIN_IO_IV" "$WIN_IO_N"
+    _win_snap start
+    for k in "$KSTAT_DIR"/*/; do
+        k="${k%/}"; [ -e "$k/txgs" ] || continue
+        pn="${k##*/}"
+        mkdir -p "$WIN_DIR/txg/$pn" 2>/dev/null
+        : > "$WIN_DIR/txg/$pn/prev"
+        echo "- - 0 0 0 0 0 0 0 - - 0 1" > "$WIN_DIR/txg/$pn/state"
+        _win_read "$pn" 0
+    done
+    lastp="$(_elapsed)"
+    while [ -z "$WIN_SIG" ]; do
+        left=$((end - $(_elapsed)))
+        [ "$left" -le 0 ] && break
+        iv="$(_win_iv)"; [ "$iv" -gt "$left" ] && iv="$left"
+        { [ -z "$WIN_IV_LO" ] || [ "$iv" -lt "$WIN_IV_LO" ]; } && WIN_IV_LO="$iv"
+        { [ -z "$WIN_IV_HI" ] || [ "$iv" -gt "$WIN_IV_HI" ]; } && WIN_IV_HI="$iv"
+        _win_sleep "$iv"
+        [ -n "$WIN_SIG" ] && break
+        [ "$(_elapsed)" -ge "$end" ] && break
+        for k in "$WIN_DIR"/txg/*/; do k="${k%/}"; [ -d "$k" ] && _win_read "${k##*/}" 0; done
+        if [ $(( $(_elapsed) - lastp )) -ge 300 ]; then
+            progress "window: $(_win_hms $(( $(_elapsed) - e0 ))) of $(_win_hms $((end - e0))); next read in $(_win_iv)s"
+            lastp="$(_elapsed)"
+        fi
+    done
+    for k in "$WIN_DIR"/txg/*/; do k="${k%/}"; [ -d "$k" ] && _win_read "${k##*/}" 1; done
+    _win_snap end
+    WIN_T1="$(date +%s)"
+    # they end by their count with the window; WIN_IO_GRACE seconds more for
+    # the last block, whatever the interval. An early end (signal, deadline)
+    # stops them at once.
+    k="$WIN_IO_GRACE"; { [ -n "$WIN_SIG" ] || [ -n "$WIN_CUT" ]; } && k=0
+    for n in zpool iostat hist-r hist-w arcstat; do
+        _bg_end "$WIN_DIR/io" "$n" "$k" "the window ended${WIN_SIG:+ early (SIG$WIN_SIG)}"
+    done
+    [ -n "$WIN_SIG" ] && warn "window: SIG$WIN_SIG after $(_win_hms $((WIN_T1 - WIN_T0))) of $(_win_hms "$WIN_SECS"); writing the report with what was collected (a second one aborts)"
+    _win_restore_traps
+}
+
+# _win_dist ROWS -> count/min/p50/p90/p99/max of the completed rows' columns
+# (nearest rank), one line per column
+_win_dist() {
+    local rows="$1" c
+    printf '        %-14s %7s %14s %14s %14s %14s %14s\n' "column" "count" "min" "p50" "p90" "p99" "max"
+    for c in "9 otime(ms) 1e6" "10 qtime(ms) 1e6" "11 wtime(ms) 1e6" "12 stime(ms) 1e6" "4 ndirty(B) 1" "6 nwritten(B) 1" "8 writes 1"; do
+        set -- $c
+        awk -v c="$1" '$1 ~ /^[0-9]+$/ && $3 == "C" { print $c }' "$rows" 2>/dev/null | sort -n | \
+        awk -v lab="$2" -v sc="$3" '
+            { v[NR] = $1 }
+            function at(q,  i) { i = int(q * NR); if (i < q * NR) i++; if (i < 1) i = 1; return v[i] / sc }
+            END {
+                if (NR == 0) { printf "        %-14s %7d %14s\n", lab, 0, "-"; exit }
+                f = (sc == 1) ? "%14.0f" : "%14.1f"
+                printf "        %-14s %7d " f " " f " " f " " f " " f "\n", lab, NR, at(0), at(0.5), at(0.9), at(0.99), v[NR] / sc
+            }'
+    done
+}
+
+# _win_delta START END -> one line per numeric counter that changed (start,
+# end, delta) and one line naming the unchanged ones; a kstat recreated in
+# between (its crtime changed) and a counter that went down are said as such
+_win_delta() {
+    awk '
+        FNR == 1 { f++; cr[f] = $6; next }
+        FNR == 2 { next }
+        f == 1 { if ($2 == 7) nm1 = $3; else { v1[$1] = $3; o[++n] = $1 } ; next }
+        f == 2 { if ($2 == 7) nm2 = $3; else v2[$1] = $3 }
+        END {
+            if (nm1 != nm2) printf "        dataset_name: %s at start, %s at end\n", nm1, nm2
+            if (cr[1] != cr[2]) { printf "        kstat recreated during the window (crtime %s at start, %s at end): deltas not computed\n", cr[1], cr[2]; exit }
+            for (i = 1; i <= n; i++) {
+                k = o[i]
+                if (v1[k] == v2[k]) { z = z (z == "" ? "" : ", ") k "=" v1[k]; continue }
+                if (!hd++) printf "        %-34s %20s %20s %20s\n", "counter", "start", "end", "delta"
+                if (!(k in v2)) { printf "        %-34s %20s %20s %20s\n", k, v1[k], "-", "absent at end"; continue }
+                if (v2[k] + 0 < v1[k] + 0) d = "went down (end < start)"; else d = sprintf("%.0f", v2[k] - v1[k])
+                printf "        %-34s %20s %20s %20s\n", k, v1[k], v2[k], d
+            }
+            # the unchanged ones, wrapped at about 150 columns
+            m = split(z, U, ", "); l = "unchanged:"
+            for (i = 1; i <= m; i++) {
+                if (length(l) + length(U[i]) > 150) { printf "        %s\n", l; l = "          " }
+                l = l " " U[i] (i < m ? "," : "")
+            }
+            if (m) printf "        %s\n", l
+        }' "$1" "$2" 2>/dev/null
+}
+
+# _win_saved PHASE NAME -> a parameter as the window's PHASE snapshot read it
+_win_saved() { awk -F'\t' -v k="$2" '$1 == k { print $2 }' "$WIN_DIR/$1/params" 2>/dev/null; }
+
+# -- O. Write-path window (--window) ---------------------------------------
+WIN_GOAL="time window (every txg, counters, zpool iostat -vlq with iostat -x, -r/-w)"
+_rep_o() {
+    section "O. Time window (every run; --window sets its length and start)"
+    goal window "$WIN_GOAL"
+    fact "length: $(_win_hms "$WIN_SECS")$( [ "$WIN_GIVEN" = 1 ] && echo ' (--window)' || echo " (default; --window=DUR sets it)")${WIN_START_EPOCH:+, from $(_win_local "$WIN_START_EPOCH")}"
+    if [ "$WIN_RAN" != 1 ]; then
+        if [ -n "$WIN_SIG" ]; then
+            fact "window: not started (SIG$WIN_SIG while waiting for the start)"
+            missed window "not started: SIG$WIN_SIG while waiting for $(_win_local "$WIN_START_EPOCH")"
+        elif [ ! -d "$KSTAT_DIR" ]; then
+            fact "window: not run (path not found: $KSTAT_DIR)"
+            if [ "${ZPOOL_COUNT:-0}" -gt 0 ] 2>/dev/null; then missed window "zpool list listed $ZPOOLS but $KSTAT_DIR is not there"
+            else na window "no kstat tree ($KSTAT_DIR not found) and no pool listed by zpool"; fi
+        elif [ "$WIN_SKIP" = nopool ]; then
+            fact "window: not run (no <pool>/txgs under $KSTAT_DIR)"
+            if [ "${ZPOOL_COUNT:-0}" -gt 0 ] 2>/dev/null; then missed window "zpool list listed $ZPOOLS but $KSTAT_DIR has no <pool>/txgs"
+            else na window "no <pool>/txgs under $KSTAT_DIR and no pool listed by zpool (no pool imported)"; fi
+        else
+            fact "window: not run (${WIN_SKIP:-not reached})"
+            missed window "not run: ${WIN_SKIP:-not reached}"
+        fi
+        return
+    fi
+    local why="" p pn f st="" n np fn g0 g1 gn ge nopool=0
+    fact "window: $(_win_local "$WIN_T0") -> $(_win_local "$WIN_T1"), $(_win_hms $((WIN_T1 - WIN_T0)))"
+    if [ -n "$WIN_SIG" ]; then
+        fact "ended early: SIG$WIN_SIG after $(_win_hms $((WIN_T1 - WIN_T0))) of $(_win_hms "$WIN_SECS"); what follows covers the part collected"
+        why="ended early by SIG$WIN_SIG after $(_win_hms $((WIN_T1 - WIN_T0))) of $(_win_hms "$WIN_SECS")"
+    elif [ -n "$WIN_CUT" ]; then
+        fact "ended early: the run deadline (${RUN_DEADLINE}s, ${WIN_RESERVE}s kept for the report) cut it to $(_win_hms "$WIN_PLAN") of $(_win_hms "$WIN_SECS"); it ran $(_win_hms $((WIN_T1 - WIN_T0))) with the last reads"
+        why="cut by the run deadline (${RUN_DEADLINE}s) to $(_win_hms "$WIN_PLAN") of $(_win_hms "$WIN_SECS")"
+    fi
+    subsection "module parameters at start and end (read, never written)"
+    for p in zfs_txg_history zfs_txg_timeout; do
+        fact "$p: start $(_win_saved start "$p"), end $(_win_saved end "$p")"
+    done
+
+    subsection "txgs per pool (reads merged by txg number)"
+    if [ -n "$WIN_IV_LO" ]; then
+        fact "read interval used: ${WIN_IV_LO}..${WIN_IV_HI}s (half the shortest ring span of all pools, clamped to ${WIN_IV_MIN}..${WIN_IV_MAX}s, cut to the time left)"
+    else
+        fact "read interval used: none (read at the start and at the end only)"
+    fi
+    np=0
+    for p in "$WIN_DIR"/txg/*/; do
+        p="${p%/}"; [ -f "$p/state" ] || continue
+        pn="${p##*/}"; np=$((np + 1))
+        _win_state "$p/state"
+        fact "pool $pn: $w_reads reads ($w_fails failed); read interval its ring's span implied: $(awk -F'\t' -v lo="$WIN_IV_MIN" -v hi="$WIN_IV_MAX" '
+            BEGIN { mn = -1 }
+            $5 ~ /^[0-9.]+$/ { i = int($5 / 2); if (i < lo) i = lo; if (i > hi) i = hi; if (mn < 0 || i < mn) mn = i; if (i > mx) mx = i }
+            END { if (mn < 0) print "-"; else printf "%d..%ds", mn, mx }' "$p/reads.tsv" 2>/dev/null)"
+        if [ "$w_first" = - ]; then
+            fact "  txgs: none read (the ring was empty or not readable at every read)"
+            why="${why:+$why; }pool $pn: no txgs row read (zfs_txg_history=$(_win_saved end zfs_txg_history) at the end)"
+            continue
+        fi
+        n=$((w_last - w_first + 1))
+        fact "  txgs in the window: $w_first .. $w_last ($n number$( [ "$n" = 1 ] || echo s)); rows kept: $w_kept"
+        fact "  rows seen completed (state C): $(awk '$1 ~ /^[0-9]+$/ && $3 == "C"' "$p/rows" 2>/dev/null | wc -l | tr -d ' '); not completed at the last read: $w_open; left the ring before seen completed (last-seen state kept): $w_part"
+        fact "  txgs never seen (left the ring between two reads): $w_gap"
+        if [ "$w_gap" -gt 0 ]; then
+            head -n 50 "$p/gaps.tsv" 2>/dev/null | while IFS="$_tab" read -r g0 g1 gn ge; do
+                blk "txg $g0 .. $g1 ($gn), missing from the read at $(_win_local "$ge")"
+            done
+            [ "$(wc -l < "$p/gaps.tsv")" -gt 50 ] && blk "(first 50 ranges; all of them in the bundle's window/gaps-$pn.tsv)"
+            why="${why:+$why; }pool $pn: $w_gap txgs left the ring unseen (zfs_txg_history=$(_win_saved end zfs_txg_history) at the end; a larger ring covers a longer span)"
+        fi
+        if [ "$w_over" -gt 0 ]; then
+            fact "  row cap: $WIN_ROW_CAP rows kept, $w_over later ones not kept"
+            why="${why:+$why; }pool $pn: $w_over rows past the ${WIN_ROW_CAP}-row cap (a shorter --window keeps them all)"
+        fi
+        if [ -f "$p/gone" ]; then
+            IFS="$_tab" read -r g0 g1 < "$p/gone"
+            fact "  $KSTAT_DIR/$pn/txgs: not found at the read of $(_win_local "$g0"); the last read with rows was at $( [ -n "$g1" ] && _win_local "$g1" || echo n/a ), newest txg $w_last; txgs after it are not in this report"
+            why="${why:+$why; }pool $pn: $KSTAT_DIR/$pn/txgs not found from $(_win_local "$g0") on"
+        fi
+        fact "  distribution over the rows seen completed (nearest rank):"
+        _win_dist "$p/rows"
+    done
+    if [ "$np" = 0 ]; then
+        fact "no <pool>/txgs under $KSTAT_DIR at the start"
+        if [ "${ZPOOL_COUNT:-0}" -gt 0 ] 2>/dev/null; then why="${why:+$why; }zpool list listed $ZPOOLS but $KSTAT_DIR has no <pool>/txgs"
+        else nopool=1; fi
+    fi
+
+    subsection "counters at start and end (dmu_tx, arcstats, objset-* per dataset)"
+    if [ -f "$WIN_DIR/start/dmu_tx" ] && [ -f "$WIN_DIR/end/dmu_tx" ]; then
+        fact "dmu_tx ($KSTAT_DIR/dmu_tx):"
+        _win_delta "$WIN_DIR/start/dmu_tx" "$WIN_DIR/end/dmu_tx"
+    else
+        fact "dmu_tx: n/a (not read at $( [ -f "$WIN_DIR/start/dmu_tx" ] && echo end || echo start ): $KSTAT_DIR/dmu_tx)"
+        why="${why:+$why; }dmu_tx not read"
+    fi
+    if [ -f "$WIN_DIR/start/arcstats" ] && [ -f "$WIN_DIR/end/arcstats" ]; then
+        fact "arcstats ($KSTAT_DIR/arcstats; the ARC counters behind arcstat, sizes as gauges):"
+        _win_delta "$WIN_DIR/start/arcstats" "$WIN_DIR/end/arcstats"
+    else
+        fact "arcstats: n/a (not read at $( [ -f "$WIN_DIR/start/arcstats" ] && echo end || echo start ): $KSTAT_DIR/arcstats)"
+        why="${why:+$why; }arcstats not read"
+    fi
+    for p in "$WIN_DIR"/start/pools/*/ "$WIN_DIR"/end/pools/*/; do
+        p="${p%/}"; [ -d "$p" ] || continue
+        pn="${p##*/}"
+        case " $st " in *" $pn "*) continue ;; esac
+        st="$st $pn"
+        for f in "$WIN_DIR/start/pools/$pn"/objset-* "$WIN_DIR/end/pools/$pn"/objset-*; do
+            [ -f "$f" ] || continue
+            fn="${f##*/}"
+            case " $st " in *" $pn/$fn "*) continue ;; esac
+            st="$st $pn/$fn"
+            if [ ! -f "$WIN_DIR/start/pools/$pn/$fn" ]; then
+                fact "$pn/$fn ($(awk '$1 == "dataset_name" { print $3 }' "$f" 2>/dev/null)): absent at start, present at end"
+            elif [ ! -f "$WIN_DIR/end/pools/$pn/$fn" ]; then
+                fact "$pn/$fn ($(awk '$1 == "dataset_name" { print $3 }' "$f" 2>/dev/null)): present at start, absent at end"
+            else
+                fact "$pn/$fn ($(awk '$1 == "dataset_name" { print $3 }' "$f" 2>/dev/null)):"
+                _win_delta "$WIN_DIR/start/pools/$pn/$fn" "$WIN_DIR/end/pools/$pn/$fn"
+            fi
+        done
+    done
+
+    subsection "zpool iostat -vlq and iostat -x over the window (started together, same interval)"
+    _pair_emit "$WIN_DIR/io" "$WIN_IO_IV" "$WIN_IO_N" "$WIN_IOSTAT_LINES"
+    [ -n "$PAIR_WHY" ] && why="${why:+$why; }$PAIR_WHY"
+
+    subsection "zpool iostat -r / -w for the window (first block: since pool import; second: the window)"
+    for n in hist-r hist-w; do
+        if [ -f "$WIN_DIR/io/$n.t0" ]; then
+            _bg_emit "$WIN_DIR/io" "$n" "zpool iostat -T d -${n#hist-} $WIN_PLAN 2 ($( [ "$n" = hist-r ] && echo 'request-size histogram' || echo 'latency histogram' )):" 1000
+            [ -n "$BG_WHY" ] && why="${why:+$why; }$BG_WHY"
+        fi
+    done
+    [ -f "$WIN_DIR/io/hist-r.t0" ] || fact "n/a (not run with zpool iostat above)"
+
+    subsection "arcstat over the window"
+    if [ -f "$WIN_DIR/io/arcstat.t0" ]; then
+        _bg_emit "$WIN_DIR/io" arcstat "arcstat $WIN_IO_IV $WIN_IO_N:" "$WIN_IOSTAT_LINES"
+        [ -n "$BG_WHY" ] && why="${why:+$why; }$BG_WHY"
+    else
+        fact "n/a (command not found: arcstat; the arcstats counters it reads are in the start/end table above)"
+    fi
+
+    subsection "txgs rows kept (column header, then one row per txg, ascending)"
+    for p in "$WIN_DIR"/txg/*/; do
+        p="${p%/}"; [ -s "$p/rows" ] || continue
+        fact "pool ${p##*/}:"
+        dump_file "$p/rows" $((WIN_ROW_CAP + 1))
+    done
+    if [ -n "$why" ]; then missed window "$why"
+    elif [ "$nopool" = 1 ]; then na window "no <pool>/txgs under $KSTAT_DIR and no pool listed by zpool (no pool imported)"
+    else got window; fi
+}
+
+bundle_window() {
+    local d="$1" p pn n
+    [ -n "$WIN_DIR" ] && [ -d "$WIN_DIR" ] || return 0
+    mkdir -p "$d" 2>/dev/null
+    for p in "$WIN_DIR"/txg/*/; do
+        p="${p%/}"; pn="${p##*/}"
+        [ -f "$p/rows" ] && cp "$p/rows" "$d/txgs-$pn.txt" 2>/dev/null
+        [ -f "$p/reads.tsv" ] && { printf 'epoch\trows\toldest\tnewest\tspan_s\tgaps_so_far\n'; cat "$p/reads.tsv"; } > "$d/reads-$pn.tsv" 2>/dev/null
+        [ -f "$p/gaps.tsv" ] && { printf 'from\tto\tcount\tfound_at_epoch\n'; cat "$p/gaps.tsv"; } > "$d/gaps-$pn.tsv" 2>/dev/null
+    done
+    for p in zpool iostat hist-r hist-w arcstat; do
+        case "$p" in zpool) n=zpool-iostat-vlq ;; iostat) n=iostat-x ;; hist-r) n=zpool-iostat-r ;; hist-w) n=zpool-iostat-w ;; *) n=arcstat ;; esac
+        [ -f "$WIN_DIR/io/$p.txt" ] && cp "$WIN_DIR/io/$p.txt" "$d/$n.txt" 2>/dev/null
+        [ -f "$WIN_DIR/io/$p.t0" ] && printf '%s\t%s\n' "$p" "$(cat "$WIN_DIR/io/$p.t0")" >> "$d/io-start-ms.tsv" 2>/dev/null
+    done
+    for p in start end; do [ -d "$WIN_DIR/$p" ] && cp -R "$WIN_DIR/$p" "$d/$p" 2>/dev/null; done
+    progress "window: merged txgs, reads log, counters and the interval jobs' output written"
+}
+
+# =============================================================================
 # Bundle (Tier 1 raw artifacts; Tier 2 only when its flag was given)
 # =============================================================================
 bundle_zfs() {
@@ -2290,24 +3042,6 @@ bundle_whatap() {
     progress "whatap: path-to-dataset map written"
 }
 
-bundle_sample() {
-    local d="$1"; mkdir -p "$d" 2>/dev/null
-    have zpool || return
-    progress "sample: zpool iostat interval samples (${SAMPLE_SECS}s each) ..."
-    run_bounded $((SAMPLE_SECS * 3 + 30)) zpool iostat -lqv "$SAMPLE_SECS" 2 > "$d/iostat-lqv.txt"
-    run_bounded $((SAMPLE_SECS * 3 + 30)) zpool iostat -r "$SAMPLE_SECS" 2   > "$d/iostat-r.txt"
-    run_bounded $((SAMPLE_SECS * 3 + 30)) zpool iostat -w "$SAMPLE_SECS" 2   > "$d/iostat-w.txt"
-    have arcstat && run_bounded $((SAMPLE_SECS * 3 + 30)) arcstat 1 "$SAMPLE_SECS" > "$d/arcstat.txt"
-    if have iostat; then
-        local ic=$(( SAMPLE_SECS * 3 / IOSTAT_BUCKET + 1 ))
-        [ "$ic" -lt 2 ] && ic=2
-        progress "sample: iostat -x in ${IOSTAT_BUCKET}s buckets over $(( (ic - 1) * IOSTAT_BUCKET ))s ..."
-        run_bounded $(( ic * IOSTAT_BUCKET + 30 )) iostat -x "$IOSTAT_BUCKET" "$ic" \
-            > "$d/iostat-x-interval.txt"
-    fi
-    progress "sample: written"
-}
-
 bundle_zdb() {
     local d="$1" p; mkdir -p "$d" 2>/dev/null
     have zdb || { warn "[Tier2] zdb: command not found"; return; }
@@ -2336,7 +3070,7 @@ do_bundle() {
     bundle_params "$work/params"
     bundle_host   "$work/host"
     bundle_whatap "$work/whatap"
-    [ "$OPT_SAMPLE" = 1 ] && bundle_sample "$work/sample"
+    bundle_window "$work/window"
     [ "$OPT_ZDB" = 1 ] && bundle_zdb "$work/zdb"
 
     tarball="$OPT_OUT/$BASENAME.tar.gz"
@@ -2385,26 +3119,51 @@ if [ "$OPT_BUNDLE" = 0 ] && [ "$OPT_STDOUT" = 0 ] && [ "$OPT_FILE" = 0 ]; then
 fi
 
 # Numeric options are checked before anything runs (exit 2), not half way.
-_need_int --sample "$SAMPLE_SECS"
-_need_int --hours "$OPT_HOURS"
-_need_int --filesizes-secs "$FILESIZES_SECS"
-_need_int --event-days "$OPT_EVENT_DAYS"
-[ "$SAMPLE_SECS" -lt 1 ] && SAMPLE_SECS=1
+# The environment caps, checked like RUN_DEADLINE and CMD_TIMEOUT: a value
+# that is not a whole number is ignored, with a warn, and the default used.
+FILESIZES_SECS="$(_cap_or FILESIZES_SECS "$FILESIZES_SECS" 300)"
+OPT_HOURS="$(_cap_or JOURNAL_HOURS "$OPT_HOURS" 24)"
+[ "$OPT_EVENT_DAYS" = 0 ] || OPT_EVENT_DAYS="$(_cap_or EVENT_DAYS "$OPT_EVENT_DAYS" 30)"
+if [ "$WIN_GIVEN" = 1 ]; then
+    # DUR[@START]
+    case "$WIN_SPEC" in *@*) WIN_START_SPEC="${WIN_SPEC#*@}"; WIN_SPEC="${WIN_SPEC%%@*}"
+        [ -n "$WIN_START_SPEC" ] || { warn "--window=DUR@START: START is empty"; exit 2; } ;;
+    esac
+    WIN_SECS="$(_win_secs "$WIN_SPEC")" || { warn "--window takes DUR[@START], DUR from 10s to 24h: N (seconds), Ns, Nm or Nh; got '$WIN_SPEC'"; exit 2; }
+    [ -n "$WIN_START_SPEC" ] && { _win_start_epoch || exit 2; }
+else
+    WIN_SECS="$WIN_DEFAULT"
+fi
 
 # The run deadline is raised to fit what was asked for, unless the caller set
-# one: the file-size walk (FILESIZES_SECS), --sample (about 12 x SEC), --zdb
+# one: the file-size walk (FILESIZES_SECS), --window (below), --zdb
 # (up to 1800s per zdb call in the report, 3600s in the bundle) and the
 # bundle's zpool events dump (600s).
 if [ -z "$_RUN_DEADLINE_ENV" ]; then
     [ "$OPT_FILESIZES" = 1 ] && RUN_DEADLINE=$((RUN_DEADLINE + FILESIZES_SECS))
-    [ "$OPT_SAMPLE" = 1 ] && RUN_DEADLINE=$((RUN_DEADLINE + SAMPLE_SECS * 12 + 150))
     [ "$OPT_ZDB" = 1 ] && RUN_DEADLINE=$((RUN_DEADLINE + 4000))
     [ "$OPT_BUNDLE" = 1 ] && RUN_DEADLINE=$((RUN_DEADLINE + 900))
     [ "$OPT_BUNDLE" = 1 ] && [ "$OPT_ZDB" = 1 ] && RUN_DEADLINE=$((RUN_DEADLINE + 7500))
+    # the wait for the window's START, the window, and its last reads
+    RUN_DEADLINE=$((RUN_DEADLINE + WIN_SECS + 60))
+    [ -n "$WIN_START_EPOCH" ] && RUN_DEADLINE=$((RUN_DEADLINE + WIN_START_EPOCH - $(date +%s)))
 fi
 
 _run_init
 _init_probe
+# A caller's RUN_DEADLINE is not raised: say at once when it cuts a requested
+# window, and refuse one that would leave it under 10s (or end it before the
+# start). The default window is cut, or not run, and says so in section O.
+if [ "$WIN_GIVEN" = 1 ] && [ -n "$_RUN_DEADLINE_ENV" ]; then
+    _ww=0; [ -n "$WIN_START_EPOCH" ] && _ww=$((WIN_START_EPOCH - $(date +%s)))
+    _wl=$((RUN_DEADLINE - WIN_RESERVE - _ww))
+    if [ "$_wl" -lt 10 ]; then
+        warn "RUN_DEADLINE=$RUN_DEADLINE leaves the window ${_wl}s (after ${_ww}s of waiting, and ${WIN_RESERVE}s kept for the report); a window needs at least 10s"
+        exit 2
+    elif [ "$_wl" -lt "$WIN_SECS" ]; then
+        warn "RUN_DEADLINE=$RUN_DEADLINE cuts the window to about ${_wl}s of ${WIN_SECS}s"
+    fi
+fi
 
 # The output directory is checked before collecting, so an unwritable one
 # fails at once rather than after a full run.
@@ -2436,6 +3195,10 @@ resolve_yardbase
 _zp="$(printf '%s' "$ZPOOLS" | tr -s ' ' ',' | sed 's/^,//; s/,$//')"
 TARGET="collection-server-zfs/$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || echo unknown)${_zp:+@pools=$_zp}"
 progress "pools: ${ZPOOLS:-none}; datasets: ${DS_COUNT:-0}; snapshots: ${SNAP_COUNT:-0}; WHATAP_HOME: ${WHOME:-n/a}"
+
+# The window runs before the report, so its START is met on time and
+# the report's snapshot is taken at the window's end.
+[ "$ZFS_ON_HOST" = 1 ] && window_run
 
 TS="$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null || echo unknown)"
 HOST="$(hostname 2>/dev/null || echo unknown)"

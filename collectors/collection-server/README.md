@@ -7,7 +7,7 @@
 > | Entrypoint | Token | Scope | validated at | Status |
 > | ---------- | ----- | ----- | ------------ | ------ |
 > | [`collect-collserver.sh`](collect-collserver.sh) | `collserver` | the WhaTap backend itself | 0.4.1 | run against three live production backends (Smartfren, 2026-09-23); log selection re-measured against that bundle's own log tree. Tier 2 probes still unvalidated. Later versions are tested against stubs and throwaway trees only (`tools/test-collserver.sh`) |
-> | [`collect-collzfs.sh`](collect-collzfs.sh) | `collzfs` | ZFS under the backend's data path | 0.4.1 | validated non-root on two live hosts (zfs 2.2.2 and 2.2.6), one of them a real collection server with `yardbase` on ZFS; `--zdb` and the root-only probes still unvalidated. Later versions are tested against a stub `zpool` only (`tools/test-collzfs.sh`) |
+> | [`collect-collzfs.sh`](collect-collzfs.sh) | `collzfs` | ZFS under the backend's data path | 0.8.0 | 0.8.0 run as root on a ZFS VM (Ubuntu 26.04, zfs 2.4.1, pool with a special vdev): the default run and the time window (idle, under an append load, a forced ring wrap, signals). 0.4.1 validated non-root on two live hosts (zfs 2.2.2 and 2.2.6), one of them a real collection server with `yardbase` on ZFS. `--zdb` still unvalidated. Stub tests: `tools/test-collzfs.sh` |
 > | [`collect-collmysql.sh`](collect-collmysql.sh) | `collmysql` | the MySQL that holds the backend's `account` / `notihub` metadata | 0.4.0 | run end to end on MySQL 5.6.51, 5.7.32, 8.4.10 and MariaDB 10.11.19 under a scheduler-shaped write load; a replicating pair, section I on 8.4 and real `iostat` sampling are still unverified. Later versions (0.8.0: no self-elevation, password sources) are tested against a stub client only (`tools/test-collmysql.sh`) |
 >
 > "validated at" is the last version run on a real environment, not the current
@@ -223,11 +223,11 @@ the reader (CONTRACT rule 1).
 
 ### (a) Facts it collects — ZFS
 
-One `.txt` report, MECE domains `[1]` + A..N:
+One `.txt` report, MECE domains `[1]` + A..O:
 
 - **`[1]` Collection environment** — bash, uid, privilege, boot time, tool presence, whether the
   kstat tree and the module-parameter dir exist, pool/dataset/snapshot counts,
-  which tiers this run enabled.
+  which tiers this run enabled and the time window's length.
 - **A. ZFS software & kernel module** — `zfs version`, userland vs `zfs-kmod`
   version, `modinfo`, package/DKMS state, kernel taint, ZFS systemd units,
   `zpool.cache`. Also **asks the installed binary which subcommands and flags it
@@ -274,8 +274,8 @@ One `.txt` report, MECE domains `[1]` + A..N:
   application. Plus an inventory of every kstat entry not inlined.
 - **J. I/O request size & latency distribution** — `zpool iostat -v`, `-lv`,
   `-qv`, and the **`-r` request-size** and **`-w` latency histograms**,
-  cumulative since boot (instant kstat reads). `--sample` adds interval samples
-  so current behaviour can be read next to the whole-uptime average.
+  cumulative since boot (instant kstat reads). The same views over a span of
+  time are in O.
 - **K. Underlying block devices** — `lsblk`, `/sys/block/*/queue/*`
   (rotational, scheduler, nr_requests, physical/logical block size, optimal_io_size,
   write_cache), `/dev/disk/by-id` links, `iostat -x`.
@@ -291,7 +291,8 @@ One `.txt` report, MECE domains `[1]` + A..N:
   one or whether they ended two months ago. On one production pool the buffer
   held 136,337 `deadman` events, the last of them two months before the run, and
   that last date is what decided the case. The per-event **detail** is a separate
-  question and is bundled only for a recent window (`--event-days`, default 30),
+  question and is bundled only for a recent window (`EVENT_DAYS` in the
+  environment, default 30),
   because the full `-v` dump of that buffer was 192MB.
 - **M. WhaTap collection-server paths → dataset mapping** — for `WHATAP_HOME`,
   `yardbase`, `logs`, `conf`, `db`, `keeperbase`, `logsink`: which filesystem and
@@ -311,12 +312,141 @@ One `.txt` report, MECE domains `[1]` + A..N:
   cannot finish in its bound. Every run has `df -i` for each WhaTap path (the
   file count), and `--zdb` gives the block-size histogram. When the size
   distribution itself is needed, walk a narrow sample (`--filesizes=PATH`, e.g.
-  one day's directory). A walk that hits its bound (`--filesizes-secs`, default
-  300) is labelled `PARTIAL`.
+  one day's directory). A walk that hits its bound (`FILESIZES_SECS` in the
+  environment, default 300) is labelled `PARTIAL`.
+- **O. Time window** — in every run, 15 s by default (`--window=DUR[@START]`
+  sets the length, 10 s to 24 h, and a start time). It collects the following
+  over the same span:
+  - every txg of the window from the `txgs` ring, with the distribution of
+    `otime` / `qtime` / `wtime` / `stime`, `ndirty`, `nwritten` and `writes`;
+  - start, end and delta of `dmu_tx`, `arcstats` and each `objset-*`;
+  - `zpool iostat -vlq` beside `iostat -x`, started together at the same
+    interval, with timestamps;
+  - `zpool iostat -r` / `-w` for the window, and `arcstat` when installed.
+
+  See "The time window (section O)" below.
 
 Values are **discovered, not assumed**; an absent value is reported as
 `n/a (<why>)`. A tunable that does not exist in the installed build is reported as
 `not present in this zfs build` — a version fact, not a collection failure.
+
+#### The time window (section O)
+
+The question it serves: after a tunable changes (for example `zfs_txg_timeout`
+5 -> 10), how long each txg stayed open, how much each one carried, and what the
+write counters did, over a chosen span of wall-clock time (for example 02:00-04:00
+local time). **Every run** includes a window: 15 s by default, because it
+reads kstat files and takes interval samples, which costs wall-clock and puts no
+load on the pool. It answers "is the device busy now"; every other interval
+number in the report is an average since boot or import. `--window` only
+changes its length and start. Section O of the report holds:
+
+- **Every txg of the window** from `/proc/spl/kstat/zfs/<pool>/txgs`, one row per
+  txg (`txg birth state ndirty nread nwritten reads writes otime qtime wtime stime`,
+  the kernel's own columns, unchanged), from the txg open when the window starts
+  to the txg open when it ends.
+- **A distribution** per pool over the completed rows (state `C`): count, min, p50,
+  p90, p99 and max (nearest rank) of `otime`, `qtime`, `wtime`, `stime` in ms, and of
+  `ndirty`, `nwritten` and `writes`.
+- **Counters at start and end, and the delta**: the global `dmu_tx` kstat
+  (`dmu_tx_assigned`, `dmu_tx_delay`, `dmu_tx_dirty_delay`, `dmu_tx_dirty_over_max`,
+  `dmu_tx_dirty_frees_delay`, ...) and every dataset's `objset-*` kstat (`writes`,
+  `nwritten`, `reads`, `nread`, `nunlinks`, the `zil_*` counters). Changed counters
+  get a row. Unchanged ones are listed with their value.
+- **`zpool iostat -T d -vlq I N` and `iostat -x -N -t I N`, started together**
+  over the window. They are two bounded background jobs with the same interval
+  `I` (the window divided by 120, between 1 s and 60 s: a 30 s window gets 1 s
+  blocks and a 2 h window 60 s blocks) and the same count, so
+  the vdev view and the block-device view describe the same seconds:
+  - zpool: per vdev operations, bandwidth, `total_wait`, `disk_wait`,
+    `syncq_wait`, `asyncq_wait` and queue depths
+  - iostat: per device `r/s`, `w/s`, `rkB/s`, `wkB/s`, `r_await`, `w_await`,
+    `aqu-sz` and `%util`
+
+  Each job's start time is printed to the ms (taken just before its fork),
+  together with the offset between them (6-8 ms on the VM). Each block also
+  carries its own timestamp: zpool uses `-T d`, and iostat uses `-t` with
+  `S_TIME_FORMAT=ISO`. The first block of each is cumulative (zpool: since pool
+  import; iostat: since boot).
+
+  `-N` (device-mapper names) and `-t` are checked once against this iostat; a
+  flag it refuses is dropped and the report says which. A job capped by its
+  bound, or still running when the window ended (it is then stopped), keeps
+  what it wrote, and the report names the cut job.
+- **`zpool iostat -T d -r DUR 2` and `-w DUR 2`**: the request-size and latency
+  histograms, with one cumulative block and one block for the whole window.
+- **ARC**: the `arcstats` kstat at start and end with deltas (the counters
+  `arcstat` reads, the cheaper source). The `arcstat I N` series is added when
+  `arcstat` is installed; its absence is stated and does not block the goal.
+- `zfs_txg_history` and `zfs_txg_timeout` as read at the start and at the end.
+
+All interval jobs start together, as bounded background jobs.
+
+**How the txgs ring is read.** `txgs` is a ring of the last `zfs_txg_history` txgs (default 100). OpenZFS
+`module/zfs/spa_stats.c`, `spa_txg_history_add`, adds a row when the previous txg
+begins to quiesce (`txg.c`, `txg_quiesce`) and drops the oldest row once the ring
+holds more than `zfs_txg_history` rows. The ring therefore spans about
+`zfs_txg_history x txg interval`: at 100 rows and 5 s txgs that is about 500 s,
+and at 1 s txgs under load about 100 s.
+
+- **Interval.** The next read comes after half the span the ring covered at the
+  last read (the `birth` of the oldest row to the newest; `birth` is `gethrtime()`
+  in ns, and only differences of it are used). With more than one pool, the
+  shortest span sets it. The interval stays between 2 s and 300 s. At a steady txg
+  rate, every txg appears in at least two reads.
+- **Merge.** Rows are merged by txg number. A txg is kept once: at its first
+  sighting in state `C`. If it left the ring before any read saw it completed, the
+  last state that was seen is kept, and the report counts these rows. At the end,
+  the rows still open, quiescing or syncing are kept with their state.
+- **Gaps.** A txg number that is in neither of two consecutive reads left the ring
+  between them. Each such range is listed with its count and the read that found it
+  missing. Nothing is filled in. A gap blocks the goal, and the reason names
+  `zfs_txg_history`. The collector never changes a tunable. Raising
+  `zfs_txg_history` (e.g. `echo 1000 > /sys/module/zfs/parameters/zfs_txg_history`)
+  is the operator's decision.
+- **Cap.** 20,000 rows per pool are kept. Rows past the cap are counted and the
+  goal is blocked.
+- **Never written.** Writing to `txgs` clears the ring
+  (`spa_txg_history_clear`). The window only reads.
+- **A read cut by the ring moving.** The Linux `procfs_list` reader
+  (`module/os/linux/spl/spl-procfs-list.c`, `procfs_list_seq_start`) returns
+  `EIO` when the row a multi-`read()` pass stopped at has been dropped before the
+  next `read()`. It never skips rows silently. Such a read is retried once at once,
+  and a read that fails twice is counted as failed.
+
+**On txg numbers "skipping" in section H.** One `cat` of `txgs` cannot have a hole
+in the middle. Rows are added at the tail and dropped at the head only, and a
+reader whose place was dropped gets `EIO`, not a jump. Section H prints the file
+in one read when it has up to 150 lines. Past 150 lines it prints the header,
+an explicit `... (N earlier records omitted ...)` line and the tail. The rows of
+one txg ring are therefore contiguous in H. Before the ring is full, its first row is
+the first txg recorded after the pool was imported or created (txg 5 in the VM
+test report), not txg 1.
+
+**Where the rows go.**
+
+- The report prints every kept row, per pool, after the counters. At 5-10 s txgs,
+  a 2 h window is 720-1,440 rows (about 150 bytes each). `zpool iostat` output is
+  printed up to 6,000 lines.
+- `--bundle` adds `window/`:
+  - `txgs-<pool>.txt`: the merged rows, with the kernel's column header
+  - `reads-<pool>.tsv`: one line per read: epoch, rows, oldest, newest, span, gaps so far
+  - `gaps-<pool>.tsv` (only when there was a gap): from, to, count, epoch of the read that found the gap
+  - `zpool-iostat-vlq.txt`, `iostat-x.txt`, `zpool-iostat-r.txt`, `zpool-iostat-w.txt`
+    and `arcstat.txt` (when present), with `io-start-ms.tsv` (the pair's starts, ms since the epoch)
+  - `start/` and `end/`: epoch, the two parameters, `dmu_tx`, `arcstats` and every `objset-*` as read
+
+**Counter caveats in the delta table.**
+
+- A kstat recreated during the window (its `crtime`, field 6 of line 1, changed,
+  e.g. a dataset remounted) gets no delta. The table says the kstat was recreated.
+- A counter lower at the end than at the start is printed as
+  `went down (end < start)`.
+- An `objset-*` present only at the start, or only at the end, is named as such.
+  So is a pool whose `txgs` disappeared during the window (export). The rows of the
+  last read that had rows are merged as final (still-open rows are kept with their
+  state). The report gives the time of that read and its newest txg, and says that
+  txgs after it are not in the report. How many there were cannot be known.
 
 ### (b) Delivery mechanism — ZFS
 
@@ -324,13 +454,97 @@ A **host shell script** the field engineer runs on the backend host — one comm
 hand over one file (CONTRACT rule 3):
 
 ```sh
-./collect-collzfs.sh --file                 # -> whatap-collzfs-<host>-<UTC>.txt   (attach this)
+./collect-collzfs.sh --file                 # -> whatap-collzfs-<host>-<UTC>.txt   (attach this; includes a 15 s window)
 ./collect-collzfs.sh --bundle               # -> whatap-collzfs-<host>-<UTC>.tar.gz (report + raw artifacts)
+./collect-collzfs.sh --file --window=2h@02:00   # wait until 02:00 local, then a 2 h window
 ./collect-collzfs.sh --file --home /whatap  # force WHATAP_HOME if auto-resolution is n/a
 ./collect-collzfs.sh --file --quiet         # no progress narration (for automation)
 ./collect-collzfs.sh                        # no arguments -> prints help (does not collect)
 ./collect-collzfs.sh --help                 # all options
 ```
+
+**Options** (10): `--file`, `--stdout`, `--bundle`, `--quiet`, `--home DIR`,
+`--out DIR`, `--window=DUR[@START]`, `--filesizes[=PATH]`, `--zdb`, `--help`.
+
+**Environment** (whole numbers; another value is ignored with a warning, and the
+default is used):
+
+| variable | default | what it bounds |
+|---|---|---|
+| `CMD_TIMEOUT` | 20 | each external command, seconds |
+| `RUN_DEADLINE` | 300 | the whole run, seconds; raised for the window, `--zdb`, `--filesizes` and `--bundle` unless set |
+| `FILESIZES_SECS` | 300 | the `--filesizes` walk, seconds |
+| `EVENT_DAYS` | 30 | the `zpool events -v` detail window, days; 0 keeps every event |
+| `JOURNAL_HOURS` | 24 | the zfs unit journal window, hours |
+
+**The window, run by run.**
+
+- `--window=DUR[@START]` sets the window's length and start. `DUR` is `N`
+  (seconds), `Ns`, `Nm` or `Nh`, from 10 s to 24 h.
+- `START` is the host's local time (its `TZ`, printed with the zone), written
+  without spaces. `HH:MM[:SS]` means the next occurrence of that time; the next
+  day's time is resolved by `date` on tomorrow's calendar date, so a DST change in
+  between is accounted for. `YYYY-MM-DDTHH:MM[:SS]` must fall within the next 24 h.
+- The run exits 2 before anything runs when:
+  - `START` is in the past or more than 24 h away;
+  - `--window` or `@` has no value;
+  - `DUR` is out of range.
+- The wait is announced on the terminal (`!! --window: waiting until ...`). One
+  window per run: for two windows, start two runs.
+- The run deadline grows by the window's length and 60 s, plus the wait for
+  `START`, unless the caller set `RUN_DEADLINE`. A caller's `RUN_DEADLINE` is not raised:
+  - with `--window`, one that leaves the window under 10 s exits 2, and one that
+    cuts it says so at the start;
+  - for the default window, one that leaves it no time means the window is not
+    run, and one that leaves it less than 15 s cuts it. Either way section O and
+    the status say so, and the goal is blocked.
+- The window goal is declared in every run. It is not applicable on a host with
+  no ZFS, or with no `<pool>/txgs` and no pool listed by `zpool`.
+- Measured on the VM (idle, `--file`, two runs each): 0.7.0 took 15.7-15.8 s and
+  0.8.0 takes 33.2-34.9 s. The difference is the 15 s window plus about 2.5 s for
+  the interval jobs' last block.
+- The window runs **before** the rest of the report. That way the start time is met
+  on time, and the Tier 0 sections record the state at the window's end. Keep the
+  session open for the whole wait and window (`nohup`, `tmux`, `screen`).
+- **Ending early.** A first `INT`, `TERM` or `HUP` during the wait or the window
+  ends it. The report is still written: section O says `ended early: SIG... after
+  X of Y` and gives what was collected, and the goal is blocked with the same
+  words. A second signal, also during the last reads, aborts the run as in any
+  other run and stops both iostat jobs.
+- The window never runs into the last 120 s of the deadline, which are left
+  for the rest of the report. They come out of the base 300 s, not out of
+  the window's raise. A window cut this way says so.
+- Every read goes through `_bounded`: `cat` of kstat files, 10 s cap each. The
+  caps of the `zpool iostat` and `iostat` jobs are the window plus one interval
+  plus 30 s. The jobs start first, at the window's start, and their count covers
+  at most the window (`(N - 1) x I` ≤ its length), so they end with it whatever
+  `I` is. A 2 h window with 60 s blocks does not overhang by 60 s. If the length
+  is not a multiple of `I`, the last `length mod I` seconds are covered by the
+  txgs, the counters and `-r`/`-w`, not by a pair block. After the window, each
+  job gets 5 s for its last block; an early end (signal, deadline) stops them at
+  once.
+- `iostat` absent (no sysstat) while ZFS is present blocks the window goal
+  (`iostat -x: command not found (sysstat)`), like a missing `zpool`.
+
+**Options removed in 0.8.0.** Each exits 2 with a message naming its replacement:
+
+| removed | use instead |
+|---|---|
+| `--sample[=SEC]` | nothing for 15 s (every run has a window); `--window=30s` or any `--window=DUR` for longer |
+| `--window-start=TIME` | `--window=DUR@HH:MM` or `--window=DUR@YYYY-MM-DDTHH:MM` |
+| `--no-filesizes` | nothing: the walk runs only when `--filesizes` is given |
+| `--filesizes-secs N` | `FILESIZES_SECS=N` in the environment (default 300). The walk also stays under `RUN_DEADLINE`, which grows by `FILESIZES_SECS` unless the caller set it. |
+| `--event-days N` | `EVENT_DAYS=N` in the environment (default 30; 0 keeps the detail of every event) |
+| `--hours N` | `JOURNAL_HOURS=N` in the environment (default 24) |
+
+The environment values are checked like `CMD_TIMEOUT` and `RUN_DEADLINE`: a
+value that is not a whole number is ignored with a warning, and the default is
+used. `--help` lists the five in an Environment block. That leaves 10 options:
+`--file --stdout --bundle --quiet --home --out --window --filesizes --zdb --help`.
+
+The report changed where `--sample` was: section J has no "interval sample
+(--sample)" subsection, and `[1]`'s tiers line is
+`Tier0=always zdb=… filesizes=… window=…` (no `sample=`).
 
 Run it as **root** when possible: `zpool history`, `zpool events` and
 `/proc/spl/kstat/zfs/dbgmsg` return only a header (or `permission denied`) for an
@@ -366,30 +580,39 @@ or the snapshot list failed, was refused or hung, or when `zfs` is absent.
 #### Collection-load tiers — ZFS
 
 - **Tier 0** (`--file` / `--stdout`) reads kstats, properties and
-  cumulative-since-boot `zpool iostat` only — no pool traversal, no tree walk, no
-  device wake-up. Measured at **~13 s** on a live 2.7 T pool. Safe to run any time.
+  cumulative-since-boot `zpool iostat`, plus the 15 s time window (kstat file
+  reads and interval samples) — no pool traversal, no tree walk, no device
+  wake-up. Measured at **~13 s** on a live 2.7 T pool at 0.4.1. The window adds
+  about 17 s: on the 0.8.0 VM, 0.7.0 took 15.7-16.1 s and 0.8.0 took 33.2-34.9 s.
+  Safe to run any time.
 - **Tier 1** — `--bundle` adds the raw artifacts (full property dumps, the whole
   kstat tree except `dbufs`, all module parameters, block-device settings, journal).
-  Measured at **~34 s / 89 KB** on the same host. `--sample[=SEC]` (default 10)
-  adds interval `zpool iostat -lqv` / `-r` / `-w` and `arcstat` samples: read-only,
-  costs roughly `6 × SEC` seconds of wall-clock, not disk load.
+  Measured at **~34 s / 89 KB** on the same host. `--window=DUR[@START]`
+  (10 s to 24 h, default 15 s) sets the length and start of the time window:
+  read-only, it costs the window's wall-clock, not disk load.
 - **Tier 2** (opt-in, announced on stderr before running):
   - `--zdb` — `zdb -C`, `zdb -Lbbbs` (block/psize/lsize histograms and **measured**
     compression), `zdb -mm` (metaslab free-space histograms). Traverses pool
     metadata: **minutes on a large pool, and it reads the data disks.**
   - `--filesizes[=PATH]` — power-of-two file-size histogram under `yardbase` (or
     `PATH`), by walking the tree. Metadata-only, `-xdev`, bounded to
-    `--filesizes-secs` (default 300 s). A walk that hits the bound, or that
+    `FILESIZES_SECS` (environment, default 300 s). A walk that hits the bound, or that
     could not read part of the tree (`find` exits 1 on a denied directory), is
     labelled `PARTIAL` with the reason.
 
 **Bounds.** Every `zpool` / `zfs` / `zdb` / `journalctl` / `find` call runs
-under the shared `_bounded` cap, and the run deadline (300 s) is raised to fit
-the file-size walk, `--sample`, `--zdb` (per pool: 3,720 s in the report and
-7,500 s more in the bundle) and the bundle unless `RUN_DEADLINE` is set. `[1]`
-prints the deadline the run used. The bundle journal keeps the newest 20,000 lines per unit. The bundle
-is assembled in the run's private temp directory. Numeric options that are not
-non-negative integers exit 2; an unwritable `--out` or a failed `tar` exits 1.
+under the shared `_bounded` cap. Unless `RUN_DEADLINE` is set, the run deadline
+(300 s) is raised to fit:
+- the time window: its length plus 60 s, plus the wait for its `START`. The
+  120 s the window leaves for the rest of the report come out of the base 300 s;
+- the file-size walk;
+- `--zdb`: per pool, 3,720 s in the report and 7,500 s more in the bundle;
+- the bundle.
+
+`[1]` prints the deadline the run used. The bundle journal keeps the newest 20,000 lines per unit. The bundle
+is assembled in the run's private temp directory. A `--window` value out of
+range, and a removed option, exit 2. An unwritable `--out` or a failed `tar`
+exits 1.
 Under sudo the `.txt` and the `.tar.gz` are handed back to the invoking user.
 
 `dbufs` is never read, in any tier: it enumerates every dbuf in the ARC.
@@ -417,10 +640,23 @@ Two habits worth keeping when extending it:
 
 #### Status notes / open items — ZFS
 
+- **0.8.0 on a ZFS VM, as root** (Ubuntu 26.04, zfs 2.4.1, TZ Asia/Jakarta, pool
+  `yard` with a **special** vdev, 200k small files). Runs covered:
+  - the default run;
+  - windows idle and under an append load;
+  - a forced ring wrap: `zfs_txg_history` was set to 10 on the VM and put back,
+    with a `zpool sync` burst, so the gaps were counted and the read interval
+    went from 23 s down to 2 s;
+  - `@START` waits;
+  - INT and TERM;
+  - `--bundle`.
+
+  The allocation-class view showed `class=special`. Every report passed
+  `tools/validate.sh --report`.
 - **Validated** on two live ZFS hosts, both as a **non-root** uid:
   - a KVM host — Ubuntu 24.04, zfs **2.2.2**, pool 2.72 T, FRAG 56 %, 19 datasets,
     2 zvols, 2 clones, and a removed vdev leaving `indirect-0/1`. Tier 0 ~13 s,
-    `--bundle` ~34 s / 89 KB, plus `--home`, `--sample`, `--filesizes`.
+    `--bundle` ~34 s / 89 KB, plus `--home`, the pre-0.8.0 `--sample`, `--filesizes`.
   - a **real WhaTap collection server** — Ubuntu 24.10, zfs **2.2.6**, pool
     `yardbase` 99.5 G / FRAG 30 %, 10 running `whatap.server` JVMs. Tier 0 ~10 s.
     Section M resolved `WHATAP_HOME` from a running JVM's
@@ -428,15 +664,15 @@ Two habits worth keeping when extending it:
     `yardbase` on ZFS (`recordsize=64K` local, `compressratio 4.43x`), while
     `logs` / `conf` / `db` / `logsink` sit on the ext4 root. The `arcstat`
     sampling branch was exercised here (that binary is absent on the KVM host).
-- **Not yet validated**: `--zdb`, and the *content* of the root-only probes.
+- **Not yet validated**: `--zdb`, and (on a production host) the *content* of the root-only probes.
   `zdb` cannot open a pool as a non-root uid (`can't open '<pool>':
   Permission denied`), `/proc/spl/kstat/zfs/dbgmsg` is `0600 root`, and
   `zpool history` / `zpool events` return `permission denied` — those absences
   are now reported with their reason, but the success path is unexercised.
   Run once as **root** on a small pool to close this.
-- **Not yet seen**: a pool that actually has a **special** or **logs** vdev. The
-  derived allocation-class view was exercised only on `data` (plus `indirect`).
-  The `special_small_blocks` column is populated, but always from a `0` default.
+- **Not yet seen**: a pool with a **logs** vdev. A special vdev was seen on the
+  0.8.0 VM. Before that, the derived allocation-class view was exercised on `data`
+  (plus `indirect`) only.
 - Portability target: bash 3.2+, `/proc`+`/sys` first, column-name parsing,
   command fallback chains. Verified on GNU awk 5.2 / bash 5.2; re-check `awk`
   user-function support and `find -printf` on the oldest OS you must support
@@ -740,6 +976,10 @@ It does not read WhaTap `conf/*.conf`. What can carry something sensitive:
   content is not read.
 - **`--bundle`** adds the journal of zfs units, `dmesg`, the kstat tree and
   `zpool events -v`.
+- **Section O (the time window)** adds dataset and pool names (from
+  `objset-*`), txg numbers and counters, the `zpool iostat` vdev names and the
+  `iostat -x` device names. It reads no file content, no configuration and no
+  command line.
 
 Treat it as internal.
 
