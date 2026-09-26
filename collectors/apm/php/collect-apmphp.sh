@@ -56,10 +56,13 @@ export LC_ALL=C
 
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-apmphp"
+# 0.5.3  "ini directory trees present" prints "(no whatap entry)" for a tree
+#        without one (the column was blank) and names an unreadable tree;
+#        section 4 reuses the `php-fpm -v` section 3 ran on the same binary.
 # 0.5.2  A directory this uid can read but not enter lists its names again
 #        (the refactor's _names dropped them; ls did not).
 # 0.5.1  Readability refactor; report unchanged.
-VERSION="0.5.2"
+VERSION="0.5.3"
 DOMAIN="apm"
 TARGET="host/$(hostname 2>/dev/null || echo unknown)"
 
@@ -686,12 +689,13 @@ file_facts() {
 _php_out=""
 php_run() {
     local label="$1" php="$2"; shift 2
-    _php_out=""
+    _php_out="" _php_rc="" _php_err=""
     [ -x "$php" ] || { fact "$label: n/a (not executable: $php)"; return; }
     local out rc err
     out="$(_bounded "$php" "$@" 2>"$_errfile")"; rc=$?
     _php_out="$out"
     err="$(head -c 2000 "$_errfile" 2>/dev/null)"
+    _php_rc="$rc" _php_err="$err"
     if [ "$rc" -eq 124 ]; then
         if _past_deadline; then fact "$label: n/a (run deadline reached: ${RUN_DEADLINE}s)"
         else fact "$label: n/a (timed out: ${CMD_TIMEOUT}s)"; fi
@@ -1436,6 +1440,16 @@ EOF
         fact "-- php binary: $php"
         fact "   resolves to: $(readlink -f "$php" 2>/dev/null || echo "$php")"
         php_run "   version" "$php" -v
+        # the php-fpm on PATH run here with -v: section 4 shows the same
+        # output instead of running it again, when it finished in time and
+        # wrote nothing to stderr (section 4 shows stdout and stderr together)
+        case "$php" in
+            */php-fpm)
+                if [ -n "$_php_rc" ] && [ "$_php_rc" != 124 ] && [ -z "$_php_err" ] \
+                    && [ "$php" = "$(command -v php-fpm 2>/dev/null)" ]; then
+                    _fpm_v_seen=1 _fpm_v_out="$_php_out"
+                fi ;;
+        esac
         if php_info "$php"; then
             php_info_grep "   php version / system" '^(PHP Version|System) =>' 4
             php_info_grep "   SAPI" '^Server API =>' 2
@@ -1563,7 +1577,13 @@ _rep_web() {
             break
         fi
     done
-    if have php-fpm; then probe "php-fpm version" sh -c "php-fpm -v 2>&1 | head -n 3"
+    if have php-fpm && [ "${_fpm_v_seen:-0}" = 1 ] && ! _past_deadline; then
+        # the first 3 lines of the `php-fpm -v` section 3 ran, as the probe
+        # below prints them (past the deadline the probe says so instead)
+        _o="$(printf '%s\n' "$_fpm_v_out" | head -n 3)"
+        if [ -n "$_o" ]; then _emit_labeled "php-fpm version" "$_o"
+        else fact "php-fpm version: n/a (empty output)"; fi
+    elif have php-fpm; then probe "php-fpm version" sh -c "php-fpm -v 2>&1 | head -n 3"
     else fact "php-fpm version: n/a (command not found: php-fpm)"; fi
     fact "php-fpm configuration files on disk:"
     _found=0
@@ -1780,7 +1800,13 @@ EOF
              /opt/alt/php*/etc/php.d /usr/local/lsws/lsphp*/etc/php.d; do
         [ -d "$d" ] || continue
         _hit=1
-        printf '        %-46s %s\n' "$d" "$(_names "$d" | grep -i whatap | tr '\n' ' ' | sed 's/^$/(no whatap entry)/')"
+        # a directory this uid cannot read lists no names: not "no entry"
+        if [ -r "$d" ]; then
+            _w="$(_names "$d" | grep -i whatap | tr '\n' ' ')"
+            printf '        %-46s %s\n' "$d" "${_w:-(no whatap entry)}"
+        else
+            printf '        %-46s %s\n' "$d" "n/a (permission denied: $d)"
+        fi
     done
     [ "$_hit" = 0 ] && fact "   none of the known ini tree paths exist on this host"
     fact "live load status — whatap module mapped into running processes (from /proc/<pid>/maps):"
