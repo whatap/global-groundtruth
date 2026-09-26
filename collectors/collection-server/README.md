@@ -37,7 +37,10 @@ One `.txt` report, organized into MECE domains (each fact in exactly one place):
 - **`[1]` Collection environment** — bash version, uid, privilege, host boot
   time and uptime, and which tools are present/absent — so every `n/a` below can
   be traced to a cause.
-- **A. Host & platform** — OS/kernel/arch, memory, cgroup limits, load, `java -version`.
+- **A. Host & platform** — hostname, kernel and arch (read from
+  `/proc/sys/kernel/{hostname,ostype,osrelease,arch}`, the strings `uname`
+  prints; `hostname`/`uname` run only where a file is unreadable), OS release,
+  memory, cgroup limits, load, `java -version`. The date and timezone are B's.
 - **B. Time & clock synchronization** — a common root-cause axis: a skewed clock
   drops data into the wrong time buckets. Reports `timedatectl` (synchronized?
   NTP active? RTC/UTC/local), timezone, clocksource, virtualization, each
@@ -237,7 +240,9 @@ One `.txt` report, MECE domains `[1]` + A..N:
   as `name = value`; then the **persisted** values in `/etc/modprobe.d/*zfs*` and
   the kernel cmdline. Runtime and persisted values are reported separately
   because they can differ.
-- **C. Pool topology & allocation classes** — raw `zpool list -v`, plus a derived
+- **C. Pool topology & allocation classes** — raw `zpool list -v` (asked once:
+  the same output feeds the derived views, section H and the bundle's
+  `zpool-list-v.txt`), plus a derived
   **per-top-level-vdev view grouped by allocation class** (data / special / logs /
   cache / dedup) carrying SIZE/ALLOC/FREE/FRAG/CAP/HEALTH, and the redundancy
   shape per class (mirror / raidz / draid / single-device / indirect). `zpool
@@ -283,9 +288,9 @@ One `.txt` report, MECE domains `[1]` + A..N:
   The tally covers the whole buffer on purpose. What that buffer answers is **when
   a class started and when it stopped**, and a recent-only view cannot answer it:
   a host with no `deadman` event this month reads identically whether it never had
-  one or whether they ended two months ago. On XLSMART `web01-bsd` (2026-09-23)
-  the buffer held 136,337 `deadman` events whose last one was 2026-07-29, and that
-  last date is what decided the case. The per-event **detail** is a separate
+  one or whether they ended two months ago. On one production pool the buffer
+  held 136,337 `deadman` events, the last of them two months before the run, and
+  that last date is what decided the case. The per-event **detail** is a separate
   question and is bundled only for a recent window (`--event-days`, default 30),
   because the full `-v` dump of that buffer was 192MB.
 - **M. WhaTap collection-server paths → dataset mapping** — for `WHATAP_HOME`,
@@ -459,7 +464,9 @@ One `.txt` report, sections `[1]` and A..K:
   `server_uuid`, uptime, `read_only` / `super_read_only`, port, socket, datadir,
   the local `mysqld` process and the listening sockets.
 - **B. HA and replication** — `binlog_format`, GTID mode, `SHOW REPLICA STATUS`
-  and the older `SHOW SLAVE STATUS`, `SHOW MASTER STATUS`, connected replicas,
+  and the older `SHOW SLAVE STATUS`, `SHOW BINARY LOG STATUS` (MySQL 8.2+; on
+  its syntax error, before 8.2 and on MariaDB, `SHOW MASTER STATUS` instead,
+  labelled so), connected replicas,
   Galera `wsrep_cluster_size`, Group Replication members, semi-sync status. It
   asks for all of them and reports the reason for each one that does not answer,
   so the topology is read off the server rather than assumed.
@@ -467,7 +474,11 @@ One `.txt` report, sections `[1]` and A..K:
   `max_binlog_size`, `binlog_expire_logs_seconds` and the older
   `expire_logs_days`, `binlog_row_image`, `sync_binlog`, `SHOW BINARY LOGS`,
   the binlog cache counters, and the on-disk file list with mtimes and sizes so
-  growth over time can be read from one snapshot.
+  growth over time can be read from one snapshot. File sizes and the total come
+  from `SHOW BINARY LOGS`; the directory is listed once, for the mtimes. Only
+  when `SHOW BINARY LOGS` gives no list (refused, timed out) does that listing
+  add a `total:` line summed over the `<basename>.NNNNNN` files. There is no
+  `du`: with the logs in the datadir it would walk the whole datadir.
 - **D. Storage and I/O** — `df -hT`, mounts, the datadir's filesystem,
   `/proc/diskstats`, and the `Innodb_data_*`, `Innodb_os_log*`,
   `Innodb_buffer_pool_*`, `Innodb_rows_*` and `Com_*` counters.
@@ -579,7 +590,53 @@ the process table locally, and fall back to `n/a (...)` when run from elsewhere.
   is capped at `BINLOG_TIMEOUT` (300 s, settable in the environment) and the run
   deadline is raised to fit. The goal is obtained only when every selected file
   was decoded to its end: a file `mysqlbinlog` could not open (Errcode 13) or a
-  decode stopped at the cap is blocked, with the file named. A
+  decode stopped at the cap is blocked, with the file named. The newest files
+  and their sizes are the last rows of `SHOW BINARY LOGS`, their paths those of
+  `@@log_bin_index` when it is readable and lists the same names (logs in more
+  than one directory), else `<binlog dir>/<name>`. A selected file that is not
+  there, or a name listed twice with no readable index, is named as skipped and
+  blocks the goal; a name the index places in two directories is printed with
+  its path. First, where the client connected (the `Connection:` line of its
+  own `status`, which is also the login check, so no extra call): a unix
+  socket, loopback or an address this host owns (`/proc/net/fib_trie`) goes
+  on; a TCP address this host does not own is the server being remote, a gap
+  "the server is remote (connected to ...); run the collector on the database
+  host", unless a local mysqld's own network namespace owns it (a container
+  reached on its bridge address), and then only that mysqld is considered. A
+  name is resolved with one `getent ahostsv4`; a name that does not resolve,
+  or an IPv6 address, falls back to the rule below. `@@hostname` is not used
+  (a container's differs from its host's). `[1]` prints `connected to:`. A
+  Kubernetes Service ClusterIP typed directly (kube-proxy in iptables mode:
+  no interface owns it) is classified remote; connect through the pod's own
+  address, its socket, or `127.0.0.1` inside the pod instead. The
+  files are read only through the server's own process, found with file
+  reads. A local `mysqld`/`mariadbd` P (not a zombie) is the server
+  when: the server's `@@pid_file` (relative: under `@@datadir`), read through
+  `/proc/P/root`, holds P's pid in its own pid namespace (last `NSpid:` field
+  of `/proc/P/status`) — or, when this uid may not enter `/proc/P/root` (a
+  container without `CAP_SYS_PTRACE`), the pid file as the run sees it holds
+  P's pid; that pid file was written at or after the server's start (its
+  mtime against now minus `Uptime`, both wall clock so a clock step does not
+  matter; 3 s early allowed) and at most 1800 s after it (mysqld writes it
+  after InnoDB crash recovery, which can take that long; a longer recovery
+  reads as another server); where readable, the `auto.cnf` under P's datadir
+  holds `@@server_uuid`; and P's binlog directory holds the server's newest
+  log (the last `SHOW BINARY LOGS` row) at no less than the listed size and
+  nothing newer (a newer file makes it ask `SHOW BINARY LOGS` once more, which
+  must then list it: a rotation in between). The logs are then read at
+  `/proc/P/root<binlog dir>`, so a containerised,
+  bind-mounted or pod mysqld works; a remote server, or a copy of its datadir
+  running here, does not match once the server has written a log the copy
+  lacks. A `binlog files: via pid P (...)` line says how they were found. No
+  such process is a gap, "the server's process (pid file ...) is not on this
+  host: ..." with what each local server failed (run the collector on the
+  database host); a pid file this uid may not read is a gap with the
+  privilege hint (a missing one is "pid file absent"); two matches are a gap.
+  What is left: with the target unknown (an unresolvable name, IPv6), an idle
+  server here started from the same image up to 1800 s after an idle remote
+  target is taken for it; their logs then hold only the init. Without
+  the `SHOW BINARY LOGS` list (refused, cut) the directory is listed by mtime
+  instead. A
   `@@log_bin_basename` that is NULL or not an absolute path is "not resolved",
   never the working directory, and `@@log_bin = 0` is `n/a`. When section I
   finds no row events, `binlog_format` in section B says whether the server

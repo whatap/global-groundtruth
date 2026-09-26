@@ -25,6 +25,31 @@
 export LC_ALL=C
 
 # ---- collector metadata -----------------------------------------------------
+# 0.9.0  Binary log sizes come from SHOW BINARY LOGS only: section C lists
+#        the directory once for the mtimes (no du; the listing sums the files
+#        only when SHOW BINARY LOGS gave no list), and section I takes the
+#        newest files and their sizes from those rows, not from ls per file.
+#        A SQL call cut by the run deadline says "run deadline reached", not
+#        "timed out". A cut or refused SHOW BINARY LOGS is no list. The
+#        login check is the client's status, whose Connection line ([1]
+#        "connected to:") classifies the target: a TCP address neither this
+#        host nor a local mysqld's network namespace owns is a remote server
+#        (a gap, no local process looked at). SHOW BINARY LOG STATUS falls
+#        back to SHOW MASTER STATUS only on its syntax error (before 8.2,
+#        MariaDB) instead of asking both. Otherwise the
+#        binary logs are read only through the server's own process: the
+#        local mysqld/mariadbd whose pid file (@@pid_file through
+#        /proc/<pid>/root, or here when that root cannot be entered) holds its
+#        pid and was written with the server's start (mtime against now -
+#        Uptime), whose auto.cnf holds @@server_uuid where readable, and whose
+#        binlog directory holds the server's newest log with nothing newer (a
+#        newer one: SHOW BINARY LOGS asked once more, and it must list it). Its /proc/<pid>/root<binlog dir> is read and a
+#        "binlog files: via pid ..." line says so. None (a remote server, a
+#        copied datadir), two, or an unreadable pid file is
+#        a gap with the reason. Paths come from a readable @@log_bin_index
+#        (logs in more than one directory; such a file is named by its
+#        path); a selected file that is not there, or a name listed twice
+#        with no index, is named and blocks the goal.
 # 0.8.3  @@log_bin, @@log_bin_basename and @@datadir are asked for once (the
 #        value shown is the value used), and one ps serves both the login
 #        reason and section A. Report unchanged.
@@ -40,7 +65,7 @@ export LC_ALL=C
 #        SHOW BINARY LOGS, a failed or capped decode, a NULL log_bin_basename and
 #        no local mysqld without arguments are gaps with reasons. Needs bash.
 COLLECTOR_NAME="whatap-collmysql"
-VERSION="0.8.3"
+VERSION="0.9.0"
 DOMAIN="collection-server"
 TARGET="collection-server-mysql/$(hostname 2>/dev/null || echo unknown)"
 
@@ -53,6 +78,8 @@ BINLOG_FILES=2        # how many of the newest binary logs to decode
 OPT_SAMPLE=0          # interval iostat/vmstat sampling
 SAMPLE_SEC=5
 SAMPLE_COUNT=6
+# The /proc the binary logs are found through (a fake tree in tools/test-collmysql.sh).
+PROC_ROOT="${COLLMYSQL_PROC:-/proc}"
 # Caps come from the environment only, and are whole numbers 1..999999 or they
 # are dropped here, before anything reads them (the rule of _cap_or in the run
 # helpers). _CAP_BAD is warned about once fd 3 is open.
@@ -866,7 +893,7 @@ sql() {
         [ "$#" -gt 0 ] && eval "_l=\${$#}"
         printf -v "$var" '%s' "$_l"
     fi
-    [ "$rc" -eq 124 ] && { fact "$label: n/a (timed out: ${CMD_TIMEOUT}s)"; return; }
+    [ "$rc" -eq 124 ] && { fact "$label: n/a ($(_why_124))"; return; }
     [ "$rc" -ne 0 ] && { fact "$label: n/a ($(_classify_err))"; return; }
     [ -z "$out" ] && { fact "$label: none"; return; }
     _emit_labeled "$label" "$out"
@@ -876,10 +903,16 @@ sqlv() {
     local label="$1" q="$2" out rc
     if [ "$MYSQL_OK" != 1 ]; then fact "$label: n/a ($MYSQL_WHY)"; return; fi
     out="$(mysql_vertical "$q")"; rc=$?
-    [ "$rc" -eq 124 ] && { fact "$label: n/a (timed out: ${CMD_TIMEOUT}s)"; return; }
+    [ "$rc" -eq 124 ] && { fact "$label: n/a ($(_why_124))"; return; }
     [ "$rc" -ne 0 ] && { fact "$label: n/a ($(_classify_err))"; return; }
     [ -z "$out" ] && { fact "$label: none"; return; }
     _emit_labeled "$label" "$out"
+}
+
+# _why_124 -> why a bounded call returned 124: the run deadline, or its own cap
+_why_124() {
+    if _past_deadline; then printf 'run deadline reached: %ss' "$RUN_DEADLINE"
+    else printf 'timed out: %ss' "$CMD_TIMEOUT"; fi
 }
 
 # one scalar value, empty on failure (used for discovery, not for output)
@@ -892,14 +925,229 @@ _resolve_mysql() {
     local c
     for c in mysql mariadb; do have "$c" && { MYSQL_BIN="$(command -v $c)"; break; }; done
     if [ -z "$MYSQL_BIN" ]; then MYSQL_WHY="command not found: mysql"; return; fi
-    mysql_q "SELECT 1" >/dev/null 2>&1
-    case "$?" in
+    # The client's own status: the login check, and where it connected (the
+    # host or socket after option files and the environment are applied).
+    local st rc l
+    st="$(mysql_q "status" 2>/dev/null)"; rc=$?
+    MYSQL_CONN=""
+    while IFS= read -r l; do
+        case "$l" in Connection:*) l="${l#Connection:}"; MYSQL_CONN="${l#"${l%%[![:space:]]*}"}" ;; esac
+    done <<EOF
+$st
+EOF
+    case "$rc" in
         0)   MYSQL_OK=1; MYSQL_WHY="ok" ;;
         124) if _past_deadline; then MYSQL_WHY="run deadline reached (${RUN_DEADLINE}s) before the login"
              else MYSQL_WHY="timed out: ${CMD_TIMEOUT}s"; fi ;;
         *)   MYSQL_WHY="$(_classify_err)" ;;
     esac
 }
+
+# _local_ips FIB_TRIE -> the IPv4 addresses a network namespace owns (its
+# "/32 host LOCAL" entries), one per line. No fork.
+_local_ips() {
+    local l prev=""
+    while IFS= read -r l; do
+        case "$l" in
+            *"/32 host LOCAL"*) [ -n "$prev" ] && printf '%s\n' "$prev" ;;
+            *"-- "[0-9]*) prev="${l##*-- }" ;;
+        esac
+    done < "$1" 2>/dev/null
+}
+
+# _bl_target -> where the client connected, classified: _BL_TGT is "local"
+# (a socket, loopback or an address of this host), "ips" (addresses in
+# _BL_TGT_IPS, not this host's: a local mysqld's own network namespace may
+# still own one, e.g. a container reached on its bridge address), or
+# "unknown" (no Connection line, IPv6, a name that did not resolve).
+# _BL_TGT_WHY says it in words.
+_bl_target() {
+    _BL_TGT="unknown"; _BL_TGT_IPS=""; _BL_TGT_WHY="not known (${MYSQL_CONN:-no Connection line})"
+    local h="${MYSQL_CONN% via *}" how="${MYSQL_CONN##* via }" ip own
+    [ -n "$MYSQL_CONN" ] || return 0
+    case "$how" in *[Ss]ocket*|*[Pp]ipe*|*[Mm]emory*)
+        _BL_TGT="local"; _BL_TGT_WHY="local ($MYSQL_CONN)"; return 0 ;;
+    esac
+    case "$h" in
+        [Ll]ocalhost|::1|127.*) _BL_TGT="local"; _BL_TGT_WHY="local ($MYSQL_CONN)"; return 0 ;;
+        *:*) return 0 ;;
+        *[!0-9.]*) have getent && _BL_TGT_IPS="$(_bounded getent ahostsv4 "$h" 2>/dev/null | awk '!s[$1]++ {print $1}')"
+                   [ -n "$_BL_TGT_IPS" ] || { _BL_TGT_WHY="not known ($h did not resolve here)"; return 0; } ;;
+        *) _BL_TGT_IPS="$h" ;;
+    esac
+    own="$_nl$(_local_ips "$PROC_ROOT/net/fib_trie")$_nl"
+    while IFS= read -r ip; do
+        case "$ip" in 127.*) _BL_TGT="local"; _BL_TGT_WHY="local ($MYSQL_CONN, loopback)"; return 0 ;; esac
+        case "$own" in *"$_nl$ip$_nl"*) _BL_TGT="local"; _BL_TGT_WHY="local ($MYSQL_CONN, $ip is an address of this host)"; return 0 ;; esac
+    done <<EOF
+$_BL_TGT_IPS
+EOF
+    _BL_TGT="ips"
+    _BL_TGT_WHY="$MYSQL_CONN, ${_BL_TGT_IPS//$_nl/ } not an address of this host"
+}
+
+# _binlog_proc -> the local mysqld/mariadbd that is the server connected to;
+# its logs are read through /proc/P/root. P qualifies when:
+# 1. @@pid_file through /proc/P/root holds P's pid in its namespace (last
+#    NSpid field); when this uid may not enter that root, the pid file as
+#    this run sees it holds P's pid;
+# 2. that pid file was written at or after the server's start (now - Uptime,
+#    both wall clock; 3 s early allowed) and within 1800 s of it (mysqld
+#    writes it after InnoDB recovery): another server's is older or newer;
+# 3. where readable, the auto.cnf under P's datadir holds @@server_uuid;
+# 4. P's binlog directory holds the server's newest log at no less than the
+#    listed size and nothing newer (a newer file: SHOW BINARY LOGS is asked
+#    once more, and it must now list it).
+# 0. First, where the client connected (its status): a TCP address that this
+#    host does not own is remote unless P's network namespace owns it; a
+#    socket, loopback or own address goes on to 1-4; unknown too.
+# One stat per candidate that passes 1, one ls per candidate that passes 3.
+# Sets _BL_PID, _BL_ROOT, _BL_VIA, _BL_LS (the listing), or _BL_WHY (a fact),
+# _BL_ADVICE (how to run it differently: for the goal reason only) and
+# _BL_PRIV=1 when a pid file could not be read for want of privilege.
+_binlog_proc() {
+    _BL_PID=""; _BL_ROOT=""; _BL_VIA=""; _BL_WHY=""; _BL_PRIV=0; _BL_LS=""; _BL_ADVICE=""
+    if [ "$MYSQL_OK" != 1 ]; then _BL_WHY="not queried: $MYSQL_WHY"; return; fi
+    local pf="$PID_FILE" d c p ns l v st rt how u lsout chk last="" lsz="" rows2 asked=0
+    local srv="" hits=0 cand=0 unread="" other="" ok="" mt r2last="" r2sz=""
+    case "$pf" in
+        '') _BL_WHY="@@pid_file gave no path, so the server's process cannot be identified"; return ;;
+        /*) ;;
+        *) pf="${DATADIR%/}/$pf" ;;
+    esac
+    case "$_NOW_AT_Q$SRV_UPTIME" in *[!0-9]*|'') ;; *) srv=$((_NOW_AT_Q - SRV_UPTIME)) ;; esac
+    # 0. where the client connected: a TCP address that neither this host nor
+    # a local mysqld's network namespace owns is a remote server
+    _bl_target
+    local netns_ok ip mine owned=0
+    if [ -n "$_bl_rows" ]; then
+        l="${_bl_rows%"$_nl"}"; l="${l##*"$_nl"}"; set -f; set -- $l; set +f; last="${1:-}"; lsz="${2:-}"
+    fi
+    for d in "$PROC_ROOT"/[0-9]*; do
+        c=""; IFS= read -r c < "$d/comm" 2>/dev/null
+        case "$c" in mysqld|mariadbd) ;; *) continue ;; esac
+        p="${d##*/}"
+        st=""; IFS= read -r st < "$d/stat" 2>/dev/null; st="${st##*) }"
+        case "$st" in Z*|X*) continue ;; esac      # a zombie holds no files
+        cand=$((cand + 1)); v=""
+        if [ "$_BL_TGT" = ips ]; then
+            netns_ok=0; mine="$_nl$(_local_ips "$d/net/fib_trie")$_nl"
+            while IFS= read -r ip; do
+                [ -n "$ip" ] && case "$mine" in *"$_nl$ip$_nl"*) netns_ok=1 ;; esac
+            done <<EOF
+$_BL_TGT_IPS
+EOF
+            if [ "$netns_ok" = 0 ]; then other="$other $p(its network namespace does not own ${_BL_TGT_IPS//$_nl/ })"; continue; fi
+            owned=$((owned + 1))
+        fi
+        # 1. the pid file
+        if [ -d "$d/root/." ]; then
+            rt="$d/root"; how="read through $rt"; ns="$p"
+            while IFS= read -r l; do
+                case "$l" in NSpid:*) set -f; set -- $l; set +f; eval "ns=\${$#}" ;; esac
+            done < "$d/status" 2>/dev/null
+            # absent only when its directory could be searched (a datadir of
+            # mode 700 hides it from a mysql-group user: unreadable, not absent)
+            v="$rt$pf"; v="${v%/*}"
+            if [ ! -e "$rt$pf" ] && [ -x "${v:-/}" ]; then other="$other $p(pid file absent)"; v=""; continue; fi
+            v=""
+            [ -r "$rt$pf" ] || { unread="$unread $p"; continue; }
+            IFS= read -r v < "$rt$pf" 2>/dev/null
+        else
+            # a root this uid may not enter (another uid; no CAP_SYS_PTRACE in
+            # a container): the pid file as seen here, holding P's own pid
+            rt=""; how="read here"; ns="$p"
+            v="${pf%/*}"
+            if [ ! -e "$pf" ] && [ -x "${v:-/}" ]; then other="$other $p(pid file absent here; /proc/$p/root not enterable by uid $(id -u 2>/dev/null || echo '?'))"; v=""; continue; fi
+            v=""
+            [ -r "$pf" ] || { unread="$unread $p"; continue; }
+            IFS= read -r v < "$pf" 2>/dev/null
+        fi
+        if [ "$v" != "$ns" ]; then other="$other $p(pid file holds ${v:-nothing})"; continue; fi
+        # 2. the pid file written with the server's start
+        mt="$(_bounded stat -c %Y -- "$rt$pf" 2>/dev/null)"
+        case "$mt$srv" in
+            *[!0-9]*|'') other="$other $p(pid file time or server start unknown)"; continue ;;
+        esac
+        if [ "$mt" -lt $((srv - 3)) ] || [ "$mt" -gt $((srv + 1800)) ]; then
+            other="$other $p(pid file written at $mt, the server started at $srv)"; continue
+        fi
+        # 2. the uuid, where MySQL keeps one
+        if [ -n "$SRV_UUID" ] && [ -n "$DATADIR" ] && [ -r "$rt${DATADIR%/}/auto.cnf" ]; then
+            u=""
+            while IFS= read -r l; do case "$l" in server-uuid=*) u="${l#server-uuid=}" ;; esac; done < "$rt${DATADIR%/}/auto.cnf"
+            if [ -n "$u" ] && [ "$u" != "$SRV_UUID" ]; then other="$other $p(auto.cnf server-uuid $u, the server's $SRV_UUID)"; continue; fi
+        fi
+        # 3. the server's newest log, and nothing newer
+        lsout=""
+        if [ -n "$last" ] && [ -n "$BINLOG_DIR" ] && [ -r "$rt$BINLOG_DIR" ] && [ -x "$rt$BINLOG_DIR" ]; then
+            lsout="$(_bounded ls -l --time-style=+%Y-%m-%dT%H:%M:%SZ -- "$rt$BINLOG_DIR" 2>/dev/null)"
+            chk="$(_bl_newest "$lsout" "$last" "$lsz")"
+            case "$chk" in
+                N\ *)
+                    # a newer file only: a rotation since SHOW BINARY LOGS, or
+                    # another server's log. Asked once more, once per run.
+                    if [ "$asked" = 0 ]; then
+                        asked=1; rows2="$(mysql_q "SHOW BINARY LOGS")" || rows2=""
+                        if [ -n "$rows2" ]; then
+                            l="${rows2%"$_nl"}"; l="${l##*"$_nl"}"; set -f; set -- $l; set +f
+                            r2last="${1:-}"; r2sz="${2:-}"
+                            # the listing's newest is now listed (rotation may
+                            # have gone on since): the fresh rows count
+                            case "$_nl$rows2" in *"$_nl${chk#N }$_tab"*)
+                                _bl_rows="$rows2"; last="$r2last"; lsz="$r2sz"; chk="" ;;
+                            esac
+                        fi
+                    fi
+                    [ -n "$chk" ] && chk="holds ${chk#N }, which SHOW BINARY LOGS does not list (asked again; its newest: ${r2last:-$last})" ;;
+            esac
+            [ -n "$chk" ] && { other="$other $p($chk)"; continue; }
+        fi
+        ok="$ok$p|$rt|$how|$ns|$mt$_nl"
+        hits=$((hits + 1)); _BL_LS="$lsout"
+    done
+    if [ "$hits" = 1 ]; then
+        IFS='|' read -r _BL_PID _BL_ROOT how ns mt <<EOF
+$ok
+EOF
+        l="$_BL_TGT_WHY"; [ "$_BL_TGT" = ips ] && l="$l, owned by its network namespace"
+        _BL_VIA="via pid $_BL_PID (connection $l; pid file $pf, $how, holds its pid $ns, written $((mt - srv))s after the server started${last:+, holds the newest log $last})"
+        return
+    fi
+    _BL_LS=""
+    if [ "$hits" -gt 1 ]; then
+        _BL_WHY="more than one local mysqld/mariadbd has the server's pid file $pf (with its start), uuid and newest log, so which one is the server is not known"
+    elif [ -n "$unread" ]; then
+        _BL_PRIV=1
+        _BL_WHY="the server's pid file $pf could not be read for mysqld/mariadbd pid${unread} by uid $(id -u 2>/dev/null || echo '?')"
+    elif [ "$_BL_TGT" = ips ] && [ "$owned" = 0 ]; then
+        _BL_WHY="the server is remote (connected to $_BL_TGT_WHY, nor of a local mysqld's network namespace)"
+        _BL_ADVICE="; run the collector on the database host to read its binary logs"
+    elif [ "$cand" = 0 ]; then
+        _BL_WHY="the server's process (pid file $pf) is not on this host: no mysqld or mariadbd process runs here"
+    else
+        _BL_WHY="the server's process (pid file $pf) is not on this host: no local mysqld/mariadbd is it:$other"
+    fi
+}
+
+# _bl_newest LISTING LAST SIZE -> empty when the listing holds LAST at no less
+# than SIZE bytes and no newer file of its name; else "N NAME" for a newer
+# file only, or the reason.
+_bl_newest() {
+    printf '%s\n' "$1" | awk -v last="$2" -v lsz="$3" '
+        function num(f) { sub(/.*\./, "", f); return f + 0 }
+        function pre(f) { sub(/\.[0-9]+$/, "", f); return f }
+        $NF ~ /\.[0-9][0-9][0-9][0-9][0-9][0-9]$/ {
+            if ($NF == last) { found = 1; sz = $5 }
+            if (pre($NF) == pre(last) && num($NF) > num(last) && num($NF) > nn) { newer = $NF; nn = num($NF) }
+        }
+        END {
+            if (!found) print "no " last ", the server'"'"'s newest log"
+            else if (sz + 0 < lsz + 0) print last " is " sz " bytes, the server'"'"'s " lsz
+            else if (newer != "") print "N " newer
+        }'
+}
+
 
 # ---- report body ------------------------------------------------------------
 run_report() {
@@ -940,6 +1188,7 @@ run_report() {
     elif [ -n "$_PW_WHY" ]; then fact "password: n/a ($_PW_WHY)"
     else fact "password: none given to this collector"; fi
     fact "mysql connection: $MYSQL_WHY"
+    [ "$MYSQL_OK" = 1 ] && fact "connected to: ${MYSQL_CONN:-n/a (no Connection line in the client status)}"
     # One process list answers both whether a mysqld runs here (the login
     # reason below) and section A's process line. Not pgrep -f: it would match
     # this run's timeout wrapper.
@@ -968,14 +1217,22 @@ run_report() {
     sql "version"        "SELECT VERSION()"
     sql "server host"    "SELECT @@hostname"
     sql "server_id"      "SELECT @@server_id"
-    sql "server_uuid"    "SELECT @@server_uuid"
-    sql "uptime(s)"      "SHOW GLOBAL STATUS LIKE 'Uptime'"
+    sql "server_uuid"    "SELECT @@server_uuid" SRV_UUID
+    # The clock just before Uptime is asked: now - Uptime is then the earliest
+    # the server can have started (wall clock), which its pid file's mtime is
+    # compared with (_binlog_proc); a slow answer cannot push it later.
+    _NOW_AT_Q=""
+    if [ "${BASH_VERSINFO[0]:-0}" -gt 4 ] || { [ "${BASH_VERSINFO[0]:-0}" -eq 4 ] && [ "${BASH_VERSINFO[1]:-0}" -ge 2 ]; }; then
+        printf -v _NOW_AT_Q '%(%s)T' -1
+    else _NOW_AT_Q="$(date +%s 2>/dev/null)"; fi
+    sql "uptime(s)"      "SHOW GLOBAL STATUS LIKE 'Uptime'" SRV_UPTIME
     # super_read_only arrived in 5.7; asking for both in one row loses read_only
     # on 5.6 and on MariaDB.
     sql "read_only"      "SELECT @@read_only"
     sql "super_read_only" "SELECT @@super_read_only"
     sql "port / socket"  "SELECT @@port, @@socket"
     sql "datadir"        "SELECT @@datadir" DATADIR
+    sql "pid_file"       "SELECT @@pid_file" PID_FILE
     # From the process list taken for the login reason. A missing ps is an
     # error, not "empty output"; no match is empty output.
     if [ "$_PS_RC" = 127 ] && ! have ps; then
@@ -1003,10 +1260,20 @@ run_report() {
     sql  "log_replica_updates" "SHOW VARIABLES LIKE 'log_slave_updates'"
     sqlv "replica status"      "SHOW REPLICA STATUS"
     sqlv "slave status"        "SHOW SLAVE STATUS"
-    # 8.4 removed SHOW MASTER STATUS; 5.7/8.0 do not know SHOW BINARY LOG
-    # STATUS. Ask both so one of them always answers with the binlog position.
-    sqlv "binary log status"   "SHOW BINARY LOG STATUS"
-    sqlv "source status"       "SHOW MASTER STATUS"
+    # 8.2 renamed SHOW MASTER STATUS (8.4 removed it); before 8.2 and on
+    # MariaDB the new name is a syntax error (1064), answered by the old one.
+    if [ "$MYSQL_OK" != 1 ]; then fact "binary log status: n/a ($MYSQL_WHY)"
+    else
+        _o="$(mysql_vertical "SHOW BINARY LOG STATUS")"; _rc=$?
+        _e=""; [ "$_rc" -ne 0 ] && [ "$_rc" -ne 124 ] && _e="$(cat "$_errfile" 2>/dev/null)"
+        case "$_e" in
+            *"ERROR 1064"*) sqlv "binary log status (SHOW MASTER STATUS)" "SHOW MASTER STATUS" ;;
+            *) if [ "$_rc" -eq 124 ]; then fact "binary log status: n/a ($(_why_124))"
+               elif [ "$_rc" -ne 0 ]; then fact "binary log status: n/a ($(_classify_err))"
+               elif [ -z "$_o" ]; then fact "binary log status: none"
+               else _emit_labeled "binary log status" "$_o"; fi ;;
+        esac
+    fi
     sql  "connected replicas"  "SHOW REPLICAS"
     sql  "connected slaves"    "SHOW SLAVE HOSTS"
     sql  "galera wsrep"        "SHOW STATUS LIKE 'wsrep_cluster_size'"
@@ -1017,7 +1284,7 @@ run_report() {
     section "C. Binary log inventory and retention"
     sql "log_bin"                     "SELECT @@log_bin" LOG_BIN
     sql "log_bin_basename"            "SELECT @@log_bin_basename" BINLOG_BASE
-    sql "log_bin_index"               "SELECT @@log_bin_index"
+    sql "log_bin_index"               "SELECT @@log_bin_index" BINLOG_INDEX
     sql "max_binlog_size"             "SELECT @@max_binlog_size"
     sql "binlog_expire_logs_seconds"  "SHOW VARIABLES LIKE 'binlog_expire_logs_seconds'"
     sql "expire_logs_days"            "SHOW VARIABLES LIKE 'expire_logs_days'"
@@ -1027,15 +1294,19 @@ run_report() {
     # A host whose binary logs accumulate can hold thousands of files, and the
     # full listing would be the whole report. Report the inventory as totals
     # plus both ends; section I attributes the content.
+    # _bl_rows (name, bytes per row) also serves the directory listing below
+    # and section I, so no file is stat'ed for a size the server already gave.
+    _bl_rows=""; _BL_INV_WHY=""
     if [ "$MYSQL_OK" != 1 ]; then
         fact "binary logs: n/a ($MYSQL_WHY)"
     else
         # A refusal is not an empty list: without REPLICATION CLIENT the server
         # answers ERROR 1227, which used to read as "binary logs: none".
-        _BL_INV_WHY=""
         _bl_rows="$(mysql_q "SHOW BINARY LOGS")"; _bl_rc=$?
         if [ "$_bl_rc" -ne 0 ]; then
-            if [ "$_bl_rc" -eq 124 ]; then _BL_INV_WHY="timed out: ${CMD_TIMEOUT}s"
+            # a cut or refused answer is no list, however many rows it printed
+            _bl_rows=""
+            if [ "$_bl_rc" -eq 124 ]; then _BL_INV_WHY="$(_why_124)"
             else _BL_INV_WHY="$(_classify_err)"; fi
             fact "binary logs: n/a (SHOW BINARY LOGS: $_BL_INV_WHY)"
         elif [ -z "$_bl_rows" ]; then
@@ -1055,19 +1326,40 @@ run_report() {
     # log_bin_basename leaves no directory, not dirname's ".".
     BINLOG_DIR=""
     case "$BINLOG_BASE" in
-        /*) BINLOG_DIR="$(dirname "$BINLOG_BASE" 2>/dev/null)" ;;
+        /*) BINLOG_DIR="${BINLOG_BASE%/*}"; BINLOG_DIR="${BINLOG_DIR:-/}" ;;
     esac
-    if [ -n "$BINLOG_DIR" ] && [ -d "$BINLOG_DIR" ] && [ -r "$BINLOG_DIR" ]; then
-        fact "binlog directory: $BINLOG_DIR"
-        # The server-supplied path is an argument, never part of the script text.
-        probe "newest binlog files (mtime, bytes)" sh -c \
-            'ls -l --time-style=+%Y-%m-%dT%H:%M:%SZ "$1" 2>/dev/null | grep -E "\.[0-9]{6}\$" | tail -20' sh "$BINLOG_DIR"
-        probe "binlog total bytes" sh -c 'du -sb "$1" 2>/dev/null | cut -f1' sh "$BINLOG_DIR"
-    elif [ -n "$BINLOG_DIR" ]; then
-        fact "binlog directory: $BINLOG_DIR (not readable by uid $(id -u 2>/dev/null || echo '?'))"
-    else
+    # The files are the server process's (_binlog_proc), read through its
+    # /proc/<pid>/root: LDIR is BINLOG_DIR as that process sees it.
+    _binlog_proc
+    LDIR=""; [ -n "$BINLOG_DIR" ] && [ -n "$_BL_PID" ] && LDIR="$_BL_ROOT$BINLOG_DIR"
+    if [ -z "$BINLOG_DIR" ]; then
         if [ "$MYSQL_OK" != 1 ]; then fact "binlog directory: n/a (not queried: $MYSQL_WHY)"
         else fact "binlog directory: n/a (@@log_bin_basename is not an absolute path: ${BINLOG_BASE:-empty})"; fi
+    elif [ -z "$LDIR" ]; then
+        fact "binlog directory: $BINLOG_DIR (not listed: $_BL_WHY)"
+    elif [ -d "$LDIR" ] && [ -r "$LDIR" ]; then
+        fact "binlog directory: $BINLOG_DIR"
+        fact "binlog files: $_BL_VIA, $LDIR"
+        # One listing: the mtimes are what only the directory has (growth).
+        # Sizes and the total are SHOW BINARY LOGS' above; without that list
+        # (refused, timed out) the same listing sums the binlog files. Not du:
+        # with the logs in the datadir it walks the whole datadir.
+        _tot=""; [ -z "$_bl_rows" ] && _tot=1
+        # the listing _binlog_proc took to check the newest log, when it did
+        if [ -n "$_BL_LS" ]; then _ls="$_BL_LS"; _rc=0
+        else _ls="$(_bounded ls -l --time-style=+%Y-%m-%dT%H:%M:%SZ -- "$LDIR" 2>"$_errfile")"; _rc=$?; fi
+        _ls="$(printf '%s\n' "$_ls" | awk -v tot="$_tot" '
+            $NF ~ /\.[0-9][0-9][0-9][0-9][0-9][0-9]$/ { n++; s += $5; l[n] = $0 }
+            END {
+                for (i = (n > 20 ? n - 19 : 1); i <= n; i++) print l[i]
+                if (tot && n) printf "total: %d files, %.0f bytes (directory listing)\n", n, s
+            }')"
+        if [ "$_rc" -eq 124 ]; then fact "newest binlog files (mtime, bytes): n/a ($(_why_124))"
+        elif [ -n "$_ls" ]; then _emit_labeled "newest binlog files (mtime, bytes)" "$_ls"
+        elif [ "$_rc" -ne 0 ]; then fact "newest binlog files (mtime, bytes): n/a ($(_classify_err))"
+        else fact "newest binlog files (mtime, bytes): n/a (empty output)"; fi
+    else
+        fact "binlog directory: $BINLOG_DIR (not readable by uid $(id -u 2>/dev/null || echo '?') at $LDIR)"
     fi
 
     section "D. Storage and I/O"
@@ -1150,23 +1442,86 @@ run_report() {
         if [ "$MYSQL_OK" != 1 ]; then fact "n/a (binary log directory not resolved: @@log_bin_basename not queried: $MYSQL_WHY)"
         else fact "n/a (binary log directory not resolved: @@log_bin_basename is ${BINLOG_BASE:-empty})"; fi
         missed binlog "binary log directory not resolved (@@log_bin_basename ${BINLOG_BASE:-unavailable}; mysql connection: $MYSQL_WHY)"
-    elif [ ! -r "$BINLOG_DIR" ] || [ ! -x "$BINLOG_DIR" ]; then
-        fact "n/a (binary log directory $BINLOG_DIR not readable by uid $(id -u 2>/dev/null || echo '?'))"
-        missed binlog "run as uid $(id -u 2>/dev/null || echo '?'); $BINLOG_DIR is $(stat -c '%U:%G %a' "$BINLOG_DIR" 2>/dev/null || echo 'not readable') and not readable by this uid$(_priv_hint)"
+    elif [ -z "$LDIR" ]; then
+        # Same-named files elsewhere on this host would be another server's.
+        fact "n/a ($_BL_WHY)"
+        if [ "$_BL_PRIV" = 1 ]; then missed binlog "$_BL_WHY$(_priv_hint)"
+        else missed binlog "$_BL_WHY$_BL_ADVICE"; fi
+    elif [ ! -r "$LDIR" ] || [ ! -x "$LDIR" ]; then
+        fact "n/a (binary log directory $LDIR not readable by uid $(id -u 2>/dev/null || echo '?'))"
+        missed binlog "run as uid $(id -u 2>/dev/null || echo '?'); $LDIR is $(stat -c '%U:%G %a' "$LDIR" 2>/dev/null || echo 'not readable') and not readable by this uid$(_priv_hint)"
     else
-        fact "decoding the $BINLOG_FILES newest binary logs under $BINLOG_DIR"
-        _bl_list="$(ls -1td -- "$BINLOG_DIR"/*.[0-9][0-9][0-9][0-9][0-9][0-9] 2>/dev/null | head -n "$BINLOG_FILES")"
-        if [ -z "$_bl_list" ]; then
-            fact "n/a (no binary log files matched under $BINLOG_DIR)"
-            na binlog "$BINLOG_DIR is readable and holds no <basename>.NNNNNN file"
+        fact "decoding the $BINLOG_FILES newest binary logs under $BINLOG_DIR ($_BL_VIA, $LDIR)"
+        # "path<TAB>bytes", newest first. The newest files and their sizes are
+        # the last rows of SHOW BINARY LOGS (section C). Their paths come from
+        # @@log_bin_index when it is readable and lists the same names in the
+        # same order (logs in more than one directory), else BINLOG_DIR/name.
+        # A selected file that is not here, or a name listed twice with no
+        # index to tell them apart, is named and blocks the goal. Only without
+        # that list does one directory listing (by mtime) supply both.
+        _bl_list=""; _bl_gap=""
+        if [ -n "$_bl_rows" ]; then
+            _bl_idx=""
+            case "$BINLOG_INDEX" in /*) [ -f "$_BL_ROOT$BINLOG_INDEX" ] && [ -r "$_BL_ROOT$BINLOG_INDEX" ] && _bl_idx="$_BL_ROOT$BINLOG_INDEX" ;; esac
+            # index entries are the server's paths: they get the same root
+            _bl_sel="$(printf '%s\n' "$_bl_rows" | awk -v d="$LDIR" -v rt="$_BL_ROOT" -v dd="${DATADIR%/}" -v idx="$_bl_idx" -v n="$BINLOG_FILES" '
+                NF { r++; name[r] = $1; size[r] = $2; cnt[$1]++ }
+                END {
+                    use = 0
+                    if (idx != "") {
+                        k = 0
+                        while ((getline l < idx) > 0) if (l != "") p[++k] = l
+                        use = (k == r)
+                        for (i = 1; i <= k && use; i++) { b = p[i]; sub(/.*\//, "", b); if (b != name[i]) use = 0 }
+                    }
+                    for (i = r; i >= 1 && i > r - n; i--) {
+                        if (use) {
+                            q = p[i]
+                            if (q !~ /^\//) { sub(/^\.\//, "", q); q = dd "/" q }
+                            q = rt q
+                            print "F\t" q "\t" size[i] "\t" (cnt[name[i]] > 1)
+                        } else if (cnt[name[i]] > 1) print "D\t" name[i] "\t" cnt[name[i]]
+                        else print "F\t" d "/" name[i] "\t" size[i] "\t0"
+                    }
+                }')"
+            while IFS="$_tab" read -r _k _p _b _dup; do
+                case "$_k" in
+                    F) if [ -f "$_p" ]; then _bl_list="$_bl_list$_p$_tab$_b$_tab${_dup:-0}$_nl"
+                       else
+                           fact "skipped: ${_p##*/} (listed by SHOW BINARY LOGS; $_p is not a file on this host)"
+                           _bl_gap="$_bl_gap${_bl_gap:+; }${_p##*/}: not a file at $_p on this host"
+                       fi ;;
+                    D) fact "skipped: $_p (SHOW BINARY LOGS lists it $_b times and @@log_bin_index ${BINLOG_INDEX:-?} is not readable here, so which file is meant is not known)"
+                       _bl_gap="$_bl_gap${_bl_gap:+; }$_p: listed $_b times, no readable index to tell them apart" ;;
+                esac
+            done <<EOF
+$_bl_sel
+EOF
+            _bl_src="SHOW BINARY LOGS"
         else
-            _bl_ok=0; _bl_gap=""
+            _bl_list="$(_bounded ls -ltd --time-style=+%s -- "$LDIR"/*.[0-9][0-9][0-9][0-9][0-9][0-9] 2>/dev/null \
+                | head -n "$BINLOG_FILES" \
+                | awk '{ sz = $5; for (i = 1; i <= 6; i++) sub(/^[^ ]+ +/, ""); print $0 "\t" sz }')"
+            _bl_src=""
+        fi
+        if [ -z "$_bl_list" ] && [ -n "$_bl_src" ]; then
+            fact "n/a (none of the $BINLOG_FILES newest files SHOW BINARY LOGS lists could be read on this host)"
+            missed binlog "none of the $BINLOG_FILES newest files SHOW BINARY LOGS lists was decoded: $_bl_gap"
+        elif [ -z "$_bl_list" ]; then
+            fact "n/a (no binary log files matched under $LDIR)"
+            na binlog "$LDIR is readable and holds no <basename>.NNNNNN file"
+        else
+            _bl_ok=0
             _sum="$(_tmp binlog.sum)"
             while IFS= read -r _bl; do
                 [ -n "$_bl" ] || continue
-                _path="$_bl"; _bl="${_bl##*/}"
-                _bytes="$(ls -l "$_path" 2>/dev/null | awk '{print $5}')"
-                fact "file: $_bl ($_bytes bytes)"
+                # path<TAB>bytes[<TAB>1 when the name is listed more than once]
+                _path="${_bl%%"$_tab"*}"; _bytes="${_bl#*"$_tab"}"; _dup=0
+                case "$_bytes" in *"$_tab"*) _dup="${_bytes#*"$_tab"}"; _bytes="${_bytes%%"$_tab"*}" ;; esac
+                _bl="${_path##*/}"
+                # a name the index lists in two directories is told apart by its path
+                if [ "$_dup" = 1 ]; then fact "file: $_path ($_bytes bytes)"
+                else fact "file: $_bl ($_bytes bytes)"; fi
                 # A decoded 1 GiB log is ~1.15 GiB: stream it once through awk,
                 # never into a variable. The status read is the decoder's
                 # (PIPESTATUS), not awk's.
