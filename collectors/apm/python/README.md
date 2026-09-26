@@ -29,6 +29,8 @@ docker exec -i <container> sh -s -- --stdout --quiet \
 
 Paste or attach the entire output. No arguments prints usage; nothing runs by
 accident. Progress is narrated on stderr (`--quiet` silences it).
+`--pip` also runs `python -m pip list` in each detailed interpreter (one
+more start each); the default library inventory needs no pip.
 
 Container notes (all verified against real images):
 
@@ -52,19 +54,20 @@ Container notes (all verified against real images):
 | --- | --- | --- |
 | 1 | Collection environment | which tools were available to this collection |
 | 2 | Host / platform | OS, arch (amd64/arm64), container markers, cgroup CPU/memory limits (container-vs-host metric questions) |
-| 3 | Python runtimes and whatap-python package | every interpreter (those of whatap-marked processes first, so the detail cap of 8 does not fill with unrelated ones) (multiple versions and **virtualenvs are kept distinct** — identity is the invocation path, not the resolved binary), whatap-python version/location per interpreter, the `whatap_python-*` metadata dirs next to the package (`.dist-info` = wheel install, `.egg-info`/`.egg` = setup.py-era install), `sys.prefix` / `base_prefix` (they differ inside a virtualenv), setuptools / `pkg_resources` import facts (Python 3.12 install issues), bundled Go module binaries per arch, `bootstrap/sitecustomize.py`, console scripts on PATH, **application library inventory** — `pip list` per interpreter (a missing pip module or a failing pip is reported with its error, not as empty output), plus a no-pip/no-exec fallback (dist-info/egg-info dir names per environment), plus the **instrumentation surface of the installed agent** (`trace/mod` tree, grouped: application/database/httpc/amqp/...) which differs across agent versions |
+| 3 | Python runtimes and whatap-python package | every interpreter (those of whatap-marked processes first, so the detail cap of 8 does not fill with unrelated ones) (multiple versions and **virtualenvs are kept distinct** — identity is the invocation path, not the resolved binary), whatap-python version/location per interpreter, the `whatap_python-*` metadata dirs next to the package (`.dist-info` = wheel install, `.egg-info`/`.egg` = setup.py-era install), `sys.prefix` / `base_prefix` (they differ inside a virtualenv), setuptools / `pkg_resources` import facts (Python 3.12 install issues), bundled Go module binaries per arch, `bootstrap/sitecustomize.py`, console scripts on PATH, **application library inventory** — the `.dist-info`/`.egg-info`/`.egg`/`.egg-link` names in every `sys.path` directory of each interpreter (see "Library inventory" below; `pip list` only with `--pip`), plus a no-exec fallback (the same names next to each whatap package dir seen in process environ), plus the **instrumentation surface of the installed agent** (`trace/mod` tree, grouped: application/database/httpc/amqp/...) which differs across agent versions |
 | 4 | Runtime processes | Go common module (`whatap_python`) processes with cwd/env; python app processes (matched by comm, argv0 or `/proc/<pid>/exe`, see below; whatap-marked ones first) with argv0, `PYTHONPATH contains whatap/bootstrap`, `VIRTUAL_ENV`, `WHATAP_*`, `OTEL_*` (co-instrumentation); **libraries the process actually loaded** — C-extension packages and the real `site-packages` path from `/proc/<pid>/maps` (pure-Python imports do not appear there) |
 | 5 | Agent homes and configuration | every `WHATAP_HOME` candidate (env, port registry `/tmp/whatap-python.lock`, process cwd/environ, `/whatap-agent`), and per home: `whatap.conf` / `container.conf` verbatim, `whatap_python` symlink resolution, pid-file liveness, `security.conf` / `paramkey.txt` presence and size, `logs/` inventory, `run/`, LLM module dir. A home that cannot be read says `path not found` or `permission denied` |
 | 6 | Network endpoints and port registry | UDP sockets on 66xx plus the `net_udp_port` of the readable `whatap.conf` files and the port registry, TCP sessions on 6600 plus the `whatap.server.port` named there (each port labelled by its source), plus every socket of a whatap-named process; port registry contents |
 | 7 | Agent logs | `whatap-hook.log` head (banner + `successfully injected <module>` lines = which libraries the agent hooked in this process) and tail (recent), the newest `whatap-boot-YYYYMMDD.log` (Go side) head + tail — all bounded reads |
-| 8 | Odoo application facts | odoo master/worker processes, Odoo version (`odoo/release.py`, read as text — no odoo code runs), `odoo.conf` (path from `-c`/`ODOO_RC`/packaged defaults; see "What the report can contain" below) with the `logfile` key resolved and the worker log tailed (with `logfile` unset, odoo writes to the process stdout/stderr, e.g. the container log) (the HTTP-worker traceback lives there, not in the master/startup log), listening sockets (8069/8072), systemd unit facts (`Environment=`/`ExecStart` visibility for `whatap-start-agent` PATH issues), `injected odoo` hook-evidence counts. Cheap no-op on non-Odoo hosts. Interpretation aid: the agent's Odoo support matrix (14–19 from agent 2.1.3; JSON-RPC errors return HTTP 200 and are not captured; WebSocket/Longpolling/Cron not instrumented) is maintained in the internal "Odoo 지원" Notion document |
+| 8 | Odoo application facts | odoo master/worker processes, Odoo version (`odoo/release.py`, read as text — no odoo code runs), `odoo.conf` (path from `-c`/`ODOO_RC`/packaged defaults; see "What the report can contain" below) with the `logfile` key resolved and the worker log tailed (with `logfile` unset, odoo writes to the process stdout/stderr, e.g. the container log) (the HTTP-worker traceback lives there, not in the master/startup log), listening sockets (8069/8072), systemd unit facts (`Environment=`/`ExecStart` visibility for `whatap-start-agent` PATH issues), `injected odoo` hook-evidence counts. On non-Odoo hosts it starts no interpreter: where each interpreter would import `odoo` from is looked up in the one start of section 3, and an interpreter whose lookup did not answer is named here. Interpretation aid: the agent's Odoo support matrix (14–19 from agent 2.1.3; JSON-RPC errors return HTTP 200 and are not captured; WebSocket/Longpolling/Cron not instrumented) is maintained in the internal "Odoo 지원" Notion document |
 | 9 | Kubernetes / operator injection context | `/whatap-agent` volume, `WHATAP_PYTHON_AGENT_PATH` (symlink vs regular file), k8s env facts |
 
 ## How each interpreter is asked
 
 The lookups of section 3 (version, prefixes, whatap-python version and
 location, metadata dirs, setuptools, `pkg_resources`, bundled binaries,
-`sitecustomize.py`, `trace/mod`) run in **one** start of each interpreter,
+`sitecustomize.py`, `trace/mod`, the library inventory, and the `odoo`
+location that section 8 reads `release.py` from) run in **one** start of each interpreter,
 not one `python -c` each: every snippet runs with fresh globals, its own
 stdout, stderr and exit status, and an uncaught exception is printed by the
 interpreter's own `sys.excepthook`, so each line and each `n/a (...)` reads
@@ -77,7 +80,35 @@ the combined script at all, every snippet is run on its own; when the cap
 stops it before any snippet started, every snippet says `timed out`, as each
 `python -c` would have. The marker lines that separate the snippets are random
 per run and read in order, so output that imitates one stays output. `pip list`
-stays a call of its own.
+(`--pip` only) stays a call of its own.
+
+## Library inventory
+
+By default the inventory is the names of the metadata entries
+(`*.dist-info`, `*.egg-info`, `*.egg`, `*.egg-link`) in each directory on the
+interpreter's `sys.path`, listed by the interpreter start above; nothing is
+imported and pip is not needed (uv-made environments have no pip module). These
+are the entries `pip list` reads, so the names and versions agree; on the
+validation host (Ubuntu 24.04 `/usr/bin/python3`, 2026-09-26) both gave the
+same 66 name/version pairs, and the directory listing also showed a
+version-less duplicate `cryptography.egg-info` from the distribution package.
+What `pip list` adds (`--pip`):
+
+- the version of an `.egg-info` entry whose name carries none (read from its
+  `PKG-INFO`), and names normalised from the metadata instead of the
+  directory name;
+- one entry per distribution: where the same distribution sits in two
+  `sys.path` directories, pip shows the first, the listing shows both;
+- whether pip itself runs in that interpreter.
+
+A legacy editable install (`setup.py develop`, pip before 21.3) shows as
+`<name>.egg-link` in site-packages, and its source directory (on `sys.path`
+through `easy-install.pth`) is listed with its `<name>.egg-info`. A PEP 660
+editable install has an ordinary `.dist-info`. The empty `sys.path` entry
+(the collector's working directory) is not listed.
+
+`--pip` declares the goal `pip`: an interpreter whose `pip list` gave no
+list (no pip module, an error, a timeout) makes it `missed`.
 
 ## How python processes are found
 
@@ -128,7 +159,8 @@ can arrive from:
 - Command lines of python, `whatap_python` and odoo processes and of pid 1
   (first 300 characters): an argument such as `--db_password=...` appears as
   given.
-- `pip list` output and the installed-distribution names (package names only).
+- The installed-distribution names (package names and versions), and with
+  `--pip` the `pip list` output.
 - `odoo.conf`, verbatim, **except** the `db_password` and `admin_passwd` lines,
   which are not collected (the report states how many were left out); the tail
   of the odoo `logfile`.
@@ -147,8 +179,9 @@ The collector itself puts no credential on a command line.
 Tier 0 only: read-only, bounded reads (`tail -n`, line-capped dumps, capped
 process/interpreter detail), every external command capped at 15 s and the
 whole run at `RUN_DEADLINE` (300 s). Each detailed interpreter (cap 8) is
-started three times: once for all ten lookups, once for `-m pip list`, and once
-for the Odoo `release.py` lookup (also on hosts without Odoo). No `--bundle` tier yet;
+started once for all twelve lookups (a lookup cut off by a hang is re-run on
+its own, see above), and once more for `-m pip list` with `--pip`. The kernel
+and machine come from one `uname -srm`. No `--bundle` tier yet;
 copy the bundle plumbing from `collect-collserver.sh` if the domain team
 needs raw log artifacts.
 

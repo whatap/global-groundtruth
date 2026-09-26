@@ -24,8 +24,8 @@
 #   * Kubernetes/operator artifacts: /whatap-agent volume,
 #     WHATAP_PYTHON_AGENT_PATH (symlink vs regular file), container.conf.
 #
-# Interpreters run only short importlib lookups and `pip list`; the whatap
-# package is never imported (importing it has side effects).
+# Interpreters run only short importlib lookups (and `pip list` with --pip);
+# the whatap package is never imported (importing it has side effects).
 #
 # Rules: ../../../CONTRACT.md, ../../../docs/collector-engineering.md; no set -e.
 # -----------------------------------------------------------------------------
@@ -53,7 +53,18 @@ COLLECTOR_NAME="whatap-apmpython"
 #        daemons no longer make a non-root run INCOMPLETE. conf is missed, not
 #        na, when homes were found without a whatap.conf while a candidate's
 #        environ/cwd was unread (its home is unknown) (2026-09-26).
-VERSION="0.8.0"
+# 0.9.0  Cheaper sources (decision 4). The Odoo release.py lookup joins the one
+#        interpreter start of section [3] instead of a start of its own per
+#        interpreter; one that did not answer is named in section [8]. The
+#        library inventory is the dist-info/egg-info/egg/egg-link names in
+#        every sys.path directory, listed by that same start; `pip list` runs
+#        only with --pip, which then declares the goal `pip`. The machine arch
+#        is taken from the one `uname -srm` call. Inventory names and paths are
+#        escaped (control characters, undecodable bytes, characters the
+#        stdout encoding lacks), so one odd name cannot break a line or lose
+#        the list; a sys.path directory that cannot be stat'ed says why
+#        (2026-09-26).
+VERSION="0.9.0"
 DOMAIN="apm"
 TARGET="host/$(hostname 2>/dev/null || echo unknown)"
 
@@ -61,6 +72,7 @@ TARGET="host/$(hostname 2>/dev/null || echo unknown)"
 OPT_FILE=0        # write the report to a .txt file
 OPT_STDOUT=0      # print the report to stdout
 OPT_QUIET=0       # suppress progress narration on stderr
+OPT_PIP=0         # --pip: also run `python -m pip list` per interpreter
 
 usage() {
     cat <<EOF
@@ -76,6 +88,9 @@ explicit action flag so nothing starts by accident.
   $(basename "$0") --file     write the facts report -> ./$COLLECTOR_NAME-<host>-<UTC>.txt
   $(basename "$0") --stdout   print the facts report to stdout
   $(basename "$0") --quiet .. silence progress on stderr (add to --file / --stdout)
+  $(basename "$0") --pip   .. also run "python -m pip list" per interpreter (one more
+                         start of each; the default library inventory is read
+                         from the metadata directory names on sys.path)
 EOF
 }
 
@@ -85,6 +100,7 @@ while [ $# -gt 0 ]; do
         --file)    OPT_FILE=1 ;;
         --stdout)  OPT_STDOUT=1 ;;
         --quiet)   OPT_QUIET=1 ;;
+        --pip)     OPT_PIP=1 ;;
         -h|--help) usage; exit 0 ;;
         *) printf 'unknown argument: %s\n' "$1" >&2; usage >&2; exit 2 ;;
     esac
@@ -1397,6 +1413,13 @@ EOF
     elif [ -n "$gaps" ]; then missed conf "no whatap.conf in any agent home found ($absent), and the home of other candidates is unknown: $gaps$ph"
     elif [ -z "$D_HOMES" ]; then na conf "no agent home found to hold a whatap.conf (every source read)$(_uncounted)"
     else na conf "no whatap.conf in any agent home: $absent"; fi
+
+    # --pip: requested, so a goal; an interpreter with no working pip is missed
+    if [ "$OPT_PIP" = 1 ]; then
+        if [ -n "$_pip_fail" ]; then missed pip "pip list gave no list in:${_pip_fail%;}"
+        elif [ "$_pip_ran" = 1 ]; then got pip
+        else na pip "no python interpreter found on PATH or among running processes to run pip list in"; fi
+    fi
 }
 
 # ---- report body ---------------------------------------------------------------
@@ -1405,6 +1428,7 @@ run_report() {
 
     goal agent "whatap-python package / agent home"
     goal conf  "agent configuration"
+    [ "$OPT_PIP" = 1 ] && goal pip "pip list of each detailed interpreter (--pip)"
 
     _rep_env
     discover
@@ -1442,11 +1466,30 @@ _rep_env() {
     done
 }
 
+# _uname_srm -> `uname -srm`, its output also kept in _tmp uname.out
+_uname_srm() {
+    local rc
+    uname -srm > "$(_tmp uname.out)"; rc=$?
+    cat "$(_tmp uname.out)" 2>/dev/null
+    return "$rc"
+}
+
 # [2] host / platform
 _rep_host() {
     section "Host / platform"
-    probe "kernel" uname -srm
-    probe "machine arch" uname -m
+    # one uname call: the machine is its last field
+    if have uname; then
+        probe "kernel" _uname_srm
+        _un=""
+        { read -r _un < "$(_tmp uname.out)"; } 2>/dev/null
+        case "$_un" in
+            *" "*) fact "machine arch: ${_un##* }" ;;
+            *) fact "machine arch: n/a (no machine field in the uname -srm output)" ;;
+        esac
+    else
+        fact "kernel: n/a (command not found: uname)"
+        fact "machine arch: n/a (command not found: uname)"
+    fi
     read_proc "os-release" /etc/os-release
     probe "cpu count (nproc)" nproc
     fact "memory:"
@@ -1487,6 +1530,7 @@ _rep_runtimes() {
     fi
     local _pycount=0 py
     _py_whatap=0 _py_fail="" _py_probed=0 _py_unprobed_live=""
+    _odoo_rel="" _odoo_miss="" _pip_fail="" _pip_ran=0
     _py_total="$(printf '%s\n' "$D_PY_EXES" | grep -c .)"
     [ -n "$D_CAP_NOTE" ] && fact "$D_CAP_NOTE"
     # newline-split, no globbing: fd 9 carries the list, so a probe that
@@ -1557,8 +1601,85 @@ else:
                 if f.endswith(".py") and f not in ("__init__.py","util.py"):
                     groups.setdefault(cat,[]).append(f[:-3])
         for k in sorted(groups): print(k+": "+", ".join(sorted(groups[k])))'
-        # one interpreter start for all ten lookups (see _pyrun)
-        _pyrun "$py" "$_pc1" "$_pc2" "$_pc3" "$_pc4" "$_pc5" "$_pc6" "$_pc7" "$_pc8" "$_pc9" "$_pc10"
+        # where an odoo package would be imported from: its release.py is
+        # read as text in section [8]; the odoo module is never imported
+        _pc11='
+import importlib.util as u, os
+s = u.find_spec("odoo")
+loc = ""
+if s:
+    if s.origin: loc = os.path.dirname(s.origin)
+    elif s.submodule_search_locations:
+        for _p in s.submodule_search_locations: loc = _p; break
+print(os.path.join(loc, "release.py") if loc else "")'
+        # library inventory: the metadata entry names in every sys.path
+        # directory (the entries pip list reads); nothing is imported
+        _pc12='
+import sys, os, errno, stat
+enc = getattr(sys.__stdout__, "encoding", None) or "ascii"
+def esc(t):
+    # one line per name, and nothing the output stream cannot encode: a
+    # control character, an undecodable byte (surrogateescape) or a character
+    # outside the stdout encoding is written as a backslash escape
+    if str is bytes and not isinstance(t, str): t = t.encode("ascii", "backslashreplace")
+    # Python 2: bytes; a name that is not UTF-8 has its high bytes escaped
+    raw = 0
+    if str is bytes:
+        try:
+            t.decode("utf-8")
+        except Exception:
+            raw = 1
+    r = []
+    for c in t:
+        o = ord(c)
+        if c == "\n": r.append("\\n")
+        elif c == "\r": r.append("\\r")
+        elif c == "\t": r.append("\\t")
+        elif o < 32 or o == 127: r.append("\\x%02x" % o)
+        elif str is bytes: r.append(raw and o > 127 and "\\x%02x" % o or c)
+        elif 0xdc80 <= o <= 0xdcff: r.append("\\x%02x" % (o - 0xdc00))
+        elif o > 127:
+            try:
+                c.encode(enc)
+                r.append(c)
+            except Exception:
+                r.append(c.encode("ascii", "backslashreplace").decode("ascii"))
+        else: r.append(c)
+    return "".join(r)
+def why(e):
+    return esc(getattr(e, "strerror", None) or str(e))
+seen = {}
+left = 200
+found = 0
+for d in sys.path:
+    if not d or d in seen: continue
+    seen[d] = 1
+    try:
+        st = os.stat(d)
+    except OSError:
+        e = sys.exc_info()[1]
+        if e.errno not in (errno.ENOENT, errno.ENOTDIR): print("%s: n/a (%s)" % (esc(d), why(e)))
+        continue
+    if not stat.S_ISDIR(st.st_mode): continue
+    try:
+        ns = os.listdir(d)
+    except OSError:
+        print("%s: n/a (%s)" % (esc(d), why(sys.exc_info()[1])))
+        continue
+    ns = [n for n in ns if n.endswith(".dist-info") or n.endswith(".egg-info") or n.endswith(".egg") or n.endswith(".egg-link")]
+    if not ns: continue
+    ns.sort()
+    found = 1
+    print("%s (%d total):" % (esc(d), len(ns)))
+    for n in ns[:left]:
+        for x in (".dist-info", ".egg-info"):
+            if n.endswith(x): n = n[:-len(x)]
+        print("  " + esc(n))
+    if len(ns) > left: print("  (%d more not listed: cap 200 per interpreter)" % (len(ns) - left))
+    left = max(0, left - len(ns))
+if not found: print("no dist-info/egg-info/egg/egg-link entries in any sys.path directory")'
+        # one interpreter start for all twelve lookups (see _pyrun)
+        _pyrun "$py" "$_pc1" "$_pc2" "$_pc3" "$_pc4" "$_pc5" "$_pc6" "$_pc7" "$_pc8" "$_pc9" "$_pc10" "$_pc11" "$_pc12"
         _pyreport 1 "version" "$_pc1"
         _pyreport 2 "sys.prefix / base_prefix" "$_pc2"
         _pyreport 3 "whatap-python version" "$_pc3"
@@ -1577,7 +1698,29 @@ else:
         _pyreport 8 "bundled Go module binaries" "$_pc8"
         _pyreport 9 "bootstrap/sitecustomize.py present" "$_pc9"
         _pyreport 10 "instrumentation modules bundled in installed agent (trace/mod)" "$_pc10"
-        probe "installed packages ($py -m pip list, first 200)" _head_of 200 env PIP_DISABLE_PIP_VERSION_CHECK=1 "$py" -m pip list --format=freeze
+        _pyreport 12 "installed distributions (metadata names per sys.path directory, first 200)" "$_pc12"
+        # the odoo lookup reports in section [8]: its facts are kept aside
+        _pyreport 11 "odoo package lookup via $py" "$_pc11" > "$(_tmp odoo.fact)"
+        if [ "$_pyrun_rc" = noexec ]; then :
+        elif [ "$_pyrc" = 0 ]; then [ -n "$_pyout" ] && _odoo_rel="$_odoo_rel$_pyout$_nl"
+        # as for the whatap lookup: an interpreter without importlib.util has
+        # nothing to look up with
+        elif [ "$_pyrc" = 124 ] || ! grep -qE '^(ImportError|ModuleNotFoundError|SyntaxError|AttributeError)' "$_errfile" 2>/dev/null; then
+            _odoo_miss="$_odoo_miss$(cat "$(_tmp odoo.fact)" 2>/dev/null)$_nl"
+        fi
+        if [ "$OPT_PIP" = 1 ]; then
+            _l="installed packages ($py -m pip list, first 200)"
+            probe "$_l" _head_of 200 env PIP_DISABLE_PIP_VERSION_CHECK=1 "$py" -m pip list --format=freeze > "$(_tmp pip.fact)"
+            cat "$(_tmp pip.fact)" 2>/dev/null
+            _f=""
+            { read -r _f < "$(_tmp pip.fact)"; } 2>/dev/null
+            case "$_f" in
+                *"No module named pip"*) _pip_fail="$_pip_fail $py (no pip module);" ;;
+                "$_l: n/a ("*) _f="${_f#"$_l: n/a ("}"; _pip_fail="$_pip_fail $py (${_f%")"});" ;;
+                "$_l (exit "*) _f="${_f#"$_l (exit "}"; _pip_fail="$_pip_fail $py (exit ${_f%%")"*});" ;;
+            esac
+            _pip_ran=1
+        fi
     done 9<<EOF
 $D_PY_EXES
 EOF
@@ -1801,11 +1944,11 @@ _rep_logs() {
 # [8] odoo application facts — Odoo has its own web framework, prefork
 # worker model, and config file; agent support depends on the Odoo version
 # and the traffic dispatcher (http vs json vs websocket/longpolling vs
-# cron), so a support case needs these facts. Without Odoo it still costs one
-# release.py lookup per interpreter.
+# cron), so a support case needs these facts. Without Odoo it costs no
+# interpreter start: the release.py lookup rides on section [3]'s.
 _rep_odoo() {
     section "Odoo application facts"
-    local opid _oc _ocands="" _rcands="" _c _pycount py
+    local opid _oc _ocands="" _rcands="" _c _l
     if [ -z "$D_ODOO_PIDS" ]; then
         fact "odoo processes: none found in /proc (by comm or cmdline)"
     else
@@ -1820,27 +1963,9 @@ _rep_odoo() {
         done
     fi
 
-    # odoo package version — read release.py as text; the odoo module is never
-    # imported and no odoo code runs
-    _pycount=0
-    while IFS= read -r py <&9; do
-        [ -n "$py" ] || continue
-        _pycount=$((_pycount + 1))
-        [ "$_pycount" -gt "$D_PY_CAP" ] && break
-        _c="$(_bounded "$py" -c '
-import importlib.util as u, os
-s = u.find_spec("odoo")
-loc = ""
-if s:
-    if s.origin: loc = os.path.dirname(s.origin)
-    elif s.submodule_search_locations:
-        for _p in s.submodule_search_locations: loc = _p; break
-print(os.path.join(loc, "release.py") if loc else "")' 2>/dev/null)"
-        [ -n "$_c" ] && _rcands="$_rcands$_c$_nl"
-    done 9<<EOF
-$D_PY_EXES
-EOF
-    _rcands="$_rcands/usr/lib/python3/dist-packages/odoo/release.py$_nl"
+    # odoo package version — release.py read as text; where each interpreter
+    # would import odoo from was looked up in section [3]'s interpreter start
+    _rcands="$_odoo_rel/usr/lib/python3/dist-packages/odoo/release.py$_nl"
     for opid in $D_ODOO_PIDS; do
         _c="$(readlink -f "/proc/$opid/cwd" 2>/dev/null)"
         [ -n "$_c" ] && _rcands="$_rcands$_c/odoo/release.py$_nl"
@@ -1864,7 +1989,13 @@ EOF
     done 9<<EOF
 $_rcands
 EOF
-    [ "$_found_rel" = 0 ] && fact "odoo release file: n/a (no odoo/release.py found via interpreters, process cwd, dist-packages, or site-packages)"
+    if [ -n "$_odoo_miss" ]; then
+        fact "odoo package lookup: no answer from these interpreters:"
+        printf '%s' "$_odoo_miss" | while IFS= read -r _l; do [ -n "$_l" ] && printf '    %s\n' "$_l"; done
+    fi
+    if [ "$_found_rel" = 1 ]; then :
+    elif [ -n "$_odoo_miss" ]; then fact "odoo release file: n/a (no odoo/release.py found via the interpreters that answered, process cwd, dist-packages, or site-packages)"
+    else fact "odoo release file: n/a (no odoo/release.py found via interpreters, process cwd, dist-packages, or site-packages)"; fi
 
     # odoo configuration — path from cmdline -c/--config, env ODOO_RC, then
     # the packaged default locations
