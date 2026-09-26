@@ -207,6 +207,46 @@ and every collector must keep them.
   write them to plain stderr: in `--file` mode the report body's stderr is
   discarded.
 
+- **Few options, one shape.** An operator reads the help once, under stress;
+  every option is one more thing to get wrong. The conventions (decided
+  2026-09-26):
+  - **The common options** a collector has: the action flags (`--file`,
+    `--stdout`, and `--bundle` where the domain has a Tier 1), `--quiet`,
+    `--out DIR` (where `--file`/`--bundle` write; checked before collecting,
+    an unwritable DIR stops the run with a `!!` line and exit 1, an empty
+    value exits 2) and `-h`/`--help`. The skeleton ships all of them; the
+    collectors that do not have `--out` yet are getting it.
+  - **Options that name the target stay** (`--home`, `--namespace`,
+    `--context`, `--kubeconfig`, a DB endpoint). Take both `--x V` and
+    `--x=V`, and show short aliases in the help (`--namespace NS (-n NS)`).
+  - **Everything else is an opt-in, one per feature**, and a feature is opt-in
+    only when it (a) loads the target (tree walk, `zdb`, heap or thread dump,
+    heavy query), (b) takes long wall-clock time (about 30 s or more), (c) can
+    reveal more sensitive data than the default report, or (d) changes or
+    touches something (pod exec, a credentialed login, a network call to an
+    endpoint the default run does not already contact, such as an external
+    time server). A feature that is none of these runs in every default run:
+    the db TLS handshake goes to the DB endpoint that section G already
+    connects to, sends no credentials, and left the same server log trace as
+    that connect when measured, so it is part of the default run. A
+    parameter of an opt-in rides on it as `--feature[=VALUE]`
+    (`--threads[=N]`, `--sample[=SEC]`), not as a second option.
+  - **Caps and time limits come from the environment**, never from options:
+    `CMD_TIMEOUT`, `RUN_DEADLINE`, and per-collector `<THING>_<KIND>` names
+    (`APM_INTERP_CAP`, `BINLOG_TIMEOUT`, `LOG_TAIL_LINES`). Validate them
+    with `_cap_or` / `_cap_from` (shared block): a value that is not a whole
+    number 1..999999 is named in a `!!` line and the default is used. List
+    them in the help. No `--x-secs` / `--max-x` per feature.
+  - **No `--no-X` for something off by default, no two options for the same
+    thing, and no option that only tests need** (tests set the environment).
+  - **A removed option fails, naming its replacement**: exit 2 with a line
+    such as `--tail is no longer an option: set LOG_TAIL_LINES=N in the
+    environment`, so an old runbook stops instead of running with something
+    silently ignored.
+  - The options that still break these rules are being removed:
+    collserver `--max-log-mb` / `--max-total-mb` (caps as options) and
+    collmysql `--no-sudo` (an option that does nothing).
+
 - **Leave nothing behind.** Put every temporary file under the run's own
   directory (`_tmp NAME` in the shared block returns a path in it). The shared
   block removes that directory on exit and on INT, TERM and HUP, so a Ctrl-C
@@ -235,4 +275,8 @@ and every collector must keep them.
 - [ ] Progress is narrated on stderr (fd 3), never into the report; `--quiet`
       suppresses it; progress strings carry no judgment words.
 - [ ] Must-see messages use `warn` (fd 3, not silenced), never plain stderr.
+- [ ] Options follow guideline 5: action flags + `--quiet`/`--out`/`--help`,
+      target options, one opt-in per loading/long/sensitive/touching feature;
+      caps via environment; no `--no-X`; a removed option exits 2 naming its
+      replacement.
 - [ ] Temporary files live under `_tmp`; nothing is left after Ctrl-C.

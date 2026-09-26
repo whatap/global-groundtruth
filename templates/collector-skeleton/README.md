@@ -78,6 +78,9 @@ every collector the behavior guideline 5 requires: running the script **bare
 prints usage** (a collection needs an explicit `--file` / `--stdout`), and it
 **narrates progress on stderr** so the operator sees it working. `section` calls
 `progress` for you, so per-section progress is automatic; `--quiet` suppresses it.
+`--out DIR` writes the `--file` report into DIR, checked before anything is
+collected. Add your collector's own options to it by the option conventions of
+guideline 5 (one opt-in per feature, caps through the environment).
 
 The `probe` / `read_proc` reasoned-absence helpers below them are recommended
 but optional — keep, trim, or extend them for your domain. See guideline 4.

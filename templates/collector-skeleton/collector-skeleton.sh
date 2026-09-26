@@ -39,9 +39,14 @@ TARGET="host/$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null
 # needs an explicit action flag (--file / --stdout) so nothing starts by accident;
 # and progress is narrated on stderr (fd 3, see main) so the operator sees it
 # working while the report on stdout stays byte-for-byte clean. --quiet silences it.
+# Option conventions (guideline 5): the action flags, --quiet, --out and --help,
+# plus one opt-in per feature that loads the target, takes long, reveals more
+# than the default report or touches something. Caps come from the environment
+# (CMD_TIMEOUT, RUN_DEADLINE, <THING>_<KIND>), validated with _cap_or.
 OPT_FILE=0        # write the report to a .txt file
 OPT_STDOUT=0      # print the report to stdout
 OPT_QUIET=0       # suppress progress narration on stderr
+OPT_OUT="."       # output directory for --file
 
 usage() {
     cat <<EOF
@@ -53,7 +58,14 @@ explicit action flag so nothing starts by accident.
   $(basename "$0") --file     write the facts report -> ./$COLLECTOR_NAME-<host>-<UTC>.txt
   $(basename "$0") --stdout   print the facts report to stdout
   $(basename "$0") --quiet .. silence progress on stderr (add to --file / --stdout)
+  $(basename "$0") --out DIR  output directory for --file (default: .)
 EOF
+}
+
+# _optval NAME VALUE -> VALUE, or exit 2 when it is empty or starts with '-'
+# (then the next option was taken for the value: `--out --stdout`)
+_optval() {
+    case "$2" in ''|-*) printf -- 'missing value for %s\n' "$1" >&2; exit 2 ;; esac
 }
 
 ARGC=$#           # 0 args -> usage (handled in main, below)
@@ -62,6 +74,8 @@ while [ $# -gt 0 ]; do
         --file)    OPT_FILE=1 ;;
         --stdout)  OPT_STDOUT=1 ;;
         --quiet)   OPT_QUIET=1 ;;
+        --out)     _optval --out "${2:-}"; OPT_OUT="$2"; shift ;;
+        --out=*)   _optval --out "${1#*=}"; OPT_OUT="${1#*=}" ;;
         -h|--help) usage; exit 0 ;;
         *) printf 'unknown argument: %s\n' "$1" >&2; usage >&2; exit 2 ;;
     esac
@@ -662,6 +676,17 @@ fi
 
 _run_init
 _init_probe
+
+# The output directory is checked before collecting, so an unwritable one
+# fails at once rather than after a full run.
+if [ "$OPT_STDOUT" != 1 ]; then
+    mkdir -p "$OPT_OUT" 2>/dev/null
+    if [ ! -d "$OPT_OUT" ] || [ ! -w "$OPT_OUT" ] || [ ! -x "$OPT_OUT" ]; then
+        warn "the report was not written: output directory $OPT_OUT is not writable by uid $(id -u 2>/dev/null || echo '?')"
+        exit 1
+    fi
+fi
+
 if [ "$OPT_STDOUT" = 1 ]; then
     progress "collecting facts (read-only) -> stdout"
     run_report
@@ -669,7 +694,7 @@ if [ "$OPT_STDOUT" = 1 ]; then
 else
     HOST="$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || echo unknown)"
     TS="$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null || echo unknown)"
-    OUTFILE="./$COLLECTOR_NAME-$HOST-$TS.txt"
+    OUTFILE="$OPT_OUT/$COLLECTOR_NAME-$HOST-$TS.txt"
     progress "collecting facts (read-only) -> writing $OUTFILE"
     _report_to_file "$OUTFILE" || exit 1
     progress "report written: $OUTFILE"
