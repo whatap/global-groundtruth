@@ -56,8 +56,10 @@ export LC_ALL=C
 
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-apmphp"
+# 0.5.2  A directory this uid can read but not enter lists its names again
+#        (the refactor's _names dropped them; ls did not).
 # 0.5.1  Readability refactor; report unchanged.
-VERSION="0.5.1"
+VERSION="0.5.2"
 DOMAIN="apm"
 TARGET="host/$(hostname 2>/dev/null || echo unknown)"
 
@@ -620,10 +622,15 @@ read_proc() {
     _emit_labeled "$label" "$out"
 }
 
-# _names DIR -> the names in DIR, as `ls DIR` lists them (no dot files, sorted)
+# _names DIR -> the names in DIR, as `ls DIR` lists them (no dot files, sorted).
+# Only an unmatched glob is skipped: in a DIR this uid can read but not enter,
+# -e fails on every entry although ls lists them all.
 _names() {
     local n
-    for n in "$1"/*; do { [ -e "$n" ] || [ -L "$n" ]; } && printf '%s\n' "${n##*/}"; done
+    for n in "$1"/*; do
+        [ "$n" = "$1/*" ] && [ ! -e "$n" ] && [ ! -L "$n" ] && continue
+        printf '%s\n' "${n##*/}"
+    done
     return 0
 }
 

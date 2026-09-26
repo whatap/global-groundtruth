@@ -44,7 +44,9 @@ COLLECTOR_NAME="whatap-apmpython"
 #        hang is that lookup's own and the ones after it are still run
 #        (two separate hangs lost the last answer in 0.7.2; 2026-09-25).
 # 0.7.4  Readability refactor; report unchanged.
-VERSION="0.7.4"
+# 0.7.5  A directory this uid can read but not enter lists its names again
+#        (the refactor's _names dropped them; ls did not).
+VERSION="0.7.5"
 DOMAIN="apm"
 TARGET="host/$(hostname 2>/dev/null || echo unknown)"
 
@@ -606,10 +608,15 @@ read_proc() {
     _emit_labeled "$label" "$out"
 }
 
-# _names DIR -> the names in DIR, as `ls DIR` lists them (no dot files, sorted)
+# _names DIR -> the names in DIR, as `ls DIR` lists them (no dot files, sorted).
+# Only an unmatched glob is skipped: in a DIR this uid can read but not enter,
+# -e fails on every entry although ls lists them all.
 _names() {
     local n
-    for n in "$1"/*; do { [ -e "$n" ] || [ -L "$n" ]; } && printf '%s\n' "${n##*/}"; done
+    for n in "$1"/*; do
+        [ "$n" = "$1/*" ] && [ ! -e "$n" ] && [ ! -L "$n" ] && continue
+        printf '%s\n' "${n##*/}"
+    done
     return 0
 }
 
