@@ -93,6 +93,7 @@ usage() {
 #   footer   the last line, exactly, after a blank line
 #   bytes    no UTF-8 BOM and no CR: a CRLF or BOM report is named as such and
 #            not checked further (every other rule would fail on it)
+#            and every line valid UTF-8
 # A section is a line at column 0 that starts with "[n] ". Fact lines are
 # indented by the shared helpers, so quoted content cannot open a section.
 check_report() {
@@ -174,6 +175,10 @@ if [ "$1" = --report ]; then
     for r in "$@"; do
         [ -f "$r" ] || { echo "not found: $r" >&2; exit 2; }
         out="$(check_report "$r")"
+        # the report is UTF-8: name the first line that is not
+        bad="$(LC_ALL=C.UTF-8 grep -naxv '.*' "$r" 2>/dev/null | head -n 1 | cut -d: -f1)"
+        [ -n "$bad" ] && out="${out:+$out
+}line $bad is not valid UTF-8 (a cut inside a multibyte character, or another encoding)"
         # the file name, when it is a delivered report, shares the Collector token
         bn="$(basename "$r")"
         coll="$(sed -n '2s/^Collector: *//p' "$r" | tr -d '\r')"

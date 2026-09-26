@@ -436,6 +436,8 @@ mut "CRLF line endings"              's/$/\r/'
 check "a CRLF report is named as such" '"$V" --report "$mf" | grep -q "end in CR (CRLF)"'
 mut "a UTF-8 BOM"                    '1s/^/\xef\xbb\xbf/'
 check "a BOM report is named as such"  '"$V" --report "$mf" | grep -q "UTF-8 BOM"'
+mut "a byte that is not UTF-8"       '9s/$/ \xed\x95/'
+check "invalid UTF-8 is named with its line" '"$V" --report "$mf" | grep -q "line 9 is not valid UTF-8"'
 cp "$T/good.txt" "$T/whatap-other-host-20260101T000000Z.txt"
 check "fails: a file name with another token" '! "$V" --report "$T/whatap-other-host-20260101T000000Z.txt" >/dev/null'
 
