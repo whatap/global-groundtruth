@@ -197,6 +197,11 @@ if [ "$HAVE_ZFS" = 0 ] && [ "$(id -u)" != 0 ]; then
   hasnt "a readable tree is not PARTIAL" "$out" "PARTIAL"
 else skip "the unreadable-subtree case (needs a non-root account on a machine without ZFS)"; fi
 
+echo "== 6b. the file-size walk is opt-in (Tier 2) =="
+out="$(ZPOOL_MODE=empty PATH="$S" "$C" --stdout </dev/null 2>/dev/null)"
+has "without --filesizes it is not requested" "$out" "not requested (--filesizes not given)"
+has "and [1] says filesizes=off" "$out" "filesizes=off"
+
 echo "== 7. options and output =="
 o="$("$C" 2>/dev/null)"; rc=$?
 has "help on stdout" "$o" "collect-collzfs.sh"; chk "help exits 0" "0" "$rc"
@@ -220,6 +225,7 @@ t="$(ls "$B"/*.tar.gz 2>/dev/null)"
 chk "a bundle exits 0" "0" "$rc"
 if [ -n "$t" ]; then
   has "the bundle carries the report" "$(tar tzf "$t")" "./report.txt"
+  has "and df -i, the file count without a walk" "$(tar tzf "$t")" "df-i.txt"
   chk "and leaves no work dir beside it" "1" "$(ls -A "$B" | wc -l | tr -d ' ')"
 else bad "bundle written" "a .tar.gz" "none"; fi
 

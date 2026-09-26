@@ -84,7 +84,11 @@ COLLECTOR_NAME="whatap-collzfs"
 #        run's private directory; numeric options are checked (exit 2); an
 #        unwritable --out or failed tar exits 1; output is handed back under
 #        sudo. Needs bash, and says so under sh.
-VERSION="0.6.1"
+# 0.6.2  The file-size walk is opt-in (Tier 2) again: on a yard of ~10^8 files
+#        it loads the special vdev and the ARC and cannot finish in its bound.
+#        df -i of every WhaTap path is in the report and df-i.txt in the
+#        bundle, so the file count is there without a walk (2026-09-26).
+VERSION="0.6.2"
 DOMAIN="collection-server"
 TARGET="collection-server-zfs/$(hostname 2>/dev/null || echo unknown)"   # refined after pool discovery
 
@@ -105,13 +109,12 @@ SAMPLE_SECS=10
 # window would average away stays visible as one tall bucket.
 IOSTAT_BUCKET=5
 OPT_ZDB=0            # Tier 2: zdb -C / -Lbbbs / -mm
-# File-size histogram. On by default since 0.2.0: it is the only thing in this
-# collector that says what size the workload actually writes, and recordsize
-# cannot be judged without it. It reads metadata only (find -printf '%s'), never
-# file contents. It was opt-in until 0.1.0 and therefore absent from the runs
-# that mattered — the XLSMART web01 bundles of 2026-09-23 came back with
-# filesizes=off because the runbook did not pass the flag.
-OPT_FILESIZES=1
+# File-size histogram: Tier 2, opt-in again. It was on by default (0.2.0-0.6.1)
+# because an opt-in walk was missing from the runs that needed it, but a full
+# metadata walk of a yard with ~10^8 files loads the special vdev and the ARC
+# and does not finish in the bound. Every run now has df -i (the file count) and
+# --zdb has the block-size histogram; pass --filesizes=PATH for a narrow sample.
+OPT_FILESIZES=0
 FILESIZES_PATH=""
 FILESIZES_SECS=300   # bound on the tree walk; a partial result is labelled as such
 # zpool events window, in days. The ring buffer holds everything back to pool
@@ -142,8 +145,8 @@ explicit action flag (--file / --stdout / --bundle) so nothing starts by acciden
   collect-collzfs.sh --hours N              journal window in hours (default: 24)
 
   Tier 0 always includes the cumulative-since-boot zpool iostat histograms
-  (-r request size, -w latency), which are instant kstat reads, and the
-  file-size histogram under yardbase (see --no-filesizes to turn it off).
+  (-r request size, -w latency), which are instant kstat reads, and df -i
+  (inodes, i.e. the file count) of every WhaTap path.
 
   zpool events. The tally (count, first date, last date per class) always covers
   the WHOLE ring buffer, because what the buffer answers is when a class started
@@ -162,13 +165,14 @@ explicit action flag (--file / --stdout / --bundle) so nothing starts by acciden
                                             since boot and cannot answer "is the
                                             device busy now".
 
-  File-size histogram (on by default since 0.2.0). recordsize cannot be judged
-  without knowing what size the workload actually writes, so this is no longer
-  opt-in. It reads metadata only (find -printf '%s'), never file contents, and a
-  walk that hits its bound is labelled PARTIAL rather than passed off as whole.
-  collect-collzfs.sh --filesizes=PATH       walk PATH instead of yardbase
+  File-size histogram (Tier 2, opt-in). It walks the whole tree reading metadata
+  (find -printf '%s'), which on a yard of 10^8 files is load on the device that
+  holds the metadata (a special vdev) and on the ARC, and does not finish in the
+  bound. The file count comes from df -i in every run; the block-size
+  distribution from --zdb. A walk that hits its bound is labelled PARTIAL.
+  collect-collzfs.sh --filesizes            walk yardbase
+  collect-collzfs.sh --filesizes=PATH       walk PATH instead (a narrow sample)
   collect-collzfs.sh --filesizes-secs N     bound on the walk (default: 300)
-  collect-collzfs.sh --no-filesizes         skip it
 
   Tier 2 (opt-in, adds pool or disk load — announced on stderr before running):
   collect-collzfs.sh --file --zdb           zdb -C, -Lbbbs, -mm per pool: block/psize
@@ -1929,7 +1933,7 @@ run_report() {
         elif ! find /dev/null -maxdepth 0 -printf '' 2>/dev/null; then
             fact "n/a (find -printf not supported by this build; GNU find is needed)"
         else
-            warn "file-size histogram: walking $fp — metadata-only tree read, bounded to ${FILESIZES_SECS}s (--no-filesizes to skip)"
+            warn "[Tier2] file-size histogram: walking $fp — a metadata read of the whole tree (special vdev and ARC load), bounded to ${FILESIZES_SECS}s"
             progress "walking $fp for the file-size histogram ..."
             fact "path: $fp (single filesystem, -xdev)"
             local fh; fh="$(filesize_histogram "$fp")"
@@ -1937,7 +1941,7 @@ run_report() {
             else fact "n/a (empty output or timed out: ${FILESIZES_SECS}s)"; fi
         fi
     else
-        fact "n/a (skipped: --no-filesizes given)"
+        fact "not requested (--filesizes not given)"
     fi
 
     got zfs
@@ -2103,6 +2107,7 @@ report_whatap_paths() {
         [ -n "$p" ] || continue
         [ -e "$p" ] || continue
         probe "df -h $p" df -h "$p"
+        probe "df -i $p" df -i "$p"
     done
     subsection "data directory markers"
     if [ -n "$YARDBASE" ] && [ -d "$YARDBASE" ]; then
@@ -2298,6 +2303,7 @@ bundle_whatap() {
         printf '%s\tfstype=%s\tdataset=%s\n' "$p" "$(fstype_of "$p")" "$(source_of "$p")" >> "$d/path-dataset-map.txt" 2>/dev/null
     done
     have df && _bounded df -h > "$d/df-h.txt" 2>/dev/null
+    have df && _bounded df -i > "$d/df-i.txt" 2>/dev/null
     progress "whatap: path-to-dataset map written"
 }
 

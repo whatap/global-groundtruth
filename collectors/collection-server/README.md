@@ -294,12 +294,14 @@ One `.txt` report, MECE domains `[1]` + A..N:
   This is the only WhaTap-specific section; backend services, configs and logs
   are `collect-collserver.sh`'s job.
 - **N. Deep block & metaslab statistics** — `zdb` is opt-in (see tiers). The
-  **file-size histogram under `yardbase` is on by default** since 0.2.0: it reads
-  metadata only (`find -printf '%s'`), and `recordsize` cannot be judged without
-  knowing what size the workload actually writes. It was opt-in until 0.1.0 and so
-  was missing from the runs that needed it. A walk that hits its bound
-  (`--filesizes-secs`, default 300) is labelled `PARTIAL` instead of being passed
-  off as a complete tree. `--no-filesizes` skips it.
+  **file-size histogram is opt-in (`--filesizes`, Tier 2)** since 0.6.2. It walks
+  the whole tree reading metadata (`find -printf '%s'`); on a yard of ~10^8 files
+  that loads the device holding the metadata (a special vdev) and the ARC, and it
+  cannot finish in its bound. Every run has `df -i` for each WhaTap path (the
+  file count), and `--zdb` gives the block-size histogram. When the size
+  distribution itself is needed, walk a narrow sample (`--filesizes=PATH`, e.g.
+  one day's directory). A walk that hits its bound (`--filesizes-secs`, default
+  300) is labelled `PARTIAL`.
 
 Values are **discovered, not assumed**; an absent value is reported as
 `n/a (<why>)`. A tunable that does not exist in the installed build is reported as
