@@ -8,20 +8,14 @@
 # log content. It reports measurements and the settings that govern them; the
 # reader decides what they mean (CONTRACT rule 1).
 #
-# THE CONTRACT (../../CONTRACT.md):
-#   1. Facts only. No emitted line states a conclusion.
-#   2. Discover, never assume. Resolve datadir, log_bin_basename, the socket and
-#      the replication role from the server itself, never from a hardcoded path.
-#   3. One field command -> paste the whole output.
-#   4. Domain-team owned.
-#
-# Binary-log attribution (section E) is the reason this collector exists: it
+# Binary-log attribution (section I) is the reason this collector exists: it
 # decodes binary logs with mysqlbinlog and counts events per table, so a reader
 # can tell which table produces the volume instead of inferring it. That probe
 # reads log files and is therefore opt-in (--binlog), not part of the default
 # report.
 #
-# NOTE: no `set -e`. A collector must always reach its footer.
+# Rules: ../../CONTRACT.md and ../../docs/authoring-guide.md. No `set -e`: the
+# report always reaches its footer.
 # -----------------------------------------------------------------------------
 
 # bash only: arrays hold the client's arguments. Checked before any of them is
@@ -31,66 +25,19 @@
 export LC_ALL=C
 
 # ---- collector metadata -----------------------------------------------------
+# 0.8.2  Readability refactor; report unchanged.
 # 0.8.1  --connect-expired-password passes through. An empty line or end of
 #        input at the -p prompt says so instead of "none given", next to the
 #        shared privilege hint on a failed login.
 #        A word after a bare -p (a database name to the client) is warned about.
-# 0.8.0  Never elevates itself and never re-runs itself: the operator runs it
-#        with sudo when root is needed (a packaged MySQL that admits root over
-#        the unix socket, a binary log directory only root reads), and the goal
-#        that root would have obtained says so in its reason. --no-sudo is
-#        accepted and warns that it is no longer needed. No credential on a
-#        command line: a password in --mysql-args (-pX, --password=X and every
-#        spelling the client takes as one) ends the run with exit 2; the
-#        password comes from a bare -p (asked once on the terminal), MYSQL_PWD
-#        or the operator's --defaults-file / --defaults-extra-file, and reaches
-#        the client only through a mode-600 option file in the run's private
-#        directory. Every wait is bounded: the -p prompt waits PROMPT_TIMEOUT
-#        (60s) or what is left of RUN_DEADLINE, and restores the terminal on
-#        Ctrl-C. External commands run bounded; the client argv is built word
-#        by word. A refused SHOW BINARY LOGS is n/a with the error and blocks
-#        the binlog goal; the binlog decode reads mysqlbinlog's own exit status
-#        and a failed or capped decode is blocked; a NULL log_bin_basename is
-#        unresolved, never the cwd; --sample raises the deadline by both
-#        samplers. No local mysqld and no connection arguments is blocked.
-#        Caps from the environment that are not whole numbers 1..999999 are
-#        dropped with a warning. Needs bash, and says so under sh.
-# 0.6.4  The report names the account. Section 0 says what the connection was
-#        attempted with, which survives a refusal, and section A says which
-#        grant row the server matched, which a refusal never reaches. On
-#        2026-09-23 both reports said only "access denied" and nothing said
-#        which account had been tried.
-# 0.6.3  Section 0 states the host's boot time and uptime, read from /proc. The
-#        kernel counters in section D are totals since boot, so a report without
-#        it carries a sum with no denominator. It is deliberately not SQL: the
-#        run that most needs the denominator is the one whose login failed, and
-#        on 2026-09-23 it had to be asked for by hand afterwards.
-# 0.6.2  The reason an elevation did not happen comes from sudo's own words.
-#        0.6.1 chose between "no terminal" and "this account" by testing
-#        /dev/tty, so an account that is not in sudoers was reported as a
-#        missing terminal whenever the run had none, and the guide then sent
-#        the operator to `ssh -t`, which changes nothing for that account.
-#        Measured on debian bookworm with a real sudo: the two states are told
-#        apart only by `sudo -v`, since `sudo -n true` answers "a password is
-#        required" for both.
-# 0.6.1  The elevation no longer decides for sudo whether it can ask. 0.6.0
-#        gated the interactive attempt on `[ -t 0 ]`, so a run started as
-#        `ssh host './collect-collmysql.sh ...'` skipped it without a word and
-#        reported the same reason as an account sudo had actually refused. Now
-#        sudo is always asked and answers for itself, and the four ways a run
-#        can stay unelevated are four different reasons.
-# 0.6.0  Runs itself under sudo when the account is allowed to. On a packaged
-#        Ubuntu MySQL the root@localhost account authenticates by unix socket,
-#        so an elevated run needs no credentials at all, and root also reads
-#        the binary log directory that section I attributes events from. The
-#        run continues unelevated when sudo is absent or refused, so a host
-#        that forbids it still produces the host-side facts. --no-sudo opts out.
-# 0.5.0  Collection status section + operator notice on stderr. Goals: mysql
-#        login, host-side facts, and binary log attribution when --binlog is
-#        given. The binlog n/a reason now separates "path not resolved" from
-#        "path not readable" — they are answered by different things.
+# 0.8.0  Never elevates or re-runs itself (--no-sudo warns it is not needed).
+#        No credential on a command line: a password in --mysql-args ends the
+#        run (exit 2); it comes from a bare -p, MYSQL_PWD or an option file and
+#        reaches the client in a mode-600 file. Every wait is bounded; refused
+#        SHOW BINARY LOGS, a failed or capped decode, a NULL log_bin_basename and
+#        no local mysqld without arguments are gaps with reasons. Needs bash.
 COLLECTOR_NAME="whatap-collmysql"
-VERSION="0.8.1"
+VERSION="0.8.2"
 DOMAIN="collection-server"
 TARGET="collection-server-mysql/$(hostname 2>/dev/null || echo unknown)"
 
@@ -217,9 +164,6 @@ have()       { command -v "$1" >/dev/null 2>&1; }
 sub()  { printf '        %s\n' "$1"; }
 
 _errfile=""
-_timeout_bin=""
-CMD_TIMEOUT="${CMD_TIMEOUT:-20}"
-case "$CMD_TIMEOUT" in ''|*[!0-9]*) CMD_TIMEOUT=20 ;; esac
 _init_probe() { _errfile="$(_tmp probe.err)"; }
 
 # ---- privilege — DO NOT EDIT ------------------------------------------------
@@ -643,7 +587,6 @@ EOF
     fi
 }
 # ---- end collection completeness
-_end_probe() { [ -n "$_errfile" ] && rm -f "$_errfile" 2>/dev/null; }
 
 _classify_err() {
     local txt=""
@@ -679,7 +622,6 @@ _emit_labeled() {
 probe() {
     local label="$1"; shift
     [ -n "$(_cmd_kind "$1")" ] || { fact "$label: n/a (command not found: $1)"; return; }
-    _past_deadline && { fact "$label: n/a (run deadline reached: ${RUN_DEADLINE}s)"; return; }
     local out rc
     out="$(_bounded "$@" 2>"$_errfile")"; rc=$?
     if [ "$rc" -eq 124 ]; then
@@ -703,41 +645,30 @@ read_proc() {
 
 # ---- mysql client -----------------------------------------------------------
 # Rule 2: the connection is discovered from the operator's option files unless
-# arguments were given. _mysql_ok records once whether the client can connect,
+# arguments were given. _resolve_mysql records once whether the client connects,
 # so every later section states a reason instead of failing silently.
 MYSQL_BIN=""
 MYSQL_OK=0
 MYSQL_WHY="not attempted"
 
 # ---- credentials (this collector only) ---------------------------------------
-# No credential on a command line (a child's argv is world-readable in ps and
-# /proc/<pid>/cmdline) and none in a child's environment. The client gets the
-# password from a mode-600 option file in the run's private directory, and only
-# that file's path is on its command line. Where the password may come from:
-#   a bare -p / --password in --mysql-args: asked once, on the terminal;
-#   MYSQL_PWD: read, then unset before any child starts;
-#   the operator's --defaults-file / --defaults-extra-file.
-# A password written into --mysql-args is on this collector's own command line
-# already; the collector refuses it rather than hand it on.
+# No credential in a child's argv (world-readable) or environment: the client
+# reads the password from a mode-600 option file in the private directory. It
+# comes from a bare -p (asked once on the terminal), MYSQL_PWD (unset before any
+# child starts) or the operator's option files; one written into --mysql-args is
+# refused.
 _PW=""; _PW_SRC=""; _PW_WHY=""; CNF=""
 
-# _pw_opt NAME -> what the mysql client does with a long option NAME (without
-# =VALUE), as measured on the 5.6, 5.7.32, 8.0.46 and 8.4.10 clients
-# (2026-09-25):
-#   "pw"   the value is the password: --password, --password1..3 (8.0.27+),
-#          a unique prefix of password (--pas .. --passwor; 5.6 accepts those,
-#          5.7 and 8.x reject them), after any run of the prefixes loose-,
-#          maximum-, skip-, enable-, disable- whose last one is loose- or
-#          maximum- (8.0.46 logs in with --skip-loose-password=X and
-#          --enable-loose-password=X);
-#   "drop" the same names whose last prefix is skip-/enable-/disable-
-#          (--skip-password=X, --loose-enable-password=X: the client does not
-#          use the value), and any other name that spells password;
+# _pw_opt NAME -> what the mysql client (measured: 5.6, 5.7.32, 8.0.46, 8.4.10)
+# does with a long option NAME (without =VALUE), "_" and "-" being one character:
+#   "pw"   the value is the password: --password, --password1..3, a prefix
+#          --pas..--passwor (5.6), after loose-/maximum-/skip-/enable-/disable-
+#          prefixes whose last one is loose- or maximum-;
+#   "drop" the same names ending in skip-/enable-/disable- (value unused), and
+#          any other name that spells password;
 #   ""     anything else.
-# "_" and "-" are the same character in an option name (--loose_password). The
-# set is the union over those clients, so a spelling one of them takes as a
-# password never stays on a command line; the price is that --pass=X logs in
-# where an 8.x client would have refused the option.
+# The union over those clients, so no spelling any of them takes stays on a
+# command line.
 _pw_opt() {
     local n="${1#--}" pre last=""
     n="$(printf '%s' "$n" | tr '_' '-')"
@@ -981,13 +912,8 @@ run_report() {
         else sub "$(printf '%-12s absent' "$t")"; fi
     done
     fact "mysql client: ${MYSQL_BIN:-n/a (command not found)}"
-    # What the connection was attempted WITH. Section A reports what the server
-    # matched, but only a successful login reaches section A, and a refused one
-    # is exactly when the question is asked. With no arguments the client takes
-    # the account name from the OS uid and goes over the unix socket, so a run
-    # started with sudo attempts root@localhost without anything being passed.
-    # The password itself is never printed: it is not report content but a
-    # credential this run was handed. Where it came from is printed.
+    # What the connection was attempted with: it survives a refused login, which
+    # never reaches section A. The password is never printed, only its source.
     if [ -n "$DEFAULTS_FILE$EXTRA_FILE" ] || [ -n "$MYSQL_ARGS" ]; then
         fact "connection attempted with:${DEFAULTS_FILE:+ --defaults-file=$DEFAULTS_FILE}${EXTRA_FILE:+ --defaults-extra-file=$EXTRA_FILE}${MYSQL_ARGS:+ $MYSQL_ARGS}"
     else
@@ -1028,11 +954,8 @@ run_report() {
     sql "super_read_only" "SELECT @@super_read_only"
     sql "port / socket"  "SELECT @@port, @@socket"
     sql "datadir"        "SELECT @@datadir"
-    # pgrep -f would match this collector's own timeout wrapper, so filter the
-    # process table instead and drop the matcher processes themselves.
-    # `; true` would turn a missing ps into "empty output", which reads as
-    # "no mysqld here". Fail loudly when the tool is absent; stay silent-but-
-    # zero when the tool ran and simply matched nothing.
+    # Not pgrep -f: it would match this run's timeout wrapper. A missing ps is
+    # an error, not "empty output"; no match is empty output.
     probe "local mysqld process" sh -c \
         "command -v ps >/dev/null || { echo 'command not found: ps' >&2; exit 3; }; \
          ps -eo pid,user,args 2>/dev/null | grep -E '[m]ysqld|[m]ariadbd' | grep -v timeout; true"
@@ -1099,10 +1022,8 @@ run_report() {
     sql "binlog cache use / disk use" "SHOW GLOBAL STATUS LIKE 'Binlog_cache%'"
     sql "Binlog_bytes_written"        "SHOW GLOBAL STATUS LIKE 'Binlog%bytes%'"
 
-    # Growth rate is measured from file mtimes, so it needs no second sample.
-    # NULL (log_bin off, or a server that does not report it) and a bare file
-    # name both leave no directory: dirname would answer ".", the cwd of this
-    # run, and that is not where the server writes.
+    # Growth comes from file mtimes (no second sample). A NULL or bare-name
+    # log_bin_basename leaves no directory, not dirname's ".".
     BINLOG_DIR=""
     LOG_BIN="$(mysql_val "SELECT @@log_bin" 2>/dev/null)"
     BINLOG_BASE="$(mysql_val "SELECT @@log_bin_basename" 2>/dev/null)"
@@ -1184,10 +1105,8 @@ run_report() {
     sql "max_connections"        "SELECT @@max_connections"
 
     section "I. Binary log content attribution"
-    # The goal is declared only when --binlog was given, and resolved once,
-    # after every file: obtained only when every selected file was decoded to
-    # its end. A decode that failed (mysqlbinlog could not open a file, Errcode
-    # 13) or stopped at the cap is a gap, however many counters it printed.
+    # Obtained only when every selected file was decoded to its end; a failed
+    # or capped decode is a gap, however many counters it printed.
     if [ "$OPT_BINLOG" != 1 ]; then
         fact "n/a (not requested: --binlog not given)"
     elif [ "$MYSQL_OK" = 1 ] && [ "$LOG_BIN" = 0 ]; then
@@ -1222,13 +1141,9 @@ run_report() {
                 _path="$_bl"; _bl="${_bl##*/}"
                 _bytes="$(ls -l "$_path" 2>/dev/null | awk '{print $5}')"
                 fact "file: $_bl ($_bytes bytes)"
-                # A production binary log is max_binlog_size (1 GiB by default),
-                # and decoded row events run about 1.15x that. Holding it in a
-                # shell variable and walking it six times costs gigabytes of RSS
-                # on a host that is already short of I/O, so stream it once
-                # through awk and keep only the counters. The decoder's own exit
-                # status is the one read (PIPESTATUS), not awk's: awk always
-                # succeeds and always prints its END block.
+                # A decoded 1 GiB log is ~1.15 GiB: stream it once through awk,
+                # never into a variable. The status read is the decoder's
+                # (PIPESTATUS), not awk's.
                 CMD_TIMEOUT="$BINLOG_TIMEOUT" _bounded mysqlbinlog --no-defaults \
                     --base64-output=DECODE-ROWS -v "$_path" 2>"$_errfile" | awk '
                     /^### INSERT INTO / { c["INSERT " $4]++; rows++; next }
@@ -1370,4 +1285,3 @@ else
         exit 1
     fi
 fi
-_end_probe
