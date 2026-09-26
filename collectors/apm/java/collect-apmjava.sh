@@ -73,7 +73,7 @@ export LC_ALL=C
 
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-apmjava"
-VERSION="0.12.4"
+VERSION="0.12.5"
 DOMAIN="apm"
 TARGET="host/$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || echo unknown)"
 
@@ -1996,10 +1996,21 @@ _conf_resolve() {
     printf '%s|%s|%s|%s\n' "$cf" "$src" "$hm" "$hsrc"
 }
 
-# _conf_value FILE KEY -> the value of the last KEY= line of a config file
+# _conf_value FILE KEY -> the value of the last KEY= line of a config file.
+# A line counts when it is optional whitespace, KEY compared literally
+# (whatap.server.host is not whatapXserverXhost), optional whitespace, "=";
+# a "#" line or "KEY:" is not one. The value is what follows the "=", without
+# the whitespace around it and without any CR. Whitespace is the [[:space:]]
+# of the C locale, spelled out for awks without character classes.
 _conf_value() {
-    grep -aE "^[[:space:]]*$2[[:space:]]*=" "$(_vfix "$1")" 2>/dev/null | tail -n1 \
-        | sed 's/^[^=]*=[[:space:]]*//; s/[[:space:]]*$//' | tr -d '\r'
+    _K="$2" awk 'BEGIN { k = ENVIRON["_K"]; n = length(k); f = 0 }
+        { l = $0; sub(/^[ \t\v\f\r]*/, "", l)
+          if (substr(l, 1, n) != k) next
+          r = substr(l, n + 1); if (r !~ /^[ \t\v\f\r]*=/) next
+          v = r; f = 1 }
+        END { if (!f) exit
+              sub(/^[ \t\v\f\r]*=[ \t\v\f\r]*/, "", v); sub(/[ \t\v\f\r]*$/, "", v); gsub(/\r/, "", v)
+              print v }' "$(_vfix "$1")" 2>/dev/null
 }
 
 # _setting_of PID KEY CONFVIEW -> "value|where it was read" from the first of
@@ -3624,7 +3635,7 @@ _rep_appclasses() {
                                 _rt="${_rrec#dir|}"
                                 case "$_rt" in /proc/[0-9]*/root*) _rt="$(_vfix "$_rt")" ;; esac
                                 [ -d "$_rt" ] || continue
-                                _bounded grep -rl -a --include='*.class' -- "$_tki" "$_rt" 2>/dev/null | head -n 400 \
+                                _bounded grep -rlF -a --include='*.class' -- "$_tki" "$_rt" 2>/dev/null | head -n 400 \
                                   | while IFS= read -r _hf; do
                                         _fq="${_hf#"$_rt"/}"; _fq="${_fq%.class}"
                                         _fq="${_fq#BOOT-INF/classes/}"; _fq="${_fq#WEB-INF/classes/}"
@@ -3643,7 +3654,7 @@ _rep_appclasses() {
                                 fi
                                 _rmtmp "$_refdir"; mkdir -p "$_refdir" 2>/dev/null || continue
                                 _bounded unzip -qq -o -d "$_refdir" "$_fsr" '*.class' >/dev/null 2>&1
-                                _bounded grep -rl -a --include='*.class' -- "$_tki" "$_refdir" 2>/dev/null | head -n 400 \
+                                _bounded grep -rlF -a --include='*.class' -- "$_tki" "$_refdir" 2>/dev/null | head -n 400 \
                                   | while IFS= read -r _hf; do
                                         _fq="${_hf#"$_refdir"/}"; _fq="${_fq%.class}"
                                         _fq="${_fq#BOOT-INF/classes/}"; _fq="${_fq#WEB-INF/classes/}"
