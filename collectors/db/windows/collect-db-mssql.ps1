@@ -32,7 +32,12 @@ param(
 )
 
 $COLLECTOR_NAME = "whatap-db-mssql"
-$VERSION        = "0.3.0"
+# 0.4.0  The status gives the run time, and when a bounded call was slow (3s),
+#        capped or not run past the deadline, the host load at start and end
+#        and where the time went, as the shell collectors do. CIM queries go
+#        through Get-CimBounded; CMD_TIMEOUT and RUN_DEADLINE are read from the
+#        environment.
+$VERSION        = "0.4.0"
 $DOMAIN         = "db"
 $CompName = $env:COMPUTERNAME; if (-not $CompName) { $CompName = [Environment]::MachineName }
 $TARGET         = "db-host/$CompName"
@@ -101,12 +106,28 @@ function Notice([string]$s)   { [Console]::Error.WriteLine(">> $s") }
 # exit is kept in $script:BoundedExit and TryFact labels it "(exit N)", as the
 # shell probe does. Invoke-BoundedBlock runs a cmdlet pipeline in its own
 # runspace under the same caps, for cmdlets with no timeout of their own
-# (Get-Service, Get-NetTCPConnection, Get-WinEvent, ...). CIM queries carry
-# -OperationTimeoutSec $script:CMD_TIMEOUT instead.
-$script:CMD_TIMEOUT  = 20
-$script:RUN_DEADLINE = 300
+# (Get-Service, Get-NetTCPConnection, Get-WinEvent, ...). Get-CimBounded runs
+# a CIM query with -OperationTimeoutSec under the same caps.
+#
+# Each bounded call is timed (Stopwatch) and logged for Emit-Status: only the
+# command name and, for a subcommand tool (appcmd list, netsh show), that word,
+# or the class of a CIM query. Never an argument: it can hold a path or a
+# credential. CMD_TIMEOUT and RUN_DEADLINE come from the environment when they
+# are whole numbers 1..999999, as in the shell collectors.
+function Cap-Or([string]$name, [string]$v, [int]$def) {
+    if ($v -eq "") { return $def }
+    if ($v -match '^[1-9][0-9]{0,5}$') { return [int]$v }
+    Warn "$name=$v ignored (not a whole number 1..999999 without leading zeros), using $def"
+    return $def
+}
+$script:CMD_TIMEOUT  = Cap-Or CMD_TIMEOUT "$env:CMD_TIMEOUT" 20
+$script:RUN_DEADLINE = Cap-Or RUN_DEADLINE "$env:RUN_DEADLINE" 300
 $script:RunStart     = [DateTime]::UtcNow
+$script:RunWatch     = [System.Diagnostics.Stopwatch]::StartNew()
 $script:BoundedExit  = $null
+$script:SLOW_SEC     = 3      # a bounded call at least this long is named in the status
+$script:TimeLog      = New-Object System.Collections.Generic.List[object]   # {ms; kind; name} per call
+$script:Load0        = ""     # Host-Load at the start of the run
 function Past-Deadline { return (([DateTime]::UtcNow - $script:RunStart).TotalSeconds -ge $script:RUN_DEADLINE) }
 function Bounded-Seconds([int]$sec) {
     if ($sec -le 0) { $sec = $script:CMD_TIMEOUT }
@@ -118,6 +139,67 @@ function Bounded-Seconds([int]$sec) {
 function Bounded-Timeout([int]$sec) {
     if (Past-Deadline) { throw "run deadline reached: $($script:RUN_DEADLINE)s" }
     throw "timed out: ${sec}s"
+}
+# Time-Log MS KIND CMD [ARGS] -> one record for Emit-Status: the command name
+# (path and .exe dropped) and, for a subcommand tool, the first argument after
+# any -opt=value when it is a plain lowercase word; for Get-CimInstance, the
+# class. No other argument is kept; a name with odd characters is "?".
+function Time-Log([long]$ms, [string]$kind, [string]$cmd, [object[]]$argv = @()) {
+    $c = ($cmd -replace '^.*[\\/]', '') -replace '\.exe$', ''
+    $w = ""
+    $rest = @($argv | ForEach-Object { "$_" })
+    $i = 0; while ($i -lt $rest.Count -and $rest[$i] -match '^-.*=') { $i++ }
+    $first = if ($i -lt $rest.Count) { $rest[$i] } else { "" }
+    if ($c -in @('kubectl','oc','helm','zfs','zpool','systemctl','journalctl','timedatectl','chronyc','npm','pip','pip3','openssl','docker','crictl','ctr','ip','appcmd','netsh','sc','reg','wevtutil')) {
+        if ($first -cmatch '^[a-z][a-z0-9-]*$') { $w = " $first" }
+    } elseif ($c -eq 'Get-CimInstance') {
+        if ($first -match '^[A-Za-z][A-Za-z0-9_]*$') { $w = " $first" }
+    }
+    if ($c -notmatch '^[A-Za-z0-9._+-]+$') { $c = '?' }
+    $script:TimeLog.Add([pscustomobject]@{ ms = $ms; kind = $kind; name = "$c$w" })
+}
+# Cap-Kind SEC REQUESTED -> how a call that hit its limit is logged: the
+# deadline cut it when it had less than it asked for
+function Cap-Kind([int]$sec, [int]$req) {
+    if ($sec -lt $req) { return "cut at the deadline" }
+    return "capped at ${sec}s"
+}
+# Block-Cmd { ... } -> the first command a script block runs, for the log
+function Block-Cmd([scriptblock]$sb) {
+    $c = $sb.Ast.Find({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true)
+    if ($c) { $n = $c.GetCommandName(); if ($n) { return $n } }
+    return "?"
+}
+# Log-NotRun { ... } -> a "not run" record for each bounded call in a block
+# that TryFact skips past the deadline, read from the block's syntax tree so
+# nothing in it runs. A program name held in a variable is read from the
+# caller's scope; a program that is not on this host is not listed, as the
+# shell probe lists no command it cannot find.
+function Log-NotRun([scriptblock]$sb) {
+    $all = $sb.Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true)
+    foreach ($_ln in $all) {
+        $_le = $_ln.CommandElements
+        $_lv = @(); if ($_le.Count -gt 1) { try { $_lv = @($_le[1].SafeGetValue()) } catch { $_lv = @() } }
+        switch ($_ln.GetCommandName()) {
+            'Invoke-Bounded' {
+                $_lx = ""
+                if ($_lv.Count -gt 0) { $_lx = "$($_lv[0])" }
+                elseif ($_le.Count -gt 1 -and $_le[1] -is [System.Management.Automation.Language.VariableExpressionAst]) {
+                    $_lx = "$(Get-Variable -Name $_le[1].VariablePath.UserPath -ValueOnly -ErrorAction SilentlyContinue)"
+                }
+                if (-not $_lx) { Time-Log 0 "not run" "?"; break }
+                if (-not (Test-Path -LiteralPath $_lx) -and -not (Get-Command $_lx -CommandType Application -ErrorAction SilentlyContinue)) { break }
+                $_la = @(); if ($_le.Count -gt 2) { try { $_la = @($_le[2].SafeGetValue()) } catch { $_la = @() } }
+                Time-Log 0 "not run" $_lx $_la
+            }
+            'Invoke-BoundedBlock' {
+                if ($_le.Count -gt 1 -and $_le[1] -is [System.Management.Automation.Language.ScriptBlockExpressionAst]) {
+                    Time-Log 0 "not run" (Block-Cmd $_le[1].ScriptBlock.GetScriptBlock())
+                } else { Time-Log 0 "not run" "?" }
+            }
+            'Get-CimBounded' { Time-Log 0 "not run" "Get-CimInstance" @($_lv | Select-Object -First 1) }
+        }
+    }
 }
 # Quote-Arg -> one argument quoted the way CommandLineToArgvW splits it back:
 # backslashes are literal except before a quote, where they are doubled
@@ -176,7 +258,8 @@ function Pipe-Id($stream) {
 # Invoke-Bounded EXE [ARGS] [SECONDS] -> stdout then stderr lines of EXE
 function Invoke-Bounded([string]$exe, [string[]]$argv = @(), [int]$sec = 0) {
     $script:BoundedExit = $null
-    $sec = Bounded-Seconds $sec
+    $req = $sec; if ($req -le 0) { $req = $script:CMD_TIMEOUT }
+    try { $sec = Bounded-Seconds $req } catch { Time-Log 0 "not run" $exe $argv; throw }
     $path = $exe
     if (-not (Test-Path -LiteralPath $exe)) {
         $c = @(Get-Command $exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1)
@@ -189,7 +272,9 @@ function Invoke-Bounded([string]$exe, [string[]]$argv = @(), [int]$sec = 0) {
     $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
     $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
     $t0 = [DateTime]::UtcNow
-    $p = [System.Diagnostics.Process]::Start($psi)
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    try { $p = [System.Diagnostics.Process]::Start($psi) }
+    catch { Time-Log $sw.ElapsedMilliseconds "ran" $exe $argv; throw }
     $pipes = @((Pipe-Id $p.StandardOutput.BaseStream), (Pipe-Id $p.StandardError.BaseStream)) | Where-Object { $_ }
     $o = $p.StandardOutput.ReadToEndAsync(); $e = $p.StandardError.ReadToEndAsync()
     $done = $p.WaitForExit($sec * 1000)
@@ -201,8 +286,10 @@ function Invoke-Bounded([string]$exe, [string[]]$argv = @(), [int]$sec = 0) {
     }
     if (-not $done) {
         Stop-Tree $p $pipes
+        Time-Log $sw.ElapsedMilliseconds (Cap-Kind $sec $req) $exe $argv
         Bounded-Timeout $sec
     }
+    Time-Log $sw.ElapsedMilliseconds "ran" $exe $argv
     if ($p.ExitCode -ne 0) { $script:BoundedExit = $p.ExitCode }
     $text = ($o.Result + $e.Result) -replace "`r", ""
     if ($text -eq "") { return @() }
@@ -212,7 +299,10 @@ function Invoke-Bounded([string]$exe, [string[]]$argv = @(), [int]$sec = 0) {
 # runs in a fresh runspace: it sees only its own text (pass values with
 # $using-free literals or -ArgumentList via $args), not this script's functions.
 function Invoke-BoundedBlock([scriptblock]$sb, [object[]]$argList = @(), [int]$sec = 0) {
-    $sec = Bounded-Seconds $sec
+    $req = $sec; if ($req -le 0) { $req = $script:CMD_TIMEOUT }
+    $name = Block-Cmd $sb
+    try { $sec = Bounded-Seconds $req } catch { Time-Log 0 "not run" $name; throw }
+    $sw = [System.Diagnostics.Stopwatch]::StartNew(); $kind = "ran"
     $ps = [PowerShell]::Create()
     try {
         $null = $ps.AddScript($sb.ToString())
@@ -224,6 +314,7 @@ function Invoke-BoundedBlock([scriptblock]$sb, [object[]]$argList = @(), [int]$s
             $stopped = $false
             try { $sh = $ps.BeginStop($null, $null); $stopped = $sh.AsyncWaitHandle.WaitOne(2000) } catch { }
             if (-not $stopped) { $ps = $null }
+            $kind = Cap-Kind $sec $req
             Bounded-Timeout $sec
         }
         try { $out = $ps.EndInvoke($h) }
@@ -240,8 +331,64 @@ function Invoke-BoundedBlock([scriptblock]$sb, [object[]]$argList = @(), [int]$s
         if ($ps) {
             try { $rs = $ps.Runspace; $ps.Dispose(); if ($rs) { $rs.Dispose() } } catch { }
         }
+        Time-Log $sw.ElapsedMilliseconds $kind $name
     }
 }
+# Get-CimBounded CLASS [FILTER] [SECONDS] -> the instances of a CIM class, the
+# query limited by -OperationTimeoutSec, skipped past the deadline, and timed.
+# A query that fails once its time is up throws "timed out: Ns" like the others.
+function Get-CimBounded([string]$class, [string]$filter = "", [int]$sec = 0) {
+    $req = $sec; if ($req -le 0) { $req = $script:CMD_TIMEOUT }
+    try { $sec = Bounded-Seconds $req } catch { Time-Log 0 "not run" "Get-CimInstance" @($class); throw }
+    $sw = [System.Diagnostics.Stopwatch]::StartNew(); $kind = "ran"
+    try {
+        $a = @{ ClassName = $class; OperationTimeoutSec = $sec; ErrorAction = 'Stop' }
+        if ($filter) { $a.Filter = $filter }
+        return @(Get-CimInstance @a)
+    } catch {
+        if ($sw.ElapsedMilliseconds -ge [long]$sec * 1000 - 250) { $kind = Cap-Kind $sec $req; Bounded-Timeout $sec }
+        throw
+    } finally { Time-Log $sw.ElapsedMilliseconds $kind "Get-CimInstance" @($class) }
+}
+
+# Host-Load -> one line, the Windows counterpart of the shell _host_load: CPU
+# load, processor queue length, disk queue length, available memory. Read at
+# the start and, when Emit-Status names slow calls, at the end. Four CIM reads
+# of instantaneous values, so one read needs no second sample:
+#   Win32_Processor.LoadPercentage (averaged over the last second; the mean over
+#     sockets), not "% Processor Time", which needs two samples;
+#   Win32_PerfRawData_PerfOS_System.ProcessorQueueLength and
+#   Win32_PerfRawData_PerfDisk_PhysicalDisk(_Total).CurrentDiskQueueLength,
+#     raw gauges, so the raw class is exact and skips the formatted class's
+#     cooking;
+#   Win32_OperatingSystem.FreePhysicalMemory (the Available MBytes counter's
+#     value) of TotalVisibleMemorySize.
+# CIM class names are not localized; Get-Counter paths are, and fail on a
+# non-English Windows. The reads share 4 seconds; what is left after that is n/a.
+function Host-Load {
+    if (-not (Get-Command Get-CimInstance -ErrorAction SilentlyContinue)) { return "n/a (Get-CimInstance is not available in this runtime)" }
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $q = {
+        param($class, $filter)
+        $left = 4 - [int][Math]::Floor($sw.Elapsed.TotalSeconds)
+        if ($left -le 0) { return $null }
+        $a = @{ ClassName = $class; OperationTimeoutSec = $left; ErrorAction = 'Stop' }
+        if ($filter) { $a.Filter = $filter }
+        try { return @(Get-CimInstance @a) } catch { return $null }
+    }
+    $parts = @()
+    $r = & $q "Win32_Processor" ""
+    $v = @($r | Where-Object { $null -ne $_.LoadPercentage } | ForEach-Object { [double]$_.LoadPercentage })
+    $parts += $(if ($v.Count -gt 0) { "cpu load {0}%" -f [int][Math]::Round(($v | Measure-Object -Average).Average) } else { "cpu load n/a" })
+    $r = & $q "Win32_PerfRawData_PerfOS_System" ""
+    $parts += $(if ($r) { "processor queue $(@($r)[0].ProcessorQueueLength)" } else { "processor queue n/a" })
+    $r = & $q "Win32_PerfRawData_PerfDisk_PhysicalDisk" "Name='_Total'"
+    $parts += $(if ($r) { "disk queue $(@($r)[0].CurrentDiskQueueLength)" } else { "disk queue n/a" })
+    $r = & $q "Win32_OperatingSystem" ""
+    $parts += $(if ($r) { "mem available {0} of {1} MiB" -f [int64][Math]::Floor(@($r)[0].FreePhysicalMemory / 1024), [int64][Math]::Floor(@($r)[0].TotalVisibleMemorySize / 1024) } else { "mem n/a" })
+    return ($parts -join "; ")
+}
+$script:Load0 = Host-Load
 
 # Priv-Hint -> " (not elevated: <gap>)", or "" when the run is elevated. Append
 # it to the reason of any goal that the missing elevation blocked, as the shell
@@ -257,7 +404,7 @@ function Priv-Hint { if ($script:PRIV_GAP) { return " (not elevated: $($script:P
 # wraps after 24.9 days, so it is not used).
 function Note-Boot {
     $boot = $null; $why = ""
-    try { $boot = (Get-CimInstance Win32_OperatingSystem -OperationTimeoutSec $script:CMD_TIMEOUT -ErrorAction Stop).LastBootUpTime }
+    try { $boot = (Get-CimBounded Win32_OperatingSystem).LastBootUpTime }
     catch { $why = $_.Exception.Message.Split("`n")[0] }
     $now = (Get-Date).ToUniversalTime()
     if ($boot) {
@@ -305,6 +452,46 @@ function Set-Got([string]$key)                  { $script:Res.Add([pscustomobjec
 function Set-Na([string]$key, [string]$why)     { $script:Res.Add([pscustomobject]@{ k = $key; o = "na"; r = (Flat $why) }) }
 function Set-Missed([string]$key, [string]$why) { $script:Res.Add([pscustomobject]@{ k = $key; o = "missed"; r = (Flat $why) }) }
 
+# Emit-Time -> the run time; when a call was slow (SLOW_SEC), capped or not
+# run, also the host load at start and end and where the time went (bounded
+# calls summed per command, largest first, and the time outside them). The
+# lines are the shell _emit_time's.
+function Emit-Time {
+    $inv = [System.Globalization.CultureInfo]::InvariantCulture
+    Fact ("run time: {0}s of {1}s allowed" -f [int][Math]::Floor(([DateTime]::UtcNow - $script:RunStart).TotalSeconds), $script:RUN_DEADLINE)
+    $log = $script:TimeLog.ToArray()
+    if ($log.Count -eq 0) { return }
+    $capped = @($log | Where-Object { $_.kind -match '^(capped|cut)' }).Count
+    $notrun = @($log | Where-Object { $_.kind -eq "not run" }).Count
+    $slow   = @($log | Where-Object { $_.kind -ne "not run" -and $_.ms -ge $script:SLOW_SEC * 1000 }).Count
+    if ($capped -eq 0 -and $notrun -eq 0 -and $slow -eq 0) { return }
+    Fact ("host load at start: " + $(if ($script:Load0) { $script:Load0 } else { "n/a" }))
+    Fact ("host load at end:   " + (Host-Load))
+    Fact ("bounded calls: {0}; stopped at their cap or the deadline: {1}; not run past the deadline: {2}" -f $log.Count, $capped, $notrun)
+    Fact "where the time went (every bounded call, summed per command, largest first):"
+    $rows = New-Object System.Collections.Generic.List[object]
+    $tot = [long]0
+    foreach ($g in @($log | Where-Object { $_.kind -ne "not run" } | Group-Object -Property name -CaseSensitive)) {
+        $ms = [long]0; foreach ($e in $g.Group) { $ms += [long]$e.ms }
+        $tot += $ms
+        # the outcomes other than "ran", in the order first seen
+        $x = ""; $seen = New-Object System.Collections.Generic.List[string]
+        foreach ($e in $g.Group) { if ($e.kind -ne "ran" -and -not $seen.Contains($e.kind)) { $seen.Add($e.kind) } }
+        foreach ($k in $seen) { $x += ", {0} {1}" -f @($g.Group | Where-Object { $_.kind -eq $k }).Count, $k }
+        $n = $(if ($g.Count -gt 1) { " x$($g.Count)" } else { "" })
+        $rows.Add([pscustomobject]@{ ms = $ms; line = ("{0}s  {1}{2}{3}" -f ($ms / 1000.0).ToString("0.0", $inv).PadLeft(6), $g.Name, $n, $x) })
+    }
+    $out = [long]$script:RunWatch.ElapsedMilliseconds - $tot
+    if ($out -gt 0) { $rows.Add([pscustomobject]@{ ms = $out; line = ("{0}s  (outside bounded calls: shell work and file reads)" -f ($out / 1000.0).ToString("0.0", $inv).PadLeft(6)) }) }
+    foreach ($r in @($rows | Sort-Object -Property @{ Expression = { $_.ms }; Descending = $true }, @{ Expression = { $_.line }; Descending = $true } | Select-Object -First 10)) {
+        Fact ("    " + $r.line)
+    }
+    # every command lost to the deadline, whatever the table above kept
+    foreach ($g in @($log | Where-Object { $_.kind -eq "not run" } | Group-Object -Property name -CaseSensitive | Sort-Object -Property Name -CaseSensitive)) {
+        Fact ("         -   {0} x{1} not run (deadline)" -f $g.Name, $g.Count)
+    }
+}
+
 function Emit-Status {
     if ($script:Goals.Count -eq 0) { return }
     $total = $script:Goals.Count
@@ -336,6 +523,7 @@ function Emit-Status {
     }
     if ($stray.Count -gt 0) { Fact ("resolved but never declared: " + ($stray -join ", ")) }
     if ($deadline) { Fact ("run deadline: reached at {0}s; commands after it were not run" -f $script:RUN_DEADLINE) }
+    Emit-Time
     if ($gaps.Count -eq 0 -and -not $deadline) {
         Fact "status: COMPLETE"
         $suffix = if ($nas.Count -gt 0) { " ({0} not applicable to this host)" -f $nas.Count } else { "" }
@@ -353,7 +541,7 @@ function Emit-Status {
 # ---- end collection completeness (PowerShell port)
 
 function TryFact([string]$label, [scriptblock]$sb) {
-    if (Past-Deadline) { Fact "${label}: n/a (run deadline reached: $($script:RUN_DEADLINE)s)"; return }
+    if (Past-Deadline) { Log-NotRun $sb; Fact "${label}: n/a (run deadline reached: $($script:RUN_DEADLINE)s)"; return }
     $script:BoundedExit = $null
     try {
         $r = & $sb
@@ -403,7 +591,7 @@ function TcpProbe([string]$label, [string]$dbhost, [int]$port, [int]$timeoutSec 
 # processes whose command line could not be read are counted for that reason.
 $agentProcs = @(); $procErr = ""; $javaUnread = @()
 try {
-    $allProc = @(Get-CimInstance Win32_Process -OperationTimeoutSec $script:CMD_TIMEOUT -ErrorAction Stop)
+    $allProc = @(Get-CimBounded Win32_Process)
     $agentProcs = @($allProc | Where-Object { $_.CommandLine -match 'whatap\.agent\.(dbx|dmx|prx|xos)' -or $_.CommandLine -match 'dbxc' })
     $javaUnread = @($allProc | Where-Object { $_.Name -match '^javaw?\.exe$' -and -not $_.CommandLine })
 } catch { $allProc = $null; $procErr = $_.Exception.Message.Split("`n")[0] }
@@ -485,10 +673,10 @@ Fact "privilege: $PRIV_WHY"
 Note-Boot
 
 Section "A. Host & platform"
-TryFact "os" { $o = Get-CimInstance Win32_OperatingSystem -OperationTimeoutSec $script:CMD_TIMEOUT -ErrorAction Stop; "$($o.Caption) $($o.Version)" }
+TryFact "os" { $o = Get-CimBounded Win32_OperatingSystem; "$($o.Caption) $($o.Version)" }
 if ($env:PROCESSOR_ARCHITECTURE) { Fact "architecture: $env:PROCESSOR_ARCHITECTURE" }
 else { TryFact "architecture (PROCESSOR_ARCHITECTURE not set; runtime OSArchitecture)" { "$([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture)" } }
-TryFact "memory MB (total/free)" { $os = Get-CimInstance Win32_OperatingSystem -OperationTimeoutSec $script:CMD_TIMEOUT -ErrorAction Stop; "{0} / {1}" -f [int]($os.TotalVisibleMemorySize/1024), [int]($os.FreePhysicalMemory/1024) }
+TryFact "memory MB (total/free)" { $os = Get-CimBounded Win32_OperatingSystem; "{0} / {1}" -f [int]($os.TotalVisibleMemorySize/1024), [int]($os.FreePhysicalMemory/1024) }
 Fact "system time: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz') (timezone: $([TimeZoneInfo]::Local.Id))"
 Fact "system time (UTC): $((Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss'))"
 TryFact "java on PATH" { Invoke-Bounded java @("-version") }
