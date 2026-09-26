@@ -68,6 +68,8 @@ emits the matching sections; what is absent is reported with its reason.
 No agent process running, or one whose install dir the report says it could
 not resolve? Point the collector at the install dir:
 `./collect-db.sh --file --home /path/to/agent`.
+`--out DIR` puts the `.txt` in DIR instead of the current directory; a DIR
+that cannot be written stops the run before it collects.
 
 ## Report sections and goals
 
@@ -75,8 +77,8 @@ not resolve? Point the collector at the install dir:
 A. Host & platform, B. Component discovery & host role, C. Agent home
 inventory, D. Configuration (verbatim), E. Runtime processes, F. Agent logs,
 G. Topology & network, H. Engine-specific facts, I. XOS / DB-host side facts,
-J. SQL pack per instance, then the opt-ins K. TLS handshake probe (`--tls`)
-and L. SQL pack over JDBC (`--sql`), and Collection status.
+J. SQL pack per instance, K. TLS handshake probe, then the opt-in L. SQL pack
+over JDBC (`--sql`), and Collection status.
 
 Goals: `components` (a dbx/dmx/prx/xos process — a java process whose
 arguments name the whatap.agent jar or class — or a dbxc/xcub binary; the
@@ -84,8 +86,9 @@ collector's own shell ancestry is never counted), `home` (every component
 process mapped to an install dir: its cwd or the dir of an absolute jar path;
 a cwd that is deleted, cannot be entered, or is a system root such as `/` is
 not taken), `conf` (every discovered `whatap.conf` / `xos.conf`, symlinks
-included, readable, and the search under each home complete), plus `tls` and
-`sql` only when `--tls` / `--sql` was given.
+included, readable, and the search under each home complete), plus `sql`
+only when `--sql` was given. Section K has no goal: its facts are part
+of every run and carry their own reasons.
 
 A `--home` resolves only the processes it matches: the process's cwd is the
 home or under it, or its relative `-jar` path exists under the home. An
@@ -95,10 +98,10 @@ path has no resolvable home and `home` is `missed` with the privilege gap (the
 gap is added only when privilege was the cause). With `/proc` mounted
 `hidepid` (and the run not in its `gid=` group), "no component process" is
 `missed`, not `na`; an unreadable mountinfo is reported as unknown visibility.
-A requested `--sql` / `--tls` that could not run (no credentials, no driver,
-no jshell/jrunscript, a connect error, no openssl, or an endpoint whose
-section G connect probe failed) is `missed`. `--tls` is `got` only when
-openssl reports a negotiated protocol and cipher.
+A requested `--sql` that could not run (no credentials, no driver, no
+jshell/jrunscript, a connect error, or an endpoint whose section G connect
+probe failed) is `missed`. Section K sends no handshake to an endpoint whose
+section G connect probe failed and says so; without openssl it says that.
 
 Reading the report: `db endpoint class` says whether `db_ip` is loopback, an
 address of this host, a DNS name, or none of this host's addresses; loopback
@@ -139,14 +142,28 @@ live in four different places — the collector puts them side by side:
 
 | # | Fact | Where it lives | Collected by |
 |---|---|---|---|
-| 1 | what the DB requires/offers (TLS versions, cert, `require_secure_transport`/`ssl`) | DB server | `--tls` handshake probe (openssl s_client, `-starttls mysql/postgres`; server TLS version, cipher, key size, cert dates + signature algorithm) + SQL pack server variables |
+| 1 | what the DB requires/offers (TLS versions, cert, `require_secure_transport`/`ssl`) | DB server | section K handshake probe (openssl s_client, `-starttls mysql/postgres`; server TLS version, cipher, key size, cert dates + signature algorithm) + SQL pack server variables |
 | 2 | what the agent requests | `whatap.conf` | `connect_option` verbatim + key-name breakdown (misspelled keys are silently ignored by drivers — the raw spelling IS the fact), `db_ssl` |
 | 3 | what the runtime permits | agent-host JDK + driver | `jdk.tls.disabledAlgorithms` from the runtime's `java.security` (per discovered java), JDBC driver jar name/version (defaults flip across versions) |
 | 4 | what actually gets negotiated | the live session | SQL pack `[6b]`/`[3b]`: `pg_stat_ssl` / `Ssl_version` for THIS session — and since `--sql` reuses the agent's own `connect_option`, this measures the agent's negotiation, not an approximation |
 
-`--tls` is Tier 2 (one handshake per instance, announced on stderr). Not
-probeable this way: MSSQL (TLS inside TDS prelogin) and Oracle TCPS — noted
-as reasoned absence.
+Section K is part of every run (0.8.0; it was the opt-in `--tls`, which is now
+refused with that message): one handshake per instance whose section G
+connect succeeded, each capped at 15 s and all of them together at 30 s
+(instances left after that say `n/a (not run: TLS probes stopped after 30s)`). It sends no credentials and nothing after
+the handshake. Measured 2026-09-26 against PostgreSQL 16.15 (ssl on, and
+ssl off) and MySQL 8.4.10 containers, the handshake leaves the same server
+trace as the section G connect probe that every run already sent: nothing in
+the default logs; with `log_connections=on` one `connection received` line
+each; at MySQL `log_error_verbosity=3` one `Got an error reading
+communication packets` note each; MySQL `Aborted_connects` +1 each, and the
+handshake also adds 1 to `Ssl_accepts` / `Ssl_finished_accepts`; nothing in
+the MySQL general log for either. A run therefore opens two connections per
+TLS-probeable instance. A server that negotiates no TLS (PostgreSQL
+`ssl=off`, MySQL without TLS) is reported as `session: none negotiated`
+with openssl's own message; the verification lines openssl prints without a
+certificate are left out. Not probeable this way: MSSQL (TLS inside TDS
+prelogin) and Oracle TCPS — noted as reasoned absence.
 
 Collection-server-side facts (server version, metrics categories) belong to
 `collectors/collection-server`, not here.
@@ -160,7 +177,7 @@ Collection-server-side facts (server version, metrics categories) belong to
   co-located / remote / AWS-endpoint topologies, engine dispatch for
   postgresql·oracle·mysql, WA-code histogram, XOS slow-query file cross-check
   (SQLSTATE `00000:` prefix and non-ASCII locale detection).
-- `--tls` ran against a live SSL-enabled PostgreSQL 16 (self-signed cert:
+- The TLS probe (then `--tls`) ran against a live SSL-enabled PostgreSQL 16 (self-signed cert:
   TLSv1.3/cipher/2048-bit key, cert dates, sha256 signature, verify-code 18
   all captured) and MySQL 8.4 (auto-generated cert captured); session-TLS
   measurement verified end-to-end: `--sql` with
@@ -203,6 +220,8 @@ secret can arrive from:
   and bind values as the DB logged them.
 - **SQL pack output** (section L): result rows of the monitoring views,
   including session and query text.
+- **Server certificates** (section K): subject and issuer of the certificate
+  each DB endpoint presents, which name hosts and the organisation.
 - **Credentials for `--sql`** are not printed (the user name is). They reach
   the JDBC runner through its environment only, never its command line.
 

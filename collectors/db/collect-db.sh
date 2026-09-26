@@ -54,7 +54,19 @@ COLLECTOR_NAME="whatap-db"
 #        (it was whole seconds, "0s"), and --sql states the JDBC connect time
 #        and one trivial query's time (SELECT 1; SELECT 1 FROM DUAL on Oracle)
 #        per instance, measured in the runner VM (2026-09-26).
-VERSION="0.7.0"
+# 0.8.0  TLS facts are part of every run: section K (one handshake per
+#        instance whose section G connect succeeded) runs by default. Measured on
+#        PostgreSQL 16 and MySQL 8.4, the handshake leaves the same server log
+#        trace as the connect probe (one connection line with log_connections,
+#        one aborted-connection note at log_error_verbosity=3, nothing
+#        otherwise). --tls is refused, naming this; the tls goal is gone with
+#        the flag. The handshakes of one run share 30 s (each at most 15 s);
+#        instances left after that say so. The certificate parses are bounded. --out DIR (default .) and --home=DIR are accepted. An
+#        output directory that cannot be written stops the run before it
+#        collects (2026-09-26).
+#        A value option given nothing, or a value starting with '-', exits 2
+#        ("missing value for --out"); it took the next option as its value.
+VERSION="0.8.0"
 DOMAIN="db"
 TARGET="db-host/$(hostname 2>/dev/null || echo unknown)"
 
@@ -62,9 +74,9 @@ TARGET="db-host/$(hostname 2>/dev/null || echo unknown)"
 OPT_FILE=0        # write the report to a .txt file
 OPT_STDOUT=0      # print the report to stdout
 OPT_QUIET=0       # suppress progress narration on stderr
+OPT_OUT="."       # output directory for --file
 OPT_HOMES=""      # newline-separated extra agent homes from --home
 OPT_SQL=0         # Tier 2: run the SQL pack over JDBC (agent's own java + driver)
-OPT_TLS=0         # Tier 2: one TLS handshake per instance against the DB endpoint
 
 usage() {
     cat <<EOF
@@ -79,23 +91,31 @@ explicit action flag so nothing starts by accident.
   $(basename "$0") --file           write the facts report -> ./$COLLECTOR_NAME-<host>-<UTC>.txt
   $(basename "$0") --stdout         print the facts report to stdout
   $(basename "$0") --quiet ..       silence progress on stderr (add to --file / --stdout)
+  $(basename "$0") --out <dir> ..   output directory for --file (default: .)
   $(basename "$0") --home <dir> ..  add an agent install dir the process scan cannot see
                                     (repeatable; useful when no agent process is running)
 
-  Tier 2 (opt-in — each is announced on stderr before anything is sent):
+Every run also sends one TLS handshake (openssl s_client) to each instance's
+DB endpoint whose TCP connect succeeded: server TLS version, cipher,
+certificate dates/signature (section K).
+
+  Tier 2 (opt-in — announced on stderr before anything is sent):
   $(basename "$0") --file --sql   run the read-only SQL pack over JDBC using the
                                   agent's own java + jdbc/ driver (no DB client
                                   needed); asks for the monitoring account on
                                   the terminal, or reads WHATAP_GGT_USER /
                                   WHATAP_GGT_PW from the environment
-  $(basename "$0") --file --tls   one TLS handshake per instance to the DB
-                                  endpoint (openssl s_client): server TLS
-                                  version, cipher, certificate dates/signature
 
 The same SQL packs can also be run through a DB client where one exists:
   sql/postgresql.sql (psql)  sql/mysql.sql (mysql)  sql/oracle.sql (sqlplus)
   windows/mssql.sql (sqlcmd)
 EOF
+}
+
+# _optval NAME VALUE -> VALUE, or exit 2 when it is empty or starts with '-'
+# (then the next option was taken for the value: `--out --stdout`)
+_optval() {
+    case "$2" in ''|-*) printf -- 'missing value for %s\n' "$1" >&2; exit 2 ;; esac
 }
 
 ARGC=$#
@@ -105,12 +125,18 @@ while [ $# -gt 0 ]; do
         --stdout)  OPT_STDOUT=1 ;;
         --quiet)   OPT_QUIET=1 ;;
         --sql)     OPT_SQL=1 ;;
-        --tls)     OPT_TLS=1 ;;
+        --tls)     printf -- '--tls is no longer an option: TLS facts are now part of every run (section K)\n' >&2; exit 2 ;;
+        --out)     _optval --out "${2:-}"; OPT_OUT="$2"; shift ;;
+        --out=*)   _optval --out "${1#*=}"; OPT_OUT="${1#*=}" ;;
         --home)
-            if [ $# -lt 2 ]; then printf -- '--home needs a directory argument\n' >&2; exit 2; fi
+            _optval --home "${2:-}"
             OPT_HOMES="$OPT_HOMES$2
 "
             shift ;;
+        --home=*)
+            _optval --home "${1#*=}"
+            OPT_HOMES="$OPT_HOMES${1#*=}
+" ;;
         -h|--help) usage; exit 0 ;;
         *) printf 'unknown argument: %s\n' "$1" >&2; usage >&2; exit 2 ;;
     esac
@@ -1868,21 +1894,21 @@ _rep_packs() {
     fi
 }
 
-# K. TLS handshake probe (--tls): what the SERVER offers (TLS version, cipher,
+# K. TLS handshake probe: what the SERVER offers (TLS version, cipher,
 # certificate dates and signature algorithm), the counterpart to the runtime
 # policy in sections A/E and the connect_option in section G
 _rep_tls() {
     local i
-    section "K. TLS handshake probe (opt-in)"
-    local tls_ok=0 tls_fail="" tls_na=""
+    section "K. TLS handshake probe"
     if ! have openssl; then
         fact "n/a (command not found: openssl)"
-        tls_fail="command not found: openssl"
     elif [ "${#INST_DIRS[@]}" -eq 0 ]; then
         fact "n/a (no instance dir discovered)"
-        tls_fail="no instance dir (whatap.conf) discovered on this host"
     else
         fact "openssl: $(_bounded openssl version 2>/dev/null)"
+        # every handshake of the run shares TLS_BUDGET seconds, each at most 15
+        local TLS_BUDGET=30 tls_t0="$SECONDS" tls_left tls_cap tls_f
+        tls_f="$(_tmp tls.out)"
         i=0
         while [ "$i" -lt "${#INST_DIRS[@]}" ]; do
             local idir="${INST_DIRS[$i]}" cf="${INST_DIRS[$i]}/whatap.conf"
@@ -1895,7 +1921,6 @@ _rep_tls() {
             subsection "instance: $idir (dbms=${dbms:-unset}, target ${dbip:-?}:${dbport:-?})"
             if [ -z "$dbip" ] || [ -z "$dbport" ]; then
                 fact "n/a (not applicable: db_ip/db_port not set)"
-                tls_na="$tls_na $idir: db_ip/db_port not set;"
                 i=$((i + 1)); continue
             fi
             st=""
@@ -1906,55 +1931,62 @@ _rep_tls() {
                     case "$dbssl$copt" in
                         *true*|*ssl*) st="" ;;
                         *) fact "n/a (not applicable: db_ssl/ssl option not set)"
-                           tls_na="$tls_na $idir: redis without db_ssl/ssl option;"
                            i=$((i + 1)); continue ;;
                     esac ;;
                 mssql)  fact "n/a (not applicable: dbms=mssql, TLS inside the TDS prelogin is not probed with openssl s_client)"
-                        tls_na="$tls_na $idir: dbms=mssql not probed;"
                         i=$((i + 1)); continue ;;
                 oracle) fact "n/a (not applicable: dbms=oracle, TCPS/native negotiation not probed in this version)"
-                        tls_na="$tls_na $idir: dbms=oracle not probed;"
                         i=$((i + 1)); continue ;;
                 *)      fact "n/a (not applicable: dbms=${dbms:-unset})"
-                        tls_na="$tls_na $idir: dbms=${dbms:-unset} not probed;"
                         i=$((i + 1)); continue ;;
             esac
             local down
             if down="$(tcp_down "$dbip" "$dbport")"; then
                 fact "handshake: n/a (skipped: $down)"
-                tls_fail="$tls_fail $dbip:$dbport not probed: $down;"
                 i=$((i + 1)); continue
             fi
-            warn "sending 1 TLS handshake to $dbip:$dbport ($dbms)"
+            tls_left=$((TLS_BUDGET - (SECONDS - tls_t0)))
+            if [ "$tls_left" -le 0 ]; then
+                fact "handshake: n/a (not run: TLS probes stopped after ${TLS_BUDGET}s)"
+                i=$((i + 1)); continue
+            fi
+            # min(CMD_TIMEOUT, 15, what is left of the budget)
+            tls_cap=15; [ "$CMD_TIMEOUT" -lt "$tls_cap" ] && tls_cap="$CMD_TIMEOUT"
+            [ "$tls_left" -lt "$tls_cap" ] && tls_cap="$tls_left"
+            progress "sending 1 TLS handshake to $dbip:$dbport ($dbms)"
             local trc summ
             # shellcheck disable=SC2086
-            out="$(printf '' | CMD_TIMEOUT=15 _bounded openssl s_client $st -connect "$dbip:$dbport" 2>&1)"; trc=$?
+            out="$(CMD_TIMEOUT="$tls_cap" _bounded_in /dev/null openssl s_client $st -connect "$dbip:$dbport" 2>&1)"; trc=$?
             if [ "$trc" -eq 124 ]; then
-                fact "handshake: n/a (timed out: 15s)"
-                tls_fail="$tls_fail $dbip:$dbport timed out (15s);"
+                fact "handshake: n/a (timed out: ${tls_cap}s)"
                 i=$((i + 1)); continue
             fi
-            summ="$(printf '%s\n' "$out" \
-                | grep -aE '^New, |Protocol *:|Cipher *(is|:)|Server public key|Verification|Verify return code|verify error|error|alert ' \
-                | head -n 10)"
-            # obtained only when openssl reports a negotiated session
-            # (protocol + cipher); anything else is openssl's own message
+            # A session exists only when openssl names a protocol and a cipher.
+            # Without one, its verification lines ("Verification: OK", "Verify
+            # return code: 0") describe no certificate and are left out, and
+            # openssl's own reason is kept.
             if printf '%s\n' "$out" | grep -aqE '^New, (TLS|SSL)|^ *Protocol *: *(TLS|SSL)' \
                && printf '%s\n' "$out" | grep -aqE 'Cipher( is| *:) *[A-Z0-9]' \
                && ! printf '%s\n' "$out" | grep -aqE 'Cipher( is| *:) *(\(NONE\)|0000)'; then
-                tls_ok=$((tls_ok + 1))
+                summ="$(printf '%s\n' "$out" \
+                    | grep -aE '^New, |Protocol *:|Cipher *(is|:)|Server public key|Verification|Verify return code|verify error|error|alert ' \
+                    | head -n 10)"
             else
                 local tmsg
-                tmsg="$(printf '%s\n' "$out" | grep -aiE -m1 'error|errno|unknown|alert|failure|NONE|no peer|didn.t' | cut -c1-120)"
-                [ -n "$tmsg" ] || tmsg="$(printf '%s\n' "$out" | grep -a -m1 . | cut -c1-120)"
-                tls_fail="$tls_fail $dbip:$dbport no TLS session (openssl rc=$trc: ${tmsg:-no output});"
+                tmsg="$(printf '%s\n' "$out" | grep -avE '^(CONNECTED|---|Verif|New, |Secure Renegotiation|Compression|Expansion|No ALPN|Early data|No client certificate|SSL handshake has read)' \
+                    | grep -a -m1 . | cut -c1-160)"
+                fact "session: none negotiated (${tmsg:-openssl exit $trc, no message})"
+                summ="$(printf '%s\n' "$out" | grep -aE '^New, |Protocol *:|Cipher *(is|:)|error|alert ' | head -n 10)"
             fi
             if [ -n "$summ" ]; then _emit_labeled "handshake summary" "$summ"
             else _emit_labeled "handshake: no session lines; openssl output (first 5 lines, exit $trc)" "$(printf '%s\n' "$out" | head -n 5)"; fi
-            certinfo="$(printf '%s\n' "$out" | openssl x509 -noout -subject -issuer -dates 2>/dev/null)"
+            # the parses read the handshake output from a private file, bounded
+            certinfo=""
+            printf '%s\n' "$out" >"$tls_f" 2>/dev/null \
+                && certinfo="$(_bounded_in "$tls_f" openssl x509 -noout -subject -issuer -dates 2>/dev/null)"
             if [ -n "$certinfo" ]; then
                 _emit_labeled "server certificate" "$certinfo"
-                sig="$(printf '%s\n' "$out" | openssl x509 -noout -text 2>/dev/null | grep -m1 'Signature Algorithm' | sed 's/^ *//')"
+                sig="$(_bounded_in "$tls_f" openssl x509 -noout -text 2>/dev/null | grep -m1 'Signature Algorithm' | sed 's/^ *//')"
                 [ -n "$sig" ] && fact "certificate signature: $sig"
             else
                 fact "server certificate: n/a (no certificate in handshake output)"
@@ -1962,9 +1994,6 @@ _rep_tls() {
             i=$((i + 1))
         done
     fi
-    if [ -n "$tls_fail" ]; then tls_fail="${tls_fail# }"; missed tls "${tls_fail%;}"
-    elif [ "$tls_ok" -gt 0 ]; then got tls
-    else na tls "no instance with a TLS-probeable endpoint:${tls_na%;}"; fi
 }
 
 # L. SQL pack over JDBC (--sql), the agent-native path
@@ -2134,7 +2163,6 @@ run_report() {
     goal components "whatap DB-monitoring components on this host"
     goal home       "agent install dir of each component"
     goal conf       "component configuration (whatap.conf / xos.conf)"
-    [ "$OPT_TLS" = 1 ] && goal tls "TLS handshake probe (--tls)"
     [ "$OPT_SQL" = 1 ] && goal sql "SQL pack over JDBC (--sql)"
 
     _rep_env
@@ -2148,7 +2176,7 @@ run_report() {
     _rep_engine
     _rep_xos
     _rep_packs
-    [ "$OPT_TLS" = 1 ] && _rep_tls
+    _rep_tls
     [ "$OPT_SQL" = 1 ] && _rep_sql
     _rep_goals
 
@@ -2169,6 +2197,17 @@ fi
 
 _run_init
 _init_probe
+
+# The output directory is checked before collecting, so an unwritable one
+# fails at once rather than after a full run.
+if [ "$OPT_STDOUT" != 1 ]; then
+    mkdir -p "$OPT_OUT" 2>/dev/null
+    if [ ! -d "$OPT_OUT" ] || [ ! -w "$OPT_OUT" ] || [ ! -x "$OPT_OUT" ]; then
+        warn "the report was not written: output directory $OPT_OUT is not writable by uid $(id -u 2>/dev/null || echo '?')"
+        exit 1
+    fi
+fi
+
 progress "discovering whatap DB components / DB server processes ..."
 discover
 progress "components: dbx=$(_count_kind dbx) dmx=$(_count_kind dmx) prx=$(_count_kind prx) xos=$(_count_kind xos) xcub=$(_count_kind xcub) dbxc=$(_count_kind dbxc); homes=${#HOME_DIRS[@]}; instances=${#INST_DIRS[@]}; db-procs=${#DBP_PIDS[@]}"
@@ -2180,7 +2219,7 @@ if [ "$OPT_STDOUT" = 1 ]; then
 else
     HOST="$(hostname 2>/dev/null || echo unknown)"
     TS="$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null || echo unknown)"
-    OUTFILE="./$COLLECTOR_NAME-$HOST-$TS.txt"
+    OUTFILE="$OPT_OUT/$COLLECTOR_NAME-$HOST-$TS.txt"
     progress "collecting facts (read-only) -> writing $OUTFILE"
     _report_to_file "$OUTFILE" || exit 1
     progress "report written: $OUTFILE"
