@@ -45,7 +45,10 @@ COLLECTOR_NAME="whatap-db"
 # 0.5.1  A CMD_TIMEOUT from the environment is used (it was overwritten by a
 #        fixed value after _run_init had checked it) (2026-09-26).
 # 0.5.2  Readability refactor; report unchanged.
-VERSION="0.5.2"
+# 0.5.3  Each (file, key) of a config is read once per run: sections G, H, J,
+#        K and L asked for the same keys again, 7 forks and 6 execs each
+#        (72 reads -> 40 for 3 instances with --tls). Report unchanged.
+VERSION="0.5.3"
 DOMAIN="db"
 TARGET="db-host/$(hostname 2>/dev/null || echo unknown)"
 
@@ -658,10 +661,24 @@ dump_file() {
     _bounded head -n "$max" "$path" 2>/dev/null | while IFS= read -r _l || [ -n "$_l" ]; do printf '        %s\n' "$_l"; done
 }
 
-# conf_get FILE KEY -> value of the last non-comment "KEY=..." line, trimmed.
+# conf_get VAR FILE KEY -> sets VAR to the value of the last non-comment
+# "KEY=..." line of FILE, trimmed. Sections D to L ask for the same keys of the
+# same files, so each (file, key) is read once per run and then answered from
+# _CONF_K/_CONF_V (the report is what the first read saw).
+_CONF_K=(); _CONF_V=()
 conf_get() {
-    grep -E "^[[:space:]]*$2[[:space:]]*=" "$1" 2>/dev/null | grep -v '^[[:space:]]*#' \
-        | tail -n1 | cut -d= -f2- | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+    local _ck="$2
+$3" _ci=0 _cv
+    while [ "$_ci" -lt "${#_CONF_K[@]}" ]; do
+        if [ "${_CONF_K[$_ci]}" = "$_ck" ]; then
+            printf -v "$1" '%s' "${_CONF_V[$_ci]}"; return 0
+        fi
+        _ci=$((_ci + 1))
+    done
+    _cv="$(grep -E "^[[:space:]]*$3[[:space:]]*=" "$2" 2>/dev/null | grep -v '^[[:space:]]*#' \
+        | tail -n1 | cut -d= -f2- | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    _CONF_K[${#_CONF_K[@]}]="$_ck"; _CONF_V[${#_CONF_V[@]}]="$_cv"
+    printf -v "$1" '%s' "$_cv"
 }
 
 # tcp_probe "label" HOST PORT -> single bounded TCP connect attempt (load-safe:
@@ -1011,11 +1028,12 @@ EOF
 # 4) watched ports = defaults (6600 collection server, 3002 xos->dbx)
 #    extended by whatap.server.port / xos_port values found in the confs
 _disc_ports() {
-    local i p ports="6600 3002"
+    local i p wp xp ports="6600 3002"
     i=0
     while [ "$i" -lt "${#INST_DIRS[@]}" ]; do
-        for p in "$(conf_get "${INST_DIRS[$i]}/whatap.conf" 'whatap\.server\.port')" \
-                 "$(conf_get "${INST_DIRS[$i]}/whatap.conf" xos_port)"; do
+        conf_get wp "${INST_DIRS[$i]}/whatap.conf" 'whatap\.server\.port'
+        conf_get xp "${INST_DIRS[$i]}/whatap.conf" xos_port
+        for p in "$wp" "$xp"; do
             case "$p" in [0-9]*) ports="$ports $p" ;; esac
         done
         i=$((i + 1))
@@ -1538,19 +1556,19 @@ _rep_network() {
         local idir="${INST_DIRS[$i]}" cf="${INST_DIRS[$i]}/whatap.conf"
         subsection "instance: $idir"
         local dbms dbip dbport whost wport
-        dbms="$(conf_get "$cf" dbms)"
-        dbip="$(conf_get "$cf" db_ip)"
-        dbport="$(conf_get "$cf" db_port)"
-        whost="$(conf_get "$cf" 'whatap\.server\.host')"
-        wport="$(conf_get "$cf" 'whatap\.server\.port')"
+        conf_get dbms "$cf" dbms
+        conf_get dbip "$cf" db_ip
+        conf_get dbport "$cf" db_port
+        conf_get whost "$cf" 'whatap\.server\.host'
+        conf_get wport "$cf" 'whatap\.server\.port'
         fact "dbms: ${dbms:-n/a (key not set in whatap.conf)}"
         fact "db_ip: ${dbip:-n/a (key not set)}   db_port: ${dbport:-n/a (key not set)}"
         fact "whatap.server.host: ${whost:-n/a (key not set)}   whatap.server.port: ${wport:-not set (the connect probe below uses 6600)}"
         # connection options, verbatim + key names split out — misspelled keys
         # are silently ignored by JDBC drivers, so the raw spelling is the fact
         local copt3 dbssl3
-        copt3="$(conf_get "$cf" connect_option)"
-        dbssl3="$(conf_get "$cf" db_ssl)"
+        conf_get copt3 "$cf" connect_option
+        conf_get dbssl3 "$cf" db_ssl
         if [ -n "$copt3" ]; then
             fact "connect_option (verbatim): $copt3"
             fact "connect_option keys: $(printf '%s' "${copt3#\?}" | tr '&' '\n' | cut -d= -f1 | tr '\n' ',' | sed 's/,$//;s/,/, /g')"
@@ -1605,7 +1623,7 @@ _rep_engine() {
     while [ "$i" -lt "${#INST_DIRS[@]}" ]; do
         local idir="${INST_DIRS[$i]}" cf="${INST_DIRS[$i]}/whatap.conf"
         local dbms nlog2 ldir2=""
-        dbms="$(conf_get "$cf" dbms)"
+        conf_get dbms "$cf" dbms
         subsection "instance: $idir (dbms=${dbms:-unset})"
         # engine-relevant conf keys, verbatim lines (value + spelling as-is)
         # grep exit 1 (no line) is "none"; exit 2 (unreadable) stays an error
@@ -1667,9 +1685,10 @@ _rep_engine() {
                 ;;
         esac
         # cloud overlay: CloudWatch / IAM traces regardless of engine
-        local cw
-        cw="$(conf_get "$cf" cloud_watch)"
-        if [ -n "$cw" ] || [ -n "$(conf_get "$cf" aws_arn)" ]; then
+        local cw arn
+        conf_get cw "$cf" cloud_watch
+        arn=""; [ -n "$cw" ] || conf_get arn "$cf" aws_arn
+        if [ -n "$cw" ] || [ -n "$arn" ]; then
             count_in_win "AWS credential/role lines" 'AssumeRole|sts|security token|expired'
             sample_in_win "AWS credential/role lines" 'AssumeRole|sts|security token.*expired' 3
         fi
@@ -1685,9 +1704,13 @@ _rep_engine() {
             esac
             i=$((i + 1))
         done
+        local rl
         i=0
         while [ "$i" -lt "${#HOME_DIRS[@]}" ]; do
-            [ -f "${HOME_DIRS[$i]}/prx.conf" ] && fact "prx.conf rss_limit: $(conf_get "${HOME_DIRS[$i]}/prx.conf" rss_limit)"
+            if [ -f "${HOME_DIRS[$i]}/prx.conf" ]; then
+                conf_get rl "${HOME_DIRS[$i]}/prx.conf" rss_limit
+                fact "prx.conf rss_limit: $rl"
+            fi
             i=$((i + 1))
         done
     fi
@@ -1710,7 +1733,7 @@ _rep_xos() {
             subsection "xos.conf: $xc"
             dump_file "xos.conf" "$xc"
             local sq
-            sq="$(conf_get "$xc" slow_query)"
+            conf_get sq "$xc" slow_query
             if [ -n "$sq" ]; then
                 fact "slow_query target: $sq"
                 if [ -r "$sq" ]; then
@@ -1761,7 +1784,7 @@ _rep_packs() {
     local said=0 packable=0
     while [ "$i" -lt "${#INST_DIRS[@]}" ]; do
         local dbms
-        dbms="$(conf_get "${INST_DIRS[$i]}/whatap.conf" dbms)"
+        conf_get dbms "${INST_DIRS[$i]}/whatap.conf" dbms
         case "$dbms" in
             postgres*|pg)   fact "instance ${INST_DIRS[$i]}: sql/postgresql.sql"; said=1; packable=1 ;;
             mysql|mariadb)  fact "instance ${INST_DIRS[$i]}: sql/mysql.sql"; said=1; packable=1 ;;
@@ -1803,11 +1826,11 @@ _rep_tls() {
         while [ "$i" -lt "${#INST_DIRS[@]}" ]; do
             local idir="${INST_DIRS[$i]}" cf="${INST_DIRS[$i]}/whatap.conf"
             local dbms dbip dbport dbssl copt st out certinfo sig
-            dbms="$(conf_get "$cf" dbms)"
-            dbip="$(conf_get "$cf" db_ip)"
-            dbport="$(conf_get "$cf" db_port)"
-            dbssl="$(conf_get "$cf" db_ssl)"
-            copt="$(conf_get "$cf" connect_option)"
+            conf_get dbms "$cf" dbms
+            conf_get dbip "$cf" db_ip
+            conf_get dbport "$cf" db_port
+            conf_get dbssl "$cf" db_ssl
+            conf_get copt "$cf" connect_option
             subsection "instance: $idir (dbms=${dbms:-unset}, target ${dbip:-?}:${dbport:-?})"
             if [ -z "$dbip" ] || [ -z "$dbport" ]; then
                 fact "n/a (not applicable: db_ip/db_port not set)"
@@ -1903,12 +1926,12 @@ _rep_sql() {
             # everything the agent itself uses to connect is reused from
             # whatap.conf (rule 2) — only credentials cannot come from it
             # (stored encrypted by uid.sh; this script does not decrypt)
-            dbms="$(conf_get "$cf" dbms)"
-            dbip="$(conf_get "$cf" db_ip)"
-            dbport="$(conf_get "$cf" db_port)"
-            dbname="$(conf_get "$cf" 'db')"
-            [ -z "$dbname" ] && dbname="$(conf_get "$cf" plan_db)"
-            copt="$(conf_get "$cf" connect_option)"
+            conf_get dbms "$cf" dbms
+            conf_get dbip "$cf" db_ip
+            conf_get dbport "$cf" db_port
+            conf_get dbname "$cf" 'db'
+            [ -z "$dbname" ] && conf_get dbname "$cf" plan_db
+            conf_get copt "$cf" connect_option
             case "$copt" in ""|\?*) ;; *) copt="?$copt" ;; esac
             subsection "instance: $idir (dbms=${dbms:-unset})"
             pack=""; jar=""; url=""; alturl=""
