@@ -50,7 +50,11 @@ COLLECTOR_NAME="whatap-db"
 #        (72 reads -> 40 for 3 instances with --tls). Report unchanged.
 # 0.6.0  The architecture is taken from the one `uname -smr` (no second
 #        `uname -m`).
-VERSION="0.6.0"
+# 0.7.0  Round trips in ms: each section G tcp connect states its time in ms
+#        (it was whole seconds, "0s"), and --sql states the JDBC connect time
+#        and one trivial query's time (SELECT 1; SELECT 1 FROM DUAL on Oracle)
+#        per instance, measured in the runner VM (2026-09-26).
+VERSION="0.7.0"
 DOMAIN="db"
 TARGET="db-host/$(hostname 2>/dev/null || echo unknown)"
 
@@ -686,19 +690,21 @@ $3" _ci=0 _cv
 # tcp_probe "label" HOST PORT -> single bounded TCP connect attempt (load-safe:
 # one attempt, NET_TIMEOUT cap through _bounded).
 tcp_probe() {
-    local label="$1" host="$2" port="$3" rc t0 t1
+    local label="$1" host="$2" port="$3" rc m0 t
     [ -n "$host" ] && [ -n "$port" ] || { fact "$label: n/a (not applicable: host/port not set)"; return; }
-    t0="$(date +%s 2>/dev/null)"
+    _now_ms; m0="$_ms"
     CMD_TIMEOUT="$NET_TIMEOUT" _bounded bash -c "exec 3<>/dev/tcp/$host/$port" 2>/dev/null
     rc=$?
-    t1="$(date +%s 2>/dev/null)"
+    _now_ms
+    # _now_ms falls back to whole seconds without EPOCHREALTIME or date %N
+    if [ -n "${EPOCHREALTIME:-}" ] || [ "$_ms_date" = 1 ]; then t="$((_ms - m0)) ms"; else t="time n/a (no ms clock)"; fi
     if [ "$rc" -eq 0 ]; then
-        fact "$label: tcp connect to $host:$port succeeded ($((t1 - t0))s)"
+        fact "$label: tcp connect to $host:$port succeeded ($t)"
     elif [ "$rc" -eq 124 ]; then
         fact "$label: tcp connect to $host:$port timed out (${NET_TIMEOUT}s)"
         TCP_DOWN="$TCP_DOWN|$host:$port=tcp connect timed out (${NET_TIMEOUT}s, section G)|"
     else
-        fact "$label: tcp connect to $host:$port did not connect (rc=$rc, $((t1 - t0))s)"
+        fact "$label: tcp connect to $host:$port did not connect (rc=$rc, $t)"
         TCP_DOWN="$TCP_DOWN|$host:$port=tcp connect did not connect (rc=$rc, section G)|"
     fi
 }
@@ -1096,8 +1102,24 @@ for (String line : Files.readAllLines(Paths.get(pack))) {
         cur.setLength(0);
     }
 }
+String ping = System.getenv("WHATAP_GGT_PING");
+String mark = System.getenv("WHATAP_GGT_MARK");
 DriverManager.setLoginTimeout(10);
+long t0 = System.nanoTime();
 try (Connection c = DriverManager.getConnection(url, usr, pw)) {
+    long t1 = System.nanoTime();
+    String rt = mark + " jdbc connect " + (t1 - t0) / 1000000 + " ms";
+    if (ping != null && !ping.isEmpty()) {
+        try (Statement st = c.createStatement()) {
+            st.setQueryTimeout(20);
+            long q0 = System.nanoTime();
+            try (ResultSet rs = st.executeQuery(ping)) { while (rs.next()) { } }
+            rt += "; " + ping + " " + (System.nanoTime() - q0) / 1000000 + " ms";
+        } catch (SQLException e) {
+            rt += "; " + ping + " failed: " + String.valueOf(e.getMessage()).split("\n")[0];
+        }
+    }
+    System.out.println(rt);
     for (String s : stmts) {
         try (Statement st = c.createStatement()) {
             st.setQueryTimeout(20);
@@ -1122,12 +1144,12 @@ try (Connection c = DriverManager.getConnection(url, usr, pw)) {
                 }
             } else { System.out.println("(ok)"); }
         } catch (SQLException e) {
-            System.out.println("SQL-ERROR: " + e.getMessage().split("\n")[0]);
+            System.out.println("SQL-ERROR: " + String.valueOf(e.getMessage()).split("\n")[0]);
             System.out.println();
         }
     }
 } catch (SQLException e) {
-    System.out.println("CONNECT-ERROR: " + e.getMessage().split("\n")[0]);
+    System.out.println("CONNECT-ERROR: " + String.valueOf(e.getMessage()).split("\n")[0]);
 }
 /exit
 JSHEOF
@@ -1147,11 +1169,24 @@ text.split("\n").forEach(function (line) {
     cur += line + "\n";
     if (/;\s*$/.test(t)) { stmts.push(cur.replace(/;\s*$/m, "")); cur = ""; }
 });
+var ping = Sys.getenv("WHATAP_GGT_PING"), mark = Sys.getenv("WHATAP_GGT_MARK");
 java.sql.DriverManager.setLoginTimeout(10);
-var conn;
-try { conn = java.sql.DriverManager.getConnection(url, usr, pw); }
+var conn, t0 = Sys.nanoTime(), t1;
+try { conn = java.sql.DriverManager.getConnection(url, usr, pw); t1 = Sys.nanoTime(); }
 catch (e) { print("CONNECT-ERROR: " + ("" + e.message).split("\n")[0]); }
 if (conn) {
+    var rt = mark + " jdbc connect " + Math.floor((t1 - t0) / 1000000) + " ms";
+    if (ping) {
+        var ps;
+        try {
+            ps = conn.createStatement(); ps.setQueryTimeout(20);
+            var q0 = Sys.nanoTime(), prs = ps.executeQuery(ping);
+            while (prs.next()) { }
+            rt += "; " + ping + " " + Math.floor((Sys.nanoTime() - q0) / 1000000) + " ms";
+            ps.close();
+        } catch (e) { rt += "; " + ping + " failed: " + ("" + e.message).split("\n")[0]; if (ps) ps.close(); }
+    }
+    print(rt);
     stmts.forEach(function (s) {
         var st;
         try {
@@ -1251,7 +1286,7 @@ _get_creds() {
     return 0
 }
 
-_run_jdbc_pack() { # PACKFILE URL JAR -> runner output on stdout
+_run_jdbc_pack() { # PACKFILE URL JAR [PING] -> runner output on stdout
     local rfile out
     # UTF-8 is forced on the runner VM: the report must carry DB text (Korean
     # query text etc.) byte-true even though the collector itself runs LC_ALL=C
@@ -1260,17 +1295,32 @@ _run_jdbc_pack() { # PACKFILE URL JAR -> runner output on stdout
     if [ "$_JDBC_MODE" = "jshell" ]; then
         rfile="$(_tmp runner.jsh)"
         _write_runner_jsh "$rfile"
-        CMD_TIMEOUT=120 WHATAP_GGT_PACK="$1" WHATAP_GGT_URL="$2" WHATAP_GGT_USER="$CRED_USER" WHATAP_GGT_PW="$CRED_PW" \
+        CMD_TIMEOUT=120 WHATAP_GGT_PACK="$1" WHATAP_GGT_URL="$2" WHATAP_GGT_USER="$CRED_USER" WHATAP_GGT_PW="$CRED_PW" WHATAP_GGT_PING="${4:-}" WHATAP_GGT_MARK="$RTT_MARK" \
             _bounded "$_JBIN/jshell" -q -J-Dfile.encoding=UTF-8 -R-Dfile.encoding=UTF-8 --class-path "$3" "$rfile" 2>&1
         echo "$?" > "$(_tmp runner.rc)"
     else
         rfile="$(_tmp runner.js)"
         _write_runner_js "$rfile"
-        CMD_TIMEOUT=120 WHATAP_GGT_PACK="$1" WHATAP_GGT_URL="$2" WHATAP_GGT_USER="$CRED_USER" WHATAP_GGT_PW="$CRED_PW" \
+        CMD_TIMEOUT=120 WHATAP_GGT_PACK="$1" WHATAP_GGT_URL="$2" WHATAP_GGT_USER="$CRED_USER" WHATAP_GGT_PW="$CRED_PW" WHATAP_GGT_PING="${4:-}" WHATAP_GGT_MARK="$RTT_MARK" \
             _bounded "$_JBIN/jrunscript" -J-Dfile.encoding=UTF-8 -cp "$3" "$rfile" 2>&1
         echo "$?" > "$(_tmp runner.rc)"
     fi
     rm -f "$rfile" 2>/dev/null
+}
+
+# The runner's timing line starts with a per-run token nobody else knows, so a
+# pack row cannot pose as it. _rtt_split OUT -> RTT_LINE = the first line that
+# starts with the token (token removed), RTT_REST = OUT without that one line.
+RTT_MARK=""; RTT_LINE=""; RTT_REST=""
+_rtt_split() {
+    RTT_LINE=""; RTT_REST="$1"
+    case "$_nl$1" in *"$_nl$RTT_MARK "*) ;; *) return 1 ;; esac
+    local pre="${1%%"$RTT_MARK "*}" post
+    post="${1#*"$RTT_MARK "}"
+    RTT_LINE="${post%%"$_nl"*}"
+    case "$post" in *"$_nl"*) post="${post#*"$_nl"}" ;; *) post="" ;; esac
+    RTT_REST="$pre$post"; RTT_REST="${RTT_REST%"$_nl"}"
+    return 0
 }
 
 # ---- log window helpers --------------------------------------------------------
@@ -1933,7 +1983,7 @@ _rep_sql() {
         i=0
         while [ "$i" -lt "${#INST_DIRS[@]}" ]; do
             local idir="${INST_DIRS[$i]}" cf="${INST_DIRS[$i]}/whatap.conf"
-            local dbms dbip dbport dbname copt pack jar url alturl out
+            local dbms dbip dbport dbname copt pack jar url alturl out ping
             # everything the agent itself uses to connect is reused from
             # whatap.conf (rule 2) — only credentials cannot come from it
             # (stored encrypted by uid.sh; this script does not decrypt)
@@ -1945,7 +1995,7 @@ _rep_sql() {
             conf_get copt "$cf" connect_option
             case "$copt" in ""|\?*) ;; *) copt="?$copt" ;; esac
             subsection "instance: $idir (dbms=${dbms:-unset})"
-            pack=""; jar=""; url=""; alturl=""
+            pack=""; jar=""; url=""; alturl=""; ping="SELECT 1"
             case "$dbms" in
                 postgres*|pg)
                     pack="$SCRIPT_DIR/sql/postgresql.sql"
@@ -1960,7 +2010,8 @@ _rep_sql() {
                     pack="$SCRIPT_DIR/sql/oracle.sql"
                     jar="$(_find_jdbc_jar 'ojdbc*.jar')"
                     url="jdbc:oracle:thin:@//$dbip:$dbport/$dbname"
-                    alturl="jdbc:oracle:thin:@$dbip:$dbport:$dbname" ;;
+                    alturl="jdbc:oracle:thin:@$dbip:$dbport:$dbname"
+                    ping="SELECT 1 FROM DUAL" ;;
                 *)
                     fact "n/a (not applicable: no JDBC pack for dbms=${dbms:-unset} in this version)"
                     sql_na="$sql_na $idir: no JDBC pack for dbms=${dbms:-unset};"
@@ -1989,15 +2040,28 @@ _rep_sql() {
                 i=$((i + 1)); continue
             fi
             warn "sending read-only SQL pack $(basename "$pack") to $dbip:$dbport as $CRED_USER over JDBC"
-            out="$(_run_jdbc_pack "$pack" "$url" "$jar")"
-            local jrc; jrc="$(cat "$(_tmp runner.rc)" 2>/dev/null)"
+            [ -n "$RTT_MARK" ] || { _now_ms; RTT_MARK="GGT-RTT-$_ms-$RANDOM$RANDOM$RANDOM:"; }
+            out="$(_run_jdbc_pack "$pack" "$url" "$jar" "$ping")"
+            local jrc rtl=""; jrc="$(cat "$(_tmp runner.rc)" 2>/dev/null)"
+            # the runner's timing line is a fact of its own, not pack output
+            _rtt_split "$out" && { rtl="$RTT_LINE"; out="$RTT_REST"; }
             if [ -n "$alturl" ] && printf '%s' "$out" | grep -q '^CONNECT-ERROR'; then
                 fact "first URL form did not connect; retrying SID form"
                 fact "jdbc url (retry): $alturl"
                 warn "retrying with SID-form URL $alturl"
+                local out2
+                out2="$(_run_jdbc_pack "$pack" "$alturl" "$jar" "$ping")"
+                _rtt_split "$out2" && { rtl="$RTT_LINE"; out2="$RTT_REST"; }
                 out="$out
 --- retry with $alturl ---
-$(_run_jdbc_pack "$pack" "$alturl" "$jar")"
+$out2"
+            fi
+            if [ -n "$rtl" ]; then
+                fact "db round trip (runner VM clock): $rtl"
+            elif printf '%s\n' "$out" | grep -q '^CONNECT-ERROR'; then
+                fact "db round trip (runner VM clock): n/a (did not connect)"
+            elif [ -n "$out" ]; then
+                fact "db round trip (runner VM clock): n/a (the runner printed no timing line)"
             fi
             if [ -n "$out" ]; then
                 fact "pack output (verbatim):"

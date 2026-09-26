@@ -102,10 +102,19 @@ openssl reports a negotiated protocol and cipher.
 
 Reading the report: `db endpoint class` says whether `db_ip` is loopback, an
 address of this host, a DNS name, or none of this host's addresses; loopback
-or a local address means the DB is co-located with the agent. On a host with
-no xos or DB server process, or with DB server processes but no DBX
-component, the run prints a `!!` line on the terminal naming the other host
-to run it on.
+or a local address means the DB is co-located with the agent. The ms after
+each section G `tcp connect` is the wall time of one bounded child bash that
+opens the socket. Process start dominates it (about 10-130 ms measured to a
+same-host container whose network round trip is under 1 ms), so it is not a
+network latency figure: only a value far above that floor says the network or
+the endpoint was slow. It is kept because it costs no extra call (it replaced
+two `date` forks that gave whole seconds). `db round trip (runner VM clock)`
+(`--sql`) is the JDBC login (`jdbc connect`) and one trivial query
+(`SELECT 1`, `SELECT 1 FROM DUAL` on Oracle), timed inside the runner VM, so
+JVM start-up is not in it. `SELECT 1` is the DB round-trip figure; the
+first connect of a run also loads the driver classes. On a host with no xos
+or DB server process, or with DB server processes but no DBX component, the
+run prints a `!!` line on the terminal naming the other host to run it on.
 
 ## Engine coverage (v0)
 
