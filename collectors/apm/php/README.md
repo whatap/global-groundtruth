@@ -188,7 +188,9 @@ Tier 0 only: read-only, bounded reads (`head`/`tail -n`, line-capped dumps,
 capped process and binary detail: 10 PHP binaries, 20 processes), every
 external command capped at 15 s and the whole run at `RUN_DEADLINE` (300 s);
 `/proc` is read in one pass for every pid; ~5 s on a healthy host. Processes executed: standard tools,
-`php -v/-m/-i` (once each per binary), `apachectl -V/-M`, `php-fpm -v`, `ipcs`, and
+`php -v/-m/-i` (once each per binary), `apachectl -V/-M`, `php-fpm -v` (only
+when section 3 did not already run it on the file the PATH `php-fpm` resolves
+to), `ipcs`, and
 `whatap_php version`. No `--bundle` tier yet; copy the bundle plumbing from
 `collect-collserver.sh` if the domain team needs raw log artifacts.
 

@@ -56,6 +56,10 @@ export LC_ALL=C
 
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-apmphp"
+# 0.6.0  Section 4 reuses the `php-fpm -v` of section 3 also when section 3
+#        ran it under a name that resolves to the PATH php-fpm (a running
+#        php-fpm8.2 found before the php-fpm link to it); the machine arch is
+#        taken from the one `uname -srm` (no second `uname -m`).
 # 0.5.4  _proc_env compares the variable name literally; PATH lookups read
 #        their answer back from a file instead of a second lookup in a $(...).
 # 0.5.3  "ini directory trees present" prints "(no whatap entry)" for a tree
@@ -64,7 +68,7 @@ COLLECTOR_NAME="whatap-apmphp"
 # 0.5.2  A directory this uid can read but not enter lists its names again
 #        (the refactor's _names dropped them; ls did not).
 # 0.5.1  Readability refactor; report unchanged.
-VERSION="0.5.4"
+VERSION="0.6.0"
 DOMAIN="apm"
 TARGET="host/$(hostname 2>/dev/null || echo unknown)"
 
@@ -1401,8 +1405,17 @@ _rep_env() {
 # [2] host / platform
 _rep_host() {
     section "Host / platform"
-    probe "kernel" uname -srm
-    probe "machine arch" uname -m
+    # the machine is the last field of `uname -srm` (uname prints the fields
+    # in its own order, and a kernel release has no blank)
+    _k="$(probe "kernel" uname -srm)"
+    printf '%s\n' "$_k"
+    case "$_k" in
+        "    kernel: n/a ("*) fact "machine arch: n/a (${_k#    kernel: n/a (}" ;;
+        "    kernel: "*" "*)  fact "machine arch: ${_k##* }" ;;
+        "    kernel (exit "*" "*)
+                             _e="${_k#    kernel (exit }"; fact "machine arch (exit ${_e%%)*}): ${_k##* }" ;;
+        *)                   fact "machine arch: n/a (no machine field in the uname -srm output)" ;;
+    esac
     read_proc "os-release" /etc/os-release
     if have ldd; then probe "libc" sh -c "ldd --version 2>&1 | head -n 1"
     else fact "libc: n/a (command not found: ldd)"; fi
@@ -1436,6 +1449,10 @@ _rep_runtimes() {
     fi
     local _n=0 php _mods=""
     _php_probed=0 _php_unprobed_live=""
+    # the file the PATH php-fpm resolves to, for section 4's reuse of its -v
+    _fpm_path_key=""
+    _which php-fpm
+    [ -n "$_wp" ] && _fpm_path_key="$(readlink -f "$_wp" 2>/dev/null || echo "$_wp")"
     _php_total="$(printf '%s\n' "$D_PHP_BINS" | grep -c .)"
     [ -n "$D_CAP_NOTE" ] && fact "$D_CAP_NOTE"
     # newline-split, no globbing; fd 9 so a probe reading stdin cannot eat it
@@ -1457,13 +1474,17 @@ EOF
         fact "-- php binary: $php"
         fact "   resolves to: $(readlink -f "$php" 2>/dev/null || echo "$php")"
         php_run "   version" "$php" -v
-        # the php-fpm on PATH run here with -v: section 4 shows the same
-        # output instead of running it again, when it finished in time and
-        # wrote nothing to stderr (section 4 shows stdout and stderr together)
+        # the php-fpm on PATH run here with -v, under this name or another
+        # that resolves to the same file (a running /usr/sbin/php-fpm8.2 is
+        # listed first, the PATH php-fpm linking to it is folded into it):
+        # section 4 shows the same output instead of running it again, when it
+        # finished in time and wrote nothing to stderr (section 4 shows stdout
+        # and stderr together)
         case "$php" in
-            */php-fpm)
+            */php-fpm*)
                 if [ -n "$_php_rc" ] && [ "$_php_rc" != 124 ] && [ -z "$_php_err" ] \
-                    && _which php-fpm && [ "$php" = "$_wp" ]; then
+                    && [ -n "$_fpm_path_key" ] \
+                    && [ "$(readlink -f "$php" 2>/dev/null || echo "$php")" = "$_fpm_path_key" ]; then
                     _fpm_v_seen=1 _fpm_v_out="$_php_out"
                 fi ;;
         esac
