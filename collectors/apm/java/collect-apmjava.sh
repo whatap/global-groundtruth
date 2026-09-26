@@ -73,7 +73,7 @@ export LC_ALL=C
 
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-apmjava"
-VERSION="0.12.3"
+VERSION="0.12.4"
 DOMAIN="apm"
 TARGET="host/$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || echo unknown)"
 
@@ -1161,23 +1161,23 @@ weaving_lines() {
 # _proc_env PID NAME -> value of NAME= in the process environ (empty if none).
 # Java agent env names may contain dots (license, whatap.server.host), which is
 # why the environ file is read directly instead of using the shell environment.
-# NAME is matched as the regex ^NAME= (a dot matches any character). The names
-# in _ENV_KEYS are looked up in one awk pass per pid, cached as "NAME<tab>value"
-# under the run's directory and read back with the shell's own read; any other
-# name, or a run without that directory, takes the pipeline.
-_ENV_KEYS="WHATAP_CONFIG_FILE WHATAP_HOME WHATAP_JAVA_AGENT_PATH JAVA_TOOL_OPTIONS JDK_JAVA_OPTIONS _JAVA_OPTIONS JAVA_OPTS CATALINA_OPTS JAVA_OPTIONS whatap.env WHATAP_CONTAINER_CONF_PATH CLASSPATH DOMAIN_HOME WHATAP_SERVER_HOST WHATAP_SERVER_PORT log_root log_name whatap.server.host whatap.server.port"
+# NAME is compared literally (whatap.env is not whatapXenv); the first entry
+# wins. One awk pass per pid writes every "NAME<tab>value" under the run's
+# directory, read back with the shell's own read; without that directory the
+# same awk answers the one name.
 _proc_env() {
     local t l
-    case " $_ENV_KEYS " in *" $2 "*) t="${_tmp_dir:+$_tmp_dir/env.$1}" ;; *) t="" ;; esac
-    if [ -z "$t" ]; then
-        tr '\0' '\n' 2>/dev/null < "/proc/$1/environ" | grep "^$2=" | head -n1 | cut -d= -f2-
+    if [ -z "$_tmp_dir" ]; then
+        tr '\0' '\n' 2>/dev/null < "/proc/$1/environ" | _K="$2" awk 'BEGIN { k = ENVIRON["_K"] "=" }
+            index($0, k) == 1 { print substr($0, length(k) + 1); exit }'
         return 0
     fi
-    # first match per name, the value after the first "=" (grep | head | cut)
-    [ -f "$t" ] || tr '\0' '\n' 2>/dev/null < "/proc/$1/environ" | awk -v keys="$_ENV_KEYS" '
-        BEGIN { n = split(keys, k, " "); for (i = 1; i <= n; i++) re[i] = "^" k[i] "=" }
-        { for (i = 1; i <= n; i++) if (!(i in v) && $0 ~ re[i]) { l = $0; sub(/^[^=]*=/, "", l); v[i] = l } }
-        END { for (i = 1; i <= n; i++) if (i in v) printf "%s\t%s\n", k[i], v[i] }' > "$t" 2>/dev/null
+    t="$_tmp_dir/env.$1"
+    # a name holding a tab could not be told apart from its value: skipped
+    [ -f "$t" ] || tr '\0' '\n' 2>/dev/null < "/proc/$1/environ" | awk '
+        { i = index($0, "="); if (i < 2) next; n = substr($0, 1, i - 1)
+          if (index(n, "\t") || (n in v)) next; v[n] = 1
+          printf "%s\t%s\n", n, substr($0, i + 1) }' > "$t" 2>/dev/null
     while IFS= read -r l; do
         case "$l" in "$2$_tab"*) printf '%s\n' "${l#"$2$_tab"}"; return 0 ;; esac
     done < "$t"
@@ -1264,23 +1264,21 @@ _jcmd_recover() {
 
 # _jvm_sysprop PID KEY -> the last -DKEY=value seen across all argument
 # sources (see _all_jvm_args for the order). Empty when the property is unset.
-# KEY is matched as the regex ^-DKEY= (a dot matches any character). As in
-# _proc_env, the keys in _SP_KEYS come from one awk pass per pid, cached under
-# the run's directory (_jcmd_recover drops it with the argument cache); any
-# other key, or a run without that directory, takes the pipeline.
-_SP_KEYS="whatap.home whatap.config.file whatap.config java.class.path catalina.base catalina.home catalina.useNaming jboss.home.dir jboss.server.name jboss.server.base.dir jetty.base jetty.home jeus.home weblogic.Name domain.home com.sun.aas.instanceRoot com.sun.aas.installRoot com.sun.aas.instanceName com.sun.aas.domainName was.install.root server.root java.protocol.handler.pkgs spring.profiles.active logback.configurationFile logback.statusListenerClass log4j.configuration log4j.configurationFile log4j2.configurationFile java.util.logging.config.file java.util.logging.manager org.jboss.logging.provider log_root log_name whatap.server.host whatap.server.port"
+# KEY is compared literally (-DwhatapXconfig is not whatap.config). As in
+# _proc_env, one awk pass per pid writes every key's last value under the run's
+# directory (_jcmd_recover drops it with the argument cache).
 _jvm_sysprop() {
     local t l
-    case " $_SP_KEYS " in *" $2 "*) t="${_tmp_dir:+$_tmp_dir/sp.$1}" ;; *) t="" ;; esac
-    if [ -z "$t" ]; then
-        _all_jvm_args "$1" | grep "^-D$2=" | tail -n1 | sed "s/^-D$2=//"
+    if [ -z "$_tmp_dir" ]; then
+        _all_jvm_args "$1" | _K="$2" awk 'BEGIN { k = "-D" ENVIRON["_K"] "="; f = 0 }
+            index($0, k) == 1 { v = substr($0, length(k) + 1); f = 1 } END { if (f) print v }'
         return 0
     fi
-    # last match per key, with the matched prefix removed (grep | tail | sed)
-    [ -f "$t" ] || _all_jvm_args "$1" | awk -v keys="$_SP_KEYS" '
-        BEGIN { n = split(keys, k, " "); for (i = 1; i <= n; i++) re[i] = "^-D" k[i] "=" }
-        substr($0, 1, 2) == "-D" { for (i = 1; i <= n; i++) if ($0 ~ re[i]) v[i] = $0 }
-        END { for (i = 1; i <= n; i++) if (i in v) { l = v[i]; sub(re[i], "", l); printf "%s\t%s\n", k[i], l } }' > "$t" 2>/dev/null
+    t="$_tmp_dir/sp.$1"
+    [ -f "$t" ] || _all_jvm_args "$1" | awk '
+        substr($0, 1, 2) == "-D" { i = index($0, "="); if (i < 4) next; k = substr($0, 3, i - 3)
+          if (index(k, "\t")) next; if (!(k in v)) o[++n] = k; v[k] = substr($0, i + 1) }
+        END { for (j = 1; j <= n; j++) printf "%s\t%s\n", o[j], v[o[j]] }' > "$t" 2>/dev/null
     while IFS= read -r l; do
         case "$l" in "$2$_tab"*) printf '%s\n' "${l#"$2$_tab"}"; return 0 ;; esac
     done < "$t"
