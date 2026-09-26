@@ -55,7 +55,14 @@ COLLECTOR_NAME="whatap-k8s"
 #        (14 -> 1 per pod), the operator deployment and operator pod list reads
 #        of section D are merged, and section A counts namespaces from the list
 #        section J prints (3 --apm-target, lab cluster: 111 s -> 75 s).
-VERSION="0.10.0"
+# 0.11.0 The Tier 0 log lines per container come from the environment,
+#        LOG_TAIL_LINES (default 200, 1..999999; another value is named in a
+#        !! line and 200 is used). --tail is refused, naming LOG_TAIL_LINES.
+#        The help shows -n for --namespace. An --out directory that cannot be
+#        written stops the run before it collects (2026-09-26).
+#        A value option given nothing, or a value starting with '-', exits 2
+#        ("missing value for --out"); it took the next option as its value.
+VERSION="0.11.0"
 DOMAIN="k8s"
 TARGET="k8s-cluster/unresolved"      # refined after CLI/context/namespace discovery
 
@@ -68,7 +75,6 @@ OPT_OUT="."
 OPT_NS=""            # skip namespace discovery (RBAC-scoped kubeconfigs)
 OPT_CONTEXT=""       # kubeconfig context passthrough
 OPT_KUBECONFIG=""    # kubeconfig path passthrough
-OPT_TAIL=200         # Tier 0 log tail lines per container
 OPT_EXEC_ALL=0       # Tier 2: run in-pod probes on every node-agent pod
 OPT_APM_EXEC=0       # Tier 2: exec into --apm-target application containers
 APM_TGTS=()          # opt-in: namespaces (ns or ns/workload) to inspect for injection facts
@@ -86,10 +92,9 @@ by accident.
   collect-k8s.sh --bundle                 Tier 0 report + yaml/log artifacts -> tar.gz
   collect-k8s.sh --quiet ...              silence progress on stderr (for automation)
   collect-k8s.sh --out DIR                output directory (default: .)
-  collect-k8s.sh --namespace NS           skip namespace discovery (RBAC-scoped access)
+  collect-k8s.sh --namespace NS (-n NS)   skip namespace discovery (RBAC-scoped access)
   collect-k8s.sh --context CTX            kubeconfig context to use (multi-cluster bastion)
   collect-k8s.sh --kubeconfig PATH        kubeconfig file to use
-  collect-k8s.sh --tail N                 Tier 0 log lines per container (default: 200)
   collect-k8s.sh --apm-target NS[/NAME]   inspect an application namespace for whatap APM
                                           auto-instrumentation facts (repeatable, max 5):
                                           workload template env (as declared) vs pod env
@@ -103,6 +108,9 @@ by accident.
                                           --apm-target application containers
                                           (agent home listing, conf, agent logs)
 
+Environment: LOG_TAIL_LINES=N  Tier 0 log lines per container (default: 200)
+             CMD_TIMEOUT=S / RUN_DEADLINE=S  per-call cap / whole-run budget
+
 Section J runs even with no --apm-target: it always reports the cluster-wide
 inventory of pods carrying a whatap APM init container.
 
@@ -113,6 +121,12 @@ report can contain", lists every place a secret can arrive from.
 EOF
 }
 
+# _optval NAME VALUE -> VALUE, or exit 2 when it is empty or starts with '-'
+# (then the next option was taken for the value: `--out --stdout`)
+_optval() {
+    case "$2" in ''|-*) printf -- 'missing value for %s\n' "$1" >&2; exit 2 ;; esac
+}
+
 ARGC=$#              # 0 args -> usage (handled in main, below)
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -120,26 +134,25 @@ while [ $# -gt 0 ]; do
         --stdout) OPT_STDOUT=1 ;;
         --bundle) OPT_BUNDLE=1 ;;
         --quiet) OPT_QUIET=1 ;;
-        --out) OPT_OUT="$2"; shift ;;
-        --out=*) OPT_OUT="${1#*=}" ;;
-        --namespace|-n) OPT_NS="$2"; shift ;;
-        --namespace=*) OPT_NS="${1#*=}" ;;
-        --context) OPT_CONTEXT="$2"; shift ;;
-        --context=*) OPT_CONTEXT="${1#*=}" ;;
-        --kubeconfig) OPT_KUBECONFIG="$2"; shift ;;
-        --kubeconfig=*) OPT_KUBECONFIG="${1#*=}" ;;
-        --tail) OPT_TAIL="$2"; shift ;;
-        --tail=*) OPT_TAIL="${1#*=}" ;;
+        --out) _optval --out "${2:-}"; OPT_OUT="$2"; shift ;;
+        --out=*) _optval --out "${1#*=}"; OPT_OUT="${1#*=}" ;;
+        --namespace|-n) _optval "$1" "${2:-}"; OPT_NS="$2"; shift ;;
+        --namespace=*) _optval --namespace "${1#*=}"; OPT_NS="${1#*=}" ;;
+        --context) _optval --context "${2:-}"; OPT_CONTEXT="$2"; shift ;;
+        --context=*) _optval --context "${1#*=}"; OPT_CONTEXT="${1#*=}" ;;
+        --kubeconfig) _optval --kubeconfig "${2:-}"; OPT_KUBECONFIG="$2"; shift ;;
+        --kubeconfig=*) _optval --kubeconfig "${1#*=}"; OPT_KUBECONFIG="${1#*=}" ;;
+        --tail|--tail=*)
+            printf -- '--tail is no longer an option: set LOG_TAIL_LINES=N in the environment (default 200)\n' >&2; exit 2 ;;
         --exec-per-node) OPT_EXEC_ALL=1 ;;
         --apm-exec) OPT_APM_EXEC=1 ;;
-        --apm-target) APM_TGTS[${#APM_TGTS[@]}]="$2"; shift ;;
-        --apm-target=*) APM_TGTS[${#APM_TGTS[@]}]="${1#*=}" ;;
+        --apm-target) _optval --apm-target "${2:-}"; APM_TGTS[${#APM_TGTS[@]}]="$2"; shift ;;
+        --apm-target=*) _optval --apm-target "${1#*=}"; APM_TGTS[${#APM_TGTS[@]}]="${1#*=}" ;;
         -h|--help) usage; exit 0 ;;
         *) printf 'unknown argument: %s\n' "$1" >&2; usage >&2; exit 2 ;;
     esac
     shift
 done
-case "$OPT_TAIL" in ''|*[!0-9]*) OPT_TAIL=200 ;; esac
 
 # ---- emit helpers — DO NOT EDIT ---------------------------------------------
 # The report shape (../../docs/output-format.md): header, numbered sections,
@@ -1816,7 +1829,7 @@ _rep_events() {
 # G. Logs (bounded tails)
 _rep_logs() {
     section "G. Logs (bounded tails)"
-    fact "bounds: --tail=$OPT_TAIL per container; previous instance --tail=100; up to 3 sample node-agent pods (--bundle carries fuller logs)"
+    fact "bounds: --tail=$LOG_TAIL_LINES per container; previous instance --tail=100; up to 3 sample node-agent pods (--bundle carries fuller logs)"
     if [ -n "$NS" ]; then
         # The admission decision is written when a pod is CREATED, which is usually
         # far behind a 200-line tail on a long-lived operator. Pull a deeper tail and
@@ -1834,10 +1847,10 @@ _rep_logs() {
             run_k logs -n "$NS" "deploy/$OP_DEPLOY" --tail=4000 --limit-bytes=4000000
             dp_rc="$K_RC" dp_out="$K_OUT"
             [ "$dp_rc" -eq 0 ] || dp_why="$(_k_reason)"
-            if [ "$dp_rc" -eq 0 ] && [ "$OPT_TAIL" -le 4000 ] && [ "${#dp_out}" -lt 3996000 ]; then
-                K_OUT="$(printf '%s\n' "$dp_out" | tail -n "$OPT_TAIL")"; K_RC=0
+            if [ "$dp_rc" -eq 0 ] && [ "$LOG_TAIL_LINES" -le 4000 ] && [ "${#dp_out}" -lt 3996000 ]; then
+                K_OUT="$(printf '%s\n' "$dp_out" | tail -n "$LOG_TAIL_LINES")"; K_RC=0
             else
-                run_k logs -n "$NS" "deploy/$OP_DEPLOY" --tail="$OPT_TAIL"
+                run_k logs -n "$NS" "deploy/$OP_DEPLOY" --tail="$LOG_TAIL_LINES"
             fi
             if [ "$K_RC" -eq 0 ] && [ -n "$K_OUT" ]; then
                 _emit_labeled "logs deploy/$OP_DEPLOY" "$K_OUT"
@@ -1861,7 +1874,7 @@ _rep_logs() {
         local mdep
         mdep="$(printf '%s\n' "$WHATAP_DEPLOYS" | awk '$1 ~ /master-agent/ {print $1; exit}')"
         if [ -n "$mdep" ]; then
-            if run_k logs -n "$NS" "deploy/$mdep" --tail="$OPT_TAIL" && [ -n "$K_OUT" ]; then
+            if run_k logs -n "$NS" "deploy/$mdep" --tail="$LOG_TAIL_LINES" && [ -n "$K_OUT" ]; then
                 _emit_labeled "logs deploy/$mdep" "$K_OUT"
             else
                 fact "logs deploy/$mdep: n/a ($(_k_reason))"
@@ -1882,7 +1895,7 @@ _rep_logs() {
             picked="$picked$pod "
             count=$((count + 1))
             for cont in $DS_CONTAINERS; do
-                emit_log_tail "$pod" "$cont" "$OPT_TAIL"
+                emit_log_tail "$pod" "$cont" "$LOG_TAIL_LINES"
                 [ "${SP_RST[$i]}" -gt 0 ] 2>/dev/null && emit_log_tail "$pod" "$cont" 100 previous
             done
             i=$((i + 1))
@@ -2686,7 +2699,7 @@ exec 3>&2
 # No arguments -> print help and stop; a collection needs an explicit action flag.
 [ "$ARGC" -eq 0 ] && { usage; exit 0; }
 
-# An action flag is required. Modifiers alone (--namespace/--tail/--quiet/...)
+# An action flag is required. Modifiers alone (--namespace/--out/--quiet/...)
 # are not enough — say so and show help rather than silently doing nothing.
 if [ "$OPT_BUNDLE" = 0 ] && [ "$OPT_STDOUT" = 0 ] && [ "$OPT_FILE" = 0 ]; then
     warn "no action flag given — need one of --file / --stdout / --bundle"
@@ -2696,7 +2709,18 @@ fi
 
 _run_init
 _init_probe
-mkdir -p "$OPT_OUT" 2>/dev/null
+# Tier 0 log lines per container, from the environment like the other caps
+LOG_TAIL_LINES="$(_cap_or LOG_TAIL_LINES "${LOG_TAIL_LINES:-200}" 200)"
+
+# The output directory is checked before collecting, so an unwritable one
+# fails at once rather than after a full run.
+if [ "$OPT_STDOUT" != 1 ] || [ "$OPT_BUNDLE" = 1 ]; then
+    mkdir -p "$OPT_OUT" 2>/dev/null
+    if [ ! -d "$OPT_OUT" ] || [ ! -w "$OPT_OUT" ] || [ ! -x "$OPT_OUT" ]; then
+        warn "the report was not written: output directory $OPT_OUT is not writable by uid $(id -u 2>/dev/null || echo '?')"
+        exit 1
+    fi
+fi
 
 progress "resolving CLI / namespace / whatap workloads ..."
 k8s_cli_discover
