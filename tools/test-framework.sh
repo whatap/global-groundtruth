@@ -234,15 +234,22 @@ while :; do _bounded f; done
 EOF
 for sh in bash dash; do
     command -v "$sh" >/dev/null 2>&1 || continue
-    leak=0; n=0
+    leak=0; n=0; lost=0
     for dl in 0.3 0.45 0.6 0.75 0.9 1.05 1.2 1.35; do
         rm -f "$T/loop.dir"
         LIB="$T/lib.sh" OUT="$T/loop.dir" "$sh" "$T/loop.sh" >/dev/null 2>&1 &
-        lp=$!; sleep "$dl"; kill -TERM "$lp" 2>/dev/null; wait "$lp" 2>/dev/null
+        lp=$!; sleep "$dl"; kill -TERM "$lp" 2>/dev/null
+        # bash itself can lose a TERM that lands mid-fork (1 in ~150 runs, also
+        # before this block existed); a collector then ends at RUN_DEADLINE. Wait
+        # 3s, then send it again rather than hang the suite on it.
+        i=0; while kill -0 "$lp" 2>/dev/null && [ "$i" -lt 30 ]; do sleep 0.1; i=$((i + 1)); done
+        kill -0 "$lp" 2>/dev/null && { lost=$((lost + 1)); kill -TERM "$lp" 2>/dev/null; sleep 1; kill -KILL "$lp" 2>/dev/null; }
+        wait "$lp" 2>/dev/null
         d="$(cat "$T/loop.dir" 2>/dev/null)"; n=$((n + 1))
         [ -n "$d" ] && [ -e "$d" ] && { leak=$((leak + 1)); rm -rf "$d"; }
     done
     check "$sh: a TERM between short bounded calls leaves no directory ($n runs)" '[ "$leak" = 0 ]' "leaked $leak of $n"
+    [ "$lost" = 0 ] || printf '  NOTE  %s: %s of %s TERMs were lost by the shell and sent again\n' "$sh" "$lost" "$n"
 done
 # dash: a bounded function used to cost ~1s on 10-15% of calls
 if command -v dash >/dev/null 2>&1; then
@@ -302,6 +309,27 @@ sed -i '/^# ---- run helpers — DO NOT EDIT/,/^# ---- end run helpers$/d' "$M/c
 check "a missing block is reported"       '"$M/tools/sync-shared-block.sh" --check | grep -q "^MISSING .*block run"'
 "$M/tools/sync-shared-block.sh" --apply >/dev/null
 check "--apply inserts a missing block"   '"$M/tools/sync-shared-block.sh" --check >/dev/null && bash -n "$M/collectors/x/collect-x.sh"'
+# the emit helpers: a collector-local one-liner right after the block (sub, blk)
+# survives, drift inside it is undone, and a missing one is inserted
+sed -i 's/^# ---- end emit helpers$/&\nsub() { printf "        %s\\n" "$1"; }/' "$M/collectors/x/collect-x.sh"
+sed -i "s/^fact()       { printf '    /fact()       { printf '  /" "$M/collectors/x/collect-x.sh"
+check "drift in the emit helpers is reported" '"$M/tools/sync-shared-block.sh" --check | grep -q "^DRIFT .*block emit"'
+"$M/tools/sync-shared-block.sh" --apply >/dev/null
+check "--apply undoes it, keeps the one-liner after it" '"$M/tools/sync-shared-block.sh" --check >/dev/null && grep -q "^sub() { printf" "$M/collectors/x/collect-x.sh"'
+sed -i '/^# ---- emit helpers — DO NOT EDIT/,/^# ---- end emit helpers$/d' "$M/collectors/x/collect-x.sh"
+"$M/tools/sync-shared-block.sh" --apply >/dev/null
+check "--apply inserts missing emit helpers"  '"$M/tools/sync-shared-block.sh" --check >/dev/null && bash -n "$M/collectors/x/collect-x.sh"'
+# every collector defines each shared name once: a second definition later in
+# the file would silently override the synced one
+dups=""
+for f in $(cd "$ROOT" && git ls-files 'collectors/*collect-*.sh'); do
+    for n in _section_n=0 emit_header section subsection fact emit_footer progress have \
+             warn _bounded _bounded_in _tmp _run_init goal got na missed emit_status _note_privilege _note_boot; do
+        case "$n" in *=*) re="^$n$" ;; *) re="^[[:space:]]*(function[[:space:]]+)?${n}[[:space:]]*\(\)" ;; esac
+        [ "$(grep -cE "$re" "$ROOT/$f")" = 1 ] || dups="$dups $f:$n"
+    done
+done
+check "each shared name is defined once per collector" '[ -z "$dups" ]' "$dups"
 
 # ---- 3. validate.sh --report ------------------------------------------------
 echo "== 3. validate.sh --report =="

@@ -71,7 +71,7 @@ format that `validate.sh` and every reader depend on. Add your sections **inside
 `run_report()`**; leave the helpers alone. The script intentionally does **not**
 use `set -e` — a collector must always run to completion and emit its footer.
 
-The **CLI harness** (`usage`, argument parsing, `progress`, and the `main`
+The **CLI harness** (`usage`, argument parsing and the `main`
 dispatch) and the `run_report()` wrapper are shared boilerplate too — leave them
 alone and edit only the four metadata variables and the fact sections. It gives
 every collector the behavior guideline 5 requires: running the script **bare
@@ -82,8 +82,8 @@ prints usage** (a collection needs an explicit `--file` / `--stdout`), and it
 The `probe` / `read_proc` reasoned-absence helpers below them are recommended
 but optional — keep, trim, or extend them for your domain. See guideline 4.
 
-Four blocks are **synced**, not just copied: privilege, boot time, run helpers
-and collection completeness. Each runs from its `# ---- <name> — DO NOT EDIT`
+Five blocks are **synced**, not just copied: emit helpers, privilege, boot
+time, run helpers and collection completeness. Each runs from its `# ---- <name> — DO NOT EDIT`
 banner to its `# ---- end <name>` line, and `tools/sync-shared-block.sh
 --apply` overwrites whatever a collector changed between them. Change them
 here, in the skeleton, and run `--apply`; `--check` reports drift. Then run

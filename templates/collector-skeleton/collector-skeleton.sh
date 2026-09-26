@@ -69,6 +69,9 @@ while [ $# -gt 0 ]; do
 done
 
 # ---- emit helpers — DO NOT EDIT ---------------------------------------------
+# The report shape (../../docs/output-format.md): header, numbered sections,
+# facts, footer. progress narrates on fd 3 (the terminal saved in main), never
+# into the report, and --quiet silences it; keep its text a fact about the run.
 _section_n=0
 
 emit_header() {
@@ -81,17 +84,18 @@ emit_header() {
     printf '===============================================\n'
 }
 
-# section "TITLE"  -> starts the next numbered section (and narrates it to fd 3)
+# section "A. TITLE" -> the next numbered section, [n] A. TITLE, narrated too
 section() {
     _section_n=$((_section_n + 1))
     printf '\n[%d] %s\n' "$_section_n" "$1"
     progress "[$_section_n] $1"
 }
-
-# fact "text"  -> one fact line under the current section
-fact() {
-    printf '    %s\n' "$1"
-}
+subsection() { printf '\n    -- %s --\n' "$1"; }
+fact()       { printf '    %s\n' "$1"; }
+emit_footer() { printf '\n==== END OF COLLECTION (no diagnosis by design) ====\n'; }
+progress()   { [ "$OPT_QUIET" = 1 ] && return; printf '>> %s\n' "$*" >&3 2>/dev/null; }
+have()       { command -v "$1" >/dev/null 2>&1; }
+# ---- end emit helpers
 
 # try CMD [ARGS...]  -> prints the command's output as fact lines; prints "n/a"
 # if the command fails or produces nothing. Simplest form; prefer `probe` below
@@ -103,10 +107,6 @@ try() {
     else
         fact "n/a"
     fi
-}
-
-emit_footer() {
-    printf '\n==== END OF COLLECTION (no diagnosis by design) ====\n'
 }
 
 # ---- privilege — DO NOT EDIT ------------------------------------------------
@@ -531,19 +531,11 @@ EOF
 }
 # ---- end collection completeness
 
-# progress: operational narration to the terminal (fd 3, saved from stderr in main
-# before any redirection). It NEVER lands in the report — stdout stays the report
-# even in --file mode. Silenced by --quiet. Keep the text a fact about collection
-# state (no judgment words) so validate.sh keeps passing.
-progress() { [ "$OPT_QUIET" = 1 ] && return; printf '>> %s\n' "$*" >&3 2>/dev/null; }
-
 # ---- reasoned-absence helpers — recommended, keep or trim as needed ---------
 # These implement guideline 4 (../../docs/collector-engineering.md): a value you
 # cannot obtain is reported WITH a classified reason, so the reader can tell
 # "not installed" from "no permission" from "timed out". Reason strings stay
 # free of judgment words so validate.sh keeps passing.
-have() { command -v "$1" >/dev/null 2>&1; }
-
 _errfile=""
 # Per-command cap (s); with many network probes, lower it or probe reachability once.
 CMD_TIMEOUT="${CMD_TIMEOUT:-20}"

@@ -99,6 +99,9 @@ while [ $# -gt 0 ]; do
 done
 
 # ---- emit helpers — DO NOT EDIT ---------------------------------------------
+# The report shape (../../docs/output-format.md): header, numbered sections,
+# facts, footer. progress narrates on fd 3 (the terminal saved in main), never
+# into the report, and --quiet silences it; keep its text a fact about the run.
 _section_n=0
 
 emit_header() {
@@ -111,19 +114,18 @@ emit_header() {
     printf '===============================================\n'
 }
 
+# section "A. TITLE" -> the next numbered section, [n] A. TITLE, narrated too
 section() {
     _section_n=$((_section_n + 1))
     printf '\n[%d] %s\n' "$_section_n" "$1"
     progress "[$_section_n] $1"
 }
-
-fact() {
-    printf '    %s\n' "$1"
-}
-
-emit_footer() {
-    printf '\n==== END OF COLLECTION (no diagnosis by design) ====\n'
-}
+subsection() { printf '\n    -- %s --\n' "$1"; }
+fact()       { printf '    %s\n' "$1"; }
+emit_footer() { printf '\n==== END OF COLLECTION (no diagnosis by design) ====\n'; }
+progress()   { [ "$OPT_QUIET" = 1 ] && return; printf '>> %s\n' "$*" >&3 2>/dev/null; }
+have()       { command -v "$1" >/dev/null 2>&1; }
+# ---- end emit helpers
 
 # ---- privilege — DO NOT EDIT ------------------------------------------------
 # What a run can read depends on the privilege it was given: a fact about this
@@ -547,11 +549,7 @@ EOF
 }
 # ---- end collection completeness
 
-progress() { [ "$OPT_QUIET" = 1 ] && return; printf '>> %s\n' "$*" >&3 2>/dev/null; }
-
 # ---- reasoned-absence helpers -------------------------------------------------
-have() { command -v "$1" >/dev/null 2>&1; }
-
 _errfile=""
 CMD_TIMEOUT="${CMD_TIMEOUT:-15}"
 # Call after _run_init: the error file lives in the run's private directory.

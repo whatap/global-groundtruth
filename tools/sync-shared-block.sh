@@ -30,6 +30,7 @@ SKELETON="$ROOT/templates/collector-skeleton/collector-skeleton.sh"
 
 # name|banner regex|end regex, in skeleton order
 BLOCKS=(
+    'emit|^# ---- emit helpers — DO NOT EDIT|^# ---- end emit helpers$'
     'privilege|^# ---- privilege — DO NOT EDIT|^# ---- end privilege$'
     'boot|^# ---- boot time — DO NOT EDIT|^# ---- end boot time$'
     'run|^# ---- run helpers — DO NOT EDIT|^# ---- end run helpers$'

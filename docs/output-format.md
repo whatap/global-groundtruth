@@ -324,7 +324,7 @@ worth sending — not every value the collector happens to print. Resolve goals
 where the discovery variables are final, not inside a `| while` pipeline: that
 runs in a subshell and the assignment does not survive.
 
-The shared blocks (privilege, boot time, run helpers, completeness) are
+The shared blocks (emit helpers, privilege, boot time, run helpers, completeness) are
 identical in every shell collector and owned by the skeleton. Each runs from
 its `# ---- <name> — DO NOT EDIT` banner to its `# ---- end <name>` line.
 `tools/sync-shared-block.sh --check` reports drift; `--apply` re-copies them.

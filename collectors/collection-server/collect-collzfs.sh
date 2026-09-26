@@ -211,7 +211,10 @@ while [ $# -gt 0 ]; do
     shift
 done
 
-# ---- shared emit helpers (shape is fixed by the framework) ------------------
+# ---- emit helpers — DO NOT EDIT ---------------------------------------------
+# The report shape (../../docs/output-format.md): header, numbered sections,
+# facts, footer. progress narrates on fd 3 (the terminal saved in main), never
+# into the report, and --quiet silences it; keep its text a fact about the run.
 _section_n=0
 
 emit_header() {
@@ -224,16 +227,22 @@ emit_header() {
     printf '===============================================\n'
 }
 
-section() { _section_n=$((_section_n + 1)); printf '\n[%d] %s\n' "$_section_n" "$1"; progress "[$_section_n] $1"; }
+# section "A. TITLE" -> the next numbered section, [n] A. TITLE, narrated too
+section() {
+    _section_n=$((_section_n + 1))
+    printf '\n[%d] %s\n' "$_section_n" "$1"
+    progress "[$_section_n] $1"
+}
 subsection() { printf '\n    -- %s --\n' "$1"; }
-fact() { printf '    %s\n' "$1"; }
+fact()       { printf '    %s\n' "$1"; }
+emit_footer() { printf '\n==== END OF COLLECTION (no diagnosis by design) ====\n'; }
+progress()   { [ "$OPT_QUIET" = 1 ] && return; printf '>> %s\n' "$*" >&3 2>/dev/null; }
+have()       { command -v "$1" >/dev/null 2>&1; }
+# ---- end emit helpers
+
 blk() { printf '        %s\n' "$1"; }
 
-emit_footer() { printf '\n==== END OF COLLECTION (no diagnosis by design) ====\n'; }
-
 # ---- reasoned-absence helpers (see docs/collector-engineering.md) -----------
-have() { command -v "$1" >/dev/null 2>&1; }
-
 _errfile=""
 _init_errfile() { _errfile="$(_tmp probe.err)"; }
 _timeout_bin=""
@@ -813,12 +822,6 @@ dump_file() {
     if [ ! -s "$path" ]; then fact "(empty file)"; return; fi
     head -n "$cap" "$path" 2>/dev/null | while IFS= read -r _l || [ -n "$_l" ]; do blk "$_l"; done
 }
-
-
-# progress: operational narration to the terminal (fd 3, saved from stderr in main
-# before any stdout/stderr redirection). It NEVER lands in the report. Silenced by
-# --quiet. Keep the text a fact about collection state (no judgment words).
-progress() { [ "$OPT_QUIET" = 1 ] && return; printf '>> %s\n' "$*" >&3 2>/dev/null; }
 
 # run_bounded SECS CMD... -> stdout only, capped at SECS by _bounded (which also
 # honours the run deadline and works without timeout(1)). Returns 124 on a cap.
