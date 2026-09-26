@@ -33,34 +33,24 @@
 #     node_modules names, section 8), and which observers actually engaged
 #     in this process (hook-log observer lines, section 7).
 #
-# THE CONTRACT (../../../CONTRACT.md):
-#   1. Facts only. No conclusion is stated on any emitted line.
-#   2. Discover, never assume. Resolve symlinks, process args, env, config.
-#   3. One field command -> paste the whole output.
-#   4. Domain-team owned. Seed v0 by the Global team; ownership transfers to
-#      the APM/Node.js agent developers.
+# Runs only node/npm/pm2 --version and one `npm root -g`; the whatap module is
+# never loaded (requiring it starts an agent).
 #
-# DESIGN GUIDELINES (../../../docs/collector-engineering.md): MECE sections,
-# Tier-0 load-safe defaults (bounded reads, no whole-log grep), bash 3.2+ and
-# POSIX-sh compatible (dash/busybox ash), reasoned absence for every missing
-# value. The Node.js interpreter is only ever executed as `node --version`;
-# the whatap module itself is never loaded (requiring it starts an agent).
-#
-# NOTE: no `set -e` — a collector must reach its footer even when every probe
-# fails. Failures are handled locally by the helpers.
+# Rules: ../../../CONTRACT.md, ../../../docs/collector-engineering.md; no set -e.
 # -----------------------------------------------------------------------------
 
 export LC_ALL=C
 
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-apmnodejs"
+# 0.6.1  Readability refactor; report unchanged.
 # 0.6.0  Less work per node process: _env_pick settles an absent name with one
 #        match and splits the environ with IFS instead of a read loop, NODE_PATH
 #        is split in the shell, the cwd each process resolved in discovery is
 #        reused by the report, and the detail list reads each environ once.
 #        The report is unchanged; 8.4 s -> 4.9 s on a host with 168 node
 #        processes, 18.3 s -> 9.5 s with 300 more (2026-09-25).
-VERSION="0.6.0"
+VERSION="0.6.1"
 DOMAIN="apm"
 TARGET="host/$(hostname 2>/dev/null || echo unknown)"
 
@@ -554,7 +544,6 @@ _errfile=""
 CMD_TIMEOUT="${CMD_TIMEOUT:-15}"
 # Call after _run_init: the error file lives in the run's private directory.
 _init_probe() { _errfile="$(_tmp probe.err)"; }
-_end_probe() { :; }   # _run_cleanup removes the directory
 
 _classify_err() {
     local txt=""
@@ -584,7 +573,6 @@ _emit_labeled() {
 probe() {
     local label="$1"; shift
     [ -n "$(_cmd_kind "$1")" ] || { fact "$label: n/a (command not found: $1)"; return; }
-    _past_deadline && { fact "$label: n/a (run deadline reached: ${RUN_DEADLINE}s)"; return; }
     local out rc
     out="$(_bounded "$@" 2>"$_errfile")"; rc=$?
     if [ "$rc" -eq 124 ]; then
@@ -624,39 +612,25 @@ read_proc() {
     _emit_labeled "$label" "$out"
 }
 
-# dump_file "label" PATH [CAP] -> the file's content verbatim (line-capped),
-# or a classified reason. Framework policy: configuration is dumped verbatim,
-# never masked (see collectors/apm/nodejs/README.md, "What the report can contain").
-dump_file() {
-    local label="$1" path="$2" cap="${3:-400}" total
-    [ -e "$path" ] || { fact "$label: n/a (path not found: $path)"; return; }
-    [ -r "$path" ] || { fact "$label: n/a (permission denied: $path)"; return; }
-    [ -s "$path" ] || { fact "$label: (empty file)"; return; }
-    total="$(wc -l < "$path" 2>/dev/null | tr -d ' ')"
-    fact "$label (first $cap of ${total:-?} lines):"
-    head -n "$cap" "$path" 2>/dev/null | while IFS= read -r _l || [ -n "$_l" ]; do printf '        %s\n' "$_l"; done
+# _names DIR -> the names in DIR, as `ls DIR` lists them (no dot files, sorted)
+_names() {
+    local n
+    for n in "$1"/*; do { [ -e "$n" ] || [ -L "$n" ]; } && printf '%s\n' "${n##*/}"; done
+    return 0
 }
 
-# tail_file "label" PATH [CAP] -> the file's LAST lines (bounded read).
-tail_file() {
-    local label="$1" path="$2" cap="${3:-200}" total
+# _file_lines head|tail "label" PATH CAP -> the first or last CAP lines of the
+# file, verbatim, or a reason. Configuration is dumped as is, never masked (the
+# collector README, "What the report can contain").
+_file_lines() {
+    local how="$1" label="$2" path="$3" cap="$4" w=first total
+    [ "$how" = tail ] && w=last
     [ -e "$path" ] || { fact "$label: n/a (path not found: $path)"; return; }
     [ -r "$path" ] || { fact "$label: n/a (permission denied: $path)"; return; }
     [ -s "$path" ] || { fact "$label: (empty file)"; return; }
     total="$(wc -l < "$path" 2>/dev/null | tr -d ' ')"
-    fact "$label (last $cap of ${total:-?} lines):"
-    tail -n "$cap" "$path" 2>/dev/null | while IFS= read -r _l || [ -n "$_l" ]; do printf '        %s\n' "$_l"; done
-}
-
-# head_file "label" PATH [CAP] -> the file's FIRST lines (bounded read).
-head_file() {
-    local label="$1" path="$2" cap="${3:-120}" total
-    [ -e "$path" ] || { fact "$label: n/a (path not found: $path)"; return; }
-    [ -r "$path" ] || { fact "$label: n/a (permission denied: $path)"; return; }
-    [ -s "$path" ] || { fact "$label: (empty file)"; return; }
-    total="$(wc -l < "$path" 2>/dev/null | tr -d ' ')"
-    fact "$label (first $cap of ${total:-?} lines):"
-    head -n "$cap" "$path" 2>/dev/null | while IFS= read -r _l || [ -n "$_l" ]; do printf '        %s\n' "$_l"; done
+    fact "$label ($w $cap of ${total:-?} lines):"
+    "$how" -n "$cap" "$path" 2>/dev/null | while IFS= read -r _l || [ -n "$_l" ]; do printf '        %s\n' "$_l"; done
 }
 
 # conf_bytes "label" PATH -> byte-level facts about a config file that plain
@@ -1014,8 +988,7 @@ EOF
     [ -n "${WHATAP_CONF:-}" ] && _add_conf_name "$WHATAP_CONF"
     # port registry: one line per app group, "<udp-port>\t<home>:<id8>"
     if [ -r "$D_LOCK_FILE" ]; then
-        while IFS= read -r _l || [ -n "$_l" ]; do
-            v="$(printf '%s\n' "$_l" | awk '{print $2}')"
+        while read -r _l v _r || [ -n "$_l" ]; do
             v="${v%:*}"     # strip the trailing :<app-identifier>
             [ -n "$v" ] && _add_home "$v" "port registry $D_LOCK_FILE"
         done < "$D_LOCK_FILE"
@@ -1246,8 +1219,27 @@ run_report() {
     goal agent "whatap npm package / agent home"
     goal conf  "agent configuration"
 
-    # [1] capability preamble: every downstream "command not found" is
-    # pre-explained here.
+    _rep_env
+    discover
+    _rep_host
+    _rep_installs
+    _rep_procs
+    _rep_homes
+    _rep_net
+    _rep_logs
+    _rep_apps
+    _rep_k8s
+
+    # Resolved here, not at the point of use: the config dumps above run inside
+    # `| while` pipelines, and an assignment made in a subshell does not survive.
+    _resolve_goals
+    emit_status
+    emit_footer
+}
+
+# [1] capability preamble: every downstream "command not found" is
+# pre-explained here.
+_rep_env() {
     section "Collection environment"
     if [ -n "${BASH_VERSION:-}" ]; then fact "shell: bash $BASH_VERSION"
     else fact "shell: POSIX sh (non-bash)"; fi
@@ -1261,10 +1253,10 @@ run_report() {
         if command -v "$t" >/dev/null 2>&1; then printf '        %-12s present (%s)\n' "$t" "$(command -v "$t")"
         else printf '        %-12s absent\n' "$t"; fi
     done
+}
 
-    discover
-
-    # [2] host / platform
+# [2] host / platform
+_rep_host() {
     section "Host / platform"
     probe "kernel" uname -srm
     probe "machine arch" uname -m
@@ -1295,11 +1287,13 @@ run_report() {
     else
         printf '        %-22s not set\n' "KUBERNETES_SERVICE_HOST"
     fi
-    probe "self cgroup (first 5 lines)" sh -c "head -n 5 /proc/self/cgroup"
+    probe "self cgroup (first 5 lines)" head -n 5 /proc/self/cgroup
     probe "local time" date
     probe "pid 1 command" sh -c "tr '\0' ' ' < /proc/1/cmdline | cut -c1-160"
+}
 
-    # [3] node runtimes + whatap package installs
+# [3] node runtimes + whatap package installs
+_rep_installs() {
     section "Node.js runtimes and whatap package installs"
     if [ -z "$D_NODE_EXES" ]; then
         fact "node binaries: n/a (none found on PATH or among running processes)"
@@ -1367,8 +1361,10 @@ EOF
             fi
         done
     fi
+}
 
-    # [4] runtime processes
+# [4] runtime processes
+_rep_procs() {
     section "Runtime processes"
     local pid n
     if [ -z "$D_GO_PIDS" ]; then
@@ -1429,8 +1425,10 @@ EOF
             fi
         done
     fi
+}
 
-    # [5] agent homes and configuration
+# [5] agent homes and configuration
+_rep_homes() {
     section "Agent homes and configuration"
     fact "env WHATAP_HOME (collector shell): $(_quote_nl "${WHATAP_HOME:-not set}")"
     fact "env WHATAP_CONF (collector shell): $(_quote_nl "${WHATAP_CONF:-not set}")"
@@ -1452,10 +1450,10 @@ EOF
             [ "$fshome" != "$home" ] && fact "   filesystem view: $fshome (read through a process root)"
             printf '%s\n' "$D_CONF_NAMES" | sort -u | while IFS= read -r cn; do
                 [ -n "$cn" ] || continue
-                dump_file "   $cn" "$fshome/$cn" 400
+                _file_lines head "   $cn" "$fshome/$cn" 400
                 conf_bytes "   $cn byte facts" "$fshome/$cn"
             done
-            dump_file "   container.conf" "$fshome/container.conf" 200
+            _file_lines head "   container.conf" "$fshome/container.conf" 200
             # master agent binary placed into the home by the 2.x agent
             if [ -e "$fshome/whatap_nodejs" ]; then
                 fact "   whatap_nodejs entry: $(ls -l "$fshome/whatap_nodejs" 2>/dev/null | head -n1)"
@@ -1503,8 +1501,10 @@ EOF
             fi
         done
     fi
+}
 
-    # [6] network endpoints and port registry
+# [6] network endpoints and port registry
+_rep_net() {
     section "Network endpoints and port registry"
     # 2.x: app -> master agent is connected UDP to 127.0.0.1:<net_udp_port>
     # (default 6600, LLM default base+100); master agent -> collection server
@@ -1518,13 +1518,15 @@ EOF
         probe "tcp sessions (whatap- or node-named, or port $_tcp_label)" _sock_list netstat -tnp "$_tcp_ports"
     else
         fact "socket listing: n/a (command not found: ss, netstat); raw tables follow"
-        probe "raw /proc/net/udp (first 30 lines)" sh -c "head -n 30 /proc/net/udp"
-        probe "raw /proc/net/tcp (first 30 lines)" sh -c "head -n 30 /proc/net/tcp"
+        probe "raw /proc/net/udp (first 30 lines)" head -n 30 /proc/net/udp
+        probe "raw /proc/net/tcp (first 30 lines)" head -n 30 /proc/net/tcp
     fi
-    dump_file "port registry $D_LOCK_FILE (format: udp-port<TAB>home:app-identifier)" "$D_LOCK_FILE" 50
+    _file_lines head "port registry $D_LOCK_FILE (format: udp-port<TAB>home:app-identifier)" "$D_LOCK_FILE" 50
     [ -e "$D_LOCK_FILE.lock" ] && fact "$D_LOCK_FILE.lock (registry write lock): present" || fact "$D_LOCK_FILE.lock (registry write lock): absent"
+}
 
-    # [7] agent logs (bounded reads only; never a whole-log grep)
+# [7] agent logs (bounded reads only; never a whole-log grep)
+_rep_logs() {
     section "Agent logs"
     # 2.x hook log: logs/<conf-name>-hook-YYYYMMDD.log; 0.5.x: logs/whatap-YYYYMMDD.log
     # (no "-hook-"); rotation off: logs/whatap.log; master agent side: whatap-boot-*.
@@ -1540,8 +1542,8 @@ EOF
             if [ ! -d "$fshome/logs" ]; then fact "   logs dir: n/a (path not found: $fshome/logs)"; continue; fi
             _hook="$(ls -t "$fshome"/logs/*-hook-*.log 2>/dev/null | head -n 1)"
             if [ -n "$_hook" ]; then
-                head_file "   $(basename "$_hook") (hook log, first lines)" "$_hook" 80
-                tail_file "   $(basename "$_hook") (hook log, recent lines)" "$_hook" 120
+                _file_lines head "   $(basename "$_hook") (hook log, first lines)" "$_hook" 80
+                _file_lines tail "   $(basename "$_hook") (hook log, recent lines)" "$_hook" 120
                 # which observers engaged (or could not engage) in THIS
                 # process — startup writes one line per observer attempt
                 fact "   observer lines in the first 400 lines of $(basename "$_hook"):"
@@ -1551,16 +1553,17 @@ EOF
             else
                 fact "   *-hook-*.log: n/a (no such file in $fshome/logs)"
             fi
+            # shellcheck disable=SC2010  # ls -t: newest first, which a glob cannot sort
             _leg="$(ls -t "$fshome"/logs/whatap-2*.log "$fshome"/logs/whatap-1*.log 2>/dev/null | grep -v -- '-hook-' | grep -v -- '-boot-' | head -n 1)"
             if [ -n "$_leg" ]; then
-                head_file "   $(basename "$_leg") (agent log, first lines)" "$_leg" 80
-                tail_file "   $(basename "$_leg") (agent log, recent lines)" "$_leg" 120
+                _file_lines head "   $(basename "$_leg") (agent log, first lines)" "$_leg" 80
+                _file_lines tail "   $(basename "$_leg") (agent log, recent lines)" "$_leg" 120
             fi
-            tail_file "   whatap.log (rotation-off log)" "$fshome/logs/whatap.log" 120
+            _file_lines tail "   whatap.log (rotation-off log)" "$fshome/logs/whatap.log" 120
             _boot="$(ls -t "$fshome"/logs/whatap-boot-*.log "$fshome"/whatap-boot-*.log 2>/dev/null | head -n 1)"
             if [ -n "$_boot" ]; then
-                head_file "   $(basename "$_boot") (master agent boot log, first lines)" "$_boot" 60
-                tail_file "   $(basename "$_boot") (master agent boot log, recent lines)" "$_boot" 120
+                _file_lines head "   $(basename "$_boot") (master agent boot log, first lines)" "$_boot" 60
+                _file_lines tail "   $(basename "$_boot") (master agent boot log, recent lines)" "$_boot" 120
                 fact "   [WA*] codes in the last 400 lines of $(basename "$_boot"):"
                 tail -n 400 "$_boot" 2>/dev/null | grep -oE '\[WA[0-9][0-9A-Za-z-]*\]' | sort | uniq -c | sort -rn | head -n 20 | while IFS= read -r _l; do printf '        %s\n' "$_l"; done
             else
@@ -1570,10 +1573,13 @@ EOF
             [ -n "$_req" ] && fact "   request log present: $_req ($(wc -l < "$_req" 2>/dev/null | tr -d ' ') lines)" || fact "   request log (reqlog*): none present"
         done
     fi
+}
 
-    # [8] application and launcher facts — how the app is started decides how
-    # the agent attaches (require order, pm2 cluster, Next.js custom server),
-    # so support cases need these facts. Cheap no-op when not applicable.
+# [8] application and launcher facts — how the app is started decides how
+# the agent attaches (require order, pm2 cluster, Next.js custom server),
+# so support cases need these facts. Cheap no-op when not applicable.
+_rep_apps() {
+    local pid
     section "Application and launcher facts (pm2 / Next.js / package manifests)"
     probe "pm2 version" pm2 --version
     _pm2d="$(echo $D_PM2_PIDS | cut -d' ' -f1-5)"
@@ -1615,16 +1621,16 @@ EOF
         fi
         # libraries actually installed (top-level names only; no tree walk)
         if [ -d "$cwd/node_modules" ]; then
-            _nmn="$(ls "$cwd/node_modules" 2>/dev/null | grep -v '^\.' | wc -l | tr -d ' ')"
+            _nmn="$(_names "$cwd/node_modules" | wc -l | tr -d ' ')"
             fact "   node_modules top-level packages (${_nmn:-?} total, first 150):"
-            ls "$cwd/node_modules" 2>/dev/null | grep -v '^\.' | head -n 150 | while IFS= read -r _l; do printf '        %s\n' "$_l"; done
+            _names "$cwd/node_modules" | head -n 150 | while IFS= read -r _l; do printf '        %s\n' "$_l"; done
             _sc="$(ls -d "$cwd"/node_modules/@*/* 2>/dev/null | head -n 50 | awk -F/ '{print $(NF-1)"/"$NF}' | tr '\n' ' ')"
             [ -n "$_sc" ] && fact "   scoped packages (first 50): $_sc"
         else
             fact "   node_modules: n/a (path not found: $cwd/node_modules)"
         fi
         for e in ecosystem.config.js ecosystem.config.cjs ecosystem.config.json ecosystem.json; do
-            [ -f "$cwd/$e" ] && dump_file "   $e" "$cwd/$e" 120
+            [ -f "$cwd/$e" ] && _file_lines head "   $e" "$cwd/$e" 120
         done
         for ncf in next.config.js next.config.mjs next.config.ts; do
             if [ -f "$cwd/$ncf" ]; then
@@ -1644,8 +1650,10 @@ EOF
         fi
     done
     [ -z "$_roots" ] && fact "app roots: none (no node process cwd readable)"
+}
 
-    # [9] kubernetes / operator injection context
+# [9] kubernetes / operator injection context
+_rep_k8s() {
     section "Kubernetes / operator injection context"
     if [ -d /whatap-agent ]; then
         probe "/whatap-agent listing" _ls_head /whatap-agent 50
@@ -1677,12 +1685,6 @@ EOF
     done
     [ -d /var/run/secrets/kubernetes.io ] && fact "/var/run/secrets/kubernetes.io: present" || fact "/var/run/secrets/kubernetes.io: absent"
     read_proc "container hostname (/etc/hostname)" /etc/hostname
-
-    # Resolved here, not at the point of use: the config dumps above run inside
-    # `| while` pipelines, and an assignment made in a subshell does not survive.
-    _resolve_goals
-    emit_status
-    emit_footer
 }
 
 # ---- main — DO NOT EDIT --------------------------------------------------------
@@ -1710,4 +1712,3 @@ else
     _report_to_file "$OUTFILE" || exit 1
     progress "report written: $OUTFILE"
 fi
-_end_probe

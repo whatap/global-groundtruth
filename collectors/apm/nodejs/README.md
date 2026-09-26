@@ -134,7 +134,7 @@ capped process/binary detail), every external command capped at 15 s and the
 whole run at `RUN_DEADLINE` (300 s). `/proc` is read in one pass for every pid
 (about 7 s on a 714-process host with 163 node processes, down from 31 s). The
 only processes executed are standard tools plus `node --version`,
-`npm --version` and one `npm root -g`; the whatap module is never loaded. No
+`npm --version`, `pm2 --version` and one `npm root -g`; the whatap module is never loaded. No
 `--bundle` tier yet; copy the bundle plumbing from `collect-collserver.sh` if
 the domain team needs raw log artifacts.
 
