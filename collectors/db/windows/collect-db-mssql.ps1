@@ -24,11 +24,27 @@ param(
     [switch]$File,
     [switch]$Stdout,
     [switch]$Quiet,
+    [switch]$Help,
     # Not "$Home": PowerShell variables are case-insensitive, so a parameter
     # named Home is the read-only automatic $HOME and every run died with
-    # "Cannot overwrite variable Home" (0.2.0). -Home still binds, as an alias.
-    [Alias("Home")]
-    [string[]]$AgentHome = @()
+    # "Cannot overwrite variable Home" (collect-db-mssql.ps1 0.2.0).
+    [string[]]$AgentHome = @(),
+    # -Out DIR: a switch, and its directory is read from the arguments below.
+    # Not a string parameter: then a -Out with no value is PowerShell's
+    # "Missing an argument", not this script's usage. It must be declared:
+    # undeclared, -Out is an ambiguous prefix of -OutVariable / -OutBuffer.
+    # Named OutFlag with the alias Out: a variable $Out would be the same
+    # variable as any $out in the script and turn a path into "True".
+    [Alias("Out")]
+    [switch]$OutFlag,
+    # everything else, read below: -Home DIR (not declared, so that -h means
+    # -Help alone and a -Home with no value is a usage error), the directory
+    # of -Out, the shell collectors' spellings (--stdout, --file, --quiet,
+    # --help, -h, --home DIR, --out DIR, --home=DIR, --out=DIR), and anything
+    # unknown, which stops the run with usage on stderr and exit 2, as the
+    # shell CLI does
+    [Parameter(ValueFromRemainingArguments = $true)]
+    [string[]]$Rest = @()
 )
 
 $COLLECTOR_NAME = "whatap-db-mssql"
@@ -37,13 +53,32 @@ $COLLECTOR_NAME = "whatap-db-mssql"
 #        and where the time went, as the shell collectors do. CIM queries go
 #        through Get-CimBounded; CMD_TIMEOUT and RUN_DEADLINE are read from the
 #        environment.
-$VERSION        = "0.4.0"
+# 0.5.0  First runs on a real Windows host (Windows Server 2022 Standard Eval
+#        20348, Windows PowerShell 5.1 and pwsh 7.6, elevated and not). The
+#        report file is UTF-8 without a BOM with LF line ends (5.1 wrote a BOM,
+#        both wrote CRLF, and validate.sh --report failed them). The host load
+#        reads raw CPU counters (Win32_Processor took 4-5 s and left every
+#        field n/a). One CIM probe with room for a refusal decides whether
+#        WMI refuses this logon; later refusals are per class. TCP probes are
+#        timed, deadline-bound and made once per endpoint. Timestamps have one
+#        format. Conf files are read as UTF-8 (in the culture's ANSI code
+#        page only when the bytes are not UTF-8). -Out DIR (the shell --out) writes the report elsewhere
+#        and is checked for writing before the run; -Help and -h print the
+#        usage; -Home DIR adds an install dir; the shell spellings
+#        --file/--stdout/--quiet/--help/--home/--out (and --x=DIR) work; an
+#        unknown argument or a --home/--out without a value prints usage to
+#        stderr and exits 2.
+#        Scheduled tasks come from schtasks and IPv4 addresses from the .NET
+#        interface list (the cmdlets' module imports cost 1.4-5.5 s); sqlservr
+#        processes come from the process inventory with their instance
+#        argument; an empty service or task list says "none".
+$VERSION        = "0.5.0"
 $DOMAIN         = "db"
 $CompName = $env:COMPUTERNAME; if (-not $CompName) { $CompName = [Environment]::MachineName }
 $TARGET         = "db-host/$CompName"
 
-if (-not $File -and -not $Stdout) {
-    Write-Output @"
+function Usage {
+    return @"
 $COLLECTOR_NAME $VERSION -- a WhaTap Global Groundtruth collector (facts only).
 Target: a Windows host running the WhaTap DBX agent for SQL Server.
 A collection needs an explicit action flag so nothing starts by accident.
@@ -52,18 +87,90 @@ A collection needs an explicit action flag so nothing starts by accident.
   .\collect-db-mssql.ps1 -File           write report -> .\$COLLECTOR_NAME-<host>-<UTC>.txt
   .\collect-db-mssql.ps1 -Stdout         print report to stdout
   .\collect-db-mssql.ps1 -Quiet ...      silence progress narration
-  .\collect-db-mssql.ps1 -AgentHome <dir> add an agent install dir (repeatable via array)
+  .\collect-db-mssql.ps1 -Home <dir>     add an agent install dir, repeatable (also -AgentHome)
+  .\collect-db-mssql.ps1 -File -Out <dir> write the report into <dir> (default: the current directory)
+  .\collect-db-mssql.ps1 -Help | -h      print this help
+The shell spellings --file, --stdout, --quiet, --home <dir>, --out <dir> and --help work too.
 
 Companion SQL pack: windows\mssql.sql, run through sqlcmd with the monitoring
 account (the command is in README.md); paste its output with this report.
 "@
+}
+# pwsh 7 hands "--out=C:\x" over as "--out=C" and "\x", the drive colon
+# dropped: such a pair is put back together
+$_rest = New-Object System.Collections.Generic.List[string]
+foreach ($_ra in @($Rest)) {
+    $_rs = "$_ra"; $_rl = $_rest.Count - 1
+    if ($_rl -ge 0 -and $_rs -match '^[\\/]' -and $_rest[$_rl] -match '^--?(out|home)=[A-Za-z]$') { $_rest[$_rl] += ":" + $_rs }
+    elseif ($_rl -ge 0 -and $_rs -match '^[\\/]' -and $_rest[$_rl] -match '^--?(out|home)=[A-Za-z]:$') { $_rest[$_rl] += $_rs }
+    else { $_rest.Add($_rs) }
+}
+$OutPath = ""; $wantHelp = $false; $badArg = @(); $_loose = @()
+for ($_ci = 0; $_ci -lt $_rest.Count; $_ci++) {
+    $_ca = $_rest[$_ci]
+    if ($_ca -in @('--help', '-help', '-h', '/?')) { $wantHelp = $true }
+    elseif ($_ca -eq '--file')   { $File = [switch]$true }
+    elseif ($_ca -eq '--stdout') { $Stdout = [switch]$true }
+    elseif ($_ca -eq '--quiet')  { $Quiet = [switch]$true }
+    elseif ($_ca -in @('--home', '-home')) {
+        if ($_ci + 1 -ge $_rest.Count) { $badArg += "$_ca (needs a directory)"; continue }
+        $_ci++; $AgentHome += $_rest[$_ci]
+    }
+    elseif ($_ca -match '^--?home[=:](.+)$') { $AgentHome += $Matches[1] }
+    elseif ($_ca -match '^--?out[=:](.+)$') { $OutPath = $Matches[1] }
+    elseif ($_ca -notmatch '^-') { $_loose += $_ca }
+    else { $badArg += $_ca }
+}
+# -Out / --out bind the switch; the directory is the one argument left over
+if ($OutFlag -and -not $OutPath) {
+    if ($_loose.Count -ge 1) { $OutPath = $_loose[0]; $_loose = @($_loose | Select-Object -Skip 1) }
+    else { $badArg += "-Out (needs a directory)" }
+}
+$badArg += $_loose
+if ($badArg.Count -gt 0) {
+    [Console]::Error.WriteLine("unknown argument: " + ($badArg -join ' '))
+    [Console]::Error.WriteLine((Usage))
+    exit 2
+}
+if ($Help -or $wantHelp -or (-not $File -and -not $Stdout)) {
+    Write-Output (Usage)
     exit 0
+}
+# The report directory: -Out, else the current file-system location. Checked
+# before anything is collected, by creating and removing a file in it, so a
+# mistyped or read-only directory costs no run.
+$OutDir = (Get-Location -PSProvider FileSystem).ProviderPath
+if ($OutPath) {
+    try { $OutDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutPath) } catch { $OutDir = $OutPath }
+    # Test-Path throws, in Windows PowerShell 5.1, for a path with characters
+    # a path cannot hold; that is a directory that is not there either
+    $isDir = $false; try { $isDir = Test-Path -LiteralPath $OutDir -PathType Container -ErrorAction Stop } catch { }
+    if (-not $isDir) {
+        [Console]::Error.WriteLine("!! output directory not found: $OutDir")
+        exit 1
+    }
+}
+if (-not $Stdout) {
+    $_wp = Join-Path $OutDir (".whatap-write-test-" + [guid]::NewGuid().ToString('N'))
+    try { [System.IO.File]::WriteAllText($_wp, ""); [System.IO.File]::Delete($_wp) }
+    catch {
+        $_wx = $_.Exception; while ($_wx.InnerException) { $_wx = $_wx.InnerException }
+        [Console]::Error.WriteLine("!! output directory not writable: $OutDir ($($_wx.Message))")
+        exit 1
+    }
 }
 
 $script:SectionN = 0
 $script:Lines = New-Object System.Collections.Generic.List[string]
 
-function Emit([string]$s) { $script:Lines.Add($s) }
+# a carriage return inside a line (an event message, a verbatim file line) is
+# dropped, so the report stays LF-only; the byte facts of a conf count CRs
+function Emit([string]$s) { $script:Lines.Add(($s -replace "`r", "")) }
+# Fmt-Time DATETIME -> yyyy-MM-dd HH:mm:ss (local time), the one format of every
+# timestamp in the report. A DateTime interpolated into a string comes out as
+# MM/dd/yyyy, and one formatted with -f in the current culture: on a Korean
+# Windows that puts non-ASCII AM/PM words in the report (0.4.0 mixed both).
+function Fmt-Time($d) { if ($d -is [DateTime]) { return $d.ToString('yyyy-MM-dd HH:mm:ss') } return "n/a" }
 function Fact([string]$s) { Emit ("    " + $s) }
 function FactBlock([string]$label, $body) {
     $arr = @($body | Where-Object { $_ -ne $null } | ForEach-Object { "$_" })
@@ -337,26 +444,41 @@ function Invoke-BoundedBlock([scriptblock]$sb, [object[]]$argList = @(), [int]$s
 # Get-CimBounded CLASS [FILTER] [SECONDS] -> the instances of a CIM class, the
 # query limited by -OperationTimeoutSec, skipped past the deadline, and timed.
 # A query that fails once its time is up throws "timed out: Ns" like the others.
+# Fail fast: once WMI has refused this run ("Access denied") before any query
+# of it succeeded, later queries throw the same refusal without asking again;
+# a refusal after a success is that class's own (Win32_Service is refused to
+# a not elevated local logon that reads every other class). A non-administrator
+# logged on over OpenSSH (a network logon) waited 5 s for each refusal, 25 s of
+# a 36 s run, while the same account in a local logon read every class (0.4.0,
+# Windows Server 2022). The first query is the probe below.
+$script:CimDenied = ""; $script:CimOk = $false
 function Get-CimBounded([string]$class, [string]$filter = "", [int]$sec = 0) {
+    if ($script:CimDenied) { throw "$($script:CimDenied) (WMI refused this run earlier; not asked again)" }
     $req = $sec; if ($req -le 0) { $req = $script:CMD_TIMEOUT }
     try { $sec = Bounded-Seconds $req } catch { Time-Log 0 "not run" "Get-CimInstance" @($class); throw }
     $sw = [System.Diagnostics.Stopwatch]::StartNew(); $kind = "ran"
     try {
         $a = @{ ClassName = $class; OperationTimeoutSec = $sec; ErrorAction = 'Stop' }
         if ($filter) { $a.Filter = $filter }
-        return @(Get-CimInstance @a)
+        $r = @(Get-CimInstance @a); $script:CimOk = $true
+        return $r
     } catch {
+        $m = "$($_.Exception.Message)".Split("`n")[0].Trim()
+        if ($_.Exception -is [System.UnauthorizedAccessException] -or $m -match '^Access (is )?denied') { if (-not $script:CimOk) { $script:CimDenied = $m }; throw $m }
         if ($sw.ElapsedMilliseconds -ge [long]$sec * 1000 - 250) { $kind = Cap-Kind $sec $req; Bounded-Timeout $sec }
         throw
     } finally { Time-Log $sw.ElapsedMilliseconds $kind "Get-CimInstance" @($class) }
 }
 
 # Host-Load -> one line, the Windows counterpart of the shell _host_load: CPU
-# load, processor queue length, disk queue length, available memory. Read at
-# the start and, when Emit-Status names slow calls, at the end. Four CIM reads
-# of instantaneous values, so one read needs no second sample:
-#   Win32_Processor.LoadPercentage (averaged over the last second; the mean over
-#     sockets), not "% Processor Time", which needs two samples;
+# busy, processor queue length, disk queue length, available memory. Read at
+# the start and, when Emit-Status names slow calls, at the end. CIM reads of
+# raw counters, which cost tens of milliseconds each:
+#   Win32_PerfRawData_PerfOS_Processor(_Total).PercentProcessorTime, read twice
+#     250 ms apart: busy = 100 * (1 - d(idle ticks) / d(Timestamp_Sys100NS)).
+#     Not Win32_Processor.LoadPercentage: WMI samples each processor for about
+#     a second in turn, and on a 4-vCPU Windows Server 2022 VM one read took
+#     4.2-5.5 s, used up the shared budget and left every field n/a (0.5.0);
 #   Win32_PerfRawData_PerfOS_System.ProcessorQueueLength and
 #   Win32_PerfRawData_PerfDisk_PhysicalDisk(_Total).CurrentDiskQueueLength,
 #     raw gauges, so the raw class is exact and skips the formatted class's
@@ -367,19 +489,27 @@ function Get-CimBounded([string]$class, [string]$filter = "", [int]$sec = 0) {
 # non-English Windows. The reads share 4 seconds; what is left after that is n/a.
 function Host-Load {
     if (-not (Get-Command Get-CimInstance -ErrorAction SilentlyContinue)) { return "n/a (Get-CimInstance is not available in this runtime)" }
+    if ($script:CimDenied) { return "n/a ($($script:CimDenied): WMI refused this run)" }
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     $q = {
         param($class, $filter)
         $left = 4 - [int][Math]::Floor($sw.Elapsed.TotalSeconds)
-        if ($left -le 0) { return $null }
+        if ($left -le 0 -or $script:CimDenied) { return $null }
         $a = @{ ClassName = $class; OperationTimeoutSec = $left; ErrorAction = 'Stop' }
         if ($filter) { $a.Filter = $filter }
         try { return @(Get-CimInstance @a) } catch { return $null }
     }
     $parts = @()
-    $r = & $q "Win32_Processor" ""
-    $v = @($r | Where-Object { $null -ne $_.LoadPercentage } | ForEach-Object { [double]$_.LoadPercentage })
-    $parts += $(if ($v.Count -gt 0) { "cpu load {0}%" -f [int][Math]::Round(($v | Measure-Object -Average).Average) } else { "cpu load n/a" })
+    $c0 = & $q "Win32_PerfRawData_PerfOS_Processor" "Name='_Total'"
+    if ($c0) { Start-Sleep -Milliseconds 250 }
+    $c1 = $(if ($c0) { & $q "Win32_PerfRawData_PerfOS_Processor" "Name='_Total'" } else { $null })
+    $busy = "cpu busy n/a"
+    if ($c0 -and $c1) {
+        $dt = [double]@($c1)[0].Timestamp_Sys100NS - [double]@($c0)[0].Timestamp_Sys100NS
+        $di = [double]@($c1)[0].PercentProcessorTime - [double]@($c0)[0].PercentProcessorTime
+        if ($dt -gt 0) { $busy = "cpu busy {0}% (250 ms sample)" -f [int][Math]::Round([Math]::Min(100, [Math]::Max(0, 100 * (1 - $di / $dt)))) }
+    }
+    $parts += $busy
     $r = & $q "Win32_PerfRawData_PerfOS_System" ""
     $parts += $(if ($r) { "processor queue $(@($r)[0].ProcessorQueueLength)" } else { "processor queue n/a" })
     $r = & $q "Win32_PerfRawData_PerfDisk_PhysicalDisk" "Name='_Total'"
@@ -387,6 +517,16 @@ function Host-Load {
     $r = & $q "Win32_OperatingSystem" ""
     $parts += $(if ($r) { "mem available {0} of {1} MiB" -f [int64][Math]::Floor(@($r)[0].FreePhysicalMemory / 1024), [int64][Math]::Floor(@($r)[0].TotalVisibleMemorySize / 1024) } else { "mem n/a" })
     return ($parts -join "; ")
+}
+# Cim-Probe: one Win32_OperatingSystem read before anything else asks WMI,
+# with room for WMI's refusal of a network logon (about 5 s; the host load's
+# 4 s ran out first and said "Timed out", 0.5.0 lab check). A refusal of this
+# basic class is WMI refusing the logon, so later CIM reads fail at once; a
+# host that refuses only some classes is not affected. The instance is kept
+# for the boot time, so the probe costs no extra round trip.
+$script:CimOS = $null
+if (Get-Command Get-CimInstance -ErrorAction SilentlyContinue) {
+    try { $script:CimOS = @(Get-CimBounded Win32_OperatingSystem "" 10)[0] } catch { }
 }
 $script:Load0 = Host-Load
 
@@ -404,7 +544,7 @@ function Priv-Hint { if ($script:PRIV_GAP) { return " (not elevated: $($script:P
 # wraps after 24.9 days, so it is not used).
 function Note-Boot {
     $boot = $null; $why = ""
-    try { $boot = (Get-CimBounded Win32_OperatingSystem).LastBootUpTime }
+    try { $boot = $(if ($script:CimOS) { $script:CimOS.LastBootUpTime } else { (Get-CimBounded Win32_OperatingSystem).LastBootUpTime }) }
     catch { $why = $_.Exception.Message.Split("`n")[0] }
     $now = (Get-Date).ToUniversalTime()
     if ($boot) {
@@ -554,35 +694,86 @@ function TryFact([string]$label, [scriptblock]$sb) {
         else { Fact "${label}: n/a (error: $m)" }
     }
 }
+# Read-Lines PATH -> the file's lines, decoded as UTF-8 (a BOM is dropped),
+# else, when the bytes are not valid UTF-8, in the ANSI code page, with
+# $script:ReadNote saying so. Not Get-Content's default: Windows PowerShell 5.1
+# decodes a file without a BOM in the ANSI code page, and the Korean comment of
+# a BOM-less UTF-8 whatap.conf arrived garbled in the verbatim dump (0.5.0 lab
+# check). Reads at most 1 MiB, the size of no conf file.
+$script:ReadNote = ""
+function Read-Lines([string]$path) {
+    $script:ReadNote = ""
+    $fs = [System.IO.File]::Open($path, 'Open', 'Read', 'ReadWrite')
+    try {
+        $len = [int][Math]::Min($fs.Length, 1048576)
+        $b = New-Object byte[] $len; $got = 0
+        while ($got -lt $len) { $n = $fs.Read($b, $got, $len - $got); if ($n -le 0) { break }; $got += $n }
+        if ($fs.Length -gt $len) { $script:ReadNote = "first 1 MiB read" }
+    } finally { $fs.Close() }
+    $off = 0; if ($got -ge 3 -and $b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF) { $off = 3 }
+    try { $txt = (New-Object System.Text.UTF8Encoding $false, $true).GetString($b, $off, $got - $off) }
+    catch {
+        # the ANSI code page of the current culture, not Encoding.Default,
+        # which is UTF-8 under pwsh 7 (a cp1252 "caf\xE9" came out "caf?");
+        # .NET Core has the legacy code pages only through CodePagesEncodingProvider
+        $cp = [System.Globalization.CultureInfo]::CurrentCulture.TextInfo.ANSICodePage
+        try { [System.Text.Encoding]::RegisterProvider([System.Text.CodePagesEncodingProvider]::Instance) } catch { }
+        try { $enc = [System.Text.Encoding]::GetEncoding($cp) } catch { $enc = [System.Text.Encoding]::GetEncoding(28591); $cp = 28591 }
+        $txt = $enc.GetString($b, 0, $got)
+        $script:ReadNote = (@($script:ReadNote, "not valid UTF-8, read in code page $cp") | Where-Object { $_ }) -join "; "
+    }
+    if ($txt -eq "") { return }
+    return ($txt.TrimEnd("`r", "`n") -split "`r`n|`n|`r")
+}
 function DumpFile([string]$label, [string]$path, [int]$max = 400) {
     if (-not (Test-Path -LiteralPath $path)) { Fact "${label}: n/a (path not found: $path)"; return }
     try {
-        $content = Get-Content -LiteralPath $path -ErrorAction Stop
+        $content = @(Read-Lines $path)
         $total = @($content).Count
-        $shown = if ($total -gt $max) { " , first $max shown" } else { "" }
+        if ($total -eq 0) { Fact "${label}: (empty file)"; return }
+        $shown = if ($total -gt $max) { ", first $max shown" } else { "" }
+        if ($script:ReadNote) { $shown += ", $($script:ReadNote)" }
         Fact "$label (verbatim, $total lines$shown):"
         @($content)[0..([Math]::Min($total, $max) - 1)] | ForEach-Object { Emit ("        " + $_) }
     } catch { Fact "${label}: n/a (permission denied or unreadable: $path)" }
 }
 function ConfGet([string]$path, [string]$key) {
     if (-not (Test-Path -LiteralPath $path)) { return $null }
-    $m = Get-Content -LiteralPath $path -ErrorAction SilentlyContinue |
+    $m = Get-Content -LiteralPath $path -Encoding UTF8 -ErrorAction SilentlyContinue |
          Where-Object { $_ -match "^\s*$key\s*=" } | Select-Object -Last 1
     if ($m) { return ($m -split '=', 2)[1].Trim() }
     return $null
 }
+# TcpProbe: one TCP connect, bounded like any other call. It is timed and
+# logged as "tcp-connect", honours RUN_DEADLINE, and a connect that gets no
+# answer is logged as capped: two unanswered probes spent 10 s of a 16 s run
+# outside every other log line (0.4.0, Windows Server 2022 lab host). An
+# endpoint is probed once per run; a second conf naming it gets the first
+# answer (Windows retries a refused connect, about 2 s each).
+$script:TcpSeen = @{}
 function TcpProbe([string]$label, [string]$dbhost, [int]$port, [int]$timeoutSec = 5) {
     if (-not $dbhost -or -not $port) { Fact "${label}: n/a (not applicable: host/port not set)"; return }
+    $key = "${dbhost}:$port".ToLowerInvariant()
+    if ($script:TcpSeen.ContainsKey($key)) { Fact "${label}: $($script:TcpSeen[$key]) (probed once above)"; return }
+    $req = $timeoutSec
+    try { $timeoutSec = Bounded-Seconds $req } catch { Time-Log 0 "not run" "tcp-connect"; Fact "${label}: tcp connect to ${dbhost}:$port n/a ($($_.Exception.Message))"; return }
+    $sw = [System.Diagnostics.Stopwatch]::StartNew(); $kind = "ran"
+    $c = New-Object System.Net.Sockets.TcpClient
     try {
-        $c = New-Object System.Net.Sockets.TcpClient
         $t = $c.BeginConnect($dbhost, $port, $null, $null)
-        if ($t.AsyncWaitHandle.WaitOne($timeoutSec * 1000) -and $c.Connected) {
-            Fact "${label}: tcp connect to ${dbhost}:$port succeeded"
+        if (-not $t.AsyncWaitHandle.WaitOne($timeoutSec * 1000)) {
+            $kind = Cap-Kind $timeoutSec $req
+            $r = "tcp connect to ${dbhost}:$port did not connect within ${timeoutSec}s"
         } else {
-            Fact "${label}: tcp connect to ${dbhost}:$port did not connect within ${timeoutSec}s"
+            $c.EndConnect($t)
+            $r = "tcp connect to ${dbhost}:$port succeeded"
         }
-        $c.Close()
-    } catch { Fact "${label}: tcp connect to ${dbhost}:$port did not connect ($($_.Exception.Message.Split("`n")[0]))" }
+    } catch {
+        $x = $_.Exception; while ($x.InnerException) { $x = $x.InnerException }
+        $r = "tcp connect to ${dbhost}:$port did not connect ($($x.Message.Split("`n")[0]))"
+    } finally { $c.Close(); Time-Log $sw.ElapsedMilliseconds $kind "tcp-connect" }
+    $script:TcpSeen[$key] = $r
+    Fact "${label}: $r"
 }
 
 # ---- discovery ---------------------------------------------------------------
@@ -594,7 +785,7 @@ try {
     $allProc = @(Get-CimBounded Win32_Process)
     $agentProcs = @($allProc | Where-Object { $_.CommandLine -match 'whatap\.agent\.(dbx|dmx|prx|xos)' -or $_.CommandLine -match 'dbxc' })
     $javaUnread = @($allProc | Where-Object { $_.Name -match '^javaw?\.exe$' -and -not $_.CommandLine })
-} catch { $allProc = $null; $procErr = $_.Exception.Message.Split("`n")[0] }
+} catch { $allProc = $null; $procErr = $_.Exception.Message.Split("`n")[0].Trim() }
 
 # Install dirs come from an absolute whatap.agent jar path in the command line,
 # or a -Dwhatap.home= property. The java.exe path is the runtime, not the agent
@@ -687,11 +878,16 @@ else { Fact "whatap agent processes found: $($agentProcs.Count)" }
 Fact "java processes whose command line was not readable: $($javaUnread.Count)"
 foreach ($p in $agentProcs) {
     $cl = if ($p.CommandLine.Length -gt 180) { $p.CommandLine.Substring(0,180) + " ..." } else { $p.CommandLine }
-    Fact "process: pid=$($p.ProcessId) start=$($p.CreationDate) cmd=$cl"
+    Fact "process: pid=$($p.ProcessId) start=$(Fmt-Time $p.CreationDate) cmd=$cl"
 }
-TryFact "sqlservr process on this host" {
-    $sp = @(Get-Process -ErrorAction Stop | Where-Object { $_.ProcessName -ieq 'sqlservr' })
-    if ($sp.Count -eq 0) { "none" } else { $sp | ForEach-Object { "pid=$($_.Id) start=$($_.StartTime)" } }
+# from the Win32_Process inventory read above, not a second process list; the
+# command line carries the instance (-sMSSQLSERVER, -sDBX2), empty when
+# another account's process is not readable to this run
+if ($null -eq $allProc) { Fact "sqlservr processes on this host: n/a (process inventory not read)" }
+else {
+    $sp = @($allProc | Where-Object { $_.Name -ieq 'sqlservr.exe' })
+    if ($sp.Count -eq 0) { Fact "sqlservr processes on this host: none" }
+    else { FactBlock "sqlservr processes on this host" @($sp | ForEach-Object { "pid=$($_.ProcessId) start=$(Fmt-Time $_.CreationDate) cmd=$(if ($_.CommandLine) { $_.CommandLine } else { 'n/a (not readable)' })" }) }
 }
 foreach ($u in $unresWhy) { Fact "install dir of $($u -replace ':.*$', ''): n/a ($($u -replace '^[^:]*: ', ''))" }
 foreach ($h in $AgentHome) { Fact "-AgentHome given: $h (exists: $(Test-Path -LiteralPath $h))" }
@@ -711,14 +907,14 @@ foreach ($h in $homes) {
     TryFact "top-level" { Get-ChildItem -LiteralPath $h -Name -ErrorAction Stop }
     TryFact "whatap component files (name=version, with mtime)" {
         Get-ChildItem -LiteralPath $h -Filter "whatap.agent.*" -ErrorAction Stop |
-            ForEach-Object { "{0}  {1}  {2}" -f $_.Name, $_.Length, $_.LastWriteTime }
+            ForEach-Object { "{0}  {1}  {2}" -f $_.Name, $_.Length, (Fmt-Time $_.LastWriteTime) }
     }
     $jdbc = Join-Path $h "jdbc"
     if (Test-Path -LiteralPath $jdbc) { TryFact "jdbc drivers" { Get-ChildItem -LiteralPath $jdbc -Name } }
     else { Fact "jdbc drivers: n/a (path not found: $jdbc)" }
     foreach ($f in @("uid.bat","db.user","start.bat","startd.bat","stop.bat","dbx.conf")) {
         $p = Join-Path $h $f
-        if (Test-Path -LiteralPath $p) { $fi = Get-Item -LiteralPath $p; Fact "${f}: present ($($fi.Length) bytes, $($fi.LastWriteTime))" }
+        if (Test-Path -LiteralPath $p) { $fi = Get-Item -LiteralPath $p; Fact "${f}: present ($($fi.Length) bytes, $(Fmt-Time $fi.LastWriteTime))" }
         else { Fact "${f}: not present at $h" }
     }
 }
@@ -731,13 +927,18 @@ foreach ($i in $instances) {
 }
 
 Section "E. Services & scheduled tasks"
-TryFact "services matching whatap/dbx" {
-    @(Invoke-BoundedBlock { Get-Service -ErrorAction Stop } | Where-Object { $_.Name -match 'whatap|dbx' -or $_.DisplayName -match 'whatap|dbx' } |
-        ForEach-Object { "{0}  {1}  {2}" -f $_.Name, $_.Status, $_.StartType })
+TryFact "services matching whatap/dbx (name, state, start mode, account, path)" {
+    $s = @(Get-CimBounded Win32_Service | Where-Object { $_.Name -match 'whatap|dbx' -or $_.DisplayName -match 'whatap|dbx' })
+    if ($s.Count -eq 0) { "none" }
+    else { $s | ForEach-Object { "{0}  state={1}  startmode={2}  account={3}  path={4}" -f $_.Name, $_.State, $_.StartMode, $_.StartName, $_.PathName } }
 }
-TryFact "scheduled tasks matching whatap" {
-    @(Invoke-BoundedBlock { Get-ScheduledTask -ErrorAction Stop } | Where-Object { $_.TaskName -match 'whatap|dbx' } |
-        ForEach-Object { "{0}  {1}" -f $_.TaskName, $_.State })
+# schtasks, not Get-ScheduledTask: the same task list, but importing the
+# ScheduledTasks module in a bounded runspace took 2.8-5.5 s against 1.8 s
+# for schtasks (0.4.0, Windows Server 2022). The lines are verbatim CSV:
+# "folder\name","next run time","status", localized by Windows.
+TryFact "scheduled tasks matching whatap/dbx (schtasks /query /fo csv)" {
+    $m = @(Invoke-Bounded schtasks @("/query", "/fo", "csv", "/nh") | Where-Object { $_ -match 'whatap|dbx' })
+    if ($m.Count -eq 0) { $(if ($isAdmin) { "none" } else { "none among the tasks this account can see (not elevated)" }) } else { $m }
 }
 
 Section "F. Agent logs"
@@ -748,10 +949,10 @@ foreach ($h in $homes) {
         if ($logs.Count -eq 0) { continue }
         $anyLog = $true
         Emit ""; Emit "    -- log dir: $ld --"
-        FactBlock "log files (newest 15)" ($logs | Select-Object -First 15 | ForEach-Object { "{0}  {1}  {2}" -f $_.Name, $_.Length, $_.LastWriteTime })
+        FactBlock "log files (newest 15)" ($logs | Select-Object -First 15 | ForEach-Object { "{0}  {1}  {2}" -f $_.Name, $_.Length, (Fmt-Time $_.LastWriteTime) })
         $n = $logs[0]
-        Fact "newest agent log: $($n.FullName) (mtime $($n.LastWriteTime))"
-        $win = @(Get-Content -LiteralPath $n.FullName -Tail 5000 -ErrorAction SilentlyContinue)
+        Fact "newest agent log: $($n.FullName) (mtime $(Fmt-Time $n.LastWriteTime))"
+        $win = @(Get-Content -LiteralPath $n.FullName -Tail 5000 -Encoding UTF8 -ErrorAction SilentlyContinue)
         Fact "last log line (verbatim): $(@($win)[-1])"
         Fact "system time at collection: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz')"
         $wa = $win | Select-String -Pattern '\(WA\d{3}\)' -AllMatches |
@@ -770,7 +971,12 @@ foreach ($h in $homes) {
 if (-not $anyLog) { Fact "agent logs: n/a (no whatap*.log under discovered homes)" }
 
 Section "G. Topology & network (per instance)"
-TryFact "local ip addresses" { @(Invoke-BoundedBlock { Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop } | ForEach-Object { $_.IPAddress }) -join " " }
+# the .NET interface list, in process: Get-NetIPAddress gave the same
+# addresses in 1.4 s (module import), this in 0.2 s (0.4.0, Windows Server 2022)
+TryFact "local ipv4 addresses" {
+    @([System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces() | ForEach-Object { $_.GetIPProperties().UnicastAddresses } |
+        Where-Object { $_.Address.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork } | ForEach-Object { "$($_.Address)" }) -join " "
+}
 if ($instances.Count -eq 0) { Fact "n/a (no instance dir discovered)" }
 foreach ($i in $instances) {
     Emit ""; Emit "    -- instance: $i --"
@@ -803,7 +1009,7 @@ if ($homeBad.Count -gt 0) {
 } elseif ($unresolved.Count -gt 0) {
     Set-Missed install (($unresWhy -join '; ') + " (pass -AgentHome <dir>)" + $(if ($homes.Count -eq 0) { "" } else { "; found: $($homes -join ', ')" }))
 } elseif ($homes.Count -gt 0) { Set-Got install }
-elseif ($null -eq $allProc) { Set-Missed install "Win32_Process query failed: $procErr" }
+elseif ($null -eq $allProc) { Set-Missed install ("Win32_Process query failed: $procErr" + $(if ($procErr -match 'denied') { Priv-Hint } else { "" })) }
 elseif ($javaUnread.Count -gt 0 -and -not $isAdmin) {
     Set-Missed install ("no whatap agent process in the command lines read; $($javaUnread.Count) java process(es) with an unreadable command line" + (Priv-Hint))
 } else { Set-Na install "no whatap agent process in any process command line, no -AgentHome given" }
@@ -822,8 +1028,15 @@ Emit "==== END OF COLLECTION (no diagnosis by design) ===="
 if ($Stdout) {
     $script:Lines | ForEach-Object { Write-Output $_ }
 } else {
-    $out = Join-Path "." "$COLLECTOR_NAME-$CompName-$((Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ')).txt"
-    try { $script:Lines | Set-Content -Path $out -Encoding UTF8 -ErrorAction Stop }
+    # UTF-8 without a BOM and LF line ends, the bytes a shell collector writes.
+    # Not Set-Content -Encoding UTF8: Windows PowerShell 5.1 prefixes a BOM and
+    # both editions end lines with CRLF, and validate.sh --report then fails
+    # the footer and header lines (seen on Windows Server 2022, 0.4.0). The
+    # directory is -Out, else the current file-system location, resolved
+    # above because .NET resolves a relative path against the process
+    # directory, which Set-Location does not change.
+    $out = Join-Path $OutDir "$COLLECTOR_NAME-$CompName-$((Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ')).txt"
+    try { [System.IO.File]::WriteAllText($out, (($script:Lines -join "`n") + "`n"), (New-Object System.Text.UTF8Encoding $false)) }
     catch { Warn "the report was not written: $out ($($_.Exception.Message.Split("`n")[0]))"; exit 1 }
     Progress "report written: $out"
 }

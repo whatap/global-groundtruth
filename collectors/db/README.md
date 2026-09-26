@@ -2,7 +2,8 @@
 
 > **Status: v0 implemented** (2026-07-16; validated at `collect-db.sh` 0.1.x
 > on mock install trees and live PostgreSQL 16 / MySQL 8.4 — see "Verification
-> status"; the script's own `VERSION` is the current one). Owned by the DB domain team once
+> status"; the script's own `VERSION` is the current one; `collect-db-mssql.ps1`
+> validated at 0.5.0 on Windows Server 2022). Owned by the DB domain team once
 > handed over (CONTRACT rule 4); until then managed by the Global team.
 > Scope grounded in a full read of #ext-db-모니터링-기술문의 (2025-04 → 2026-07,
 > ~282 field questions) plus deep-reads of the four longest support threads.
@@ -63,7 +64,22 @@ emits the matching sections; what is absent is reported with its reason.
 
    Leave `-P` out so sqlcmd asks for the password; a `-P <password>` argument
    is visible in the process list. `-AgentHome <dir>` adds an install dir the
-   process scan cannot see (`-Home` still binds as an alias).
+   process scan cannot see (`-Home`, `--home` and `--home=` too). `-Out <dir>`
+   (the shell `--out`) writes the report into another directory, checked
+   for writing before the run starts; `-Help` and `-h` print the usage. The shell spellings
+   `--file`, `--stdout`, `--quiet`, `--help` and `--out` work; an unknown
+   argument prints usage to stderr and exits 2. It has no opt-in.
+
+   Send the `-File` report: it is UTF-8 without a BOM with LF line ends
+   under either PowerShell. `-Stdout` hands the lines to the PowerShell host,
+   which ends them with CRLF, converts them to the console code page and,
+   under Windows PowerShell 5.1, writes a `>` redirection as UTF-16LE;
+   `tools/validate.sh --report` rejects such a copy. Run it elevated: not
+   elevated, another account's java command line is empty, so the DBX process
+   is not found and the install goal is `missed` with the privilege hint. Over
+   OpenSSH a non-administrator gets a network logon that WMI refuses
+   ("Access denied" on every CIM read, after which the run stops asking);
+   the same account in a local logon reads the process list.
 
 No agent process running, or one whose install dir the report says it could
 not resolve? Point the collector at the install dir:
@@ -192,12 +208,26 @@ Collection-server-side facts (server version, metrics categories) belong to
   `oracle.sql` and `windows/mssql.sql` are syntax-reviewed only — first field
   runs double as their validation. The Nashorn (JDK 8 jrunscript) runner path
   is untested on a live JDK 8.
-- `collect-db-mssql.ps1`: `tools/validate.sh` parses it with pwsh and lints
-  it; 0.3.0 runs to its footer under pwsh 7 on Linux and passes
-  `tools/validate.sh --report` (Windows-only probes report n/a there). Not yet
-  run on a Windows host. It was not runnable before 0.3.0: its `-Home`
-  parameter clashed with the read-only `$HOME` and every run stopped with
-  "Cannot overwrite variable Home".
+- `collect-db-mssql.ps1`: validated at 0.5.0 on Windows Server 2022 Standard
+  Evaluation 10.0.20348 (lab VM jjsong-ggt-win) under Windows PowerShell
+  5.1.20348.558 and pwsh 7.6.6, 2026-09-26: SQL Server 2022 Express
+  16.0.1000.6 with two instances (`SQLEXPRESS` on 1433, `DBX2` on 14330) and
+  a **simulated** DBX agent (a java process started from
+  `C:\Program Files\WhaTap DBX\whatap.agent.dbx-2.63.06.jar`, two
+  `whatap.conf` instances, a log with WA codes; the DBX package is not
+  publicly downloadable). Elevated: COMPLETE, 7 s (5.1) / 6 s (7); agent
+  stopped: both goals `na`, COMPLETE; not elevated in a local logon: the
+  install goal `missed` with the privilege hint, 3 s; not elevated over
+  OpenSSH: `missed` on the WMI refusal, 11-12 s; `-Home` / `--home` with a
+  path with spaces, a missing `-Home` (`missed`), an unwritable current
+  directory (the `!!` line and exit 1), `RUN_DEADLINE` / `CMD_TIMEOUT` and
+  invalid values of them. Every `-File` report passes `validate.sh --report`.
+  Before 0.3.0 it was not runnable (`-Home` clashed with `$HOME`).
+- `windows/mssql.sql` ran against both instances through go-sqlcmd 1.10.0
+  (`sqlcmd -S localhost,<port> -E -i mssql.sql`) as a sysadmin and as a
+  Windows login holding only VIEW SERVER STATE and VIEW ANY DEFINITION: every
+  batch ran without an error. go-sqlcmd drops a leading `[n]` from a PRINT
+  message, so the pack's section labels arrive without their numbers there.
 
 ## What the report can contain
 
@@ -226,4 +256,6 @@ secret can arrive from:
   the JDBC runner through its environment only, never its command line.
 
 Windows (`collect-db-mssql.ps1`): `whatap.conf` verbatim, agent process command
-lines (first 180 characters), agent log tail.
+lines (first 180 characters), `sqlservr` command lines, the path and account of
+services named whatap/dbx, the names of scheduled tasks named whatap/dbx, and
+the agent log tail.
