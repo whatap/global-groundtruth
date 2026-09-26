@@ -73,7 +73,7 @@ export LC_ALL=C
 
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-apmjava"
-VERSION="0.12.2"
+VERSION="0.12.3"
 DOMAIN="apm"
 TARGET="host/$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || echo unknown)"
 
@@ -1161,8 +1161,27 @@ weaving_lines() {
 # _proc_env PID NAME -> value of NAME= in the process environ (empty if none).
 # Java agent env names may contain dots (license, whatap.server.host), which is
 # why the environ file is read directly instead of using the shell environment.
+# NAME is matched as the regex ^NAME= (a dot matches any character). The names
+# in _ENV_KEYS are looked up in one awk pass per pid, cached as "NAME<tab>value"
+# under the run's directory and read back with the shell's own read; any other
+# name, or a run without that directory, takes the pipeline.
+_ENV_KEYS="WHATAP_CONFIG_FILE WHATAP_HOME WHATAP_JAVA_AGENT_PATH JAVA_TOOL_OPTIONS JDK_JAVA_OPTIONS _JAVA_OPTIONS JAVA_OPTS CATALINA_OPTS JAVA_OPTIONS whatap.env WHATAP_CONTAINER_CONF_PATH CLASSPATH DOMAIN_HOME WHATAP_SERVER_HOST WHATAP_SERVER_PORT log_root log_name whatap.server.host whatap.server.port"
 _proc_env() {
-    tr '\0' '\n' 2>/dev/null < "/proc/$1/environ" | grep "^$2=" | head -n1 | cut -d= -f2-
+    local t l
+    case " $_ENV_KEYS " in *" $2 "*) t="${_tmp_dir:+$_tmp_dir/env.$1}" ;; *) t="" ;; esac
+    if [ -z "$t" ]; then
+        tr '\0' '\n' 2>/dev/null < "/proc/$1/environ" | grep "^$2=" | head -n1 | cut -d= -f2-
+        return 0
+    fi
+    # first match per name, the value after the first "=" (grep | head | cut)
+    [ -f "$t" ] || tr '\0' '\n' 2>/dev/null < "/proc/$1/environ" | awk -v keys="$_ENV_KEYS" '
+        BEGIN { n = split(keys, k, " "); for (i = 1; i <= n; i++) re[i] = "^" k[i] "=" }
+        { for (i = 1; i <= n; i++) if (!(i in v) && $0 ~ re[i]) { l = $0; sub(/^[^=]*=/, "", l); v[i] = l } }
+        END { for (i = 1; i <= n; i++) if (i in v) printf "%s\t%s\n", k[i], v[i] }' > "$t" 2>/dev/null
+    while IFS= read -r l; do
+        case "$l" in "$2$_tab"*) printf '%s\n' "${l#"$2$_tab"}"; return 0 ;; esac
+    done < "$t"
+    return 0
 }
 
 # _env_readable PID -> success when this run can read /proc/PID/environ. As
@@ -1237,7 +1256,7 @@ _jcmd_recover() {
         | awk -v f="$dst" 'BEGIN { while ((getline l < f) > 0) if (substr(l, 1, 2) == "-D") { split(l, kv, "="); seen[kv[1]] = 1 } }
                { split($0, kv, "="); if (!(kv[1] in seen)) print }' > "$(_tmp "jcmdsp.$pid")" 2>/dev/null
     cat "$(_tmp "jcmdsp.$pid")" >> "$dst" 2>/dev/null
-    _rmtmp "$(_tmp "jcmdsp.$pid")" "$(_tmp "args.$pid")"
+    _rmtmp "$(_tmp "jcmdsp.$pid")" "$(_tmp "args.$pid")" "$(_tmp "sp.$pid")" "$(_tmp "conf.$pid")"
     [ -s "$dst" ] || { _rmtmp "$dst"; return 1; }
     _JCMD_RECOVERED="$_JCMD_RECOVERED $pid"
     return 0
@@ -1245,8 +1264,27 @@ _jcmd_recover() {
 
 # _jvm_sysprop PID KEY -> the last -DKEY=value seen across all argument
 # sources (see _all_jvm_args for the order). Empty when the property is unset.
+# KEY is matched as the regex ^-DKEY= (a dot matches any character). As in
+# _proc_env, the keys in _SP_KEYS come from one awk pass per pid, cached under
+# the run's directory (_jcmd_recover drops it with the argument cache); any
+# other key, or a run without that directory, takes the pipeline.
+_SP_KEYS="whatap.home whatap.config.file whatap.config java.class.path catalina.base catalina.home catalina.useNaming jboss.home.dir jboss.server.name jboss.server.base.dir jetty.base jetty.home jeus.home weblogic.Name domain.home com.sun.aas.instanceRoot com.sun.aas.installRoot com.sun.aas.instanceName com.sun.aas.domainName was.install.root server.root java.protocol.handler.pkgs spring.profiles.active logback.configurationFile logback.statusListenerClass log4j.configuration log4j.configurationFile log4j2.configurationFile java.util.logging.config.file java.util.logging.manager org.jboss.logging.provider log_root log_name whatap.server.host whatap.server.port"
 _jvm_sysprop() {
-    _all_jvm_args "$1" | grep "^-D$2=" | tail -n1 | sed "s/^-D$2=//"
+    local t l
+    case " $_SP_KEYS " in *" $2 "*) t="${_tmp_dir:+$_tmp_dir/sp.$1}" ;; *) t="" ;; esac
+    if [ -z "$t" ]; then
+        _all_jvm_args "$1" | grep "^-D$2=" | tail -n1 | sed "s/^-D$2=//"
+        return 0
+    fi
+    # last match per key, with the matched prefix removed (grep | tail | sed)
+    [ -f "$t" ] || _all_jvm_args "$1" | awk -v keys="$_SP_KEYS" '
+        BEGIN { n = split(keys, k, " "); for (i = 1; i <= n; i++) re[i] = "^-D" k[i] "=" }
+        substr($0, 1, 2) == "-D" { for (i = 1; i <= n; i++) if ($0 ~ re[i]) v[i] = $0 }
+        END { for (i = 1; i <= n; i++) if (i in v) { l = v[i]; sub(re[i], "", l); printf "%s\t%s\n", k[i], l } }' > "$t" 2>/dev/null
+    while IFS= read -r l; do
+        case "$l" in "$2$_tab"*) printf '%s\n' "${l#"$2$_tab"}"; return 0 ;; esac
+    done < "$t"
+    return 0
 }
 
 # _jvm_maps_lib PID -> the VM shared library mapped into the process, or empty.
@@ -1930,8 +1968,18 @@ _agent_jar_of() {
 # every path as the process writes it (a relative one is relative to its
 # working directory). The order is the one the README "Config" row describes.
 # "whatap.conf" is the file name used when -Dwhatap.config is unset: an assumed
-# default, and the "how" field says so.
+# default, and the "how" field says so. Sections E, G, J and _log_targets all
+# ask; the record is resolved once per pid and cached under the run's
+# directory (a single line: every part is a single-line lookup).
 _conf_of() {
+    local c l
+    c="${_tmp_dir:+$_tmp_dir/conf.$1}"
+    [ -n "$c" ] || { _conf_resolve "$1"; return 0; }
+    [ -f "$c" ] || _conf_resolve "$1" > "$c" 2>/dev/null
+    if IFS= read -r l < "$c"; then printf '%s\n' "$l"; else _conf_resolve "$1"; fi
+    return 0
+}
+_conf_resolve() {
     local pid="$1" cf src hm hsrc cn
     cf="$(_proc_env "$pid" WHATAP_CONFIG_FILE)"; src="env WHATAP_CONFIG_FILE"
     if [ -z "$cf" ]; then cf="$(_jvm_sysprop "$pid" whatap.config.file)"; src="-Dwhatap.config.file"; fi
@@ -2154,7 +2202,11 @@ _rep_env() {
     fact "collector cwd: $(pwd 2>/dev/null || echo unknown)"
     fact "tools:"
     for t in java javap jstack jcmd jps unzip od sha256sum ss netstat lsof readlink timeout stat awk tr xargs getconf; do
-        if command -v "$t" >/dev/null 2>&1; then printf '        %-12s present (%s)\n' "$t" "$(command -v "$t")"
+        # the path is read back from a file rather than a second lookup in
+        # a $(...); without the file (no run directory) it is looked up again
+        if [ -n "$_tmp_dir" ] && command -v "$t" > "$_tmp_dir/cmdv" 2>/dev/null && IFS= read -r _p < "$_tmp_dir/cmdv"; then
+            printf '        %-12s present (%s)\n' "$t" "$_p"
+        elif command -v "$t" >/dev/null 2>&1; then printf '        %-12s present (%s)\n' "$t" "$(command -v "$t")"
         else printf '        %-12s absent\n' "$t"; fi
     done
     fact "per-command cap: ${CMD_TIMEOUT}s; run deadline: ${RUN_DEADLINE}s"
@@ -2958,6 +3010,9 @@ _rep_weaving() {
     # what actually loaded in the running process: the "Weaving" lines of the
     # agent log, at the log locations section I reads
     _log_targets > "$(_tmp logt)" 2>/dev/null
+    # the most recent rotated log of each location, kept for section I
+    _rotf="$(_tmp logrot)"
+    true > "$_rotf" 2>/dev/null
     if [ ! -s "$(_tmp logt)" ]; then
         fact "weaving activity in the agent log: n/a (no JVM carrying a WhaTap attach marker and no agent home discovered)"
     else
@@ -2969,6 +3024,7 @@ _rep_weaving() {
             fi
             weaving_lines "$_ld/$_ln.log" "$_lv/$_ln.log"
             _rot2="$(ls -t "$_lv"/"$_ln"-*.log 2>/dev/null | head -n 1)"
+            printf '%s\t%s\n' "$_lv/$_ln" "$_rot2" >> "$_rotf" 2>/dev/null
             [ -n "$_rot2" ] && weaving_lines "$(basename "$_rot2") (most recent rotated log by mtime)" "$_rot2"
         done < "$(_tmp logt)"
     fi
@@ -3055,7 +3111,12 @@ _rep_agentlogs() {
             _probe_ls "   listing (first 60 lines)" "$_lv" 60
             _file_lines first "   $_ln.log (first lines)" "$_lv/$_ln.log" 40
             _file_lines last "   $_ln.log (recent lines)" "$_lv/$_ln.log" 200
-            _rot="$(ls -t "$_lv"/"$_ln"-*.log 2>/dev/null | head -n 1)"
+            # section G listed this location already; ls only when it did not
+            _rot=""; _rk=""
+            while IFS= read -r _l; do
+                case "$_l" in "$_lv/$_ln$_tab"*) _rot="${_l#"$_lv/$_ln$_tab"}"; _rk=1; break ;; esac
+            done < "$(_tmp logrot)"
+            [ -n "$_rk" ] || _rot="$(ls -t "$_lv"/"$_ln"-*.log 2>/dev/null | head -n 1)"
             if [ -n "$_rot" ]; then
                 _file_lines last "   $(basename "$_rot") (most recent rotated log by mtime, recent lines)" "$_rot" 120
             else
