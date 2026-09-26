@@ -403,5 +403,54 @@ H23="$ROOT/home23"; mkhome "$H23"; rm -rf "$H23/logs"; ln -s "$ROOT/gone23" "$H2
 out="$("$C" --home "$H23" --stdout 2>/dev/null)"
 has "a dangling logs link says so" "$out" "*.hprof in $H23/logs: n/a (dangling symlink to $ROOT/gone23)"
 
+echo "== 24. 0.10.0: uname strings from /proc, the time once, deadline wording =="
+# hostname and uname stubs log every call; with /proc/sys/kernel readable
+# section A must not run either.
+S24="$ROOT/stub24"; stub_clone "$S" "$S24"; UNLOG="$ROOT/uname.log"; : >| "$UNLOG"
+for c in hostname uname; do
+    stub_write "$S24/$c" <<EOF
+#!/bin/sh
+echo "$c \$*" >> "$UNLOG"
+exec "$(type -P "$c")" "\$@"
+EOF
+done
+out="$(PATH="$S24" "$C" --stdout </dev/null 2>/dev/null)"
+if [ -r /proc/sys/kernel/hostname ] && [ -r /proc/sys/kernel/osrelease ]; then
+    has "hostname from /proc/sys/kernel" "$out" "hostname: $(cat /proc/sys/kernel/hostname)"
+    has "kernel from ostype + osrelease" "$out" "kernel: $(cat /proc/sys/kernel/ostype) $(cat /proc/sys/kernel/osrelease)"
+    hasnt "no uname -sr" "$(cat "$UNLOG")" "uname -sr"
+    [ -r /proc/sys/kernel/arch ] && has "arch from /proc/sys/kernel/arch" "$out" "arch: $(cat /proc/sys/kernel/arch)"
+    [ -r /proc/sys/kernel/arch ] && hasnt "and no uname -m" "$(cat "$UNLOG")" "uname -m"
+else skip "the /proc/sys/kernel cases (not readable here)"; fi
+chk "the timezone is printed once" "1" "$(printf '%s\n' "$out" | grep -cE '^    (system )?timezone:')"
+hasnt "no date(UTC) line next to section B's UTC time" "$out" "date(UTC):"
+has "section B keeps the UTC time" "$out" "UTC time:"
+stub_write "$S24/java" <<'EOF'
+#!/bin/sh
+exec sleep 30
+EOF
+t0=$(date +%s)
+out="$(RUN_DEADLINE=3 PATH="$S24" "$C" --stdout </dev/null 2>/dev/null)"
+t1=$(date +%s)
+has "java -version cut by the run deadline says so" "$out" "java -version: n/a (run deadline reached: 3s)"
+[ $((t1 - t0)) -le 30 ] && ok "and the run ends ($((t1 - t0))s)" || bad "the run ends" "<= 30s" "$((t1 - t0))s"
+rm -f "$S24/java"
+stub_write "$S24/curl" <<'EOF'
+#!/bin/sh
+exec sleep 30
+EOF
+rm -f "$S24/ntpdate" "$S24/sntp"
+t0=$(date +%s)
+out="$(CMD_TIMEOUT=2 PATH="$S24" "$C" --stdout --time-ref </dev/null 2>/dev/null)"
+t1=$(date +%s)
+has "a curl that never answers is capped" "$out" "external time: n/a (timed out: 2s)"
+[ $((t1 - t0)) -le 60 ] && ok "and the run ends ($((t1 - t0))s)" || bad "the curl cap binds" "<= 60s" "$((t1 - t0))s"
+stub_write "$S24/curl" <<'EOF'
+#!/bin/sh
+echo "curl: (7) Failed to connect to www.google.com port 443" >&2; exit 7
+EOF
+out="$(PATH="$S24" "$C" --stdout --time-ref </dev/null 2>/dev/null)"
+has "a failed curl names its exit status" "$out" "external time: n/a (curl exit 7: "
+
 echo; echo "PASS=$PASS FAIL=$FAIL SKIP=$SKIP"
 [ "$FAIL" -eq 0 ]

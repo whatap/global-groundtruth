@@ -22,6 +22,14 @@
 export LC_ALL=C
 
 # ---- collector metadata -----------------------------------------------------
+# 0.10.0 Section A reads hostname, kernel and arch from /proc/sys/kernel
+#        (hostname/uname only where a file is unreadable) and no longer
+#        prints the date and the timezone: section B has both, and its
+#        timezone falls back to date +%Z as A's did. The --time-ref curl is
+#        bounded and its Date header loses the trailing CR; a failure names
+#        curl's exit status. A call cut by the
+#        run deadline (java -version, journalctl, curl) says "run deadline
+#        reached", not "timed out".
 # 0.9.2  Readability refactor; report unchanged.
 # 0.9.1  No *.hprof found is "none", not "n/a (empty output)", and only when
 #        every directory searched could be listed (a symlink this uid cannot
@@ -38,7 +46,7 @@ export LC_ALL=C
 #        private directory; bad numeric options exit 2, a failed write exits 1;
 #        output is handed back under sudo. Needs bash.
 COLLECTOR_NAME="whatap-collserver"
-VERSION="0.9.2"
+VERSION="0.10.0"
 DOMAIN="collection-server"
 TARGET="collection-server/$(hostname 2>/dev/null || echo unknown)"   # refined after WHATAP_HOME is resolved
 
@@ -615,6 +623,22 @@ _emit_labeled() {
     fi
 }
 
+# _why_124 -> why a bounded call returned 124: the run deadline, or its own cap
+# (the same two wordings as probe)
+_why_124() {
+    if _past_deadline; then printf 'run deadline reached: %ss' "$RUN_DEADLINE"
+    else printf 'timed out: %ss' "$CMD_TIMEOUT"; fi
+}
+
+# _ksys NAME -> /proc/sys/kernel/NAME in _KV, read without a fork; false when
+# unreadable or empty. hostname, ostype, osrelease and arch are the strings
+# uname prints for -n, -s, -r and -m.
+_ksys() {
+    _KV=""
+    [ -r "/proc/sys/kernel/$1" ] && IFS= read -r _KV < "/proc/sys/kernel/$1" 2>/dev/null
+    [ -n "$_KV" ]
+}
+
 # probe "label" CMD [ARGS...] -> emits output as facts, or "label: n/a (<why>)".
 # Every call goes through _bounded (run helpers), so a hung command costs at
 # most CMD_TIMEOUT and the run still reaches its footer. A non-zero exit that
@@ -644,7 +668,7 @@ probe_merged() {
     [ -n "$(_cmd_kind "$1")" ] || { fact "$label: n/a (command not found: $1)"; return; }
     local out rc
     out="$(_bounded "$@" 2>&1)"; rc=$?
-    [ "$rc" -eq 124 ] && { fact "$label: n/a (timed out: ${CMD_TIMEOUT}s)"; return; }
+    [ "$rc" -eq 124 ] && { fact "$label: n/a ($(_why_124))"; return; }
     [ -z "$out" ] && { fact "$label: n/a (empty output)"; return; }
     _emit_labeled "$label" "$out"
 }
@@ -1021,14 +1045,20 @@ time_ref_probe() {
     elif have sntp; then
         probe "sntp $TIMEREF_SERVER" sntp "$TIMEREF_SERVER"
     elif have curl; then
-        local hdr rt lt d
-        hdr="$(curl -sI --max-time 10 https://www.google.com 2>"$_errfile" | grep -i '^date:' | head -n1 | cut -d' ' -f2-)"
-        if [ -n "$hdr" ]; then
+        local hdr rt lt d rc
+        # bounded like every other call; curl's own --max-time stays the tighter cap
+        hdr="$(_bounded curl -sI --max-time 10 https://www.google.com 2>"$_errfile")"; rc=$?
+        hdr="$(printf '%s\n' "$hdr" | tr -d '\r' | grep -i '^date:' | head -n1 | cut -d' ' -f2-)"
+        if [ "$rc" -eq 124 ]; then
+            fact "external time: n/a ($(_why_124))"
+        elif [ -n "$hdr" ]; then
             fact "HTTP Date header (https://www.google.com): $hdr"
             rt="$(date -u -d "$hdr" +%s 2>/dev/null)"; lt="$(date -u +%s 2>/dev/null)"
             if [ -n "$rt" ] && [ -n "$lt" ]; then d=$((lt - rt)); fact "local clock minus reference: ${d}s (1s resolution + network latency)"; fi
+        elif [ "$rc" -ne 0 ]; then
+            fact "external time: n/a (curl exit $rc: $(_classify_err))"
         else
-            fact "external time: n/a ($(_classify_err))"
+            fact "external time: n/a (curl exit 0: no Date header in the response)"
         fi
     else
         fact "external time: n/a (command not found: ntpdate/sntp/curl)"
@@ -1084,12 +1114,13 @@ run_report() {
 
     # -- A. Host & platform ---------------------------------------------------
     section "A. Host & platform"
-    probe "hostname" hostname
-    probe "kernel" uname -sr
-    probe "arch" uname -m
+    # uname's strings from /proc/sys/kernel, without a fork; hostname/uname
+    # only where that file is missing or unreadable. The date and the timezone
+    # are section B's.
+    if _ksys hostname; then fact "hostname: $_KV"; else probe "hostname" hostname; fi
+    if _ksys ostype && _k1="$_KV" && _ksys osrelease; then fact "kernel: $_k1 $_KV"; else probe "kernel" uname -sr; fi
+    if _ksys arch; then fact "arch: $_KV"; else probe "arch" uname -m; fi
     read_proc "os-release" /etc/os-release
-    probe "date(UTC)" date -u +%Y-%m-%dT%H:%M:%SZ
-    fact "timezone: $( { cat /etc/timezone 2>/dev/null; } || date +%Z 2>/dev/null || echo n/a )"
     read_proc "uptime" /proc/uptime
     fact "nproc: $(nproc 2>/dev/null || grep -c ^processor /proc/cpuinfo 2>/dev/null || echo n/a)"
     if have free; then probe "memory (free -m)" free -m; else read_proc "meminfo" /proc/meminfo; fi
@@ -1105,7 +1136,15 @@ run_report() {
     # external comparison is opt-in (--time-ref).
     section "B. Time & clock synchronization"
     probe "timedatectl" timedatectl
-    fact "system timezone: $( { cat /etc/timezone 2>/dev/null; } || { readlink -f /etc/localtime 2>/dev/null | sed 's#.*/zoneinfo/##'; } || echo 'n/a' )"
+    # /etc/timezone, else the zone /etc/localtime links to, else date's abbreviation
+    local _stz=""
+    [ -r /etc/timezone ] && IFS= read -r _stz < /etc/timezone 2>/dev/null
+    if [ -z "$_stz" ]; then
+        _stz="$(readlink -f /etc/localtime 2>/dev/null)"
+        case "$_stz" in */zoneinfo/*) _stz="${_stz#*/zoneinfo/}" ;; *) _stz="" ;; esac
+    fi
+    [ -z "$_stz" ] && _stz="$(date +%Z 2>/dev/null)"
+    fact "system timezone: ${_stz:-n/a (no /etc/timezone, no zoneinfo link at /etc/localtime, no date +%Z)}"
     fact "local time: $(date '+%Y-%m-%d %H:%M:%S %z' 2>/dev/null || echo n/a)"
     fact "UTC time:   $(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo n/a)"
     read_proc "clocksource" /sys/devices/system/clocksource/clocksource0/current_clocksource
@@ -1441,7 +1480,7 @@ EOF
             jout="$(_bounded journalctl -u "$unit.service" -p err --since "${OPT_HOURS} hours ago" -n 20 --no-pager 2>/dev/null)"
             case "$?" in
                 0|1) ;;
-                124) _jfail="$_jfail $unit (timed out: ${CMD_TIMEOUT}s)"; fact "$unit.service: n/a (timed out: ${CMD_TIMEOUT}s)"; continue ;;
+                124) _jfail="$_jfail $unit ($(_why_124))"; fact "$unit.service: n/a ($(_why_124))"; continue ;;
                 *)   [ -z "$jout" ] && { _jfail="$_jfail $unit (journalctl failed)"; fact "$unit.service: n/a (journalctl failed)"; continue; } ;;
             esac
             case "$jout" in
