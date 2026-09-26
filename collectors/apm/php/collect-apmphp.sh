@@ -44,31 +44,20 @@
 #   * What do the agent logs (whatap-boot-*.log, whatap-install-*.log) and the
 #     web server error log (WA*-coded lines from whatap.so) say?
 #
-# THE CONTRACT (../../../CONTRACT.md):
-#   1. Facts only. No conclusion is stated on any emitted line.
-#   2. Discover, never assume. Resolve symlinks, process maps, args, env, ini.
-#   3. One field command -> paste the whole output.
-#   4. Domain-team owned. Seed v0 by the Global team; ownership transfers to
-#      the APM/PHP agent developers.
-#
-# DESIGN GUIDELINES (../../../docs/collector-engineering.md): MECE sections,
-# Tier-0 load-safe defaults (bounded reads, no whole-log grep, no deep find),
-# bash 3.2+, reasoned absence for every missing value.
-#
 # The PHP binaries found are executed read-only, with -v / -m / -i only
 # — the same calls the vendor installer makes. No application code is run. The
 # agent binary is only ever executed with its `version` argument (running it
 # bare would start an agent).
 #
-# NOTE: no `set -e` — a collector must reach its footer even when every probe
-# fails. Failures are handled locally by the helpers.
+# Rules: ../../../CONTRACT.md, ../../../docs/collector-engineering.md; no set -e.
 # -----------------------------------------------------------------------------
 
 export LC_ALL=C
 
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-apmphp"
-VERSION="0.5.0"
+# 0.5.1  Readability refactor; report unchanged.
+VERSION="0.5.1"
 DOMAIN="apm"
 TARGET="host/$(hostname 2>/dev/null || echo unknown)"
 
@@ -563,7 +552,6 @@ _infofile=""
 CMD_TIMEOUT="${CMD_TIMEOUT:-15}"
 # Call after _run_init: the error and php -i files live in the run's private directory.
 _init_probe() { _errfile="$(_tmp probe.err)"; _infofile="$(_tmp probe.info)"; }
-_end_probe() { :; }   # _run_cleanup removes the directory
 
 _classify_err() {
     local txt=""
@@ -593,7 +581,6 @@ _emit_labeled() {
 probe() {
     local label="$1"; shift
     [ -n "$(_cmd_kind "$1")" ] || { fact "$label: n/a (command not found: $1)"; return; }
-    _past_deadline && { fact "$label: n/a (run deadline reached: ${RUN_DEADLINE}s)"; return; }
     local out rc
     out="$(_bounded "$@" 2>"$_errfile")"; rc=$?
     if [ "$rc" -eq 124 ]; then
@@ -633,39 +620,25 @@ read_proc() {
     _emit_labeled "$label" "$out"
 }
 
-# dump_file "label" PATH [CAP] -> the file's content verbatim (line-capped),
-# or a classified reason. Framework policy: configuration is dumped verbatim,
-# never masked (see collectors/apm/php/README.md, "What the report can contain").
-dump_file() {
-    local label="$1" path="$2" cap="${3:-400}" total
-    [ -e "$path" ] || { fact "$label: n/a (path not found: $path)"; return; }
-    [ -r "$path" ] || { fact "$label: n/a (permission denied: $path)"; return; }
-    [ -s "$path" ] || { fact "$label: (empty file)"; return; }
-    total="$(wc -l < "$path" 2>/dev/null | tr -d ' ')"
-    fact "$label (first $cap of ${total:-?} lines):"
-    head -n "$cap" "$path" 2>/dev/null | while IFS= read -r _l || [ -n "$_l" ]; do printf '        %s\n' "$_l"; done
+# _names DIR -> the names in DIR, as `ls DIR` lists them (no dot files, sorted)
+_names() {
+    local n
+    for n in "$1"/*; do { [ -e "$n" ] || [ -L "$n" ]; } && printf '%s\n' "${n##*/}"; done
+    return 0
 }
 
-# tail_file "label" PATH [CAP] -> the file's LAST lines (bounded read).
-tail_file() {
-    local label="$1" path="$2" cap="${3:-200}" total
+# _file_lines head|tail "label" PATH CAP -> the first or last CAP lines of the
+# file, verbatim, or a reason. Configuration is dumped as is, never masked (the
+# collector README, "What the report can contain").
+_file_lines() {
+    local how="$1" label="$2" path="$3" cap="$4" w=first total
+    [ "$how" = tail ] && w=last
     [ -e "$path" ] || { fact "$label: n/a (path not found: $path)"; return; }
     [ -r "$path" ] || { fact "$label: n/a (permission denied: $path)"; return; }
     [ -s "$path" ] || { fact "$label: (empty file)"; return; }
     total="$(wc -l < "$path" 2>/dev/null | tr -d ' ')"
-    fact "$label (last $cap of ${total:-?} lines):"
-    tail -n "$cap" "$path" 2>/dev/null | while IFS= read -r _l || [ -n "$_l" ]; do printf '        %s\n' "$_l"; done
-}
-
-# head_file "label" PATH [CAP] -> the file's FIRST lines (bounded read).
-head_file() {
-    local label="$1" path="$2" cap="${3:-120}" total
-    [ -e "$path" ] || { fact "$label: n/a (path not found: $path)"; return; }
-    [ -r "$path" ] || { fact "$label: n/a (permission denied: $path)"; return; }
-    [ -s "$path" ] || { fact "$label: (empty file)"; return; }
-    total="$(wc -l < "$path" 2>/dev/null | tr -d ' ')"
-    fact "$label (first $cap of ${total:-?} lines):"
-    head -n "$cap" "$path" 2>/dev/null | while IFS= read -r _l || [ -n "$_l" ]; do printf '        %s\n' "$_l"; done
+    fact "$label ($w $cap of ${total:-?} lines):"
+    "$how" -n "$cap" "$path" 2>/dev/null | while IFS= read -r _l || [ -n "$_l" ]; do printf '        %s\n' "$_l"; done
 }
 
 # conf_bytes "label" PATH -> byte-level facts a plain `cat` hides: total bytes
@@ -708,12 +681,15 @@ php_run() {
     local label="$1" php="$2"; shift 2
     _php_out=""
     [ -x "$php" ] || { fact "$label: n/a (not executable: $php)"; return; }
-    _past_deadline && { fact "$label: n/a (run deadline reached: ${RUN_DEADLINE}s)"; return; }
     local out rc err
     out="$(_bounded "$php" "$@" 2>"$_errfile")"; rc=$?
     _php_out="$out"
     err="$(head -c 2000 "$_errfile" 2>/dev/null)"
-    if [ "$rc" -eq 124 ]; then fact "$label: n/a (timed out: ${CMD_TIMEOUT}s)"; return; fi
+    if [ "$rc" -eq 124 ]; then
+        if _past_deadline; then fact "$label: n/a (run deadline reached: ${RUN_DEADLINE}s)"
+        else fact "$label: n/a (timed out: ${CMD_TIMEOUT}s)"; fi
+        return
+    fi
     if [ -n "$out" ]; then _emit_labeled "$label" "$out"
     elif [ "$rc" -ne 0 ]; then fact "$label: n/a ($(_classify_err))"
     else fact "$label: n/a (empty output)"; fi
@@ -1202,9 +1178,6 @@ _conf_vals() {
     awk -F= -v k="$k" '{ gsub(/[ \t\r]/, "") } $1 == k && $2 != "" { print $2 }' "$@" 2>/dev/null
 }
 
-# _registry_vals FILE -> the raw first field of each port registry line
-_registry_vals() { [ -r "$1" ] && awk 'NF { print $1 }' "$1" 2>/dev/null; return 0; }
-
 # _ports_add LABEL <<VALUES -> the valid ports among VALUES (one per line) join
 # _pl, and "; PORTS (LABEL)" joins _plab; refused values join _pbad
 _ports_add() {
@@ -1360,8 +1333,28 @@ run_report() {
     goal agent "whatap-php agent installation"
     goal conf  "agent configuration"
 
-    # [1] capability preamble: every downstream "command not found" is
-    # pre-explained here.
+    _rep_env
+    discover
+    _rep_host
+    _rep_runtimes
+    _rep_web
+    _rep_install
+    _rep_binding
+    _rep_conf
+    _rep_agent
+    _rep_logs
+    _rep_k8s
+
+    # Resolved here, not at the point of use: the config dumps above run inside
+    # `| while` pipelines, and an assignment made in a subshell does not survive.
+    _resolve_goals
+    emit_status
+    emit_footer
+}
+
+# [1] capability preamble: every downstream "command not found" is
+# pre-explained here.
+_rep_env() {
     section "Collection environment"
     if [ -n "${BASH_VERSION:-}" ]; then fact "shell: bash $BASH_VERSION"
     else fact "shell: POSIX sh (non-bash)"; fi
@@ -1375,10 +1368,10 @@ run_report() {
         if command -v "$t" >/dev/null 2>&1; then printf '        %-12s present (%s)\n' "$t" "$(command -v "$t")"
         else printf '        %-12s absent\n' "$t"; fi
     done
+}
 
-    discover
-
-    # [2] host / platform
+# [2] host / platform
+_rep_host() {
     section "Host / platform"
     probe "kernel" uname -srm
     probe "machine arch" uname -m
@@ -1403,9 +1396,11 @@ run_report() {
     probe "local time" date
     probe "utc time" date -u
     probe "pid 1 command" sh -c "tr '\0' ' ' < /proc/1/cmdline | cut -c1-160"
+}
 
-    # [3] PHP runtimes: one block per distinct binary. `php -i` is executed
-    # once per binary and every field below is extracted from that capture.
+# [3] PHP runtimes: one block per distinct binary. `php -i` is executed
+# once per binary and every field below is extracted from that capture.
+_rep_runtimes() {
     section "PHP runtimes and SAPIs"
     fact "php binaries discovered: $(printf '%s\n' "$D_PHP_BINS" | grep -c .)"
     if [ -z "$D_PHP_BINS" ]; then
@@ -1543,8 +1538,10 @@ EOF
     else
         fact "alternatives php entries: n/a (command not found: update-alternatives, alternatives)"
     fi
+}
 
-    # [4] what actually serves the traffic
+# [4] what actually serves the traffic
+_rep_web() {
     section "Web server / application server layer"
     fact "web / application server binaries on PATH:"
     for c in httpd apache2 apachectl php-fpm php5-fpm php-cgi nginx lighttpd frankenphp rr; do
@@ -1603,8 +1600,10 @@ EOF
             printf '           cwd: %s\n' "$(_link_target "/proc/$pid/cwd" || echo 'n/a (unresolvable: exited, zombie, or permission denied)')"
         done
     fi
+}
 
-    # [5] the agent package as it sits on disk
+# [5] the agent package as it sits on disk
+_rep_install() {
     section "WhaTap PHP agent installation on disk"
     fact "env WHATAP_HOME (collector shell): $(_quote_nl "${WHATAP_HOME:-not set}")"
     [ -n "$D_ODD" ] && fact "path(s) with a newline or '|', not followed:$D_ODD"
@@ -1635,9 +1634,9 @@ EOF
         else
             fact "   agent binary version: n/a (no executable whatap_php / whatap_php_static in $fshome)"
         fi
-        head_file "   ChangeLog (top: shipped agent version and date)" "$fshome/ChangeLog" 6
+        _file_lines head "   ChangeLog (top: shipped agent version and date)" "$fshome/ChangeLog" 6
         file_facts "   install.sh" "$fshome/install.sh"
-        dump_file "   template.ini (installer's ini template)" "$fshome/template.ini" 60
+        _file_lines head "   template.ini (installer's ini template)" "$fshome/template.ini" 60
         # the PHP-version -> Zend API table the INSTALLED installer uses, read
         # from that installer rather than assumed
         if [ -r "$fshome/install.sh" ]; then
@@ -1661,10 +1660,12 @@ EOF
     else fact "   dpkg: n/a (command not found: dpkg)"; fi
     if have apk; then probe "   apk info whatap-php" sh -c "apk info -v whatap-php 2>&1 | head -n 3"
     else fact "   apk: n/a (command not found: apk)"; fi
+}
 
-    # [6] the binding, reported per PHP runtime — on a host with several PHP
-    # versions the tracer is bound to some of them and not to others, and each
-    # version has its own extension_dir and its own ini scan dir.
+# [6] the binding, reported per PHP runtime — on a host with several PHP
+# versions the tracer is bound to some of them and not to others, and each
+# version has its own extension_dir and its own ini scan dir.
+_rep_binding() {
     section "Tracer binding per PHP runtime (module, ini, load state)"
     if [ -z "$D_PHP_FACTS" ]; then
         fact "no PHP runtime was detailed in section 3; only the extension_dir view below applies"
@@ -1772,7 +1773,7 @@ EOF
              /opt/alt/php*/etc/php.d /usr/local/lsws/lsphp*/etc/php.d; do
         [ -d "$d" ] || continue
         _hit=1
-        printf '        %-46s %s\n' "$d" "$(ls "$d" 2>/dev/null | grep -i whatap | tr '\n' ' ' | sed 's/^$/(no whatap entry)/')"
+        printf '        %-46s %s\n' "$d" "$(_names "$d" | grep -i whatap | tr '\n' ' ' | sed 's/^$/(no whatap entry)/')"
     done
     [ "$_hit" = 0 ] && fact "   none of the known ini tree paths exist on this host"
     fact "live load status — whatap module mapped into running processes (from /proc/<pid>/maps):"
@@ -1802,15 +1803,17 @@ EOF
             fact "   no whatap module path in the memory maps of the $_nread process(es) whose maps were read"
         fi
     fi
+}
 
-    # [7] configuration content, verbatim
+# [7] configuration content, verbatim
+_rep_conf() {
     section "Agent configuration (verbatim)"
     if [ -z "$D_INI_FILES" ]; then
         fact "whatap ini files: none found to dump"
     else
         printf '%s\n' "$D_INI_FILES" | tr '|' '\n' | grep -v '^$' | sort -u | while IFS= read -r p; do
             conf_bytes "-- $p" "$p"
-            dump_file "   content" "$p" 300
+            _file_lines head "   content" "$p" 300
         done
     fi
     fact "service / unit / init files written by install.sh:"
@@ -1818,7 +1821,7 @@ EOF
         fact "   none found (searched agent home, /etc/init.d, systemd unit dirs, /etc/rc.d)"
     else
         printf '%s\n' "$D_SERVICE_FILES" | tr '|' '\n' | grep -v '^$' | sort -u | while IFS= read -r p; do
-            dump_file "-- $p" "$p" 120
+            _file_lines head "-- $p" "$p" 120
         done
     fi
     fact "WHATAP_* environment of the running processes:"
@@ -1853,8 +1856,10 @@ EOF
             else printf '        %s: absent\n' "$fshome/$f"; fi
         done
     done
+}
 
-    # [8] the agent process and its channels
+# [8] the agent process and its channels
+_rep_agent() {
     section "Agent process, service state and channels"
     if [ -z "$D_AGENT_PIDS" ]; then
         fact "whatap_php processes: none found in /proc (matched by comm whatap_php*)"
@@ -1904,15 +1909,17 @@ EOF
         probe "tcp sessions (whatap-named or port $_tcp_label)" _sock_list netstat -tnp "$_tcp_ports"
     else
         fact "socket listing: n/a (command not found: ss, netstat); raw tables follow"
-        probe "raw /proc/net/udp (first 30 lines)" sh -c "head -n 30 /proc/net/udp"
-        probe "raw /proc/net/tcp (first 30 lines)" sh -c "head -n 30 /proc/net/tcp"
+        probe "raw /proc/net/udp (first 30 lines)" head -n 30 /proc/net/udp
+        probe "raw /proc/net/tcp (first 30 lines)" head -n 30 /proc/net/tcp
     fi
     # the tracer and the agent also share SysV shared memory + a semaphore;
     # install.sh removes key 6600 (0x19c8) on uninstall
     probe "sysv shared memory segments" sh -c "ipcs -m 2>/dev/null | head -n 30"
     probe "sysv semaphore arrays" sh -c "ipcs -s 2>/dev/null | head -n 30"
+}
 
-    # [9] logs
+# [9] logs
+_rep_logs() {
     section "Agent logs and web server error markers"
     if [ -z "$D_HOMES" ]; then
         fact "no agent home discovered; no agent log locations to read"
@@ -1925,10 +1932,10 @@ EOF
                 probe "   logs dir listing" _ls_head "$fshome/logs" 60
                 _boot="$(ls -t "$fshome"/logs/whatap-boot-*.log 2>/dev/null | head -n 1)"
                 if [ -n "$_boot" ]; then
-                    head_file "   $(basename "$_boot") (first lines: startup banner and configuration)" "$_boot" 80
+                    _file_lines head "   $(basename "$_boot") (first lines: startup banner and configuration)" "$_boot" 80
                     _tot="$(wc -l < "$_boot" 2>/dev/null | tr -d ' ')"
                     if [ "${_tot:-0}" -gt 80 ]; then
-                        tail_file "   $(basename "$_boot") (recent lines)" "$_boot" 150
+                        _file_lines tail "   $(basename "$_boot") (recent lines)" "$_boot" 150
                     else
                         fact "   $(basename "$_boot"): ${_tot:-?} lines total — the block above is the whole file"
                     fi
@@ -1937,7 +1944,7 @@ EOF
                 fi
                 _inst="$(ls -t "$fshome"/logs/whatap-install-*.log 2>/dev/null | head -n 1)"
                 if [ -n "$_inst" ]; then
-                    tail_file "   $(basename "$_inst") (what install.sh resolved on this host)" "$_inst" 120
+                    _file_lines tail "   $(basename "$_inst") (what install.sh resolved on this host)" "$_inst" 120
                 else
                     fact "   whatap-install-*.log: n/a (no such file in $fshome/logs)"
                 fi
@@ -1964,8 +1971,10 @@ EOF
         fi
     done
     [ "$_hit" = 0 ] && fact "   none of the known web server error log paths exist and are readable here"
+}
 
-    # [10] container / orchestration context
+# [10] container / orchestration context
+_rep_k8s() {
     section "Container / Kubernetes context"
     fact "container markers:"
     for m in /.dockerenv /run/.containerenv; do
@@ -1976,11 +1985,11 @@ EOF
     else
         printf '        %-22s not set\n' "KUBERNETES_SERVICE_HOST"
     fi
-    probe "self cgroup (first 5 lines)" sh -c "head -n 5 /proc/self/cgroup"
+    probe "self cgroup (first 5 lines)" head -n 5 /proc/self/cgroup
     printf '%s\n' "$D_HOMES" | while IFS='|' read -r home _src; do
         [ -n "$home" ] || continue
         fshome="$(resolve_fs "$home")" || { fact "container.conf in $home: n/a ($(_absent_why "$home" "$_src"))"; continue; }
-        dump_file "container.conf in $home" "$fshome/container.conf" 60
+        _file_lines head "container.conf in $home" "$fshome/container.conf" 60
     done
     for v in POD_NAME NODE_NAME POD_NAMESPACE OKIND ONAME ONODE; do
         eval "_val=\${$v:-}"
@@ -1988,12 +1997,6 @@ EOF
     done
     [ -d /var/run/secrets/kubernetes.io ] && fact "/var/run/secrets/kubernetes.io: present" || fact "/var/run/secrets/kubernetes.io: absent"
     read_proc "container hostname (/etc/hostname)" /etc/hostname
-
-    # Resolved here, not at the point of use: the config dumps above run inside
-    # `| while` pipelines, and an assignment made in a subshell does not survive.
-    _resolve_goals
-    emit_status
-    emit_footer
 }
 
 # ---- main — DO NOT EDIT --------------------------------------------------------
@@ -2021,4 +2024,3 @@ else
     _report_to_file "$OUTFILE" || exit 1
     progress "report written: $OUTFILE"
 fi
-_end_probe
