@@ -293,6 +293,12 @@ One `.txt` report, MECE domains `[1]` + A..N:
   which **dataset** each lives on, that dataset's full property set, and `df`.
   This is the only WhaTap-specific section; backend services, configs and logs
   are `collect-collserver.sh`'s job.
+
+  Reading `df -i` on ZFS: ZFS has no fixed inode table. `IUsed` is the number of
+  objects in the dataset (files, directories and the like), so it is the file
+  count without a walk. `Inodes` and `IFree` are derived from the free space and
+  move with it; read them as estimates, not as a limit (추정 — to be checked on a
+  real ZFS host).
 - **N. Deep block & metaslab statistics** — `zdb` is opt-in (see tiers). The
   **file-size histogram is opt-in (`--filesizes`, Tier 2)** since 0.6.2. It walks
   the whole tree reading metadata (`find -printf '%s'`); on a yard of ~10^8 files

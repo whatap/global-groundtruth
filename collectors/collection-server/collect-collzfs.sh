@@ -29,28 +29,12 @@
 #   * rewrite / send-receive path   -> A (whether the rewrite subcommand exists),
 #                                      F (snapshot and clone space accounting)
 #
-# THE CONTRACT (../../CONTRACT.md) — facts only, no diagnosis / no judgment.
-# Thresholds, defaults-in-the-docs and "good/bad" belong to the reader, not to
-# this script: it prints the measured value and the tunable that governs it.
+# Tier 0 (the default report) reads kstats, properties and since-boot iostat
+# only: no pool traversal, no tree walk, no device wake-up. What costs wall-clock
+# (--sample) or pool I/O (--zdb, --filesizes) is opt-in and announced first.
 #
-# DESIGN GUIDELINES (../../docs/collector-engineering.md):
-#   * MECE sections     — every fact lives in exactly one domain (A..N below).
-#   * Load-safe by tier — Tier 0 (default report) reads kstats, properties and
-#                         cumulative-since-boot iostat only: no pool traversal,
-#                         no tree walk, no device wake-up. Anything that costs
-#                         wall-clock (--sample) or pool I/O (--zdb,
-#                         --filesizes) is opt-in and announced first.
-#   * Portable          — /proc and /sys first; parse `zpool list -v` by column
-#                         NAME instead of position; discover kstat files instead
-#                         of hardcoding them; target bash 3.2+.
-#   * Reasoned absence  — a value we cannot obtain is a fact too, carrying WHY
-#                         (command not found / permission denied / path not
-#                         found / timed out / not applicable / empty output).
-#                         A tunable that does not exist in this ZFS build is
-#                         reported as such — that is a version fact.
-#
-# NOTE: no `set -e` / no `set -u`. A collector must run to completion and emit
-# its footer even when individual steps fail; each step guards itself.
+# Rules: ../../CONTRACT.md and ../../docs/collector-engineering.md. No `set -e`:
+# the report always reaches its footer.
 # -----------------------------------------------------------------------------
 
 # bash only (arrays, local, PIPESTATUS). Checked first, so sh or dash stops with
@@ -60,35 +44,21 @@
 export LC_ALL=C
 
 # ---- collector metadata -----------------------------------------------------
-COLLECTOR_NAME="whatap-collzfs"
+# 0.6.3  Readability refactor; report unchanged.
+# 0.6.2  The file-size walk is opt-in (Tier 2) again: on a yard of ~10^8 files
+#        it loads the special vdev and the ARC and cannot finish in its bound.
+#        df -i of every WhaTap path is in the report and df-i.txt in the
+#        bundle, so the file count is there without a walk.
 # 0.6.1  WHATAP_HOME is also found from a whatap JVM's working directory. Where
 #        a whatap JVM runs, a path-to-dataset goal is declared; a home not
 #        resolved there (a cwd this uid cannot read included) is blocked,
 #        whatever route resolved the home (-Dwhatap.server.home included); a
 #        home that is not there is "path not found" (na), a dangling home link
-#        says so, and only an unlistable one is blocked. A
-#        process counts as a whatap module only when it is java and names a
-#        server/opslake jar or the yard boot class (not -Dwhatap.server.host).
-# 0.6.0  "No pool" is an answer only when `zpool list` ran and listed none: a
-#        list that was refused, failed or hung, and a kstat tree with no zpool,
-#        now block the pools goal instead of "none imported", COMPLETE. A third
-#        goal, dataset properties and snapshots, is blocked when zfs get or
-#        the snapshot list failed, hung or is absent, and [1] and the per-pool
-#        lines say why nothing was queried. Every zpool / zfs / zdb /
-#        journalctl / find call is bounded, a zpool or zfs that hangs during
-#        discovery is not asked again, and the run deadline is raised to fit
-#        the file-size walk, --sample, --zdb (per pool) and the bundle; [1]
-#        prints it. A walk that could not read part of the tree is PARTIAL.
-#        Discovery reads /proc with one grep through xargs (5.2s -> 0.5s) and
-#        works with the script on stdin. Temp files and the bundle live in the
-#        run's private directory; numeric options are checked (exit 2); an
-#        unwritable --out or failed tar exits 1; output is handed back under
-#        sudo. Needs bash, and says so under sh.
-# 0.6.2  The file-size walk is opt-in (Tier 2) again: on a yard of ~10^8 files
-#        it loads the special vdev and the ARC and cannot finish in its bound.
-#        df -i of every WhaTap path is in the report and df-i.txt in the
-#        bundle, so the file count is there without a walk (2026-09-26).
-VERSION="0.6.2"
+#        says so, and only an unlistable one is blocked. A process counts as a
+#        whatap module only when it is java and names a server/opslake jar or
+#        the yard boot class (not -Dwhatap.server.host).
+COLLECTOR_NAME="whatap-collzfs"
+VERSION="0.6.3"
 DOMAIN="collection-server"
 TARGET="collection-server-zfs/$(hostname 2>/dev/null || echo unknown)"   # refined after pool discovery
 
@@ -102,27 +72,20 @@ OPT_HOME=""
 OPT_HOURS=24         # journal window
 OPT_SAMPLE=0         # Tier 1: interval iostat/arcstat samples
 SAMPLE_SECS=10
-# Block-layer sampling bucket, in seconds. `iostat -x` with no interval prints
-# the average since boot, which on a long-lived host averages a busy hour into a
-# year and reads as idle. A reader cannot tell the two apart from the output, so
-# --sample takes buckets too and keeps every one of them: a peak that a single
-# window would average away stays visible as one tall bucket.
+# Block-layer sampling bucket, in seconds. `iostat -x` without an interval is
+# the since-boot average; --sample keeps every bucket, so a peak one window
+# would average away stays visible.
 IOSTAT_BUCKET=5
 OPT_ZDB=0            # Tier 2: zdb -C / -Lbbbs / -mm
-# File-size histogram: Tier 2, opt-in again. It was on by default (0.2.0-0.6.1)
-# because an opt-in walk was missing from the runs that needed it, but a full
-# metadata walk of a yard with ~10^8 files loads the special vdev and the ARC
-# and does not finish in the bound. Every run now has df -i (the file count) and
-# --zdb has the block-size histogram; pass --filesizes=PATH for a narrow sample.
+# File-size histogram: Tier 2. A metadata walk of a yard with ~10^8 files loads
+# the special vdev and the ARC and does not finish in the bound; df -i gives the
+# file count and --zdb the block sizes. --filesizes=PATH walks a narrow sample.
 OPT_FILESIZES=0
 FILESIZES_PATH=""
 FILESIZES_SECS=300   # bound on the tree walk; a partial result is labelled as such
-# zpool events window, in days. The ring buffer holds everything back to pool
-# creation when zfs_zevent_len_max is large, and `zpool events -v` of that is
-# hundreds of MB (192MB on XLSMART web01-bsd, 2026-09-23). The per-event detail
-# is only useful for recent events, but the TALLY is useful over the whole buffer
-# because what matters is when a class STARTED and when it STOPPED. So: tally
-# everything, keep the detail for this window. 0 keeps the detail for everything.
+# zpool events detail window, in days (0 = everything). With a large
+# zfs_zevent_len_max, `zpool events -v` of the whole ring buffer is hundreds of
+# MB; the tally (when a class started and stopped) always covers all of it.
 OPT_EVENT_DAYS=30
 # RUN_DEADLINE as the caller gave it (empty when not given), read before the run
 # helpers default it: the file-size walk, --sample, --zdb and the bundle's
@@ -244,10 +207,7 @@ blk() { printf '        %s\n' "$1"; }
 
 # ---- reasoned-absence helpers (see docs/collector-engineering.md) -----------
 _errfile=""
-_init_errfile() { _errfile="$(_tmp probe.err)"; }
-_timeout_bin=""
-CMD_TIMEOUT="${CMD_TIMEOUT:-20}"
-case "$CMD_TIMEOUT" in ''|*[!0-9]*) CMD_TIMEOUT=20 ;; esac
+_init_probe() { _errfile="$(_tmp probe.err)"; }
 
 _classify_err() {
     # reads a stderr file, prints a short classified reason
@@ -723,7 +683,6 @@ probe() {
     local label="$1"; shift
     [ -n "$(_cmd_kind "$1")" ] || { fact "$label: n/a (command not found: $1)"; return; }
     _hung "$1" && { fact "$label: n/a ($(_skip_why "$1"))"; return; }
-    _past_deadline && { fact "$label: n/a (run deadline reached: ${RUN_DEADLINE}s)"; return; }
     local out rc
     out="$(_bounded "$@" 2>"$_errfile")"; rc=$?
     if [ "$rc" -eq 124 ]; then
@@ -739,25 +698,9 @@ probe() {
     _emit_labeled "$label" "$out"
 }
 
-# probe_merged: like probe but folds stderr into stdout (tools that print to stderr).
-probe_merged() {
-    local label="$1"; shift
-    [ -n "$(_cmd_kind "$1")" ] || { fact "$label: n/a (command not found: $1)"; return; }
-    local out rc
-    out="$(_bounded "$@" 2>&1)"; rc=$?
-    [ "$rc" -eq 124 ] && { fact "$label: n/a (timed out: ${CMD_TIMEOUT}s)"; return; }
-    [ -z "$out" ] && { fact "$label: n/a (empty output)"; return; }
-    _emit_labeled "$label" "$out"
-}
-
-# probe_t SECS "label" CMD... -> probe with a one-shot timeout override
-probe_t() {
-    local t="$1"; shift
-    local sv="$CMD_TIMEOUT"
-    CMD_TIMEOUT="$t"
-    probe "$@"
-    CMD_TIMEOUT="$sv"
-}
+# probe_t SECS "label" CMD... -> probe capped at SECS (bash restores the
+# prefix assignment when the function returns)
+probe_t() { local t="$1"; shift; CMD_TIMEOUT="$t" probe "$@"; }
 
 # probe_pipe "label" REQBIN 'shell pipeline' -> probe a pipeline, but classify a
 # missing primary binary as "command not found: REQBIN" rather than as sh output.
@@ -770,13 +713,7 @@ probe_pipe() {
     probe "$label" sh -c "$pipeline"
 }
 
-probe_pipe_t() {
-    local t="$1"; shift
-    local sv="$CMD_TIMEOUT"
-    CMD_TIMEOUT="$t"
-    probe_pipe "$@"
-    CMD_TIMEOUT="$sv"
-}
+probe_pipe_t() { local t="$1"; shift; CMD_TIMEOUT="$t" probe_pipe "$@"; }
 
 # read_proc "label" PATH -> emits a /proc or /sys file's content with a reason.
 read_proc() {
@@ -845,10 +782,8 @@ source_of() {
     echo ""
 }
 
-# cmdline_of PID -> sets _CL to the process's argv joined by spaces (the same
-# bytes `tr '\0' ' '` gave), with builtins only: it runs once per candidate,
-# and a fork per process made discovery linear in the process count (3.5s of
-# an 8s run on a 759-process host, 2026-09-25).
+# cmdline_of PID -> sets _CL to the process's argv joined by spaces (the bytes
+# `tr '\0' ' '` gives), with builtins only: no fork per process.
 _CL=""
 cmdline_of() {
     local a=""
@@ -887,12 +822,10 @@ _scan_cmdlines() {
 }
 
 
-# One `systemctl show` for every unit this run asks about, instead of one per
-# question (57 calls, about 1.4s, on a host with the whatap units; 2026-09-25).
-# The output is one block per unit, separated by blank lines, properties in
-# systemd's order rather than the order asked; each block is read whole and
-# filed under its Id. sd_show answers from here, and asks systemctl itself
-# only for a unit that was not prefetched.
+# One `systemctl show` for every unit this run asks about, not one per question.
+# It prints one block per unit (blank-line separated, properties in systemd's
+# order); each block is filed under its Id. sd_show answers from here and asks
+# systemctl only for a unit that was not prefetched.
 _SD_CACHE=""   # lines: <unit><TAB><Prop>=<value>
 _SD_KNOWN=" "  # units the prefetch answered for
 _sd_prefetch() {
@@ -1134,12 +1067,15 @@ resolve_yardbase() {
 # Derived views (re-projections of command output — no interpretation added)
 # =============================================================================
 
-# Per-top-level-vdev usage grouped by allocation class, derived from
-# `zpool list -v`. The raw output is emitted next to this, so nothing is lost if
-# a future layout defeats the parser. Columns are located by HEADER NAME, not by
+# `zpool list -v`, read once in section C for both views below (and H).
+ZLIST_V=""
+
+# Per-top-level-vdev usage grouped by allocation class, from `zpool list -v` on
+# stdin. The raw output is emitted next to this, so nothing is lost if a future
+# layout defeats the parser. Columns are located by HEADER NAME, not by
 # position, because zpool grew CKPOINT/EXPANDSZ/DEDUP columns over time.
 zpool_class_view() {
-    run_bounded 20 zpool list -v 2>/dev/null | awk '
+    awk '
         NR==1 { for (i=1; i<=NF; i++) col[$i]=i; next }
         {
             ind = 0
@@ -1164,11 +1100,11 @@ zpool_class_view() {
     '
 }
 
-# Redundancy shape per allocation class, derived from the same output. A vdev
+# Redundancy shape per allocation class, from the same output on stdin. A vdev
 # named mirror-N / raidzP-N / draid* carries its own shape in the name; a bare
 # device name means a single-device top-level vdev.
 zpool_class_shape() {
-    run_bounded 20 zpool list -v 2>/dev/null | awk '
+    awk '
         NR==1 { next }
         {
             ind = 0
@@ -1342,18 +1278,10 @@ filesize_histogram() {
 }
 
 # =============================================================================
-# Report body (MECE domains A..N)
+# Report body: one _rep_<x> per section (MECE domains A..N)
 # =============================================================================
-run_report() {
-    emit_header
-
-    goal zfs   "ZFS present on this host"
-    goal pools "pool topology and properties"
-    # Only where a whatap JVM runs: the path-to-dataset mapping is then expected.
-    [ -n "$ZH_JVM" ] && goal paths "WhaTap path to dataset mapping"
-    [ "$ZFS_ON_HOST" = 1 ] && goal datasets "dataset properties and snapshots"
-
-    # -- [1] Collection environment -------------------------------------------
+# -- [1] Collection environment -------------------------------------------
+_rep_env() {
     section "Collection environment"
     fact "collector: $COLLECTOR_NAME $VERSION"
     fact "bash: ${BASH_VERSION:-unknown}"
@@ -1387,24 +1315,10 @@ run_report() {
     elif [ "$ZSNAP_RC" -ne 0 ]; then fact "snapshots discovered: n/a (zfs list -t snapshot exit $ZSNAP_RC${ZSNAP_ERR:+: $ZSNAP_ERR})"
     else fact "snapshots discovered: ${SNAP_COUNT:-0}"; fi
     fact "tiers in this run: Tier0=always sample=$( [ "$OPT_SAMPLE" = 1 ] && echo "on(${SAMPLE_SECS}s)" || echo off ) zdb=$( [ "$OPT_ZDB" = 1 ] && echo on || echo off ) filesizes=$( [ "$OPT_FILESIZES" = 1 ] && echo on || echo off )"
+}
 
-    if [ "$ZFS_ON_HOST" != 1 ]; then
-        section "A. ZFS software & kernel module"
-        fact "n/a (not applicable: no zfs/zpool command and no $KSTAT_DIR on this host)"
-        fact "sections B..L: not collected (no zfs/zpool command and no $KSTAT_DIR)"
-        section "M. WhaTap collection-server paths"
-        report_whatap_paths
-        # This early return is exactly the case the status is for: a host with no
-        # ZFS produces a short, tidy-looking report that answers none of the
-        # questions this collector exists for. Say so before leaving.
-        na zfs "no zfs or zpool command and no $KSTAT_DIR on this host"
-        na pools "no zfs or zpool command and no $KSTAT_DIR on this host"
-        emit_status
-        emit_footer
-        return
-    fi
-
-    # -- A. ZFS software & kernel module --------------------------------------
+# -- A. ZFS software & kernel module --------------------------------------
+_rep_a() {
     section "A. ZFS software & kernel module"
     probe "zfs version" zfs version
     read_proc "kmod version (/sys/module/zfs/version)" /sys/module/zfs/version
@@ -1466,8 +1380,10 @@ run_report() {
         fact "zfs units: n/a (command not found: systemctl)"
     fi
     fact "/etc/zfs/zpool.cache: $( [ -e /etc/zfs/zpool.cache ] && echo "present ($(wc -c < /etc/zfs/zpool.cache 2>/dev/null | tr -d ' ') bytes, mtime $(date -u -r /etc/zfs/zpool.cache +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo n/a))" || echo 'absent (path not found)' )"
+}
 
-    # -- B. ZFS module parameters ---------------------------------------------
+# -- B. ZFS module parameters ---------------------------------------------
+_rep_b() {
     # The runtime value of a tunable and the value persisted in modprobe.d can
     # differ (a live `echo > /sys/module/...` is lost on reboot; a modprobe.d
     # entry added after boot is not yet active). Both are reported.
@@ -1557,25 +1473,30 @@ run_report() {
     done
     [ "$any_mp" = 0 ] && fact "no /etc/modprobe.d/*zfs* or *spl* file (path not found)"
     probe_pipe "kernel cmdline zfs options" cat "tr ' ' '\n' < /proc/cmdline 2>/dev/null | grep -iE 'zfs|spl' || true"
+}
 
-    # -- C. Pool topology & allocation classes --------------------------------
+# -- C. Pool topology & allocation classes --------------------------------
+_rep_c() {
     section "C. Pool topology & allocation classes"
     probe "zpool list -v (raw)" zpool list -v
     subsection "per-top-level-vdev usage by allocation class (derived from zpool list -v)"
-    local cv; cv="$(zpool_class_view)"
+    ZLIST_V="$(run_bounded 20 zpool list -v)"
+    local cv; cv="$(printf '%s\n' "$ZLIST_V" | zpool_class_view)"
     if [ -n "$cv" ]; then printf '%s\n' "$cv" | while IFS= read -r _l; do blk "$_l"; done
     elif _hung zpool; then fact "n/a ($(_skip_why zpool))"
     else fact "n/a (empty output or layout not parsed — see the raw zpool list -v above)"; fi
     subsection "redundancy shape per allocation class (derived from zpool list -v)"
-    local cs; cs="$(zpool_class_shape)"
+    local cs; cs="$(printf '%s\n' "$ZLIST_V" | zpool_class_shape)"
     if [ -n "$cs" ]; then printf '%s\n' "$cs" | while IFS= read -r _l; do blk "$_l"; done
     elif _hung zpool; then fact "n/a ($(_skip_why zpool))"
     else fact "n/a (empty output or layout not parsed)"; fi
     subsection "zpool status"
     # -v and -t combined in one call: -t only annotates the same vdev tree with
-    # trim state, so two separate calls would print the tree twice.
-    if run_bounded "$CMD_TIMEOUT" zpool status -vt >/dev/null 2>&1; then
-        probe "zpool status -vt (verbose + trim state per vdev)" zpool status -vt
+    # trim state, so two separate calls would print the tree twice. The answer
+    # to the support test is the one printed.
+    local zst
+    if zst="$(run_bounded "$CMD_TIMEOUT" zpool status -vt)" && [ -n "$zst" ]; then
+        _emit_labeled "zpool status -vt (verbose + trim state per vdev)" "$zst"
     else
         probe "zpool status -v" zpool status -v
         probe "zpool status -t (trim state per vdev)" zpool status -t
@@ -1590,8 +1511,11 @@ run_report() {
             "zpool status -PL '$p' 2>/dev/null | awk 'NF>=2 && \$1 ~ /^\\// {print \$1\"  \"\$2}' || true"
     done
     [ -z "$ZPOOLS" ] && fact "leaf device paths: n/a ($(_nopool_why))"
+}
 
-    # -- D. Pool properties, features & capacity ------------------------------
+# -- D. Pool properties, features & capacity ------------------------------
+_rep_d() {
+    local p
     section "D. Pool properties, features & capacity"
     probe "zpool list" zpool list
     for p in $ZPOOLS; do
@@ -1601,8 +1525,10 @@ run_report() {
     [ -z "$ZPOOLS" ] && fact "zpool get all: n/a ($(_nopool_why))"
     subsection "dataset space overview (zfs list -o space)"
     probe_t 60 "zfs list -o space" zfs list -o space
+}
 
-    # -- E. Dataset block size & compression ----------------------------------
+# -- E. Dataset block size & compression ----------------------------------
+_rep_e() {
     # recordsize and special_small_blocks are printed adjacently and each value
     # carries its property source, because an inherited or default value and a
     # deliberately set one are different facts.
@@ -1629,8 +1555,11 @@ run_report() {
     fi
     subsection "compression runtime counters (global kstats)"
     read_proc "zstd" "$KSTAT_DIR/zstd"
+}
 
-    # -- F. Snapshots, clones & space accounting ------------------------------
+# -- F. Snapshots, clones & space accounting ------------------------------
+_rep_f() {
+    local p
     section "F. Snapshots, clones & space accounting"
     subsection "space accounting matrix (where used space sits)"
     local sm_; sm_="$(dataset_space_matrix)"
@@ -1680,8 +1609,10 @@ run_report() {
         probe_pipe "$p: checkpoint" zpool "zpool get -H -o value checkpoint '$p' 2>/dev/null || true"
     done
     probe_t 60 "bookmarks" zfs list -t bookmark
+}
 
-    # -- G. ARC / L2ARC / memory ----------------------------------------------
+# -- G. ARC / L2ARC / memory ----------------------------------------------
+_rep_g() {
     section "G. ARC / L2ARC / memory"
     read_proc "arcstats (verbatim)" "$KSTAT_DIR/arcstats"
     probe_t 30 "arc_summary" arc_summary
@@ -1694,8 +1625,10 @@ run_report() {
     subsection "host memory context for the ARC values above"
     read_proc "meminfo" /proc/meminfo
     fact "/proc/spl/kmem/slab: $( [ -e /proc/spl/kmem/slab ] && echo 'present (not inlined in this report)' || echo 'absent (path not found)' )"
+}
 
-    # -- H. Write path: transaction groups & ZIL ------------------------------
+# -- H. Write path: transaction groups & ZIL ------------------------------
+_rep_h() {
     # The txgs kstat is a ring buffer of the last zfs_txg_history transaction
     # groups with, per txg, the bytes dirtied and the time spent in each state.
     # When zfs_txg_history is 0 the file exists but stays empty (see section B).
@@ -1718,12 +1651,14 @@ run_report() {
     read_proc "dmu_tx" "$KSTAT_DIR/dmu_tx"
     read_proc "zil (global)" "$KSTAT_DIR/zil"
     subsection "separate log (SLOG) vdev presence"
-    local shp; shp="$(zpool_class_shape 2>/dev/null | grep -E '/(logs|log)/' || true)"
+    local shp; shp="$(printf '%s\n' "$ZLIST_V" | zpool_class_shape | grep -E '/(logs|log)/' || true)"
     if [ -n "$shp" ]; then printf '%s\n' "$shp" | while IFS= read -r _l; do blk "$_l"; done
     elif _hung zpool; then fact "separate log vdev: n/a ($(_skip_why zpool))"
     else fact "no vdev in the logs allocation class was parsed from zpool list -v"; fi
+}
 
-    # -- I. Per-dataset I/O counters (objset kstats) --------------------------
+# -- I. Per-dataset I/O counters (objset kstats) --------------------------
+_rep_i() {
     section "I. Per-dataset I/O counters (objset kstats)"
     fact "source: $KSTAT_DIR/<pool>/objset-<objsetid>; counters are cumulative since pool import"
     local ov; ov="$(objset_kstat_view)"
@@ -1738,13 +1673,14 @@ run_report() {
     else
         fact "kstat inventory: n/a (path not found: $KSTAT_DIR)"
     fi
+}
 
-    # -- J. I/O request size & latency distribution ---------------------------
-    # zpool iostat with no interval prints cumulative-since-boot values from
-    # kstats — instant and load-free. -r is the request-SIZE histogram (the
-    # distribution an on-disk block size question turns on); -w is the latency
-    # histogram. An interval sample (--sample) shows current behaviour instead
-    # of the whole-uptime average.
+# -- J. I/O request size & latency distribution ---------------------------
+_rep_j() {
+    local kd pn
+    # zpool iostat without an interval is the since-boot kstat values (instant,
+    # load-free): -r the request-size histogram, -w the latency histogram.
+    # --sample adds interval samples of current behaviour.
     section "J. I/O request size & latency distribution"
     subsection "cumulative since boot (instant kstat read)"
     probe "zpool iostat -v" zpool iostat -v
@@ -1768,11 +1704,8 @@ run_report() {
             "zpool iostat -w ${SAMPLE_SECS} 2 2>/dev/null | head -n 500 || true"
         progress "sampling arcstat over ${SAMPLE_SECS}s ..."
         probe_pipe_t "$st" "arcstat 1 ${SAMPLE_SECS}" arcstat "arcstat 1 ${SAMPLE_SECS} 2>/dev/null || true"
-        # Block layer, bucketed. J's `iostat -x` is the since-boot average and
-        # says nothing about now; these buckets do. Both are kept because the
-        # since-boot one still serves device-to-device comparison over the same
-        # span. The first block printed here is the since-boot one again — the
-        # interval blocks are the ones after it.
+        # Block layer, bucketed: the since-boot `iostat -x` (section K) says
+        # nothing about now. The first block printed is the since-boot one.
         local ic=$(( SAMPLE_SECS * 3 / IOSTAT_BUCKET + 1 ))
         [ "$ic" -lt 2 ] && ic=2
         progress "sampling iostat -x in ${IOSTAT_BUCKET}s buckets over $(( (ic - 1) * IOSTAT_BUCKET ))s ..."
@@ -1795,8 +1728,10 @@ run_report() {
     else
         fact "n/a (not applicable: --sample not given)"
     fi
+}
 
-    # -- K. Underlying block devices ------------------------------------------
+# -- K. Underlying block devices ------------------------------------------
+_rep_k() {
     section "K. Underlying block devices"
     probe "lsblk" lsblk -o NAME,KNAME,TYPE,SIZE,ROTA,PHY-SEC,LOG-SEC,SCHED,MOUNTPOINT,MODEL
     subsection "queue settings per block device (/sys/block/*/queue)"
@@ -1818,20 +1753,17 @@ run_report() {
     probe_pipe "device id links (/dev/disk/by-id)" ls "ls -l /dev/disk/by-id 2>/dev/null | awk 'NF>=9 {print \$9\" -> \"\$NF}' || true"
     probe_pipe "iostat -x (cumulative since boot)" iostat "iostat -x 2>/dev/null | head -n 60 || true"
     fact "multipath: $( have multipath && echo 'command present (multipath -ll not run in this report)' || echo 'n/a (command not found: multipath)' )"
+}
 
-    # -- L. Pool events, errors & maintenance ---------------------------------
+# -- L. Pool events, errors & maintenance ---------------------------------
+_rep_l() {
+    local p
     section "L. Pool events, errors & maintenance"
-    # stderr is folded into the output (2>&1) on purpose: for an unprivileged uid
-    # these two write "permission denied" to stderr and still print their header
-    # line to stdout, so discarding stderr would leave a header that reads like
-    # "no events" / "no history". Folding it in keeps the reason visible.
-    # The tally comes before the last-100 list on purpose. The list answers "what
-    # is happening now", the tally answers "when did this class start and when did
-    # it stop" — and the second question is the one a recent-only view cannot
-    # answer. A host with no deadman event this month reads identically whether it
-    # never had one or whether they ended in July. This uses the short form of
-    # `zpool events` (one line per event), not -v, so it stays cheap here; the
-    # per-event detail is bundled by zevents_split.
+    # The lists fold stderr in: for an unprivileged uid zpool prints its header
+    # and writes "permission denied" to stderr, which would read as "no events".
+    # The tally (when each class started and stopped, over the whole buffer)
+    # comes first: a recent-only view cannot answer that. It reads the short
+    # form (one line per event); the -v detail is bundled by zevents_split.
     probe_pipe_t 180 "zpool events: tally over the whole ring buffer (count, first, last)" zpool \
         "zpool events 2>/dev/null | awk '
             BEGIN { split(\"Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec\", mn, \" \")
@@ -1884,21 +1816,18 @@ run_report() {
     done
     probe_pipe "zed / replication processes" ps \
         "ps -eo comm,args 2>/dev/null | grep -iE 'zed|sanoid|syncoid|zrepl|zfs (send|recv|receive)' | grep -v grep || true"
+}
 
-    # -- M. WhaTap collection-server paths -> dataset mapping -----------------
-    section "M. WhaTap collection-server paths -> dataset mapping"
-    report_whatap_paths
-
-    # -- N. Deep block & metaslab statistics (opt-in) -------------------------
+# -- N. Deep block & metaslab statistics (opt-in) -------------------------
+_rep_n() {
+    local p
     section "N. Deep block & metaslab statistics (opt-in)"
     if [ "$OPT_ZDB" = 1 ]; then
         if ! have zdb; then
             fact "zdb: n/a (command not found: zdb)"
         else
-            # zdb opens the pool's devices directly. For an unprivileged uid it
-            # exits with "can't open '<pool>': Permission denied"; stderr is
-            # folded into the output below so that message is visible verbatim
-            # instead of appearing as an empty result.
+            # zdb opens the pool devices directly; stderr is folded in so a
+            # non-root "can't open '<pool>': Permission denied" stays visible.
             fact "uid for this run: $(id -u 2>/dev/null || echo unknown) ($( [ "$(id -u 2>/dev/null)" = 0 ] && echo root || echo non-root )) — zdb opens the pool devices directly"
             for p in $ZPOOLS; do
                 subsection "$p (zdb)"
@@ -1908,11 +1837,8 @@ run_report() {
                     "zdb -C '$p' 2>&1 | head -n 400 || true"
                 warn "[Tier2] zdb -Lbbbs $p — traverses pool metadata; takes minutes on a large pool and reads the data disks"
                 progress "zdb -Lbbbs $p (block statistics; this is the long one) ..."
-                # zdb writes a carriage-return progress line to stderr while it
-                # traverses ("... estimated time remaining ..."). stderr is kept
-                # (it carries the permission error for a non-root uid), but the
-                # progress is split on \r and dropped so it does not flood the
-                # report as one very long line.
+                # Its \r-separated "estimated time remaining" progress on stderr
+                # is split and dropped; the rest of stderr is kept.
                 probe_pipe_t 1800 "zdb -Lbbbs $p (block/psize/lsize histogram, measured compression; first 500 lines)" zdb \
                     "zdb -Lbbbs '$p' 2>&1 | tr '\r' '\n' | grep -v 'estimated time remaining' | head -n 500 || true"
                 warn "[Tier2] zdb -mm $p — loads metaslab space maps"
@@ -1946,7 +1872,50 @@ run_report() {
     else
         fact "not requested (--filesizes not given)"
     fi
+}
 
+run_report() {
+    emit_header
+
+    goal zfs   "ZFS present on this host"
+    goal pools "pool topology and properties"
+    # Only where a whatap JVM runs: the path-to-dataset mapping is then expected.
+    [ -n "$ZH_JVM" ] && goal paths "WhaTap path to dataset mapping"
+    [ "$ZFS_ON_HOST" = 1 ] && goal datasets "dataset properties and snapshots"
+
+    _rep_env
+    if [ "$ZFS_ON_HOST" != 1 ]; then
+        section "A. ZFS software & kernel module"
+        fact "n/a (not applicable: no zfs/zpool command and no $KSTAT_DIR on this host)"
+        fact "sections B..L: not collected (no zfs/zpool command and no $KSTAT_DIR)"
+        section "M. WhaTap collection-server paths"
+        report_whatap_paths
+        # A short report that answers none of this collector's questions: the
+        # status says so.
+        na zfs "no zfs or zpool command and no $KSTAT_DIR on this host"
+        na pools "no zfs or zpool command and no $KSTAT_DIR on this host"
+        emit_status
+        emit_footer
+        return
+    fi
+
+    _rep_a
+    _rep_b
+    _rep_c
+    _rep_d
+    _rep_e
+    _rep_f
+    _rep_g
+    _rep_h
+    _rep_i
+    _rep_j
+    _rep_k
+    _rep_l
+    # -- M. WhaTap collection-server paths -> dataset mapping -----------------
+    section "M. WhaTap collection-server paths -> dataset mapping"
+    report_whatap_paths
+
+    _rep_n
     got zfs
     _resolve_pools
     _resolve_datasets
@@ -2068,14 +2037,18 @@ report_whatap_paths() {
         fact "n/a (WHATAP_HOME and yardbase both unresolved: no -Dwhatap.server.home and no home as the cwd of a readable whatap JVM, no WorkingDirectory in a loaded whatap unit, no conf/ + logs/ beside this script)"
         return
     fi
-    local seen=""
+    # zmap: "path<TAB>dataset" of each present path on zfs, for the next loop
+    local seen="" zmap=""
     for p in $paths; do
         [ -n "$p" ] || continue
         case " $seen " in *" $p "*) continue ;; esac
         seen="$seen $p"
         if [ -e "$p" ]; then ex="present"; else ex="path not found"; fi
-        ft="$(fstype_of "$p")"; [ -z "$ft" ] && ft="n/a"
-        sr="$(source_of "$p")"; [ -z "$sr" ] && sr="n/a"
+        ft="$(fstype_of "$p")"
+        sr="$(source_of "$p")"
+        [ "$ft" = zfs ] && [ -e "$p" ] && [ -n "$sr" ] && zmap="$zmap$p$_tab$sr$_nl"
+        [ -z "$ft" ] && ft="n/a"
+        [ -z "$sr" ] && sr="n/a"
         # The pool is the part of the dataset name before the first '/', but only
         # when the mount source IS a dataset. Deriving it unconditionally turns a
         # device path (/dev/vda2) into an empty pool and "n/a" into "n".
@@ -2084,13 +2057,8 @@ report_whatap_paths() {
     done
     subsection "dataset properties for the paths above"
     local done_ds=""
-    for p in $paths; do
+    while IFS="$_tab" read -r p sr; do
         [ -n "$p" ] || continue
-        [ -e "$p" ] || continue
-        ft="$(fstype_of "$p")"
-        [ "$ft" = "zfs" ] || continue
-        sr="$(source_of "$p")"
-        [ -n "$sr" ] || continue
         case " $done_ds " in *" $sr "*) continue ;; esac
         done_ds="$done_ds $sr"
         fact "$sr (mounted at or containing $p):"
@@ -2103,7 +2071,9 @@ report_whatap_paths() {
             [ -z "$v" ] && v="n/a (property not reported for this dataset)"
             blk "$(printf '%-24s %s' "$pr" "$v")"
         done
-    done
+    done <<EOF
+$zmap
+EOF
     [ -z "$done_ds" ] && fact "no WhaTap path resolved to a ZFS dataset"
     subsection "capacity as the filesystem reports it"
     for p in $paths; do
@@ -2123,20 +2093,12 @@ report_whatap_paths() {
 
 # zevents_split DESTDIR -> split `zpool events -v` into a tally and a window.
 #
-# The zevent ring buffer holds every event back to pool creation when
-# zfs_zevent_len_max is large (it is INT_MAX on the XLSMART hosts), so the -v
-# dump is hundreds of MB and cannot travel or live in a repo. But truncating it
-# to a recent window loses the one thing the buffer is good for: **when a class
-# started and when it stopped**. A host with zero deadman events in the last
-# month reads the same whether it never had any or whether they ended in July.
-#
-# So the stream is read ONCE and split three ways:
+# With a large zfs_zevent_len_max the -v dump is hundreds of MB, but a recent
+# window alone loses when each class started and stopped. So the stream is read
+# ONCE (a second pass costs the same minutes and sees a moved buffer) and split:
 #   zpool-events-tally.tsv     class x date x vdev, counted over the whole buffer
 #   zpool-events-overview.tsv  class, count, first date, last date
 #   zpool-events-v.txt         full detail, but only for the last OPT_EVENT_DAYS
-#
-# Reading it once matters: a second pass costs the same minutes again and sees a
-# buffer that has moved.
 zevents_split() {
     local d="$1" cut=""
     if [ "$OPT_EVENT_DAYS" -gt 0 ] 2>/dev/null; then
@@ -2404,8 +2366,7 @@ if [ "$OPT_BUNDLE" = 0 ] && [ "$OPT_STDOUT" = 0 ] && [ "$OPT_FILE" = 0 ]; then
     exit 2
 fi
 
-# Numeric options are checked before anything runs (exit 2), so a value the
-# shell cannot do arithmetic on never aborts a run half way.
+# Numeric options are checked before anything runs (exit 2), not half way.
 _need_int --sample "$SAMPLE_SECS"
 _need_int --hours "$OPT_HOURS"
 _need_int --filesizes-secs "$FILESIZES_SECS"
@@ -2425,7 +2386,7 @@ if [ -z "$_RUN_DEADLINE_ENV" ]; then
 fi
 
 _run_init
-_init_errfile
+_init_probe
 
 # The output directory is checked before collecting, so an unwritable one
 # fails at once rather than after a full run.

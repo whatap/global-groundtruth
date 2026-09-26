@@ -57,6 +57,19 @@ status_adds_up() {
   chk "$2 ($line)" "$d" "$((g + n + b))"
 }
 
+# The collector finds whatap JVMs with one `xargs grep` over /proc/*/cmdline.
+# This xargs, first on PATH, passes on only the PIDs in ONLY_PIDS (empty: none),
+# so a whatap-looking process elsewhere on the host (a parallel suite's fake
+# JVM) cannot change what a test sees.
+mkdir -p "$ROOT/only"
+stub_write "$ROOT/only/xargs" <<EOF
+#!$(type -P bash)
+while IFS= read -r -d '' p; do
+    q="\${p#/proc/}"; case " \${ONLY_PIDS:-} " in *" \${q%%/*} "*) printf '%s\\0' "\$p" ;; esac
+done | exec $(type -P xargs) -r "\$@"
+EOF
+export PATH="$ROOT/only:$PATH" ONLY_PIDS=""
+
 # A PATH of the ordinary tools and no zfs userland; each group adds its own
 # zpool stub. ZPOOL_MODE picks what the stub does.
 S="$ROOT/stub"; mkdir -p "$S"
@@ -65,6 +78,7 @@ for c in cat ls date wc tail head sed awk grep tr id hostname find sort mktemp c
          readlink findmnt lsblk kill xargs; do
   p="$(type -P "$c" 2>/dev/null)" && [ -n "$p" ] && ln -sf "$p" "$S/$c"
 done
+rm -f "$S/xargs"; stub_write "$S/xargs" < "$ROOT/only/xargs"
 stub_write "$S/zpool" <<'STUB'
 #!/bin/sh
 case "${ZPOOL_MODE:-empty}" in
@@ -234,7 +248,7 @@ H8="$ROOT/home8"; mkdir -p "$H8/conf"
 ( exec -a "java -Dwhatap.server.home=$H8 -jar whatap.server.yard.jar" sleep 60 ) >/dev/null 2>&1 </dev/null &
 jvm=$!
 sleep 1
-out="$(PATH="$S0" bash -s -- --stdout --no-filesizes < "$C" 2>/dev/null)"
+out="$(ONLY_PIDS="$jvm" PATH="$S0" bash -s -- --stdout --no-filesizes < "$C" 2>/dev/null)"
 kill "$jvm" 2>/dev/null; wait "$jvm" 2>/dev/null
 has "bash -s: WHATAP_HOME comes from a whatap JVM" "$out" "(-Dwhatap.server.home)"
 
@@ -243,7 +257,7 @@ H9="$ROOT/home9"; mkdir -p "$H9/conf"; : >| "$H9/conf/yard.conf"
 ( cd "$H9" && exec -a "java -jar whatap.server.yard.jar" sleep 60 ) >/dev/null 2>&1 </dev/null &
 jvm=$!
 sleep 1
-out="$(PATH="$S0" "$C" --stdout --no-filesizes </dev/null 2>/dev/null)"
+out="$(ONLY_PIDS="$jvm" PATH="$S0" "$C" --stdout --no-filesizes </dev/null 2>/dev/null)"
 kill "$jvm" 2>/dev/null; wait "$jvm" 2>/dev/null
 has "the home is the JVM's cwd" "$out" "WHATAP_HOME: $H9"
 has "and says so" "$out" "working directory"
@@ -253,7 +267,7 @@ if [ "$(id -u)" != 0 ] && sudo -n true 2>/dev/null; then
   sudo -n -u nobody bash -c 'cd /tmp && exec -a "java -jar whatap.server.yard.jar" sleep 60' >/dev/null 2>&1 </dev/null &
   sleep 1
   opid="$(pgrep -u nobody -f '^java -jar whatap.server.yard.jar' | head -1)"
-  out="$(PATH="$S0" "$C" --stdout --no-filesizes </dev/null 2>/dev/null)"
+  out="$(ONLY_PIDS="$opid" PATH="$S0" "$C" --stdout --no-filesizes </dev/null 2>/dev/null)"
   [ -n "$opid" ] && sudo -n kill "$opid" 2>/dev/null; wait 2>/dev/null
   has "the cwd is said to be unreadable" "$out" "whatap JVM working directory: n/a (not readable by uid $(id -u): pid"
   has "and the paths goal is blocked with the privilege hint" "$out" "WhaTap path to dataset mapping — whatap JVM pid"
@@ -268,7 +282,7 @@ p1=$!
 tail -f "$F11/whatap.server.log" >/dev/null 2>&1 </dev/null &
 p2=$!
 sleep 1
-out="$(PATH="$S0" "$C" --stdout --no-filesizes </dev/null 2>/dev/null)"
+out="$(ONLY_PIDS="$p1 $p2" PATH="$S0" "$C" --stdout --no-filesizes </dev/null 2>/dev/null)"
 kill "$p1" "$p2" 2>/dev/null; wait "$p1" "$p2" 2>/dev/null
 hasnt "an app JVM with the agent and a tail of a whatap log: no paths goal" "$out" "WhaTap path to dataset mapping"
 has "and the host stays COMPLETE" "$out" "status: COMPLETE"
@@ -278,15 +292,15 @@ H12="$ROOT/home12"; mkdir -p "$H12/conf"
 ( exec -a "java -Dwhatap.server.home=$H12 -jar whatap.server.yard.jar" sleep 60 ) >/dev/null 2>&1 </dev/null &
 jvm=$!
 sleep 1
-out="$(PATH="$S0" "$C" --stdout --no-filesizes </dev/null 2>/dev/null)"
+out="$(ONLY_PIDS="$jvm" PATH="$S0" "$C" --stdout --no-filesizes </dev/null 2>/dev/null)"
 has "-Dwhatap.server.home: the goal is declared and obtained" "$out" "obtained: WhaTap path to dataset mapping"
-out="$(PATH="$S0" "$C" --stdout --no-filesizes --home "$ROOT/home12" </dev/null 2>/dev/null)"
+out="$(ONLY_PIDS="$jvm" PATH="$S0" "$C" --stdout --no-filesizes --home "$ROOT/home12" </dev/null 2>/dev/null)"
 has "--home with a module running: declared too" "$out" "WhaTap path to dataset mapping"
 kill "$jvm" 2>/dev/null; wait "$jvm" 2>/dev/null
 ( exec -a "java -Dwhatap.server.home=$ROOT/gone12 -jar whatap.server.yard.jar" sleep 60 ) >/dev/null 2>&1 </dev/null &
 jvm=$!
 sleep 1
-out="$(PATH="$S0" "$C" --stdout --no-filesizes </dev/null 2>/dev/null)"
+out="$(ONLY_PIDS="$jvm" PATH="$S0" "$C" --stdout --no-filesizes </dev/null 2>/dev/null)"
 kill "$jvm" 2>/dev/null; wait "$jvm" 2>/dev/null
 # na_block REPORT -> only the lines under "not applicable to this host"
 na_block() { printf '%s\n' "$1" | awk '/not applicable to this host/ {f=1; next} f && /^        / {print; next} {f=0}'; }
@@ -298,7 +312,7 @@ home12_case() {
     ( exec -a "java -Dwhatap.server.home=$1 -jar whatap.server.yard.jar" sleep 60 ) >/dev/null 2>&1 </dev/null &
     local j=$!
     sleep 1
-    PATH="$S0" "$C" --stdout --no-filesizes </dev/null 2>/dev/null
+    ONLY_PIDS="$j" PATH="$S0" "$C" --stdout --no-filesizes </dev/null 2>/dev/null
     kill "$j" 2>/dev/null; wait "$j" 2>/dev/null
 }
 out="$(home12_case "$ROOT/nodata12/whatap")"
@@ -317,6 +331,17 @@ if [ "$(id -u)" != 0 ]; then
     has "which names the uid" "$out" "is not readable by uid $(id -u) (not elevated: run again with sudo)"
     chmod 755 "$ROOT/locked12"
 else skip "the unlistable-home case (root lists everything)"; fi
+
+echo "== 13. the default report has df -i for every WhaTap path that exists =="
+# 0.6.2 put the file count in df -i instead of a walk; the bundle test above
+# covers df-i.txt, this the report.
+H13="$ROOT/home13"; mkdir -p "$H13/conf" "$H13/logs" "$H13/yardbase"
+out="$(PATH="$S0" "$C" --stdout --home "$H13" </dev/null 2>/dev/null)"
+for p13 in "$H13" "$H13/yardbase" "$H13/logs" "$H13/conf"; do
+  has "df -i $p13" "$out" "df -i $p13:"
+done
+hasnt "and none for a path that is not there" "$out" "df -i $H13/db"
+chk "one df -i per distinct present path" "4" "$(printf '%s\n' "$out" | grep -c '^    df -i ')"
 
 echo; echo "PASS=$PASS FAIL=$FAIL SKIP=$SKIP"
 [ "$FAIL" -eq 0 ]
