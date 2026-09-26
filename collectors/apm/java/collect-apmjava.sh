@@ -2,106 +2,78 @@
 #
 # WhaTap Global Groundtruth — APM Java agent collector
 # -----------------------------------------------------------------------------
-# Gathers the hidden facts a remote WhaTap Java-agent developer repeatedly asks
-# a field engineer for, from the host or container where the target JVM runs.
-# Derived from the agent source (io.whatap.java/whatap.agent.tracer, v2.2.76),
-# the whatap-operator Java injector (internal/webhook/v2alpha1/injector_java.go),
-# and WhaTap Global support cases 2026-06-16 (JBoss 5.1 eorder_uat), 2026-06-24
-# (KBANESCFServer socket gateway), 2026-06-30 (keypro GlassFish logging loop).
+# Gathers the facts a remote WhaTap Java-agent developer repeatedly asks a
+# field engineer for, from the host or container where the target JVM runs.
+# Derived from the agent source (io.whatap.java/whatap.agent.tracer, v2.2.76)
+# and the whatap-operator Java injector (internal/webhook/v2alpha1/
+# injector_java.go). The support cases behind each part: README, "Cases".
 #
-# Recurring field questions this report answers with facts:
-#   * Is a WhaTap -javaagent actually attached, and how many agents are on the
-#     JVM? The option may come from the command line OR from JAVA_TOOL_OPTIONS /
+# What the report answers with facts:
+#   * Is a WhaTap -javaagent attached, and how many agents are on the JVM? The
+#     option may come from the command line OR from JAVA_TOOL_OPTIONS /
 #     _JAVA_OPTIONS / JDK_JAVA_OPTIONS (the operator injects it that way, so it
-#     never appears in /proc/<pid>/cmdline) — all four sources are read.
-#   * Which agent jar, which version? Version is read from whatap/v.properties
-#     INSIDE the jar (VERSION/BUILD), with the jar's size/mtime/sha256 and the
-#     agent log banner as independent cross-checks.
-#   * Where does the agent look for its config? The resolution the agent
-#     performs is: env WHATAP_CONFIG_FILE, else -Dwhatap.config.file, else
-#     -Dwhatap.home (DEFAULT ".", i.e. the process working directory) plus
-#     -Dwhatap.config (default "whatap.conf"). Resolved per process, and the
-#     file dumped verbatim.
-#   * Which settings are in force? whatap.conf is dumped verbatim, and every
-#     whatap-related environment variable and -D system property is listed per
-#     process: the agent overlays env and system properties onto the config
-#     (whatap/lang/conf/ConfigValueUtil.replaceSysProp), and env names may carry
-#     dots (license, whatap.server.host, whatap.server.port).
-#   * What kind of Java process is this? Server markers (catalina.base,
-#     jboss.home.dir, jeus.home, weblogic, websphere, Spring Boot loader) are
-#     read the same way the agent's own ProcessTypeDetector reads them.
-#   * The most frequent Java case — "the agent is installed, the process is
-#     healthy, but the hitmap stays empty because the application's framework
-#     is not instrumented" — needs four facts side by side, and the report
-#     carries all four: what the application carries (section F), what THIS
-#     agent build can instrument (section G: the weaving modules bundled in
-#     the installed jar plus its built-in ASM classes — read from the jar, so
-#     the list matches the deployed version), which modules the configuration
-#     selects (the weaving / hook_service_* / instrumentation_* keys), and
-#     which modules the running process actually loaded (the agent log's
-#     "Weaving" lines, including the compiled-class-version warnings that stop
-#     a module from applying).
-#   * Which libraries does the deployed application actually carry? Enumerated
-#     from the target's own -cp/-classpath, -jar (BOOT-INF/lib), CLASSPATH and
-#     the server deploy directories derived from its -D properties. The
-#     -javaagent jar itself is EXCLUDED from these lists and the exclusion is
-#     stated: the agent jar bundles weaving-module markers, so a scan that
-#     includes it reports the agent's own catalog instead of the application's
-#     libraries (case 2026-06-16).
-#   * Where does the JVM's stdout go? /proc/<pid>/fd/1 is resolved — the agent
-#     boot banner and a SIGQUIT thread dump land there, not in the agent log.
-#   * Which logging framework is in play, and where are its config files and
-#     output files? (case 2026-06-30: a console/JUL loop produced 19.8M events
-#     while the on-disk server log stayed small.)
-#   * Is the process a JVM at all when nothing about it says java? A native
-#     launcher that creates the VM in-process through JNI_CreateJavaVM (Axway
-#     API Gateway's `vshell` is one) has its own comm and exe and passes the
-#     JVM options in memory, so no /proc file names them. Such a process is
-#     identified by the VM shared library mapped into it (libjvm.so /
-#     libj9vm*.so), and --jcmd then reads its options back from the VM itself
-#     (case 2026-09-11 BAF: section D reported no JVM while section J showed
-#     two `vshell` processes connected to the collection server).
-#   * Tier 2, opt-in: thread dumps (--threads) and jcmd VM data (--jcmd) of the
-#     target JVM — the artifact that decided both transaction-entry cases.
-#   * Which of the application's own classes implement, extend or call a
-#     given type? The console answers it with an Interfaces column; from the
-#     artifact it is answered by the constant pool, which carries the type as
-#     a UTF8 entry in every class that names it. --class-refs does that scan
-#     (case 2026-09-17 FIF: which of 72 batchprocess classes are Quartz jobs).
-#   * A thread dump the field already holds (WhaTap console dump, jstack file,
-#     kill -3 output) enters the same counts through --dump-file, without
-#     touching any JVM (case 2026-09-17 FIF: the dump arrived over Slack and
-#     was counted by hand). The counts also cover what the FRAMES of an idle
-#     JVM do not show: thread names (a cache or scheduler thread carries the
-#     application's package in its name), thread states, and the frame and
-#     thread footprint of other APM agents attached to the same JVM.
+#     never appears in /proc/<pid>/cmdline); all four sources are read.
+#   * Which agent jar and version: whatap/v.properties INSIDE the jar
+#     (VERSION/BUILD), with its size/mtime/sha256 and the agent log banner as
+#     independent cross-checks.
+#   * Where the agent looks for its config: env WHATAP_CONFIG_FILE, else
+#     -Dwhatap.config.file, else -Dwhatap.home (default ".", the process working
+#     directory) plus -Dwhatap.config (default "whatap.conf"). Resolved per
+#     process, and the file dumped verbatim.
+#   * Which settings are in force: the agent overlays env and system properties
+#     onto the config (whatap/lang/conf/ConfigValueUtil.replaceSysProp), so every
+#     whatap-related env variable (names may carry dots: license,
+#     whatap.server.host) and -D property is listed per process.
+#   * What kind of Java process: the server markers the agent's own
+#     ProcessTypeDetector reads (catalina.base, jboss.home.dir, jeus.home,
+#     weblogic, websphere, the Spring Boot loader).
+#   * "Installed and healthy, but the hitmap stays empty": four facts side by
+#     side — what the application carries (F), what THIS agent build can
+#     instrument (G: the weaving modules and ASM classes read from the installed
+#     jar), which modules the configuration selects, and which the running
+#     process loaded (the agent log's Weaving lines, class-version warnings
+#     included).
+#   * The application's own libraries: from its -cp/-classpath, -jar
+#     (BOOT-INF/lib), CLASSPATH and the server deploy directories its -D
+#     properties name. The -javaagent jar is EXCLUDED and the exclusion stated:
+#     it bundles weaving-module markers, so a scan that includes it reports the
+#     agent's catalog instead of the application's libraries.
+#   * Where the JVM's stdout goes (/proc/<pid>/fd/1): the agent boot banner and
+#     a SIGQUIT thread dump land there, not in the agent log.
+#   * The logging framework in play, its config files and its output files.
+#   * A JVM nothing names as java: a native launcher that creates the VM
+#     in-process through JNI_CreateJavaVM (Axway API Gateway's vshell) has its
+#     own comm and exe and passes the JVM options in memory. It is identified by
+#     the VM library mapped into it (libjvm.so / libj9vm*.so), and --jcmd reads
+#     its options back from the VM itself.
+#   * Opt-in, read-only: --library (detail pack for writing a weaving module),
+#     --appclasses (the application's own classes), --class-refs (which of them
+#     name a type, from the constant pool: "names it", not "implements it"),
+#     --dump-file (a thread dump taken elsewhere enters the same frame, thread
+#     name, state and other-APM-agent counts, without touching any JVM).
+#   * Tier 2, opt-in: thread dumps (--threads) and jcmd VM data (--jcmd).
 #
-# THE CONTRACT (../../../CONTRACT.md):
-#   1. Facts only. No conclusion is stated on any emitted line.
-#   2. Discover, never assume. Resolve symlinks, process args, env, config.
-#   3. One field command -> paste the whole output.
-#   4. Domain-team owned. Seed v0 by the Global team; ownership transfers to
-#      the APM/Java agent developers.
+# Sections: [1] environment, A host, B Java runtimes, C agent artifacts, D JVM
+# processes and attachment, E home and config, F application libraries,
+# G instrumentation, H logging, I agent logs, J network, K Kubernetes,
+# L Tier 2, M library detail pack, N application class index; then status.
 #
-# DESIGN GUIDELINES (../../../docs/collector-engineering.md): MECE sections,
-# Tier-0 load-safe defaults (bounded reads, directory listings, a depth-3
-# search for WEB-INF/classes under server directories, no whole-log grep),
-# every external command under _bounded, bash 3.2+ and POSIX-sh compatible,
-# reasoned absence for every missing value. Tier 0 NEVER attaches to, signals,
-# or pauses the target JVM: `-version` is only ever run on a discovered binary
-# named java (a separate short-lived JVM), never against a running process and
-# never on an embedding launcher. jstack / jcmd / SIGQUIT are Tier 2 and print
-# their impact before running.
-#
-# NOTE: no `set -e` — a collector must reach its footer even when every probe
-# fails. Failures are handled locally by the helpers.
+# Contract ../../../CONTRACT.md, guidelines ../../../docs/collector-engineering.md;
+# no `set -e`, so the report reaches its footer when every probe fails.
+# Tier 0 never attaches to, signals or pauses the target JVM: `-version` runs
+# only on a discovered binary named java (a separate short-lived JVM), never on
+# a running process or an embedding launcher. jstack / jcmd / SIGQUIT are
+# Tier 2 and announce their impact before running. Tier-0 reads are bounded
+# (directory listings, a depth-limited search for WEB-INF/classes, no
+# whole-log grep); every external command runs under _bounded; bash 3.2+ and
+# POSIX sh.
 # -----------------------------------------------------------------------------
 
 export LC_ALL=C
 
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-apmjava"
-VERSION="0.12.1"
+VERSION="0.12.2"
 DOMAIN="apm"
 TARGET="host/$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || echo unknown)"
 
@@ -658,11 +630,9 @@ EOF
 
 # ---- reasoned-absence helpers -------------------------------------------------
 _errfile=""
-_timeout_bin=""
 CMD_TIMEOUT="${CMD_TIMEOUT:-15}"
 # Call after _run_init: the error file lives in the run's private directory.
 _init_probe() { _errfile="$(_tmp probe.err)"; }
-_end_probe() { :; }   # _run_cleanup removes the directory
 
 # _rmtmp PATH... -> remove paths this run made under its own directory. A no-op
 # when no directory could be made: _tmp then returns /dev/null, which a root
@@ -706,7 +676,6 @@ _emit_labeled() {
 probe() {
     local label="$1"; shift
     [ -n "$(_cmd_kind "$1")" ] || { fact "$label: n/a (command not found: $1)"; return; }
-    _past_deadline && { fact "$label: n/a (run deadline reached: ${RUN_DEADLINE}s)"; return; }
     local out rc
     out="$(_bounded "$@" 2>"$_errfile")"; rc=$?
     if [ "$rc" -eq 124 ]; then
@@ -737,39 +706,19 @@ read_proc() {
 # whole-file read.
 _fsize() { ls -Lln "$(_vfix "$1")" 2>/dev/null | awk '{print $5; exit}'; }
 
-# dump_file "label" PATH [CAP] -> the file's content verbatim (line-capped),
-# or a classified reason. Framework policy: configuration is dumped verbatim,
-# never masked (see collectors/apm/java/README.md, "What the report can contain").
-dump_file() {
-    local label="$1" path="$2" cap="${3:-400}"
+# _file_lines first|last "label" PATH CAP -> the first or last CAP lines of a
+# file verbatim (a bounded read), or a classified reason. Framework policy:
+# configuration is dumped verbatim, never masked (README, "What the report can
+# contain").
+_file_lines() {
+    local end="$1" label="$2" path="$3" cap="$4"
     case "$path" in /proc/[0-9]*/root*) path="$(_vfix "$path")" ;; esac
     [ -e "$path" ] || { fact "$label: n/a (path not found: $path)"; return; }
     [ -r "$path" ] || { fact "$label: n/a (permission denied: $path)"; return; }
     [ -s "$path" ] || { fact "$label: (empty file)"; return; }
-    fact "$label (first $cap lines; file size $(_fsize "$path") bytes):"
-    head -n "$cap" "$path" 2>/dev/null | while IFS= read -r _l || [ -n "$_l" ]; do printf '        %s\n' "$_l"; done
-}
-
-# tail_file "label" PATH [CAP] -> the file's LAST lines (bounded read).
-tail_file() {
-    local label="$1" path="$2" cap="${3:-200}"
-    case "$path" in /proc/[0-9]*/root*) path="$(_vfix "$path")" ;; esac
-    [ -e "$path" ] || { fact "$label: n/a (path not found: $path)"; return; }
-    [ -r "$path" ] || { fact "$label: n/a (permission denied: $path)"; return; }
-    [ -s "$path" ] || { fact "$label: (empty file)"; return; }
-    fact "$label (last $cap lines; file size $(_fsize "$path") bytes):"
-    tail -n "$cap" "$path" 2>/dev/null | while IFS= read -r _l || [ -n "$_l" ]; do printf '        %s\n' "$_l"; done
-}
-
-# head_file "label" PATH [CAP] -> the file's FIRST lines (bounded read).
-head_file() {
-    local label="$1" path="$2" cap="${3:-120}"
-    case "$path" in /proc/[0-9]*/root*) path="$(_vfix "$path")" ;; esac
-    [ -e "$path" ] || { fact "$label: n/a (path not found: $path)"; return; }
-    [ -r "$path" ] || { fact "$label: n/a (permission denied: $path)"; return; }
-    [ -s "$path" ] || { fact "$label: (empty file)"; return; }
-    fact "$label (first $cap lines; file size $(_fsize "$path") bytes):"
-    head -n "$cap" "$path" 2>/dev/null | while IFS= read -r _l || [ -n "$_l" ]; do printf '        %s\n' "$_l"; done
+    fact "$label ($end $cap lines; file size $(_fsize "$path") bytes):"
+    if [ "$end" = last ]; then tail -n "$cap" "$path" 2>/dev/null; else head -n "$cap" "$path" 2>/dev/null; fi \
+        | while IFS= read -r _l || [ -n "$_l" ]; do printf '        %s\n' "$_l"; done
 }
 
 # conf_bytes "label" PATH -> byte-level facts a plain `cat` hides: total bytes
@@ -892,9 +841,12 @@ jvprobe() {
     local label="$1" jv="$2" out rc
     shift 2
     [ -x "$jv" ] || { fact "$label: n/a (not executable: $jv)"; return; }
-    _past_deadline && { fact "$label: n/a (run deadline reached: ${RUN_DEADLINE}s)"; return; }
     out="$(_bounded "$jv" "$@" 2>&1)"; rc=$?
-    [ "$rc" -eq 124 ] && { fact "$label: n/a (timed out: ${CMD_TIMEOUT}s)"; return; }
+    if [ "$rc" -eq 124 ]; then
+        if _past_deadline; then fact "$label: n/a (run deadline reached: ${RUN_DEADLINE}s)"
+        else fact "$label: n/a (timed out: ${CMD_TIMEOUT}s)"; fi
+        return
+    fi
     [ -z "$out" ] && { fact "$label: n/a (empty output, exit $rc)"; return; }
     [ "$rc" -ne 0 ] && label="$label (exit $rc)"
     _emit_labeled "$label" "$out"
@@ -932,6 +884,16 @@ _appclass_record() {
     printf '%s\n' "$1" >> "$_APPSINK" 2>/dev/null
 }
 
+# _names DIR -> the names in DIR, one per line, as `ls DIR` prints them under
+# LC_ALL=C (sorted, no dot files), without parsing ls output. An unreadable or
+# empty DIR prints nothing.
+_names() {
+    for _ne in "$1"/*; do
+        [ "$_ne" = "$1/*" ] && [ ! -e "$_ne" ] && [ ! -L "$_ne" ] && continue
+        printf '%s\n' "${_ne##*/}"
+    done
+}
+
 # list_jars "indent" DIR CAP -> *.jar names in ONE directory level (no walk),
 # with the agent jar filtered out and the count reported.
 list_jars() {
@@ -939,7 +901,7 @@ list_jars() {
     case "$d" in /proc/[0-9]*/root*) d="$(_vfix "$d")" ;; esac
     [ -d "$d" ] || { printf '%s%s: n/a (%s)\n' "$ind" "$d" "$(_path_why "$d")"; return; }
     [ -r "$d" ] || { printf '%s%s: n/a (permission denied)\n' "$ind" "$d"; return; }
-    out="$(ls "$d" 2>/dev/null | grep -i '\.jar$')"
+    out="$(_names "$d" | grep -i '\.jar$')"
     if [ -z "$out" ]; then printf '%s%s: 0 jar files\n' "$ind" "$d"; return; fi
     out="$(printf '%s\n' "$out" | grep -v -i 'whatap\.agent')"
     n="$(printf '%s\n' "$out" | grep -c . )"
@@ -951,7 +913,7 @@ list_jars() {
     fi
     # record every jar, print only the first CAP: a deployment unit can carry
     # several hundred jars, and the application's own ones sort anywhere in
-    # that list (case 2026-09-17 FIF: 282 jars, the customer's own at "f")
+    # that list
     _lj=0
     printf '%s\n' "$out" | while IFS= read -r _l; do
         [ -n "$_l" ] || continue
@@ -995,8 +957,7 @@ list_deploy() {
 # capped. Built once, before section M, because M asks it whether a jar it is
 # about to detail will appear in that index: the package histogram of a jar
 # whose class names section N prints is the same information twice, and a
-# report a field engineer pastes into a chat is not the place to send it twice
-# (case 2026-09-17 FIF: 40 jars, 988 of the report's 2738 lines).
+# report a field engineer pastes into a chat is not the place to send it twice.
 _LIBROOTS=""
 _build_libroots() {
     _LIBROOTS="$(_tmp libroots)"
@@ -1327,8 +1288,7 @@ _whatap_attached() {
 # A path a JVM names is a path in THAT process's view: a relative one is
 # relative to its working directory, an absolute one to its mount namespace.
 # Resolving either against the collector's own cwd or namespace reads another
-# file, or none, and reports its absence as a fact (a relative -Dwhatap.home
-# was reported "not visible from this mount namespace", 2026-09-25).
+# file, or none, and reports its absence as a fact.
 #
 # D_NSMAP holds " <pid>=same|other|unknown" for every JVM: whether it shares
 # this collector's mount namespace. "unknown" is a namespace link this run
@@ -1683,11 +1643,23 @@ _add_java() {
 # Scale with the host, not per process: the exe links come from one ls, the
 # argument test from one grep -z over every cmdline, comm and the verdicts
 # from one awk, and the maps test from one grep over the processes the first
-# three did not settle. Forking per pid took 14s at 676 pids.
+# three did not settle; a fork per pid does not scale to a large host.
 _find_jvms() {
-    local f_pids f_exe f_arg f_out f_map zok=0 kind pid why exe lib c n
-    f_pids="$(_tmp d.pids)"; f_exe="$(_tmp d.exe)"; f_arg="$(_tmp d.arg)"; f_out="$(_tmp d.out)"; f_map="$(_tmp d.map)"
-    ls /proc 2>/dev/null | grep -E '^[0-9]+$' > "$f_pids"
+    local f_out f_map
+    f_out="$(_tmp d.out)"; f_map="$(_tmp d.map)"
+    _jvm_walk "$f_out"
+    _jvm_maps "$f_out" "$f_map"
+    _jvm_tasks
+    _jvm_verdicts "$f_out" "$f_map"
+}
+
+# _jvm_walk OUT -> tests 1 to 3 over every /proc entry into OUT: "J|pid|why"
+# for a JVM, "U|pid|comm|exe" for a process they did not settle, "S|pid" for
+# an unreadable cmdline, "N|count"; sets D_PROC_SCANNED and D_PROC_SKIPPED.
+_jvm_walk() {
+    local f_out="$1" f_pids f_exe f_arg zok=0 kind pid c exe n
+    f_pids="$(_tmp d.pids)"; f_exe="$(_tmp d.exe)"; f_arg="$(_tmp d.arg)"
+    printf '%s\n' /proc/[0-9]* | cut -d/ -f3 | grep -E '^[0-9]+$' > "$f_pids"
     # path lists are written by the printf builtin and fed through xargs, so
     # no single exec carries one argument per process (ARG_MAX on a large host)
     printf '%s\n' /proc/[0-9]*/exe > "$(_tmp d.exelist)" 2>/dev/null
@@ -1751,6 +1723,12 @@ _find_jvms() {
         done >> "$(_tmp d.out3)"
         cat "$(_tmp d.out3)" > "$f_out"
     fi
+}
+
+# _jvm_maps OUT MAP -> test 4: the pids among the unsettled ones in OUT whose
+# maps name a VM library, into MAP; sets D_MAPS_UNREAD.
+_jvm_maps() {
+    local f_out="$1" f_map="$2"
     # the maps test, over the unsettled processes only
     grep '^U|' "$f_out" | cut -d'|' -f2 | sed 's|^\(.*\)$|/proc/\1/maps|' > "$(_tmp d.maplist)"
     if [ -s "$(_tmp d.maplist)" ]; then
@@ -1760,6 +1738,11 @@ _find_jvms() {
     else
         true > "$f_map"
     fi
+}
+
+# _jvm_tasks -> the candidates by VM thread name among the processes whose
+# maps were not readable, into $(_tmp d.tjvm); sets D_TASK_*.
+_jvm_tasks() {
     # A process whose maps this run cannot read (another user's, as non-root)
     # still names its threads in /proc/<pid>/task/*/comm, which is readable by
     # everyone, and a JVM's own threads have fixed names. Verified on HotSpot
@@ -1794,6 +1777,12 @@ _find_jvms() {
                  END { for (p in n) if (n[p] >= 2) print p }' "$(_tmp d.hits)" > "$(_tmp d.tjvm)"
         fi
     fi
+}
+
+# _jvm_verdicts OUT MAP -> D_JVM_PIDS, D_JVM_WHY, D_JVM_NOARGS, D_TASKJVM from
+# the walk (OUT), the maps test (MAP) and the thread-name candidates.
+_jvm_verdicts() {
+    local f_out="$1" f_map="$2" kind pid why exe lib c _mapset _tjset _inmap _intj
     D_TASKJVM=""
     # both verdict lists as words, so the loop below tests them without a fork
     _mapset=" $(tr '\n' ' ' < "$f_map" 2>/dev/null)"
@@ -2148,20 +2137,13 @@ EOF_H
 _probe_ls() { probe "$1" sh "$(_tmp ls_head.sh)" "$(_vfix "$2")" "$3"; }
 
 # ---- report body ---------------------------------------------------------------
-run_report() {
-    emit_header
+# One _rep_* function per section, called in order by run_report. They declare
+# no locals: the variables are run_report's, and a section reads only the ones
+# it sets itself, the D_* discovery results and _nm.
 
-    # Without an agent on disk and a config to read, nothing downstream can be
-    # settled remotely. Both are resolved just before emit_status, from the
-    # flags the sections record. A requested opt-in is a goal of its own.
-    goal agent "whatap agent artifacts on disk"
-    goal conf  "agent configuration"
-    [ "$OPT_THREADS" != 0 ] && goal threads "thread dumps (--threads)"
-    [ "$OPT_JCMD" != 0 ] && goal jcmd "jcmd VM data (--jcmd)"
-    [ -n "$(printf '%s' "$OPT_DUMPS" | tr -d '\n')" ] && goal dumpfile "supplied thread dump files (--dump-file)"
-
-    # [1] capability preamble: every downstream "command not found" is
-    # pre-explained here.
+# [1] capability preamble: every downstream "command not found" is
+# pre-explained here.
+_rep_env() {
     section "Collection environment"
     if [ -n "${BASH_VERSION:-}" ]; then fact "shell: bash $BASH_VERSION"
     else fact "shell: POSIX sh (non-bash)"; fi
@@ -2180,17 +2162,10 @@ run_report() {
     fact "library detail flags: --library=${OPT_LIBS:-none}  --library-all=$OPT_LIBALL  --class=${OPT_CLASSES:-none}"
     fact "application class flags: --appclasses=$OPT_APPCLASSES  --class-refs=${OPT_REFS:-none}"
     fact "supplied dump files (--dump-file): $(printf '%s\n' "$OPT_DUMPS" | grep -c .)"
+}
 
-    _PATHSINK="$(_tmp paths)"
-    true > "$_PATHSINK" 2>/dev/null
-    _APPSINK="$(_tmp approots)"
-    true > "$_APPSINK" 2>/dev/null
-    true > "$(_tmp flags)" 2>/dev/null
-    _write_helpers
-
-    discover
-
-    # [2] A. host / platform
+# [2] A. host / platform
+_rep_host() {
     section "A. Host / platform"
     probe "kernel" uname -srm
     read_proc "os-release" /etc/os-release
@@ -2229,8 +2204,10 @@ run_report() {
     probe "local time" date
     probe "UTC time" date -u
     probe "timedatectl" timedatectl
+}
 
-    # [3] B. Java runtimes present on this host
+# [3] B. Java runtimes present on this host
+_rep_runtimes() {
     section "B. Java runtimes discovered"
     if [ -z "$D_JAVA_EXES" ] && [ -z "$D_JAVA_OTHER" ] && [ -z "$D_JAVA_UNCONF" ]; then
         fact "java binaries: none found among running processes, PATH, JAVA_HOME, /usr/lib/jvm, /usr/java, /opt/java*, /opt/jdk*"
@@ -2289,8 +2266,10 @@ EOF
             [ -n "$_p" ] && printf '        -- %s   <- %s\n' "$_p" "$_s"
         done
     fi
+}
 
-    # [4] C. WhaTap Java agent artifacts on disk
+# [4] C. WhaTap Java agent artifacts on disk
+_rep_artifacts() {
     section "C. WhaTap agent artifacts on disk"
     if [ -z "$D_AGENT_JARS" ]; then
         fact "whatap agent jars: none named by -javaagent or env WHATAP_JAVA_AGENT_PATH of any JVM whose arguments were read, and no /whatap-agent/whatap.agent.java.jar"
@@ -2334,7 +2313,7 @@ EOF
             [ -n "$p" ] || continue
             fsd="$(_rpath "$pid" "$(dirname "$p")")"
             [ -n "$fsd" ] || continue
-            ls "$fsd" 2>/dev/null | grep -i -E 'helper|whatap' | grep -v -x -F "$(basename "$p")" \
+            _names "$fsd" | grep -i -E 'helper|whatap' | grep -v -x -F "$(basename "$p")" \
                 | head -n 20 | while IFS= read -r _l; do printf '%s/%s\n' "$fsd" "$_l"; done
         done | sort -u)"
         if [ -n "$_comp" ]; then
@@ -2344,11 +2323,12 @@ EOF
             fact "companion files next to an agent jar (names containing helper or whatap): none in the readable jar directories"
         fi
     fi
+}
 
-    # [5] D. JVM processes and how the agent is attached
+# [5] D. JVM processes and how the agent is attached
+_rep_jvms() {
     section "D. JVM processes and agent attachment"
     _n="$(echo $D_JVM_PIDS | wc -w | tr -d ' ')"
-    _nm="$(echo $D_MARKED | wc -w | tr -d ' ')"
     # what an empty result rests on: the walk that produced it and the tests
     # applied to each entry
     fact "/proc walk: $D_PROC_SCANNED numeric pid entries scanned, $D_PROC_SKIPPED skipped (cmdline unreadable)"
@@ -2363,13 +2343,17 @@ EOF
         for pid in $D_JVM_PIDS; do
             _shown=$((_shown + 1))
             [ "$_shown" -gt 20 ] && { fact "-- remaining $((_n - 20)) JVM processes not detailed (cap: 20)"; break; }
-            printf '        -- pid %s (ppid %s)\n' "$pid" "$(awk '/^PPid:/{print $2}' "/proc/$pid/status" 2>/dev/null)"
+            # one read of the status file: "ppid|uid / state / threads|rss"
+            _pst="$(awk '/^PPid:/{p=$2} /^Uid:/{u=$2} /^State:/{s=$2} /^Threads:/{t=$2} /^VmRSS:/{r=$2" "$3}
+                         END{print p "|" u " / " s " / " t "|" r}' "/proc/$pid/status" 2>/dev/null)"
+            printf '        -- pid %s (ppid %s)\n' "$pid" "${_pst%%|*}"
             printf '           detected as a JVM by: %s\n' "$(printf '%s\n' "$D_JVM_WHY" | awk -F'|' -v p="$pid" '$1==p{sub(/^[^|]*\|/,""); print; exit}')"
             printf '           comm: %s\n' "$(cat "/proc/$pid/comm" 2>/dev/null)"
             printf '           exe: %s\n' "$(readlink "/proc/$pid/exe" 2>/dev/null || echo 'n/a (permission denied or gone)')"
             printf '           root and mount namespace: %s\n' "$(case "$(_ns_of "$pid")" in same) echo "the collector's own" ;; other) echo "not the collector's (root $(readlink "/proc/$pid/root" 2>/dev/null); paths are read through /proc/$pid/root)" ;; *) echo "n/a (/proc/$pid/root not readable)" ;; esac)"
-            printf '           uid/state/threads: %s\n' "$(awk '/^Uid:/{u=$2} /^State:/{s=$2} /^Threads:/{t=$2} END{print u" / "s" / "t}' "/proc/$pid/status" 2>/dev/null)"
-            printf '           VmRSS: %s\n' "$(awk '/^VmRSS:/{print $2" "$3}' "/proc/$pid/status" 2>/dev/null)"
+            _pst="${_pst#*|}"
+            printf '           uid/state/threads: %s\n' "${_pst%%|*}"
+            printf '           VmRSS: %s\n' "${_pst#*|}"
             printf '           start time(UTC): %s\n' "$(_proc_start "$pid")"
             printf '           cwd: %s\n' "$(readlink "/proc/$pid/cwd" 2>/dev/null || echo 'n/a (permission denied or gone)')"
             # where the boot banner and any SIGQUIT dump land
@@ -2445,8 +2429,10 @@ EOF
             fi
         done
     fi
+}
 
-    # [6] E. Agent home resolution and configuration
+# [6] E. Agent home resolution and configuration
+_rep_conf() {
     section "E. Agent home resolution and configuration"
     fact "config path resolution applied by this collector: env WHATAP_CONFIG_FILE, else -Dwhatap.config.file, else <home>/<-Dwhatap.config, or whatap.conf when unset>; <home> is -Dwhatap.home, else the directory of the -javaagent jar, else the JVM working directory; a relative path is joined to the working directory of the JVM"
     if [ "${_nm:-0}" -eq 0 ]; then
@@ -2476,7 +2462,7 @@ EOF
         if [ -n "$_fsc" ]; then
             _n="$(_rnote "$pid" "$_cf" "$_fsc")"; [ -n "$_n" ] && fact "   config file $_n"
             if [ -r "$_fsc" ]; then
-                dump_file "   config file (verbatim)" "$_fsc" 400
+                _file_lines first "   config file (verbatim)" "$_fsc" 400
                 conf_bytes "   config file byte facts" "$_fsc"
                 _flag conf_read "$_cf"
             else
@@ -2533,10 +2519,10 @@ EOF
             if [ -n "$_ccp" ]; then
                 fact "   env WHATAP_CONTAINER_CONF_PATH: $_ccp"
                 _ccv="$(_rpath "$pid" "$_ccp/container.conf")"
-                if [ -n "$_ccv" ]; then dump_file "   container.conf" "$_ccv" 40
+                if [ -n "$_ccv" ]; then _file_lines first "   container.conf" "$_ccv" 40
                 else fact "   container.conf: n/a ($(_rwhy "$pid" "$_ccp/container.conf"))"; fi
             else
-                dump_file "   container.conf" "$_fsh/container.conf" 40
+                _file_lines first "   container.conf" "$_fsh/container.conf" 40
             fi
         elif [ -n "$_fsh" ]; then
             fact "   home listing: n/a (permission denied: $_fsh)"
@@ -2575,7 +2561,7 @@ EOF
             [ -n "$_v" ] && [ -d "$_v" ] || continue
             if [ -e "$_v/whatap.conf" ]; then
                 if [ -r "$_v/whatap.conf" ]; then
-                    dump_file "        $_p/whatap.conf (assumed default file name; verbatim)" "$_v/whatap.conf" 400
+                    _file_lines first "        $_p/whatap.conf (assumed default file name; verbatim)" "$_v/whatap.conf" 400
                     _flag conf_read "$_p/whatap.conf"
                 else
                     printf '        %s/whatap.conf: n/a (permission denied)\n' "$_p"
@@ -2587,8 +2573,10 @@ EOF
             fi
         done
     fi
+}
 
-    # [7] F. Application libraries visible to the target JVMs
+# [7] F. Application libraries visible to the target JVMs
+_rep_libs() {
     section "F. Application libraries visible to the target JVMs"
     fact "excluded from every list below: any entry whose name contains whatap.agent (the -javaagent jar)"
     if [ "${_nm:-0}" -eq 0 ]; then
@@ -2854,12 +2842,14 @@ EOF
         fi
         _LIBSINK=""
     done
+}
 
-    # [8] G. Agent instrumentation surface and weaving activation
-    # Four facts side by side: what the application carries (section F), what
-    # THIS agent build can instrument (read from the installed jar), which
-    # modules the configuration selects, and which modules the process loaded
-    # (the agent log lines). README, "The common case".
+# [8] G. Agent instrumentation surface and weaving activation
+# Four facts side by side: what the application carries (section F), what
+# THIS agent build can instrument (read from the installed jar), which
+# modules the configuration selects, and which modules the process loaded
+# (the agent log lines). README, "The common case".
+_rep_weaving() {
     section "G. Agent instrumentation surface and weaving activation"
     # the jars listed here (bundled weaving/*.jar entries, <home>/weaving) are
     # the agent's own, never the application's, so they stay out of the
@@ -2896,6 +2886,7 @@ EOF
                 fact "-- on-disk plugin directory $home/weaving: absent"
             fi
             if [ -d "$fshome/plugin" ]; then
+                # shellcheck disable=SC2010  # the ls -l line is the fact printed
                 _pxl="$(ls -l "$(_vfix "$fshome/plugin")" 2>/dev/null | grep '\.x$')"
                 _pxn="$(printf '%s\n' "$_pxl" | grep -c .)"
                 fact "-- script plugin directory $home/plugin: ${_pxn:-0} .x file(s) (ls -l lines, first 40):"
@@ -2981,8 +2972,10 @@ EOF
             [ -n "$_rot2" ] && weaving_lines "$(basename "$_rot2") (most recent rotated log by mtime)" "$_rot2"
         done < "$(_tmp logt)"
     fi
+}
 
-    # [9] H. Application logging stack
+# [9] H. Application logging stack
+_rep_logging() {
     section "H. Application logging stack"
     if [ "${_nm:-0}" -eq 0 ]; then
         fact "logging stack: n/a (no JVM carrying a WhaTap attach marker)"
@@ -3012,7 +3005,7 @@ EOF
         for pid in $D_MARKED; do
             _cwd="$(cwd_view "$pid")"
             if [ -z "$_cwd" ]; then printf '        pid %s: n/a (%s)\n' "$pid" "$(_rwhy "$pid" .)"; continue; fi
-            _lgf="$(ls "$_cwd" 2>/dev/null | grep -i -E '^(logback|log4j|log4j2|logging)[^/]*\.(xml|properties|yaml|yml|json)$' | head -n 10)"
+            _lgf="$(_names "$_cwd" | grep -i -E '^(logback|log4j|log4j2|logging)[^/]*\.(xml|properties|yaml|yml|json)$' | head -n 10)"
             if [ -n "$_lgf" ]; then
                 printf '%s\n' "$_lgf" | while IFS= read -r _l; do printf '        pid %s  %s/%s\n' "$pid" "$_cwd" "$_l"; done
             else
@@ -3032,13 +3025,16 @@ EOF
                 [ -n "$_fsl" ] && [ -d "$_fsl" ] || continue
                 _lds=$((_lds + 1))
                 printf '        pid %s log dir %s (newest 15 by mtime, ls -lt):\n' "$pid" "$_fsl"
+                # shellcheck disable=SC2010  # the ls -lt lines are the facts printed
                 ls -lt "$_fsl" 2>/dev/null | grep -v '^total ' | head -n 15 | while IFS= read -r _l; do printf '             %s\n' "$_l"; done
             done
             [ "$_lds" = 0 ] && printf '        pid %s: no readable directory among%s%s logs, log (under the working directory)\n' "$pid" "${_cb:+ $_cb/logs,}" "${_jsb:+ $_jsb/log,}"
         done
     fi
+}
 
-    # [10] I. WhaTap agent logs
+# [10] I. WhaTap agent logs
+_rep_agentlogs() {
     section "I. WhaTap agent logs"
     if [ ! -s "$(_tmp logt)" ]; then
         fact "agent log locations: n/a (no JVM carrying a WhaTap attach marker and no agent home discovered)"
@@ -3057,11 +3053,11 @@ EOF
                 continue
             fi
             _probe_ls "   listing (first 60 lines)" "$_lv" 60
-            head_file "   $_ln.log (first lines)" "$_lv/$_ln.log" 40
-            tail_file "   $_ln.log (recent lines)" "$_lv/$_ln.log" 200
+            _file_lines first "   $_ln.log (first lines)" "$_lv/$_ln.log" 40
+            _file_lines last "   $_ln.log (recent lines)" "$_lv/$_ln.log" 200
             _rot="$(ls -t "$_lv"/"$_ln"-*.log 2>/dev/null | head -n 1)"
             if [ -n "$_rot" ]; then
-                tail_file "   $(basename "$_rot") (most recent rotated log by mtime, recent lines)" "$_rot" 120
+                _file_lines last "   $(basename "$_rot") (most recent rotated log by mtime, recent lines)" "$_rot" 120
             else
                 fact "   rotated logs ($_ln-*.log): none present"
             fi
@@ -3076,8 +3072,10 @@ EOF
             fi
         done < "$(_tmp logt)"
     fi
+}
 
-    # [11] J. Network endpoints
+# [11] J. Network endpoints
+_rep_network() {
     section "J. Network endpoints"
     _ports=""; _psrc=""
     if [ "${_nm:-0}" -eq 0 ]; then
@@ -3134,8 +3132,10 @@ EOF
     read_proc "/etc/resolv.conf" /etc/resolv.conf
     _px="${http_proxy:+http_proxy=$http_proxy }${https_proxy:+https_proxy=$https_proxy }${no_proxy:+no_proxy=$no_proxy}"
     fact "proxy variables in the collector shell: ${_px:-none set}"
+}
 
-    # [12] K. Kubernetes / operator injection context
+# [12] K. Kubernetes / operator injection context
+_rep_k8s() {
     section "K. Kubernetes / operator injection context"
     if [ -d /whatap-agent ]; then
         _probe_ls "/whatap-agent listing (first 40 lines)" /whatap-agent 40
@@ -3150,8 +3150,10 @@ EOF
     done
     if [ -d /var/run/secrets/kubernetes.io ]; then fact "/var/run/secrets/kubernetes.io: present"; else fact "/var/run/secrets/kubernetes.io: absent"; fi
     read_proc "container hostname (/etc/hostname)" /etc/hostname
+}
 
-    # [13] L. Tier 2 — only when explicitly requested
+# [13] L. Tier 2 — only when explicitly requested
+_rep_tier2() {
     section "L. Tier 2 artifacts (opt-in)"
     if [ "$OPT_THREADS" = 0 ] && [ "$OPT_JCMD" = 0 ] && [ -z "$OPT_DUMPS" ]; then
         fact "not requested (--threads / --jcmd / --dump-file absent); no attach, signal, or pause was applied to any JVM"
@@ -3175,12 +3177,14 @@ EOF
             while [ "$_k" -le "$_tn" ]; do
                 _td="$(_tmp tdump)"
                 _tool=""
-                if have jstack; then _tool="jstack -l"; set -- jstack -l "$pid"
-                elif have jcmd; then _tool="jcmd Thread.print -l"; set -- jcmd "$pid" Thread.print -l; fi
+                if have jstack; then _tool="jstack -l"
+                elif have jcmd; then _tool="jcmd Thread.print -l"; fi
                 if [ -n "$_tool" ]; then
                     # a dump of a large JVM outlasts the per-command cap
                     _ct="$CMD_TIMEOUT"; CMD_TIMEOUT=60
-                    _bounded "$@" > "$_td" 2>&1; _trc=$?
+                    if [ "$_tool" = "jstack -l" ]; then _bounded jstack -l "$pid" > "$_td" 2>&1
+                    else _bounded jcmd "$pid" Thread.print -l > "$_td" 2>&1; fi
+                    _trc=$?
                     CMD_TIMEOUT="$_ct"
                     if [ "$_trc" = 0 ] && grep -q '^"' "$_td" 2>/dev/null; then
                         fact "-- thread dump pid $pid ($_k/$_tn) via $_tool (first 5000 lines):"
@@ -3326,13 +3330,15 @@ EOF_DUMPS
             [ "$_jp" = 0 ] && [ -z "$_jseen" ] && fact "jcmd data: n/a (no JVM carrying a WhaTap attach marker, and none whose options are absent from /proc)"
         fi
     fi
+}
 
-    # [14] M. Library detail pack — only when explicitly requested
-    # Writing a new weaving module needs more than a file name: the module is
-    # compiled against the customer's own artifact, redeclares the target
-    # class's fields and method signatures, and must not be compiled for a
-    # class-file version above the target's. This section carries exactly
-    # those inputs for the libraries named on the command line.
+# [14] M. Library detail pack — only when explicitly requested
+# Writing a new weaving module needs more than a file name: the module is
+# compiled against the customer's own artifact, redeclares the target
+# class's fields and method signatures, and must not be compiled for a
+# class-file version above the target's. This section carries exactly
+# those inputs for the libraries named on the command line.
+_rep_libpack() {
     section "M. Library detail pack (opt-in)"
     if [ "$OPT_LIBALL" = 0 ] && [ -z "$OPT_LIBS" ]; then
         fact "not requested (--library / --library-all absent)"
@@ -3360,8 +3366,7 @@ EOF_DUMPS
                     if [ -z "$_fsp" ]; then fact "-- $_p: n/a ($(_path_why "$_p"))"; continue; fi
                     # Several deployment units of one application carry the same
                     # jar. Detailing each copy spends the cap on identical
-                    # content and hides the other units entirely (case
-                    # 2026-09-17 FIF: all 40 came from one unit of two), so a
+                    # content and hides the other units entirely, so a
                     # byte-identical copy is named rather than detailed again.
                     _sh="$(_sha256 "$_fsp")"
                     case "$_sh" in n/a*) _sh="" ;; esac
@@ -3422,14 +3427,16 @@ EOF_DUMPS
             done
         done
     fi
+}
 
-    # [15] N. Application class index — only when explicitly requested
-    # Attaching a transaction to an application that no weaving module covers
-    # starts from one question: which classes are the application's own? The
-    # customer's source is frequently out of reach for procurement or security
-    # reasons, and the deployed artifact answers the same question. Section F
-    # inventories the LIBRARIES; this section inventories the classes the
-    # application itself ships, from the same roots the JVM loads them from.
+# [15] N. Application class index — only when explicitly requested
+# Attaching a transaction to an application that no weaving module covers
+# starts from one question: which classes are the application's own? The
+# customer's source is frequently out of reach for procurement or security
+# reasons, and the deployed artifact answers the same question. Section F
+# inventories the LIBRARIES; this section inventories the classes the
+# application itself ships, from the same roots the JVM loads them from.
+_rep_appclasses() {
     section "N. Application class index (opt-in)"
     # The jars named with --library are read into this index too. An
     # application can ship its own code as jars inside WEB-INF/lib rather than
@@ -3477,7 +3484,7 @@ EOF_DUMPS
                     if [ "${_cnt:-0}" -eq 0 ]; then
                         _sib="${_rt%/classes}/lib"
                         if [ -d "$_sib" ]; then
-                            _sibn="$(ls "$_sib" 2>/dev/null | grep -i -c '\.jar$')"
+                            _sibn="$(_names "$_sib" | grep -i -c '\.jar$')"
                             fact "   sibling ${_sib}: ${_sibn:-0} jar files"
                         else
                             fact "   sibling ${_sib}: absent"
@@ -3616,9 +3623,11 @@ EOF_DUMPS
         fi
         fi
     fi
+}
 
-    # Resolved here, from the flags the sections recorded: most of them ran
-    # inside `| while` pipelines, where an assignment does not survive.
+# The goals, resolved from the flags the sections recorded: most of them ran
+# inside `| while` pipelines, where an assignment does not survive.
+_rep_goals() {
     _vis="$(_visibility)"
     _n="$(echo $D_JVM_PIDS | wc -w | tr -d ' ')"
     # A JVM whose environment or VM options this run could not read may carry
@@ -3676,6 +3685,48 @@ EOF_DUMPS
         if _flagged dump_fail; then missed dumpfile "$(_flag_text dump_fail)"
         else got dumpfile; fi
     fi
+}
+
+run_report() {
+    emit_header
+
+    # Without an agent on disk and a config to read, nothing downstream can be
+    # settled remotely. Both are resolved just before emit_status, from the
+    # flags the sections record. A requested opt-in is a goal of its own.
+    goal agent "whatap agent artifacts on disk"
+    goal conf  "agent configuration"
+    [ "$OPT_THREADS" != 0 ] && goal threads "thread dumps (--threads)"
+    [ "$OPT_JCMD" != 0 ] && goal jcmd "jcmd VM data (--jcmd)"
+    [ -n "$(printf '%s' "$OPT_DUMPS" | tr -d '\n')" ] && goal dumpfile "supplied thread dump files (--dump-file)"
+
+    _rep_env
+
+    _PATHSINK="$(_tmp paths)"
+    true > "$_PATHSINK" 2>/dev/null
+    _APPSINK="$(_tmp approots)"
+    true > "$_APPSINK" 2>/dev/null
+    true > "$(_tmp flags)" 2>/dev/null
+    _write_helpers
+
+    discover
+    # the attached-JVM count sections E to J test
+    _nm="$(echo $D_MARKED | wc -w | tr -d ' ')"
+
+    _rep_host
+    _rep_runtimes
+    _rep_artifacts
+    _rep_jvms
+    _rep_conf
+    _rep_libs
+    _rep_weaving
+    _rep_logging
+    _rep_agentlogs
+    _rep_network
+    _rep_k8s
+    _rep_tier2
+    _rep_libpack
+    _rep_appclasses
+    _rep_goals
 
     emit_status
     emit_footer
@@ -3706,4 +3757,3 @@ else
     _report_to_file "$OUTFILE" || exit 1
     progress "report written: $OUTFILE"
 fi
-_end_probe

@@ -324,6 +324,20 @@ INT, TERM and HUP.
 No `--bundle` tier yet; copy the bundle plumbing from `collect-collserver.sh`
 if the domain team needs raw log artifacts.
 
+## Cases
+
+The support cases behind parts of the collector (the script's comments name
+the mechanism, not the case):
+
+| case | what it showed | what the collector does about it |
+|---|---|---|
+| 2026-06-16, JBoss 5.1 `eorder_uat` | a library scan that included the agent jar matched `spring-boot-2.1`…`4.0` at once | the `-javaagent` jar is excluded from every library list, and the exclusion is stated (F) |
+| 2026-06-24, `KBANESCFServer` socket gateway | the transaction entry was not a servlet | server markers and program identity (D), `hook_service_*` (G), thread dumps (L) |
+| 2026-06-30, keypro GlassFish | a console/JUL loop produced 19.8M events while the on-disk server log stayed small | logging properties, libraries, config files, the console destination and the server log directories side by side (H) |
+| 2026-09-11, BAF | section D reported no JVM while section J showed two `vshell` processes connected on :6600 | the `libjvm.so` mapping test and `--jcmd` argument recovery (D) |
+| 2026-09-17, FIF | one unit carried 282 jars, the customer's own sorting at "f"; the thread dump arrived over Slack and was counted by hand; which of 72 batchprocess classes are Quartz jobs; 40 detailed jars made 988 of the report's 2738 lines, and all 40 came from one of two units | every jar is recorded though 120 are printed (F); `--dump-file` (L); `--class-refs` (N); no package histogram for a jar section N indexes, and a byte-identical copy is named, not detailed again (M) |
+| 2026-09-25, verification | a relative `-Dwhatap.home` was reported "not visible from this mount namespace" | every path is resolved as the JVM that names it resolves it (the Config row above) |
+
 ## Validate
 
 ```sh
