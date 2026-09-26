@@ -1,8 +1,9 @@
 # collectors/apm/dotnet — WhaTap .NET APM agent collector (Windows)
 
-> **Status: SEEDED (v0; validated at: no run on a real Windows host is
-> recorded here — `.github/workflows/smoke-windows-dotnet.yml` is the harness
-> for one; the script's own `VERSION` is the current one).**
+> **Status: SEEDED (v0; validated at: 0.5.0 on Windows Server 2022 Standard
+> Evaluation 10.0.20348 under Windows PowerShell 5.1.20348.558 and pwsh 7.6.6,
+> elevated and not elevated, with a simulated agent, 2026-09-26; see
+> "Validation" below).**
 > `collect-apmdotnet.ps1` is a working Tier-0
 > collector seeded by the Global team (CONTRACT rule 4 — interim ownership).
 > Ongoing ownership belongs to the .NET agent developers once handed over.
@@ -40,7 +41,9 @@ and "actually attached".
 
 Run **on the Windows host where the application runs**, in a **64-bit
 elevated** PowerShell (5.1+, the Windows Server 2016+ default). Without
-elevation the IIS/event-log/module probes degrade to reasoned `n/a` lines.
+elevation the IIS/event-log/module probes degrade to reasoned `n/a` lines, and
+a `whatap.conf` the account cannot read makes the run INCOMPLETE with the hint
+`not elevated: run PowerShell as Administrator`.
 
 ```powershell
 # PowerShell (administrator)
@@ -49,13 +52,28 @@ elevation the IIS/event-log/module probes degrade to reasoned `n/a` lines.
 # if script execution is blocked by policy
 powershell -ExecutionPolicy Bypass -File .\collect-apmdotnet.ps1 -File
 
-# extra install dir the discovery cannot see
-.\collect-apmdotnet.ps1 -File -AgentHome "D:\WhaTap .NET"
+# extra install dir the discovery cannot see (-AgentHome works too)
+.\collect-apmdotnet.ps1 -File -Home "D:\WhaTap .NET"
+
+# write the report into another directory (checked before the run starts)
+.\collect-apmdotnet.ps1 -File -Out "D:\case files"
 ```
 
 Paste or attach the entire output. No arguments prints usage; nothing runs by
 accident. Progress is narrated on the console (`-Quiet` silences it); the
-report itself goes to the `.txt` (or stdout with `-Stdout`).
+report itself goes to the `.txt` (or stdout with `-Stdout`). The shell
+collectors' spellings work too (`--file`, `--stdout`, `--quiet`, `--help`,
+`--home <dir>`, `--out <dir>`, `--out=<dir>`); `-Help` and `-h` print the
+usage; an unknown argument, or `--home`/`--out` without a directory, prints
+usage to stderr and exits 2. `-Out` is checked for writing before the run. There is no opt-in: every probe is
+Tier 0 and runs by default.
+
+**Send the `-File` report.** It is written as UTF-8 without a BOM with LF line
+ends, the bytes a shell collector writes, whichever PowerShell ran it.
+`-Stdout` hands the lines to the PowerShell host, which ends them with CRLF,
+converts them to the console code page (non-ASCII text in a verbatim
+`whatap.conf` arrives as `?`), and under Windows PowerShell 5.1 writes a `>`
+redirection as UTF-16LE; `tools/validate.sh --report` rejects such a copy.
 
 ## Facts collected (report sections)
 
@@ -69,7 +87,7 @@ report itself goes to the `.txt` (or stdout with `-Stdout`).
 | 6 | E. IIS topology | app pools (state, CLR version, pipeline, `enable32BitAppOnWin64`, identity), sites/apps/vdirs with physical paths, ISAPI filters — via appcmd, WebAdministration, or applicationHost.config fallback |
 | 7 | F. Agent configuration | `whatap.conf` verbatim per home **plus byte facts (first bytes/BOM, CR count)** |
 | 8 | G. Agent logs | both log dirs (`C:\ProgramData\WhaTap\dotnet\logs` fixed + `<home>\logs` legacy): inventory with **file owners**, native `core-YYYYMMDD.log` banner+head+tail, newest tracer log version/identity lines+head+tail, exception-line count, **PID-named log files cross-referenced against currently running PIDs** (PID-reuse leftovers owned by another pool's identity have caused w3wp CPU spins), audit dir presence/size only, `WT_TRACE_LOG_PATH` override |
-| 9 | H. Network endpoints | TCP/UDP endpoints on port 6600 with owning pids (local tracer→daemon UDP and daemon→server TCP), live TCP probe to `whatap.server.host:whatap.server.port` from each conf |
+| 9 | H. Network endpoints | `netstat -ano` lines on port 6600 with owning pids (local tracer→daemon UDP and daemon→server TCP), one live TCP probe per `whatap.server.host:whatap.server.port` endpoint named in any conf |
 | 10 | I. Windows event logs | Application log (.NET Runtime / ASP.NET / Application Error / WER / WhaTap) and System log (WAS/W3SVC/HTTP), bounded to last 7 days, capped counts |
 | 11 | J. Application facts | per IIS app (≤10, capped with a note): `web.config` targetFramework lines + `<runtime>` assemblyBinding block verbatim, `bin\` facade assembly versions (`System.Net.Http` and friends — the assembly-binding case), `bin\Whatap.*` files, .NET Core markers (`*.runtimeconfig.json` dumped) |
 
@@ -88,6 +106,22 @@ report itself goes to the `.txt` (or stdout with `-Stdout`).
   `C:\ProgramData\WhaTap\dotnet\logs`.
 - Reading IIS configuration through appcmd needs elevation; section J says
   whether the run was elevated when appcmd returned no vdir lines.
+- Not elevated, Windows hides another account's process details: a w3wp line
+  then reads `apppool=n/a (command line not readable)` and `exe=n/a (not
+  readable)`, and its module list `n/a (module list not readable)`.
+- Over OpenSSH a non-administrator gets a network logon, and WMI refuses every
+  CIM read of such a logon ("Access denied"): the boot time, OS, memory,
+  process and service facts are then `n/a`. The same account logged on
+  locally (console, RDP, a scheduled task) reads them. After the first
+  refusal the run stops asking WMI.
+- A collection-server endpoint is probed once; a second conf naming it shows
+  the first answer with `(probed once above)`. Windows retries a refused
+  connect, so a refused probe takes about 2 s, an unanswered one its 5 s cap.
+- `run time` and, when a call was slow, capped or cut by the deadline, the
+  host load (CPU busy over a 250 ms sample, processor and disk queue, free
+  memory) and "where the time went" close the status section, as in the
+  shell collectors. `CMD_TIMEOUT` and `RUN_DEADLINE` are read from the
+  environment.
 
 Goals: `agent` (a home or an uninstall entry; `missed` when the HKLM
 uninstall registry could not be read) and `conf` (a readable `whatap.conf`;
@@ -133,8 +167,10 @@ Tier 0 only: read-only registry/file/process queries, bounded reads
 with explicit "omitted" notes). Nothing is written to the target: no registry
 value is set (Fusion settings are only read), no app pool is recycled, no
 iisreset, no service restart. The only external processes executed are
-`appcmd list …`, `dotnet --list-runtimes` / `--list-sdks`, and `netstat -ano`
-(fallback). Managed assemblies are identified via metadata-only reflection
+`appcmd list …`, `dotnet --list-runtimes` / `--list-sdks`, and `netstat -ano`.
+Registry values are read through the .NET registry API, which answers an
+absent key at once where the PowerShell registry provider took 1.2-1.5 s per
+absent key under `HKLM:\SOFTWARE\Classes`. Managed assemblies are identified via metadata-only reflection
 (`AssemblyName.GetAssemblyName`) — no assembly is loaded for execution.
 
 ## Not covered (v0)
@@ -153,4 +189,12 @@ iisreset, no service restart. The only external processes executed are
 
 ```sh
 tools/validate.sh collectors/apm/dotnet/collect-apmdotnet.ps1
+tools/validate.sh --report whatap-apmdotnet-<host>-<UTC>.txt   # the -File report
 ```
+
+## Validation
+
+| version | where | how | result |
+|---|---|---|---|
+| 0.5.0 | Windows Server 2022 Standard Evaluation 10.0.20348 (lab VM jjsong-ggt-win), Windows PowerShell 5.1.20348.558 and pwsh 7.6.6 | IIS 10 with ASP.NET 4.8 pools (64- and 32-bit, one app with a failing `bindingRedirect`), a .NET 8.0.31 in-process pool (ANCM) and a standalone `dotnet.exe`; the WhaTap .NET agent **simulated** as this README describes (install dir, uninstall entry `WhaTap .NET_is1`, machine and W3SVC/WAS service environment, CLSID registration, ProgramData logs, a stopped `WhaTap .NET` service, a `whatap_dotnet.exe` holding UDP 6600), since no installer is publicly downloadable. Elevated (Administrator over OpenSSH), not elevated in a local logon (scheduled task as a Users-only account) and not elevated over OpenSSH; `-File`, `-Stdout`, `--help`, an unknown argument, `RUN_DEADLINE`/`CMD_TIMEOUT`, a clean host without IIS or agent | every `-File` report passes `validate.sh --report`. Elevated: COMPLETE, 15 s (5.1) / 12 s (7), 7 s of it the two collection-server probes of the fixture conf (one refused, one unanswered at its 5 s cap); the same host under 0.4.0 took 24 s / 19 s and its status explained none of it. Not elevated, local logon: INCOMPLETE on `agent configuration` with the privilege hint (the fixture `whatap.conf` is readable by Administrators, SYSTEM and IIS_IUSRS only), 7 s / 3 s. Not elevated over OpenSSH: the same, 14 s / 12 s (was 36 s before the CIM fail-fast). |
+
