@@ -21,21 +21,38 @@ workstation, not on the node. One report, MECE sections:
 | [5] D. Operator, RBAC & webhooks | operator deploy yaml + ReplicaSet image history, mutating/validating webhooks (yaml, verbatim), ServiceAccounts + the SA referenced by DS/operator, whatap clusterroles/bindings **plus their rules** (apiGroups/resources/verbs — the pod-mutating path reads the Pod's Namespace object while matching a namespaceSelector), **the webhook serving certificate vs the registered caBundle** — the same openssl fingerprint taken three ways (caBundle in the configuration / the operator's `whatap-webhook-certificate` Secret, public `cert.pem` field only / the running pod's `/etc/webhook/certs/ca.crt`, read out and fingerprinted locally) plus the times each side was produced. The operator mints a fresh CA on every process start into an emptyDir, so these can disagree and the API server then rejects the call with `x509 … "whatap-webhook-ca"` — silently, under `failurePolicy: Ignore`. Private key fields are never requested or printed. Also **every admission webhook in the cluster** (config -> hook names, deliberately not whatap-filtered: a third-party mutating webhook on the same pods is part of the injection path, and a reused hook name shares whatap's metric series), **admission call counters from the API server's own `/metrics`** (`request_total` per HTTP code, `fail_open_count`, `admission_duration_seconds_count`, keyed by per-hook name, with a check for hook names carried by more than one configuration since the metrics have no configuration label and kubebuilder scaffolds generic names like `mpod.kb.io` — these come from the CALLER, so they state whether the API server reached the webhook at all, independently of anything the operator logs; available on managed control planes too), secret names/types only |
 | [6] E. Agent workloads | DaemonSet status + yaml, container names (discovered, covers operator vs legacy v2 naming), pod table by restart count, describe of top-2 restart pods, other whatap deployments |
 | [7] F. Events & quotas | namespace events (last 60), resourcequota/limitrange, ns labels |
-| [8] G. Logs | bounded tails: operator, master-agent, up to 3 sample node-agent pods × both containers, `--previous` when restarted | Plus **kube-apiserver logs filtered to webhook call outcomes** (tail 2000 × up to 3 control-plane pods): the API server warns on every failed webhook call *including* when `failurePolicy: Ignore` then admits the request, and that line carries the reason (timeout / x509 / refused) which the counters do not. Reasoned absence on managed control planes.
+| [8] G. Logs | bounded tails: operator (cut from the 4000-line injection-marker read when that read holds it; its own call when `--tail` exceeds 4000 or the 4 MB byte cap was reached), master-agent, up to 3 sample node-agent pods × both containers, `--previous` when restarted | Plus **kube-apiserver logs filtered to webhook call outcomes** (tail 2000 × up to 3 control-plane pods): the API server warns on every failed webhook call *including* when `failurePolicy: Ignore` then admits the request, and that line carries the reason (timeout / x509 / refused) which the counters do not. Reasoned absence on managed control planes.
 | [9] H. Helm & images | helm releases/history/values (verbatim); without the helm binary degrades to `sh.helm.release.v1.*` secret names; all deployed whatap image:tags |
 | [10] I. In-pod node facts | `kubectl exec` into up to 2 running node-agent pods: container-log symlink real target (standard `/var/log/pods` vs CCE `/mnt/paas/...`), log roots & runtime sockets (candidate paths derived from the DS's declared mounts, e.g. `/rootfs`), cgroup fs type, node-helper health endpoint, kubelet cmdline (only when hostPID) |
 | [11] J. APM auto-instrumentation | **always**: name-mapping inputs (WhatapAgent CR names + whether one is named `whatap`, per-target namespaceSelector/podSelector, every namespace's labels) and a cluster-wide inventory of instrumented pods by **two** markers (whatap init container **or** the `whatap-apm-injected` annotation), with the mismatch list. With `--apm-target NS[/NAME]`: workload template env **as declared** vs pod env **as admitted** (per container, in API order, with repeated-name detection, **including `envFrom` ConfigMap/Secret sources** — a container with an empty `.env[]` is not a container without environment), init-container state (waiting reason/message), volumes/mounts, securityContext, every pod's labels + injection markers, init-container log and app-container log **head**, namespace events. Pods named by a CR target's `podSelector` are detailed first, so a per-target cap never skips the workloads the CR actually asks for. With `--apm-exec` (Tier 2): `/proc/1/environ` and cmdline, agent home, `whatap.conf`, agent logs, `/tmp/whatap-*.lock`, runtime version |
 
+### Collection status (goals)
+
+The status section rolls up five goals. A `missed` goal makes the run
+INCOMPLETE: change what its reason names and run again. `na` is an answer
+(every list behind it answered) and the report is fine to send.
+
+| Goal | Obtained when | `na` when | `missed` when |
+|---|---|---|---|
+| Kubernetes API reachable | `get --raw /version` (5 s) answered, a refusal included | never | the call failed or timed out, or no kubectl/oc |
+| WhatapAgent CR | a WhatapAgent is listed | the cluster-wide CRD list has no `whatapagents.*` CRD, or the WhatapAgent list (all namespaces for a namespaced CRD) answered with no items | the CRD or CR list was refused, failed or timed out |
+| whatap namespace | `--namespace` given, or a whatap pod found by the discovery lists (see (c)) | all three cluster-wide pod lists answered with no whatap pod | a discovery list failed and no later one found a whatap pod |
+| whatap workloads (daemonset, deployments) | a whatap DaemonSet or Deployment is listed in the namespace and neither list failed | both lists answered with nothing named whatap, or there is no whatap namespace (`na` above) | the DaemonSet or Deployment list was refused, failed or timed out, or the namespace was not located |
+| node-agent pods | node-agent pods are listed (label `name=whatap-node-agent`, then pods named after the DaemonSet) | the lists answered with no pod, or there is no whatap namespace | a pod list was refused, failed or timed out; the label list answered empty and the DaemonSet list behind the name fallback failed; or the namespace was not located |
+
+A refusal of an inventory list (`forbidden: ...`, quoting kubectl's message with the user and the
+resource) carries an `(RBAC: ...)` hint: the grant that would obtain the read,
+or `--namespace` for a namespace-scoped identity. The kubeconfig identity is
+this collector's privilege, so it plays the part `_priv_hint` plays for a uid.
+The three inventory goals are separate because each rests on its own list and
+its own RBAC rule, and one can be `got` while another is `na`. Other n/a facts
+(node table, events, logs, helm) stay fact lines and do not change the status.
+
 Before any of this, one reachability call (`kubectl get --raw /version`,
 5 s). When it fails (unreachable API server, a context that does not exist,
-bad credentials) every API section is printed with that one reason, the API
-and CR goals are `missed`, and the run reaches its footer in seconds instead of
+bad credentials) every API section is printed with that one reason, every
+goal is `missed` with it, and the run reaches its footer in seconds instead of
 timing out call by call.
-
-The `cr` goal is `na` only when the lists behind it answered: the cluster-wide
-CRD list carries no `whatapagents.*` CRD, or the WhatapAgent list (across all
-namespaces for a namespaced CRD) answered with no items. A forbidden, failed or
-timed-out CRD or CR list is `missed` with the call's reason.
 
 Everything is **discovered** (CRD group, namespace, DS/container names, mount
 prefixes), never hardcoded, so a new platform or install generation needs no

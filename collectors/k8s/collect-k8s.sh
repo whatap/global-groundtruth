@@ -38,6 +38,10 @@ export LC_ALL=C
 
 # ---- collector metadata -----------------------------------------------------
 COLLECTOR_NAME="whatap-k8s"
+# 0.9.0  The whatap namespace, the whatap workloads and the node-agent pods are
+#        goals: a refused, failed or timed-out list behind them is missed and
+#        the run INCOMPLETE (it was COMPLETE). The operator log tail is cut from
+#        the 4000-line read when that read holds it (one call instead of two).
 # 0.8.6  --apm-exec reads the runtime versions without JAVA_TOOL_OPTIONS and the
 #        other agent variables: the JVM loaded the WhaTap agent, which wrote a
 #        Start block to the app's whatap.log on every run.
@@ -48,7 +52,7 @@ COLLECTOR_NAME="whatap-k8s"
 #        (14 -> 1 per pod), the operator deployment and operator pod list reads
 #        of section D are merged, and section A counts namespaces from the list
 #        section J prints (3 --apm-target, lab cluster: 111 s -> 75 s).
-VERSION="0.8.6"
+VERSION="0.9.0"
 DOMAIN="k8s"
 TARGET="k8s-cluster/unresolved"      # refined after CLI/context/namespace discovery
 
@@ -888,7 +892,9 @@ KM_T=()
 KM_IKEYS=""
 _km_mark() { printf '{"\\n%s %s\\n"}' "$_KM_M" "$1"; }
 km_get() {
-    local g="$1" tpl="" i=0 l key="" acc="" n=0 t ks="" ik="" nm="" want
+    local g="$1" tpl="" i=0 l key="" acc="" n=0 t ks="" ik="" nm="" want ikeys="$KM_IKEYS"
+    # KM_IKEYS is for this call only: cleared before any return
+    KM_IKEYS=""
     shift
     while [ "$i" -lt "${#KM_T[@]}" ]; do
         t="${KM_T[$i]}"; tpl="$tpl$t"
@@ -912,10 +918,10 @@ km_get() {
                 t="${l#"$_KM_M "}"
                 if [ "$#" -gt 0 ]; then
                     [ "$t" = "$1" ] && { want="$t"; shift; }
-                elif [ -n "$KM_IKEYS" ]; then
+                elif [ -n "$ikeys" ]; then
                     # per item: the first KM_IKEYS key under any name, then
                     # the rest in order under that same name
-                    [ -n "$ik" ] || { ik="$KM_IKEYS "; nm=""; }
+                    [ -n "$ik" ] || { ik="$ikeys "; nm=""; }
                     case "$t" in
                         */"${ik%% *}")
                             if [ -z "$nm" ] || [ "${t%/*}" = "$nm" ]; then
@@ -942,7 +948,6 @@ EOF
         while :; do case "$acc" in *"$_nl") acc="${acc%"$_nl"}" ;; *) break ;; esac; done
         eval "${g}_K[\${#${g}_K[@]}]=\$key; ${g}_S[\${#${g}_S[@]}]=\$acc"
     fi
-    KM_IKEYS=""
     return 0
 }
 
@@ -1106,6 +1111,7 @@ _pod_probe_emit() {
 
 # ---- discovery (run once, before the report) ---------------------------------
 NS=""; NS_SRC=""; NS_ALL=""
+NS_FAILS=""          # the pod lists of the discovery that failed, "; "-joined
 k8s_ns_discover() {
     if [ -n "$OPT_NS" ]; then NS="$OPT_NS"; NS_SRC="option --namespace"; return; fi
     [ -n "$KCTL_BIN" ] || { NS_SRC="n/a (command not found: kubectl/oc)"; return; }
@@ -1131,6 +1137,7 @@ k8s_ns_discover() {
             NS="$(printf '%s\n' "$out" | head -n1)"; NS_ALL="$out"; NS_SRC="pod name scan (whatap-*)"; return
         fi
     else fails="$fails; pod name scan: $(_k_reason)"; fi
+    NS_FAILS="${fails#; }"
     if [ -n "$fails" ]; then NS_SRC="n/a (no whatap workloads in the pod lists that answered; failed:${fails#;})"
     else NS_SRC="n/a (no whatap workloads in any namespace: labels name=whatap-node-agent, app.kubernetes.io/name=whatap-operator, pod names whatap-*)"; fi
 }
@@ -1790,31 +1797,44 @@ _rep_logs() {
     section "G. Logs (bounded tails)"
     fact "bounds: --tail=$OPT_TAIL per container; previous instance --tail=100; up to 3 sample node-agent pods (--bundle carries fuller logs)"
     if [ -n "$NS" ]; then
-        if [ -n "$OP_DEPLOY" ]; then
-            if run_k logs -n "$NS" "deploy/$OP_DEPLOY" --tail="$OPT_TAIL" && [ -n "$K_OUT" ]; then
-                _emit_labeled "logs deploy/$OP_DEPLOY" "$K_OUT"
-            else
-                fact "logs deploy/$OP_DEPLOY: n/a ($(_k_reason))"
-            fi
-        fi
         # The admission decision is written when a pod is CREATED, which is usually
         # far behind a 200-line tail on a long-lived operator. Pull a deeper tail and
         # keep only the lines the injector emits (agent injection, env assembly,
         # webhook admission), so the trail survives without shipping the whole log.
+        # The same read carries the --tail lines: they are its last lines when
+        # --tail is at most 4000 and the byte cap did not cut it. The cap cuts the
+        # NEWEST lines (the kubelet seeks to the --tail start, then stops writing
+        # at --limit-bytes). $(...) strips only the trailing newlines, at most one
+        # per line, so an output under 4000000 - 4000 bytes was not cut. Otherwise, or when the
+        # deep read failed, the tail is its own call, as before. One read also
+        # means one pod: deploy/NAME is resolved to a pod per call.
         if [ -n "$OP_DEPLOY" ]; then
-            if run_k logs -n "$NS" "deploy/$OP_DEPLOY" --tail=4000 --limit-bytes=4000000; then
-                local inj
+            local dp_rc dp_out dp_why="" inj
+            run_k logs -n "$NS" "deploy/$OP_DEPLOY" --tail=4000 --limit-bytes=4000000
+            dp_rc="$K_RC" dp_out="$K_OUT"
+            [ "$dp_rc" -eq 0 ] || dp_why="$(_k_reason)"
+            if [ "$dp_rc" -eq 0 ] && [ "$OPT_TAIL" -le 4000 ] && [ "${#dp_out}" -lt 3996000 ]; then
+                K_OUT="$(printf '%s\n' "$dp_out" | tail -n "$OPT_TAIL")"; K_RC=0
+            else
+                run_k logs -n "$NS" "deploy/$OP_DEPLOY" --tail="$OPT_TAIL"
+            fi
+            if [ "$K_RC" -eq 0 ] && [ -n "$K_OUT" ]; then
+                _emit_labeled "logs deploy/$OP_DEPLOY" "$K_OUT"
+            else
+                fact "logs deploy/$OP_DEPLOY: n/a ($(_k_reason))"
+            fi
+            if [ "$dp_rc" -eq 0 ]; then
                 # includes the webhook's own skip wording (target disabled / pod labels do
                 # not match / namespace does not match / no matching targets), which is the
                 # trail for a pod that was seen by the webhook and left untouched
-                inj="$(printf '%s\n' "$K_OUT" | grep -Ei 'inject|instrument|whatap-agent-init|NODE_OPTIONS|NODE_PATH|PYTHONPATH|JAVA_TOOL_OPTIONS|AGENT_PATH|mutat|admission|apm-init|target|selector|skipping' | tail -n 200)"
+                inj="$(printf '%s\n' "$dp_out" | grep -Ei 'inject|instrument|whatap-agent-init|NODE_OPTIONS|NODE_PATH|PYTHONPATH|JAVA_TOOL_OPTIONS|AGENT_PATH|mutat|admission|apm-init|target|selector|skipping' | tail -n 200)"
                 if [ -n "$inj" ]; then
                     _emit_labeled "operator log lines matching injection markers (tail 4000 -> last 200 matches)" "$inj"
                 else
                     fact "operator log lines matching injection markers: none in the last 4000 lines"
                 fi
             else
-                fact "operator log injection markers: n/a ($(_k_reason))"
+                fact "operator log injection markers: n/a ($dp_why)"
             fi
         fi
         local mdep
@@ -2258,11 +2278,60 @@ _rep_apm() {
     fi
 }
 
+# _rbac_hint REASON WHAT -> " (RBAC: WHAT)" when REASON holds a refusal, else nothing.
+# The kubeconfig identity is this collector's privilege: what _priv_hint says for
+# a uid, this says for an API refusal (what would obtain the read).
+_rbac_hint() { case "$1" in *"forbidden: "*) printf ' (RBAC: %s)' "$2" ;; esac; return 0; }
+
+# _resolve_inventory -> the ns, wl and pods goals, once, after the last fallback
+# of the discovery lists (k8s_ns_discover, discover_workloads, pick_sample_pods).
+# A list that failed is missed with its reason; na only when every list behind
+# the absence answered.
+_resolve_inventory() {
+    local w="" r
+    # namespace: --namespace, else the three cluster-wide pod lists
+    if [ -n "$NS" ]; then got ns
+    elif [ -n "$NS_FAILS" ]; then
+        missed ns "no whatap pod found by the discovery lists; failed: $NS_FAILS$(_rbac_hint "$NS_FAILS" "rerun with --namespace <whatap namespace>, or with a context that may list pods cluster-wide")"
+    else
+        na ns "the cluster-wide pod lists (labels name=whatap-node-agent, app.kubernetes.io/name=whatap-operator, names whatap-*) answered with no whatap pod"
+    fi
+    if [ -z "$NS" ]; then
+        if [ -n "$NS_FAILS" ]; then
+            missed wl "not listed: the whatap namespace was not located"
+            missed pods "not listed: the whatap namespace was not located"
+        else
+            na wl "no whatap namespace: the cluster-wide pod lists answered with no whatap pod"
+            na pods "no whatap namespace: the cluster-wide pod lists answered with no whatap pod"
+        fi
+        return 0
+    fi
+    # workloads: the daemonset list and the deployment lists of NS
+    [ -n "$DS_WHY" ] && w="daemonset list: $DS_WHY$(_rbac_hint "$DS_WHY" "grant list on daemonsets.apps in $NS")"
+    r="${OP_WHY:-$DEP_WHY}"
+    [ -n "$r" ] && w="${w:+$w; }deployment list: $r$(_rbac_hint "$r" "grant list on deployments.apps in $NS")"
+    if [ -n "$w" ]; then missed wl "in $NS: $w"
+    elif [ -n "$DS_NAME" ] || [ -n "$OP_DEPLOY" ] || printf '%s\n' "$WHATAP_DEPLOYS" | awk 'NF && $1 != "NAME" { f = 1 } END { exit !f }'; then got wl
+    else na wl "the daemonset and deployment lists of $NS answered with nothing named whatap"; fi
+    # node-agent pods: label list, then pods named after the daemonset
+    if [ "${#SP_POD[@]}" -gt 0 ]; then got pods
+    elif [ -n "$SP_WHY" ]; then
+        missed pods "pod list in $NS: $SP_WHY$(_rbac_hint "$SP_WHY" "grant list on pods in $NS")"
+    elif [ -z "$DS_NAME" ] && [ -n "$DS_WHY" ]; then
+        missed pods "the label list (name=whatap-node-agent) in $NS answered with no items; the name fallback needs the daemonset list, which failed: $DS_WHY"
+    else
+        na pods "the pod list of $NS (label name=whatap-node-agent${DS_NAME:+, then names $DS_NAME-*}) answered with no items"
+    fi
+}
+
 run_report() {
     emit_header
 
     goal api "Kubernetes API reachable"
     goal cr  "WhatapAgent CR"
+    goal ns  "whatap namespace"
+    goal wl  "whatap workloads (daemonset, deployments)"
+    goal pods "node-agent pods"
 
     section "Collection environment"
     fact "collector: $COLLECTOR_NAME $VERSION"
@@ -2304,6 +2373,9 @@ run_report() {
         done
         missed api "$API_WHY"
         missed cr "not listed: $API_WHY"
+        missed ns "not located: $API_WHY"
+        missed wl "not listed: $API_WHY"
+        missed pods "not listed: $API_WHY"
         emit_status
         emit_footer
         return
@@ -2324,6 +2396,7 @@ run_report() {
     if [ "${#CR_NAMES[@]}" -gt 0 ]; then got cr
     elif [ "$CR_STATE" = listed ] || [ "$CR_STATE" = nocrd ]; then na cr "$CR_WHY"
     else missed cr "${CR_WHY:-the whatapagents list was not reached}"; fi
+    _resolve_inventory
 
     emit_status
     emit_footer
