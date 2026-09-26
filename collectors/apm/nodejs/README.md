@@ -133,8 +133,12 @@ Tier 0 only: read-only, bounded reads (`head`/`tail -n`, line-capped dumps,
 capped process/binary detail), every external command capped at 15 s and the
 whole run at `RUN_DEADLINE` (300 s). `/proc` is read in one pass for every pid
 (about 7 s on a 714-process host with 163 node processes, down from 31 s). The
-only processes executed are standard tools plus `node --version`,
-`npm --version`, `pm2 --version` and one `npm root -g`; the whatap module is never loaded. No
+only processes executed are standard tools plus `node --version` and one
+`npm root -g`. The npm and pm2 versions are read as text from the
+`package.json` of the package each command's entry script resolves to (the
+report line names the file); `npm --version` / `pm2 --version`, each of which
+starts node, run only when no such file gives the version, and the report line
+then names the command. The whatap module is never loaded. No
 `--bundle` tier yet; copy the bundle plumbing from `collect-collserver.sh` if
 the domain team needs raw log artifacts.
 

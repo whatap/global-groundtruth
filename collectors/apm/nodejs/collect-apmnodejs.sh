@@ -33,8 +33,10 @@
 #     node_modules names, section 8), and which observers actually engaged
 #     in this process (hook-log observer lines, section 7).
 #
-# Runs only node/npm/pm2 --version and one `npm root -g`; the whatap module is
-# never loaded (requiring it starts an agent).
+# Runs only `node --version` per node binary and one `npm root -g`; the npm and
+# pm2 versions are read from their package.json (`npm/pm2 --version` only when
+# that file gives none). The whatap module is never loaded (requiring it starts
+# an agent).
 #
 # Rules: ../../../CONTRACT.md, ../../../docs/collector-engineering.md; no set -e.
 # -----------------------------------------------------------------------------
@@ -43,6 +45,12 @@ export LC_ALL=C
 
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-apmnodejs"
+# 0.7.0  The npm and pm2 versions are read from the package.json next to the
+#        entry script each command resolves to (the line names the file);
+#        `npm/pm2 --version`, which starts node, runs only when that file gives
+#        none, and its line then names the command. A value read from the
+#        file does not show whether npm/pm2 can run. The machine arch is taken
+#        from the one `uname -srm` (no second `uname -m`).
 # 0.6.2  A directory this uid can read but not enter lists its names again
 #        (the refactor's _names dropped them; ls did not).
 # 0.6.1  Readability refactor; report unchanged.
@@ -52,7 +60,7 @@ COLLECTOR_NAME="whatap-apmnodejs"
 #        reused by the report, and the detail list reads each environ once.
 #        The report is unchanged; 8.4 s -> 4.9 s on a host with 168 node
 #        processes, 18.3 s -> 9.5 s with 300 more (2026-09-25).
-VERSION="0.6.2"
+VERSION="0.7.0"
 DOMAIN="apm"
 TARGET="host/$(hostname 2>/dev/null || echo unknown)"
 
@@ -669,6 +677,46 @@ pkg_json_field() {
     grep -m1 "\"$field\"" "$path" 2>/dev/null | sed 's/^[[:space:]]*//; s/,[[:space:]]*$//'
 }
 
+# _cli_pkg_version NAME -> sets _pv to the "version" and _pj to the path of the
+# package.json of the npm package NAME whose entry script `command -v NAME`
+# resolves to (npm -> .../npm/bin/npm-cli.js, pm2 -> .../pm2/bin/pm2), read as
+# text: `NAME --version` starts node to print the same field. Looks at most
+# three directories up from the entry script and takes the first package.json
+# whose top-level "name" is NAME. Fails, with both empty, when none is readable.
+_cli_pkg_version() {
+    local d i=0 v
+    _pv="" _pj=""
+    d="$(command -v "$1" 2>/dev/null)" || return 1
+    case "$d" in /*) ;; *) return 1 ;; esac
+    d="$(readlink -f "$d" 2>/dev/null)" || return 1
+    d="${d%/*}"
+    while [ "$i" -lt 3 ] && [ -n "$d" ]; do
+        if [ -r "$d/package.json" ]; then
+            # top-level keys: the indent of the first key line; nested ones are deeper
+            v="$(_N="$1" awk 'BEGIN { n = "\"" ENVIRON["_N"] "\"" }
+                !got && match($0, /^[ \t]*"/) { ind = substr($0, 1, RLENGTH - 1); got = 1 }
+                got && substr($0, 1, length(ind) + 1) == ind "\"" {
+                    k = substr($0, length(ind) + 1)
+                    if (k ~ /^"name"[ \t]*:/)    { sub(/^"name"[ \t]*:[ \t]*/, "", k); nm = (index(k, n) == 1) }
+                    if (k ~ /^"version"[ \t]*:/ && ver == "") { sub(/^"version"[ \t]*:[ \t]*"/, "", k); sub(/".*/, "", k); ver = k }
+                }
+                END { if (nm && ver != "") print ver }' "$d/package.json" 2>/dev/null)"
+            [ -n "$v" ] && { _pv="$v" _pj="$d/package.json"; return 0; }
+        fi
+        d="${d%/*}"; i=$((i + 1))
+    done
+    return 1
+}
+
+# cli_version "label" NAME -> the version of the npm-installed CLI NAME from its
+# package.json (_cli_pkg_version), naming the file; only when no package.json
+# gives it, `NAME --version` under probe, the label naming that command.
+cli_version() {
+    have "$2" || { fact "$1: n/a (command not found: $2)"; return; }
+    if _cli_pkg_version "$2"; then fact "$1: $_pv (read from $_pj)"
+    else probe "$1 ($2 --version)" "$2" --version; fi
+}
+
 # ---- process table (internal; emits nothing) ----------------------------------
 # _proc_table -> one line per process that has a command line, fields joined by
 # the unit separator \037 (a whitespace IFS would merge empty fields):
@@ -1265,8 +1313,17 @@ _rep_env() {
 # [2] host / platform
 _rep_host() {
     section "Host / platform"
-    probe "kernel" uname -srm
-    probe "machine arch" uname -m
+    # the machine is the last field of `uname -srm` (uname prints the fields
+    # in its own order, and a kernel release has no blank)
+    _k="$(probe "kernel" uname -srm)"
+    printf '%s\n' "$_k"
+    case "$_k" in
+        "    kernel: n/a ("*) fact "machine arch: n/a (${_k#    kernel: n/a (}" ;;
+        "    kernel: "*" "*)  fact "machine arch: ${_k##* }" ;;
+        "    kernel (exit "*" "*)
+                             _e="${_k#    kernel (exit }"; fact "machine arch (exit ${_e%%)*}): ${_k##* }" ;;
+        *)                   fact "machine arch: n/a (no machine field in the uname -srm output)" ;;
+    esac
     read_proc "os-release" /etc/os-release
     probe "cpu count (nproc)" nproc
     fact "memory:"
@@ -1320,7 +1377,7 @@ _rep_installs() {
     done 9<<EOF
 $D_NODE_EXES
 EOF
-    probe "npm version" npm --version
+    cli_version "npm version" npm
     if ! have npm; then fact "global node_modules (npm root -g): n/a (command not found: npm)"
     elif [ -z "$D_NPM_ROOT" ]; then fact "global node_modules (npm root -g): n/a (no output: failed or timed out after ${CMD_TIMEOUT}s)"
     elif [ -e "$D_NPM_ROOT/whatap/package.json" ]; then fact "global node_modules (npm root -g): $D_NPM_ROOT (whatap present)"
@@ -1588,7 +1645,7 @@ _rep_logs() {
 _rep_apps() {
     local pid
     section "Application and launcher facts (pm2 / Next.js / package manifests)"
-    probe "pm2 version" pm2 --version
+    cli_version "pm2 version" pm2
     _pm2d="$(echo $D_PM2_PIDS | cut -d' ' -f1-5)"
     if [ -n "$_pm2d" ]; then
         fact "pm2 daemon process(es): $_pm2d"
