@@ -38,6 +38,9 @@ export LC_ALL=C
 
 # ---- collector metadata -----------------------------------------------------
 COLLECTOR_NAME="whatap-k8s"
+# 0.10.0 Section [1] states the API round trip: the time of the one
+#        reachability call (get --raw /version) in ms, no extra call
+#        (2026-09-26).
 # 0.9.0  The whatap namespace, the whatap workloads and the node-agent pods are
 #        goals: a refused, failed or timed-out list behind them is missed and
 #        the run INCOMPLETE (it was COMPLETE). The operator log tail is cut from
@@ -52,7 +55,7 @@ COLLECTOR_NAME="whatap-k8s"
 #        (14 -> 1 per pod), the operator deployment and operator pod list reads
 #        of section D are merged, and section A counts namespaces from the list
 #        section J prints (3 --apm-target, lab cluster: 111 s -> 75 s).
-VERSION="0.9.0"
+VERSION="0.10.0"
 DOMAIN="k8s"
 TARGET="k8s-cluster/unresolved"      # refined after CLI/context/namespace discovery
 
@@ -746,6 +749,8 @@ k8s_cli_discover() {
 K_OUT=""; K_RC=1
 API_OK=""            # "" = not checked yet, 1 = answered, 0 = not usable
 API_WHY=""           # the reason, when API_OK=0
+API_RTT=""           # the reachability call's time in ms; "" = no ms clock or no call
+API_ANS=""           # that call: "" = answered, "no answer", or "answered: <kind>" / "failed: <kind>"
 run_k() {
     K_OUT=""; K_RC=1
     [ -n "$KCTL_BIN" ] || { : > "$_errfile" 2>/dev/null; return 1; }
@@ -778,15 +783,31 @@ _k_reason() {
 # counts as reachable and the per-call reasons below say what was refused.
 k8s_api_check() {
     if [ -z "$KCTL_BIN" ]; then API_OK=0; API_WHY="command not found: kubectl/oc"; return; fi
-    local saved="$CMD_TIMEOUT" why
+    local saved="$CMD_TIMEOUT" why m0
     CMD_TIMEOUT=10
+    _now_ms; m0="$_ms"
     run_k get --raw /version --request-timeout=5s
+    _now_ms
+    # _now_ms falls back to whole seconds without EPOCHREALTIME or date %N
+    if [ -n "${EPOCHREALTIME:-}" ] || [ "$_ms_date" = 1 ]; then API_RTT="$((_ms - m0))"; fi
     # the reason is built while the check's own cap is still in force
     why="$(_k_reason)"
     CMD_TIMEOUT="$saved"
     if [ "$K_RC" -eq 0 ]; then API_OK=1; return; fi
-    case "$(cat "$_errfile" 2>/dev/null)" in
+    local etxt; etxt="$(cat "$_errfile" 2>/dev/null)"
+    case "$etxt" in
         *"(Forbidden)"*|*" is forbidden: "*) API_OK=1; return ;;
+    esac
+    # whether the server answered the failed call: an HTTP error is an answer
+    case "$why" in
+        "connection refused"*|"API request timed out"*|"API server unreachable"*|"timed out"*|"run deadline"*|"skipped"*)
+            API_ANS="no answer" ;;
+        "unauthorized"*) API_ANS="answered: unauthorized" ;;
+        *) case "$etxt" in
+               "Error from server"*|*"
+Error from server"*) API_ANS="answered: ${why%%:*}" ;;
+               *) API_ANS="failed: ${why%%:*}" ;;
+           esac ;;
     esac
     API_WHY="API check (get --raw /version, 5s) failed: $why"
     API_OK=0
@@ -2353,6 +2374,18 @@ run_report() {
     kprobe "client version" version --client
     if [ "$API_OK" = 1 ]; then fact "api reachability (get --raw /version, 5s): answered"
     else fact "api reachability (get --raw /version, 5s): n/a (${API_WHY#API check (get --raw /version, 5s) failed: })"; fi
+    # the time of that one call, answered or not: no second call is made
+    local rtt="api round trip (get --raw /version, one kubectl call)"
+    if [ -z "$KCTL_BIN" ]; then fact "$rtt: n/a (command not found: kubectl/oc)"
+    elif [ -z "$API_RTT" ]; then fact "$rtt: n/a (no ms clock)"
+    elif [ "$API_OK" = 1 ]; then fact "$rtt: $API_RTT ms"
+    elif [ "$API_ANS" = "no answer" ]; then fact "$rtt: n/a (no answer after $API_RTT ms)"
+    else
+        case "$API_ANS" in
+            answered*) fact "$rtt: $API_RTT ms ($API_ANS)" ;;
+            *)         fact "$rtt: n/a (call failed after $API_RTT ms: ${API_ANS#failed: })" ;;
+        esac
+    fi
     if [ -n "$NS" ]; then fact "namespace: $NS (via $NS_SRC)"; else fact "namespace: $NS_SRC"; fi
     if [ -n "$NS_ALL" ] && [ "$(printf '%s\n' "$NS_ALL" | wc -l | tr -d ' ')" -gt 1 ]; then
         fact "whatap workloads seen in multiple namespaces; this run covers '$NS':"

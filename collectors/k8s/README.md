@@ -95,6 +95,10 @@ bundle artifact. See "What the report can contain" below.
   call failed or was refused prints `n/a (<reason>)` instead.
 - **Repeated env names.** Kubernetes applies the first occurrence of a
   duplicated env name in a container.
+- **API round trip** (section [1]) is the wall time of the one reachability
+  call, in ms: kubectl start-up, kubeconfig and auth-plugin work, and one
+  request to the API server. Multiply by the kubectl call count in the status
+  section's time table to see how much of a slow run the API accounts for.
 - **Registries.** External registry tag listings are out of scope (clusters are
   often air-gapped); section H lists the images in use.
 
