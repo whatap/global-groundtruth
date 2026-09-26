@@ -172,20 +172,18 @@ appends the gap to the reason of any goal that privilege blocked — so the gap
 reaches the operator's terminal on the same line as what it cost:
 
 ```
->>   mysql login — access denied (not elevated: sudo does not permit this account)
+>>   mysql login — access denied (not elevated: run again with sudo)
 ```
 
 Three rules for the author.
 
-- **A collector does not elevate itself, unless elevation is the whole job.**
-  One does (`collect-collmysql.sh`: nearly every section is SQL, and a packaged
-  MySQL admits root over the unix socket with no password). Everywhere else the
-  operator decides, because probing sudo logs a security event on a host whose
-  account is not in sudoers.
-- **A collector that does elevate takes its reason from whatever refused it.**
-  An account sudo does not permit and a run with no terminal to be asked on fail
-  identically, and they are answered by different people. `sudo -n` cannot tell
-  them apart — it answers "a password is required" to both.
+- **A collector never elevates itself.** The operator runs it with sudo when a
+  goal needs root. Probing sudo logs a security event on a host whose account is
+  not in sudoers, and doing it from a shell script (sudo -v, re-exec, a password
+  hand-over) breaks in edge cases no test finds first.
+- **The hint states the run was not elevated; it does not promise sudo helps.**
+  Guessing from an error code whether root would succeed was wrong as often as
+  right, so every goal a non-root run left blocked carries the same hint.
 - **The line speaks for the process, not for every authority the run needs.**
   A SQL login or a Kubernetes role is its own goal's business.
 

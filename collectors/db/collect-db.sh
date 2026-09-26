@@ -145,24 +145,12 @@ emit_footer() {
 }
 
 # ---- privilege — DO NOT EDIT ------------------------------------------------
-# What a collection can read is decided by the privilege it was given. That is a
-# fact about this run, not a claim about the environment, so it stays inside
-# CONTRACT rule 1 and belongs in the environment section ([1]) with the rest of the run's own facts.
-#
-# Two places, one sentence. The environment section says which privilege this run had. Every
-# goal that privilege blocked repeats it on its own line, because the roll-up is
-# what reaches the operator's terminal while they are still logged in, and "this
-# is what was missing, this is what would have obtained it" is one thought.
-#
-# Real case: three collection-server bundles came back carrying no conf/ at all,
-# and nothing in the report or the status said the uid could not reach it
-# (Smartfren, 2026-09-23).
-#
-# A collector that elevates itself fills these in first, and _note_privilege
-# then leaves them alone. What it fills in has to come from whatever refused it
-# rather than from a guess: an account sudo does not permit and a run with no
-# terminal to be asked on fail the same way, and they are answered by different
-# people (collect-collmysql.sh 0.6.2).
+# What a run can read depends on the privilege it was given: a fact about this
+# run (CONTRACT rule 1), stated in the environment section ([1]). Each goal that
+# privilege blocked repeats it via _priv_hint, because the status roll-up is what
+# reaches the operator while still logged in, and "what was missing" and "what
+# would have obtained it" are one thought. Without it, bundles came back with no
+# conf/ and nothing said the uid could not reach it.
 PRIV_WHY="unknown"
 PRIV_GAP=""   # what a further privilege would obtain; empty when the run is root
 
@@ -170,11 +158,9 @@ PRIV_GAP=""   # what a further privilege would obtain; empty when the run is roo
 # Append it to the reason of any goal that a privilege blocked.
 _priv_hint() { [ -n "$PRIV_GAP" ] && printf ' (not elevated: %s)' "$PRIV_GAP"; return 0; }
 
-# _note_privilege -> describe this process. Call it once, before the environment section reads
-# PRIV_WHY. It yields to a value already set, so a self-elevating collector can
-# say something more exact.
+# _note_privilege -> set PRIV_WHY/PRIV_GAP for this process. Call it once,
+# before the environment section prints PRIV_WHY.
 _note_privilege() {
-    [ "$PRIV_WHY" = unknown ] || return 0
     # No uid is not uid 0. A run that cannot tell says so, and claims no root.
     _priv_uid="$(id -u 2>/dev/null)"
     [ -n "$_priv_uid" ] || _priv_uid="$(awk '/^Uid:/{print $2; exit}' /proc/self/status 2>/dev/null)"
@@ -192,27 +178,11 @@ _note_privilege() {
 # ---- end privilege
 
 # ---- boot time — DO NOT EDIT ------------------------------------------------
-# Most of what a collector reports is cumulative since boot: /proc/diskstats,
-# ZFS kstat trees, zpool iostat histograms, MySQL GLOBAL STATUS. Without the boot
-# time those are sums with no denominator and cannot be read as a rate, so the
-# reader either asks the site for it afterwards or reconstructs it. Both are work
-# the collector could have done, and it belongs in the environment section ([1]) with the rest of the
-# facts about this run.
-#
-# Two real cases, both 2026-09-23 Smartfren. A MySQL bundle whose section D kernel
-# counters had no start time, so `uptime -s` had to be asked for by hand and a
-# runbook carried a step to write that one line down. And a ZFS bundle whose
-# 869-day uptime had to be rebuilt from kstat snaptime, a pool_create event and
-# dmesg monotonic time before `try_hard` 29,727,745 could be stated as 34,209/day.
-#
-# It reads /proc rather than running `uptime` on purpose. It arrives on a host
-# without procps, and it still arrives on a run whose main collection failed early
-# (a refused login, an absent zpool), which is exactly the run whose counters most
-# need a denominator.
-#
-# _note_boot -> emit the two facts. Call it from the environment section, after the privilege
-# line. It prints rather than returning, because both values are always wanted
-# together and neither is read back by the collector.
+# Most counters a collector reports are cumulative since boot (/proc/diskstats,
+# ZFS kstats, MySQL GLOBAL STATUS); without the boot time they cannot be read as
+# a rate. It reads /proc, not `uptime`: that works without procps and on a run
+# whose main collection failed early, the run whose counters most need it.
+# _note_boot -> the two facts; call it in the environment section after privilege.
 _note_boot() {
     _boot_btime="$(awk '/^btime/{print $2; exit}' /proc/stat 2>/dev/null)"
     if [ -n "$_boot_btime" ]; then
@@ -226,47 +196,23 @@ _note_boot() {
 # ---- end boot time
 
 # ---- run helpers — DO NOT EDIT ----------------------------------------------
-# Four things every collector needs and none may get wrong on its own.
-#
-# warn. What the operator must see whatever --quiet says: a Tier 2 impact before
-# it runs, a hard error, a skipped step. It goes to fd 3, the terminal saved in
-# main, because --file mode discards the report body's stderr. Every collector
-# once wrote warn to plain stderr, and in --file mode the "[Tier2] ... pauses
-# the target JVM" line never reached the terminal while jstack still ran
-# (apmjava 0.10.1, found 2026-09-25).
-#
-# _bounded CMD... Every external command runs under a cap. timeout(1) when the
-# host has it and CMD is a file; otherwise a shell watchdog, which also covers
-# shell functions and hosts without coreutils. Returns 124 on a cap, whatever
-# the local timeout(1) returns for a kill (busybox gives 143). timeout(1) gets
-# -k 5 where it takes it: without it a command that ignores SIGTERM ran on
-# past its cap (`timeout 1 bash -c 'trap "" TERM; sleep 4'` took 4s; found
-# 2026-09-25).
-#
-# RUN_DEADLINE. The whole run is bounded too. Past it, _bounded runs nothing and
-# returns 124, so a host where every command hangs still yields a report that
-# reaches its footer, and emit_status says the deadline was reached.
-#
-# Where the time went. _bounded logs every call it makes or refuses, with its
-# time in ms, and emit_status sums them per command when any call was slow
-# (SLOW_SEC), capped or not run. A report that says "run deadline reached" used to
-# leave the reader guessing which command ate the time (2026-09-25). Only the
-# command's name and a subcommand word are kept, never its arguments, which
-# can hold a path or a credential.
-#
-# _tmp NAME. One private directory per run, removed on exit and on INT, TERM
-# and HUP. A Ctrl-C used to leave config copies and thread dumps in /tmp, and a
-# $$-named path in a shared /tmp is one a root run follows through a planted
-# symlink.
-#
-# _report_to_file FILE. --file mode's write, which says so and fails when the
-# file cannot be written instead of printing "report written".
-#
-# POSIX sh only in the synced blocks, because the apm collectors are piped into
-# `sh -s` inside containers, where sh is often dash or busybox: no SECONDS, no
-# `type -t`, no ${v//x/y}. The first draft of this block used all three.
+# warn            must-see operator text on fd 3 (the terminal saved in main);
+#                 not silenced by --quiet and not lost in --file mode.
+# _bounded CMD... every external command under CMD_TIMEOUT and RUN_DEADLINE.
+# _tmp NAME       a path in this run's private directory, removed on exit.
+# _report_to_file --file mode's write; fails when the file is not written whole.
+# Constraints:
+# - POSIX sh only (apm collectors run under `sh -s`, often dash or busybox):
+#   no SECONDS, no `type -t`, no ${v//x/y} outside a BASH_VERSION guard.
+# - A cap returns 124 whatever timeout(1) returns for a kill (busybox: 143).
+#   timeout(1) gets -k where it takes it, so a command deaf to TERM still ends;
+#   without timeout(1), or for a shell function, a watchdog that ends in KILL.
+# - Past RUN_DEADLINE nothing runs (124), so the report still reaches its footer.
+# - Each call is logged with its time; only the command name and a subcommand
+#   word, never arguments (they can hold a path or a credential).
 RUN_DEADLINE="${RUN_DEADLINE:-300}"
 _tmp_dir=""
+_timeout_bin=""   # timeout(1), found in _run_init; empty = watchdog only
 _run_t0=""
 _timeout_k=""     # 5 when timeout(1) takes -k (_run_init)
 _load0=""         # _host_load at _run_init
@@ -279,8 +225,9 @@ _tab="$(printf '\t')"
 # Falls back to stderr when fd 3 is not open yet (an error before main).
 warn() { { printf '!! %s\n' "$*" >&3; } 2>/dev/null || printf '!! %s\n' "$*" >&2; }
 
-# _elapsed -> seconds since _run_init; 0 when no clock is available, which
-# disables the deadline rather than tripping it at once
+# _elapsed -> seconds since _run_init; 0 without a clock, which disables the
+# deadline rather than tripping it at once
+# shellcheck disable=SC3028  # SECONDS only under BASH_VERSION
 _elapsed() {
     if [ -n "${BASH_VERSION:-}" ]; then printf '%s' "${SECONDS:-0}"
     elif [ -n "$_run_t0" ]; then printf '%s' "$(( $(date +%s 2>/dev/null || echo "$_run_t0") - _run_t0 ))"
@@ -291,17 +238,15 @@ _past_deadline() { [ "$(_elapsed)" -ge "$RUN_DEADLINE" ]; }
 # _cmd_kind CMD -> "file", "shell" (function or builtin) or "" (not found)
 _cmd_kind() {
     case "$(command -v "$1" 2>/dev/null)" in
-        '') printf '' ;;
         /*) printf 'file' ;;
+        '') ;;
         *)  printf 'shell' ;;
     esac
 }
 
-# Only the process that ran _run_init removes the directory. The background
-# jobs _bounded_in forks inherit the traps, and a job killed before it reset
-# them ran this cleanup mid-run (lost within 1..176 `_bounded true` calls under
-# bash, 2026-09-25). A flag set around the fork left a window in which a Ctrl-C
-# to the run itself skipped the cleanup, so the process is identified instead.
+# Only the process that ran _run_init removes the directory: jobs forked by
+# _bounded_in inherit the traps and would remove it mid-run. The owner is told
+# by its pid, not by a flag set around the fork, which left a Ctrl-C window.
 _owner_pid=""
 _run_cleanup() {
     local me
@@ -328,24 +273,20 @@ _run_init() {
     _run_t0="$(date +%s 2>/dev/null)"
     _owner_pid="$$"
     _load0="$(_host_load)"
-    # 16+ digits: a date that drops %N silently prints bare seconds (10 digits)
+    # 16+ digits: a date without %N prints bare seconds
     [ -z "${EPOCHREALTIME:-}" ] && case "$(date +%s%N 2>/dev/null)" in *[!0-9]*|'') ;; ????????????????*) _ms_date=1 ;; esac
     _now_ms; _run_ms0="$_ms"
     case "$_run_t0" in ''|*[!0-9]*) _run_t0="" ;; esac
-    # No predictable fallback name: without mktemp the run has no directory,
-    # and _tmp answers /dev/null.
+    # no predictable fallback name: without mktemp, _tmp answers /dev/null
     _tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/ggt.XXXXXX" 2>/dev/null)"
-    # Is this script read from stdin (`sh -s`, `kubectl exec ... sh -s`)? Then
-    # fd 0 is the script itself: a bounded command must not read it, and bash
-    # 5.2 kills a $(...) subshell that so much as duplicates fd 0 while it
-    # reads its script from there (`true 4<&0` is enough; found 2026-09-25).
+    # Script read from stdin (`sh -s`)? Then fd 0 is the script: a bounded
+    # command must not read it, and bash 5.2 kills a $(...) that duplicates it.
     case "$0" in
         */*|*.sh) [ -f "$0" ] || _stdin_script=1 ;;
         *)        _stdin_script=1 ;;
     esac
     [ -n "$_tmp_dir" ] || warn "no private temp directory could be made under ${TMPDIR:-/tmp}; values that need one are reported as n/a"
-    # Caps from the environment are numbers or they are not used. `abc` made
-    # every [ -lt ] fail and 0 means "no limit" to timeout(1) (found 2026-09-25).
+    # caps from the environment: whole numbers or unused (0 = no limit to timeout(1))
     RUN_DEADLINE="$(_cap_or RUN_DEADLINE "$RUN_DEADLINE" 300)"
     CMD_TIMEOUT="$(_cap_or CMD_TIMEOUT "${CMD_TIMEOUT:-20}" 20)"
     trap '_run_cleanup' EXIT
@@ -362,9 +303,8 @@ _run_init() {
 # could be made, so a write is lost rather than landing somewhere shared.
 _tmp() { if [ -n "$_tmp_dir" ]; then printf '%s/%s' "$_tmp_dir" "$1"; else printf '/dev/null'; fi; }
 
-# _kill_tree SIG PID -> signal PID and every descendant. dash starts a background
-# job in the caller's process group even under set -m, so a group kill misses
-# the grandchildren; /proc/<pid>/status names each process's parent.
+# _kill_tree SIG PID -> signal PID and every descendant, found by PPid in
+# /proc/<pid>/status. dash keeps a job in the caller's group even under set -m.
 _kill_tree() {
     local sig="$1" all="$2" list="$2" next c
     while [ -n "$list" ]; do
@@ -372,6 +312,7 @@ _kill_tree() {
         for c in $list; do
             next="$next $(grep -l "^PPid:[[:space:]]*$c\$" /proc/[0-9]*/status 2>/dev/null | cut -d/ -f3)"
         done
+        # shellcheck disable=SC2086,SC2116  # word-splitting squeezes the list
         list="$(echo $next)"
         all="$all $list"
     done
@@ -379,14 +320,13 @@ _kill_tree() {
     kill -"$sig" $all 2>/dev/null
 }
 
-# _now_ms -> _ms, milliseconds since the epoch. A variable, not output: every
-# bounded call is timed twice, and $(...) would fork each time. bash has
-# EPOCHREALTIME (no fork); elsewhere date +%s%N when it gives nanoseconds
-# (_ms_date=1, set in _run_init), else whole seconds. Timing in ms lets forty
-# 0.3s calls add up to the 12s they took, which whole seconds counted as 0.
+# _now_ms -> _ms, ms since the epoch, in a variable so a call does not fork.
+# EPOCHREALTIME (bash), else date +%s%N when it has %N (_ms_date=1), else
+# whole seconds. Milliseconds let many short calls add up to their real time.
 _ms_date=0
 _run_ms0=0
 _ms=0
+# shellcheck disable=SC3028  # EPOCHREALTIME is empty outside bash
 _now_ms() {
     local t="${EPOCHREALTIME:-}" f
     if [ -n "$t" ]; then
@@ -400,10 +340,9 @@ _now_ms() {
     fi
 }
 
-# _time_log MS KIND CMD ARGS... -> one line for emit_status: the command's name,
-# and for a tool whose first word is a subcommand (kubectl get, zfs list) that
-# word, after any --opt=value. Nothing else of the call, so no argument can
-# carry a path or a secret into the report; a name with odd bytes is "?".
+# _time_log MS KIND CMD ARGS... -> one line for emit_status: the command name
+# and, for a subcommand tool (kubectl get, zfs list), that word after any
+# --opt=value. No other argument is kept; a name with odd bytes is "?".
 _time_log() {
     [ -n "$_tmp_dir" ] || return 0
     local ms="$1" kind="$2" c="${3##*/}" w=""
@@ -418,11 +357,9 @@ _time_log() {
     { printf '%s\t%s\t%s\n' "$ms" "$kind" "$c$w" >> "$_tmp_dir/time.log"; } 2>/dev/null
 }
 
-# _host_load -> one line on how busy the host is: load average, pressure stall
-# (PSI) avg10 for cpu/io/memory, available memory, and the processes running
-# and blocked on I/O. Read at the start and at the end of the run, so a slow or
-# capped call in the status can be set against the load it ran under. Only
-# /proc files, no command per process.
+# _host_load -> one line: load average, PSI avg10 (cpu/io/memory), available
+# memory, procs running/blocked. Read at start and end, so a slow call can be
+# set against the load it ran under. /proc only.
 _host_load() {
     LC_ALL=C awk '
         FILENAME == "/proc/loadavg" { la = "load " $1 " " $2 " " $3 }
@@ -442,10 +379,9 @@ _host_load() {
         }' /proc/loadavg /proc/pressure/cpu /proc/pressure/io /proc/pressure/memory /proc/meminfo /proc/stat 2>/dev/null
 }
 
-# _bounded CMD... -> CMD under the caps. Its stdin is the caller's when this
-# script was run from a file, and /dev/null when the script itself is on stdin.
-# _bounded_in FILE CMD... -> the same, with FILE as CMD's stdin. Use it, not a
-# `< FILE` on the call, for any bounded command that needs input.
+# _bounded CMD... -> CMD under the caps, with the caller's stdin (/dev/null when
+# the script itself is on stdin). _bounded_in FILE CMD... -> FILE as its stdin;
+# use it, not `< FILE` on the call.
 _bounded() { _bounded_in "" "$@"; }
 
 _bounded_in() {
@@ -455,35 +391,30 @@ _bounded_in() {
     [ "$left" -le 0 ] && { _time_log 0 "not run" "$@"; return 124; }
     _now_ms; m0="$_ms"
     [ "$left" -lt "$t" ] && t="$left"
+    [ -z "$in" ] && [ "$_stdin_script" = 1 ] && in=/dev/null
     if [ -n "${_timeout_bin:-}" ] && [ "$(_cmd_kind "$1")" = file ]; then
-        if [ -n "$in" ];                   then "$_timeout_bin" ${_timeout_k:+-k "$_timeout_k"} "$t" "$@" < "$in"
-        elif [ "$_stdin_script" = 1 ];     then "$_timeout_bin" ${_timeout_k:+-k "$_timeout_k"} "$t" "$@" < /dev/null
-        else                                    "$_timeout_bin" ${_timeout_k:+-k "$_timeout_k"} "$t" "$@"; fi
+        if [ -n "$in" ]; then "$_timeout_bin" ${_timeout_k:+-k "$_timeout_k"} "$t" "$@" < "$in"
+        else                  "$_timeout_bin" ${_timeout_k:+-k "$_timeout_k"} "$t" "$@"; fi
         rc=$?
     else
-        # The kill has to reach whatever CMD started: an orphaned grandchild
-        # holds a $(...) pipe open and the caller waits for it anyway. bash
-        # under set -m gives the job its own group; _kill_tree covers dash.
-        # stdin through fd 4 when it is passed on: POSIX gives an async list
-        # /dev/null as stdin before its own redirections, so a plain 0<&0
-        # hands dash /dev/null.
+        # The kill must reach all CMD started (an orphaned grandchild holds a
+        # $(...) pipe open): set -m gives bash a job group, _kill_tree covers
+        # dash. Inherited stdin goes through fd 4: an async list gets /dev/null
+        # as stdin before its own redirections, so 0<&0 would hand dash /dev/null.
         set -m 2>/dev/null
-        if [ -n "$in" ];                   then "$@" < "$in" &
-        elif [ "$_stdin_script" = 1 ];     then "$@" < /dev/null &
-        else                                    { "$@" 0<&4 4<&- & } 4<&0; fi
+        if [ -n "$in" ]; then "$@" < "$in" &
+        else                  { "$@" 0<&4 4<&- & } 4<&0; fi
         p=$!
         set +m 2>/dev/null
         ( i=0
-          # sleep in the background and wait: a TERM then ends the watchdog at
-          # once, where dash let a foreground sleep finish (60-280ms a call)
+          # background sleep + wait, so a TERM ends the watchdog at once
           while [ "$i" -lt "$t" ]; do sleep 1 & wait $!; kill -0 "$p" 2>/dev/null || exit 0; i=$((i + 1)); done
           kill -TERM -- "-$p" 2>/dev/null; _kill_tree TERM "$p"
           sleep 2
           kill -KILL -- "-$p" 2>/dev/null; _kill_tree KILL "$p" ) >/dev/null 2>&1 &
         w=$!
         wait "$p"; rc=$?
-        # KILL: a TERM can reach the watchdog before dash has reset the traps it
-        # inherited and be lost, and it then ran a full 1s round (p90 ~1s a call)
+        # KILL: a TERM can arrive before dash resets the inherited traps and be lost
         kill -KILL "$w" 2>/dev/null; wait "$w" 2>/dev/null
     fi
     _now_ms; d=$((_ms - m0))
@@ -510,54 +441,22 @@ _report_to_file() {
 # ---- end run helpers
 
 # ---- collection completeness — DO NOT EDIT ----------------------------------
-# A collector knows, at the host, whether it obtained what it came for. Saying so
-# is a fact about THIS COLLECTION RUN, not a claim about the environment, so it
-# stays inside CONTRACT rule 1. (Rule 1 is spelled out for this case in
-# CONTRACT.md, "Saying whether the collection worked".)
-#
-# Why it exists. A report full of `n/a (permission denied)` reads as finished to
-# an operator whose terminal only said ">> done.". They package it and send it,
-# and the gap surfaces days later in another time zone. Real case: two of three
-# collection-server bundles came back carrying no conf/ at all, and nobody knew
-# until the files had crossed a time zone (Smartfren, 2026-09-23). Every fact
-# needed to catch that was already on the host while the operator was still
-# logged in.
-#
-# It also serves rule 3 ("one field command → paste output"): deciding whether a
-# run is worth sending is interpretation, and the field is not asked to do it.
-#
-# The status answers ONE question for the operator: send this, or change
-# something and run again? So there are three outcomes, not two.
+# Whether this run obtained what it came for is a fact about the run (CONTRACT.md,
+# "Saying whether the collection worked"). A report full of n/a otherwise reads as
+# finished and the gap surfaces days later; the status says, while the operator
+# is still logged in: send this, or change something and run again.
 #
 #     goal   conf "module configs"                     # what this run is for
 #     got    conf                                      # obtained
 #     na     conf "this host runs no yard"             # legitimately absent
 #     missed conf "uid 3103 cannot reach /data/whatap"  # this run was blocked
 #
-# `na` and `missed` are both absences, and telling them apart is the whole point.
-# An absence is `na` when it IS the answer and no re-run would change it: no ZFS
-# on a host that does not use ZFS, no DBX component on a database host, no binary
-# logs when log_bin is off. An absence is `missed` when this run was blocked and
-# running it differently would get the value: a permission, a missing tool, a
-# timeout, an unreadable path.
-#
-# Only `missed` makes a run INCOMPLETE. Marking a normal environment INCOMPLETE
-# would teach the field to ignore the line, and then it protects nothing.
-#
-# `na` needs every input behind the absence to have been read. One unreadable
-# path, one refused call, one timeout, and it is `missed` (output-format.md,
-# "Three outcomes"). A non-root run that sees no agent process because it cannot
-# read other users' /proc/<pid>/environ has not seen that there is no agent.
-#
-# Declare a goal once, then resolve it exactly once, after the last fallback. A
-# goal left unresolved counts as missed with reason "not reached": the run ended
-# before that step. A goal resolved twice with different outcomes counts as
-# blocked and says so, because the second call usually hides the first (missed
-# then na turned a refused read into COMPLETE). A resolution for a goal never
-# declared is listed. A requested opt-in is a goal; an unrequested one is not.
-#
-# Storage is one line per record, KEY<TAB>VALUE, so a reason cannot shift the
-# others: tabs and newlines inside a reason are flattened on the way in.
+# `na` only when every input behind the absence was read and it IS the answer;
+# one unreadable path, refused call or timeout makes it `missed`. Only `missed`
+# makes a run INCOMPLETE. Resolve each goal once, after the last fallback:
+# unresolved counts as "not reached", resolved twice differently counts as
+# blocked, an undeclared resolution is listed. Records are KEY<TAB>VALUE lines;
+# tabs and newlines in a reason are flattened.
 _goals='' _res=''
 
 _flat() { printf '%s' "$1" | tr '\n\t' '  '; }
@@ -570,17 +469,13 @@ got()    { _res="$_res$1${_tab}got$_tab$_nl"; }
 na()     { _res="$_res$1${_tab}na$_tab$(_flat "$2")$_nl"; }
 missed() { _res="$_res$1${_tab}missed$_tab$(_flat "$2")$_nl"; }
 
-# notice: like progress, but NOT silenced by --quiet. Reserved for the
-# completeness roll-up. --quiet exists to keep run narration out of automation
-# logs; the one line that decides whether a run is worth sending is not
-# narration, and an automated caller wants it most of all.
+# notice: like progress, but NOT silenced by --quiet; reserved for the status
+# roll-up, the one line an automated caller wants most.
 notice() { printf '>> %s\n' "$*" >&3 2>/dev/null; }
 
-# _emit_time -> the run time; and when a call was slow (SLOW_SEC), capped or not
-# run, the host load at the start and the end of the run and where the time
-# went: every bounded call summed per command, largest first, with how many
-# were capped, and the time spent outside them. A "run deadline reached" can
-# then be read against the load and the facts above it.
+# _emit_time -> the run time; when a call was slow (SLOW_SEC), capped or not
+# run, also the host load at start and end and where the time went (bounded
+# calls summed per command, largest first, and the time outside them).
 _emit_time() {
     local f="${_tmp_dir:+$_tmp_dir/time.log}" counts
     fact "run time: $(_elapsed)s of ${RUN_DEADLINE}s allowed"
@@ -618,32 +513,25 @@ _emit_time() {
 # Also repeats each gap on fd 3 so the operator sees it while still logged in.
 emit_status() {
     [ -n "$_goals" ] || return 0
-    local k lab outs total=0 obtained=0 nacount=0 blocked=0 gaps='' nas='' oks='' stray deadline=''
+    local k lab outs u why total=0 obtained=0 nacount=0 blocked=0 gaps='' nas='' oks='' stray deadline=''
     while IFS="$_tab" read -r k lab; do
         [ -n "$k" ] || continue
         total=$((total + 1))
         # every outcome recorded for this key, in order, and the distinct set
         outs="$(printf '%s' "$_res" | awk -F'\t' -v k="$k" '$1 == k { printf "%s%s", (n++ ? ", " : ""), $2 }')"
-        case "$outs" in
-            got|got,\ got*)
-                case "$outs" in *na*|*missed*) ;; *)
-                    obtained=$((obtained + 1)); oks="$oks $lab,"; continue ;; esac ;;
-        esac
-        case "$outs" in
-            na|na,\ na*)
-                case "$outs" in *got*|*missed*) ;; *)
-                    nacount=$((nacount + 1))
-                    nas="$nas$lab — $(printf '%s' "$_res" | awk -F'\t' -v k="$k" '$1 == k { print $3; exit }')$_nl"
-                    continue ;; esac ;;
+        u="$(printf '%s' "$_res" | awk -F'\t' -v k="$k" '$1 == k && !s[$2]++ { printf "%s%s", (n++ ? " " : ""), $2 }')"
+        case "$u" in
+            got) obtained=$((obtained + 1)); oks="$oks $lab,"; continue ;;
+            na)  nacount=$((nacount + 1))
+                 nas="$nas$lab — $(printf '%s' "$_res" | awk -F'\t' -v k="$k" '$1 == k { print $3; exit }')$_nl"
+                 continue ;;
         esac
         blocked=$((blocked + 1))
-        local why
         why="$(printf '%s' "$_res" | awk -F'\t' -v k="$k" '$1 == k && $2 == "missed" { printf "%s%s", (n++ ? "; " : ""), $3 }')"
-        case "$outs" in
-            '')           why='not reached' ;;
-            missed|missed,\ missed*)
-                case "$outs" in *got*|*na*) why="resolved $(printf '%s' "$outs" | awk -F', ' '{print NF}') times: $outs${why:+ — $why}" ;; esac ;;
-            *)            why="resolved $(printf '%s' "$outs" | awk -F', ' '{print NF}') times: $outs${why:+ — $why}" ;;
+        case "$u" in
+            '')     why='not reached' ;;
+            missed) ;;
+            *)      why="resolved $(printf '%s' "$outs" | awk -F', ' '{print NF}') times: $outs${why:+ — $why}" ;;
         esac
         gaps="$gaps$lab — $why$_nl"
     done <<EOF

@@ -63,12 +63,14 @@ _timeout_bin=""
 t0=$(date +%s); probe "slow grandchild" sh -c 'sleep 30'; echo "took-watchdog $(( $(date +%s) - t0 ))"
 echo "piped: $(echo abc | _bounded tr a-z A-Z)"
 echo "tmpdir: $_tmp_dir"
-goal a "A"; goal a "A again"; goal b "B"; goal c "C"; goal d "D"; goal e "E"
+goal a "A"; goal a "A again"; goal b "B"; goal c "C"; goal d "D"; goal e "E"; goal f "F"; goal g "G"
 got a; got a
 missed b "refused"; got b
 missed c "line one
 line	two"; na c "none"
 na d "empty"
+missed f "r1"; missed f "r2"
+na g "x"; na g "y"
 got stray
 emit_status
 RUN_DEADLINE=1; sleep 2
@@ -99,9 +101,11 @@ for sh in bash dash; do
     check "the watchdog reaches a grandchild"               'printf "%s" "$out" | grep -Eq "took-watchdog [2-4]$"' \
           "an orphaned grandchild holds \$(...) open; took: $(printf '%s' "$out" | grep took-watchdog)"
     check "_bounded passes stdin through"                   'printf "%s" "$out" | grep -q "piped: ABC"'
-    check "a duplicate goal counts once"                    'printf "%s" "$out" | grep -q "goals: 5 declared, 1 obtained, 1 not applicable here, 3 blocked"'
+    check "a duplicate goal counts once"                    'printf "%s" "$out" | grep -q "goals: 7 declared, 1 obtained, 2 not applicable here, 4 blocked"'
     check "missed then got is blocked, and says so"         'printf "%s" "$out" | grep -q "B — resolved 2 times: missed, got — refused"'
     check "a reason with newlines and tabs stays one line"  'printf "%s" "$out" | grep -q "C — resolved 2 times: missed, na — line one line two"'
+    check "missed twice is blocked with both reasons"       'printf "%s" "$out" | grep -q "^ *F — r1; r2$"'
+    check "na twice is not applicable, first reason"        'printf "%s" "$out" | grep -q "^ *G — x$"'
     check "an undeclared resolution is listed"              'printf "%s" "$out" | grep -q "resolved but never declared: stray"'
     check "an unresolved goal is not reached"               'printf "%s" "$out" | grep -q "E — not reached"'
     check "past the deadline a probe does not run"          'printf "%s" "$out" | grep -q "late: n/a (run deadline reached: 1s)"'
