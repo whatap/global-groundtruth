@@ -2,37 +2,21 @@
 #
 # WhaTap Global Groundtruth — NMS Control Manager collector (seeded v0)
 # -----------------------------------------------------------------------------
-# Gathers the environment facts that NMS support cases ask for over and over
-# (fact list derived from the #nms-support channel history 2025-04 ~ 2026-07;
-# see cases/2026-07-03-nms-support-channel-analysis/analysis.md in the analysis
-# workspace for the question -> section traceability), cross-checked against
-# the official docs:
-#   https://docs.whatap.io/nms/supported-spec   (OS/python matrix, ports)
-#   https://docs.whatap.io/nms/install-agent    (repo setup, wtinitset, units)
+# The facts NMS support cases ask for over and over (from the #nms-support
+# history; question -> section traceability in the analysis workspace case
+# 2026-07-03-nms-support-channel-analysis), checked against
+# docs.whatap.io/nms/supported-spec (OS/python, ports) and /install-agent (repo,
+# wtinitset, units). Runs on the host where the NMS Control Manager (whatap-nms
+# rpm or deb) is, or was supposed to be, installed.
 #
-# Runs on the host where the WhaTap NMS Control Manager (whatap-nms package,
-# rpm on RHEL-family / deb on Debian-family) is — or was supposed to be —
-# installed.
+# Load-safe: the default run is read-only; log reads are tail-bounded, no
+# recursive du/find, two outbound HEAD requests capped at 5s each (closed-network
+# detection is itself a recurring question). SNMP is Tier 2, opt-in, single GETs.
+# Discovery: install root from rpm -ql / dpkg -L, services from systemd, ports
+# from ss/netstat/proc, never hardcoded. Owned by the NMS development team.
 #
-# THE CONTRACT (../../CONTRACT.md):
-#   1. Facts only. No diagnosis, no likely-cause, no recommendation, no fix.
-#   2. Discover, never assume. The install root comes from rpm -ql, services
-#      from systemd state, ports from ss/netstat/proc — never hardcoded guesses.
-#      A value we cannot obtain is a fact with a reason (n/a (...)).
-#   3. One field command -> paste. `./collect-nms.sh --file`, send the .txt.
-#   4. Domain-team owned. Seeded v0 by the Global team (framework owner);
-#      ongoing ownership belongs to the NMS development team.
-#
-# DESIGN (../../docs/collector-engineering.md):
-#   * MECE sections [1]..[10] — every fact lives in exactly one place.
-#   * Load-safe: Tier 0 default is read-only and near-instant. Log reads are
-#     tail-bounded; no recursive du/find; the two outbound reachability probes
-#     are single HEAD requests capped at 5s each (closed-network detection is
-#     itself a recurring support question). The SNMP probe is Tier 2, opt-in,
-#     single GET requests only — never a walk.
-#   * Portable: bash 3.2+, /proc first, command chains with fallbacks,
-#     no set -e / set -u.
-#   * Reasoned absence: probe/read_proc/dump helpers classify every miss.
+# CONTRACT ../../CONTRACT.md, guidelines ../../docs/collector-engineering.md;
+# no set -e on purpose (the run must reach its footer).
 # -----------------------------------------------------------------------------
 
 # bash only: arrays, `read -d`, $SECONDS. Another shell would run on and give
@@ -46,7 +30,7 @@ export LC_ALL=C
 
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-nms"
-VERSION="0.6.1"
+VERSION="0.6.2"
 DOMAIN="nms"
 TARGET="host/$(hostname 2>/dev/null || echo unknown)"
 
@@ -555,13 +539,7 @@ EOF
 
 # ---- reasoned-absence helpers --------------------------------------------------
 _errfile=""
-_timeout_bin=""
-CMD_TIMEOUT="${CMD_TIMEOUT:-20}"
-_init_probe() {
-    _errfile="$(_tmp probe.err)"
-    have timeout && _timeout_bin="$(command -v timeout)"
-}
-_end_probe() { [ -n "$_errfile" ] && rm -f "$_errfile" 2>/dev/null; }
+_init_probe() { _errfile="$(_tmp probe.err)"; }
 
 _classify_err() {
     local txt=""
@@ -593,7 +571,6 @@ _emit_labeled() {
 probe() {
     local label="$1"; shift
     [ -n "$(_cmd_kind "$1")" ] || { fact "$label: n/a (command not found: $1)"; return; }
-    _past_deadline && { fact "$label: n/a (run deadline reached: ${RUN_DEADLINE}s)"; return; }
     local out rc
     out="$(_bounded "$@" 2>"$_errfile")"; rc=$?
     if [ "$rc" -eq 124 ]; then
@@ -613,7 +590,6 @@ probe() {
 probe_merged() {
     local label="$1"; shift
     [ -n "$(_cmd_kind "$1")" ] || { fact "$label: n/a (command not found: $1)"; return; }
-    _past_deadline && { fact "$label: n/a (run deadline reached: ${RUN_DEADLINE}s)"; return; }
     local out rc
     out="$(_bounded "$@" 2>&1)"; rc=$?
     if [ "$rc" -eq 124 ]; then
@@ -663,28 +639,15 @@ read_proc() {
     _emit_labeled "$label" "$out"
 }
 
-# tail_file PATH N -> last N lines of a file (bounded read), or a reason.
-tail_file() {
-    local path="$1" n="${2:-60}"
+# _file_lines head|tail PATH N -> the first or last N lines of a file, indented,
+# or a reason. Configuration is dumped verbatim, never masked: a value has to be
+# readable to be checked against the other side (docs/authoring-guide.md step 3).
+_file_lines() {
+    local path="$2"
     [ -e "$path" ] || { fact "n/a (path not found: $path)"; return; }
     [ -r "$path" ] || { fact "n/a (permission denied: $path)"; return; }
     [ -s "$path" ] || { fact "(empty file)"; return; }
-    tail -n "$n" "$path" 2>/dev/null | while IFS= read -r _l || [ -n "$_l" ]; do printf '        %s\n' "$_l"; done
-}
-
-# dump_file PATH [CAP] -> a file's content verbatim (line-capped), or a reason.
-# Framework policy (docs/authoring-guide.md step 3): configuration is dumped
-# verbatim, never masked — a value has to be readable to be verified or refuted
-# against the other side (e.g. a community string compared with the device),
-# and genuinely sensitive WhaTap material is stored encrypted anyway.
-dump_file() {
-    local path="$1" cap="${2:-400}"
-    [ -e "$path" ] || { fact "n/a (path not found: $path)"; return; }
-    [ -r "$path" ] || { fact "n/a (permission denied: $path)"; return; }
-    [ -s "$path" ] || { fact "(empty file)"; return; }
-    head -n "$cap" "$path" 2>/dev/null | while IFS= read -r _l || [ -n "$_l" ]; do
-        printf '        %s\n' "$_l"
-    done
+    "$1" -n "$3" "$path" 2>/dev/null | while IFS= read -r _l || [ -n "$_l" ]; do printf '        %s\n' "$_l"; done
 }
 
 # file_meta PATH -> "bytes / mtime" one-liner for a file.
@@ -716,8 +679,11 @@ elapsed_s() {  # elapsed_s START END -> "X.XXX" (awk does the float math)
     awk -v a="$1" -v b="$2" 'BEGIN{printf "%.3f", b-a}'
 }
 
-# systemd helper — avoid `--value` (unsupported on systemd < 230)
-sd_show() { have systemctl && _bounded systemctl show -p "$1" "$2.service" 2>/dev/null | cut -d= -f2-; }
+# _sd_val KEY -> the value(s) of KEY in $_sd, one `systemctl show` of a unit
+# (read by key, not with --value: systemd < 230 lacks it)
+_sd=""
+_sd_val() { printf '%s\n' "$_sd" | sed -n "s/^$1=//p"; }
+NMS_LOADED=""        # units whose LoadState is loaded, from section F
 
 # ---- discovery ----------------------------------------------------------------
 # Install root: resolved from the package manifest first (Contract rule 2) —
@@ -864,7 +830,7 @@ run_report() {
     goal logs    "NMS logs"
     [ "$OPT_SNMP" = 1 ] && goal snmp "SNMP GET probe (--snmp)"
 
-    # [1] capability preamble — pre-explains every downstream "command not found"
+    # the tool list pre-explains every "command not found" below
     section "Collection environment"
     fact "bash: ${BASH_VERSION:-unknown}"
     fact "uid: $(id -u 2>/dev/null || echo unknown) ($(id -un 2>/dev/null || echo unknown))"
@@ -894,7 +860,6 @@ run_report() {
     else fact "nms install root: n/a (no path from ${PKG_SCAN:-no package manifest (rpm, dpkg absent)}, no nms process argv[0] under a whatap-nms tree, /usr/share/whatap-nms not present)"; fi
     [ -n "$PKG_FAIL" ] && fact "package manifest query: n/a ($PKG_FAIL)"
 
-    # [2] host & platform — asked as "OS 종류와" in field sessions (2026-01-20)
     section "A. Host & platform"
     probe "hostname" hostname
     read_proc "os-release" /etc/os-release
@@ -908,32 +873,28 @@ run_report() {
     probe "virtualization" systemd-detect-virt
     probe "selinux" getenforce
 
-    # [3] time & clock — the backend rejects packs as "future data" when the
-    # manager host clock drifts (observed delta ~3157s, 2026-06-18)
+    # the backend rejects packs as "future data" when the manager clock drifts
     section "B. Time & clock synchronization"
     fact "host clock (UTC): $(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown)"
     probe "timedatectl" timedatectl
     probe "chrony tracking" chronyc tracking
     probe "ntpstat" ntpstat
 
-    # [4] python runtime — "python버전 알려주세요" (2026-01-20); the rpm %post
-    # builds a venv with the system python and needs >= 3.9 (2026-07-02)
+    # the rpm %post builds a venv with the system python and needs >= 3.9
     section "C. Python runtime"
     probe_merged "python3 --version" python3 --version
     if have python3; then
         fact "python3 resolves to: $(readlink -f "$(command -v python3)" 2>/dev/null || command -v python3)"
     fi
     fact "python3* binaries on PATH dirs (/usr/bin, /usr/local/bin):"
-    ls -1 /usr/bin/python3* /usr/local/bin/python3* 2>/dev/null | while IFS= read -r _p; do
-        printf '        %s\n' "$_p"
-    done
-    [ -z "$(ls -1 /usr/bin/python3* /usr/local/bin/python3* 2>/dev/null)" ] && fact "    (none found)"
+    local _py
+    _py="$(ls -1 /usr/bin/python3* /usr/local/bin/python3* 2>/dev/null)"
+    if [ -n "$_py" ]; then printf '%s\n' "$_py" | while IFS= read -r _p; do printf '        %s\n' "$_p"; done
+    else fact "    (none found)"; fi
     probe_merged "pip3 --version" pip3 --version
 
-    # [5] package & repository — exclude= lines and a repo missing the package
-    # are both field-observed causes of "whatap-nms not found" (2026-06-04 / 07-02).
-    # Both official install paths are covered: rpm/dnf (RHEL family) and
-    # dpkg/apt (Debian family) — docs.whatap.io/nms/install-agent.
+    # exclude= lines and a repo without the package both end in "whatap-nms not
+    # found"; both official install paths: rpm/dnf and dpkg/apt
     section "D. Package & repository"
     if have rpm; then
         probe "rpm -qi $NMS_PKG" rpm -qi "$NMS_PKG"
@@ -949,7 +910,7 @@ run_report() {
         if grep -qi whatap "$_rf" 2>/dev/null; then
             _found_repo=1
             fact "$_rf ($(file_meta "$_rf")):"
-            tail_file "$_rf" 40
+            _file_lines tail "$_rf" 40
         fi
     done
     for _rf in /etc/apt/sources.list.d/*.list /etc/apt/sources.list; do
@@ -957,7 +918,7 @@ run_report() {
         if grep -qi whatap "$_rf" 2>/dev/null; then
             _found_repo=1
             fact "$_rf ($(file_meta "$_rf")):"
-            tail_file "$_rf" 40
+            _file_lines tail "$_rf" 40
         fi
     done
     [ "$_found_repo" = 0 ] && fact "no yum/apt repo definition mentions whatap (/etc/yum.repos.d, /etc/apt/sources.list*)"
@@ -996,8 +957,7 @@ run_report() {
     probe "dpkg.log entries (last 20)" sh -c 'grep -h "whatap-nms" /var/log/dpkg.log /var/log/dpkg.log.1 2>/dev/null | tail -n 20; :'
     probe "apt history entries (last 30 lines)" sh -c 'grep -h -B2 -A4 "whatap-nms" /var/log/apt/history.log 2>/dev/null | tail -n 30; :'
 
-    # [6] deployment layout — venv/wheelhouse state is where rpm %post pip
-    # installs break (bcrypt case, 2025-05-30)
+    # the venv and wheelhouse are where the rpm %post pip install breaks
     section "E. Deployment layout (on-disk)"
     if [ -n "$NMS_ROOT" ]; then
         fact "root: $NMS_ROOT"
@@ -1029,19 +989,21 @@ run_report() {
         fact "n/a (install root not resolved)"
     fi
 
-    # [7] runtime services & processes — the three units and their start order
-    # (uvicorn -> nmscore -> icmptcphealthd) are the standard field checklist
-    # (2026-01-09); icmphealthd is the pre-rename unit (<= v0.42.x era)
+    # units in start order (uvicorn -> nmscore -> icmptcphealthd); icmphealthd
+    # is the unit's pre-rename name (<= v0.42.x)
     section "F. Runtime services & processes"
     if have systemctl; then
         local _u _ls
         for _u in $NMS_UNITS; do
-            _ls="$(sd_show LoadState "$_u")"
+            _sd="$(_bounded systemctl show -p LoadState -p NRestarts -p ActiveEnterTimestamp \
+                -p FragmentPath -p ExecStart "$_u.service" 2>/dev/null)"
+            _ls="$(_sd_val LoadState)"
             if [ "$_ls" = "loaded" ]; then
-                fact "$_u.service: active=$(_bounded systemctl is-active "$_u.service" 2>/dev/null) enabled=$(_bounded systemctl is-enabled "$_u.service" 2>/dev/null) restarts=$(sd_show NRestarts "$_u")"
-                fact "    since: $(sd_show ActiveEnterTimestamp "$_u")"
-                fact "    unit file: $(sd_show FragmentPath "$_u")"
-                fact "    ExecStart: $(sd_show ExecStart "$_u" | cut -c1-200)"
+                NMS_LOADED="$NMS_LOADED $_u"
+                fact "$_u.service: active=$(_bounded systemctl is-active "$_u.service" 2>/dev/null) enabled=$(_bounded systemctl is-enabled "$_u.service" 2>/dev/null) restarts=$(_sd_val NRestarts)"
+                fact "    since: $(_sd_val ActiveEnterTimestamp)"
+                fact "    unit file: $(_sd_val FragmentPath)"
+                fact "    ExecStart: $(_sd_val ExecStart | cut -c1-200)"
             else
                 fact "$_u.service: n/a (LoadState=${_ls:-unknown})"
             fi
@@ -1062,9 +1024,8 @@ run_report() {
         fact "no matching process in the /proc scan"
     fi
 
-    # [8] network endpoints — UDP 514 (syslog) is shared territory: a co-located
-    # WhaTap collection server binds it first and the manager then cannot
-    # (2025-07-15); 162/udp is trap intake, 5000/tcp the manager UI
+    # 514/udp (syslog) is also bound by a co-located WhaTap collection server;
+    # 162/udp is trap intake, 5000/tcp the manager UI
     section "G. Network endpoints"
     subsection "listening TCP sockets"
     if have ss; then probe "ss -ltnp" sh -c "ss -ltnp 2>/dev/null | head -n 40"
@@ -1103,8 +1064,7 @@ run_report() {
     probe "proxy variables in current environment" sh -c "env | grep -i proxy; :"
     probe "proxy variables in /etc/environment" sh -c 'grep -i proxy /etc/environment 2>/dev/null; :'
 
-    # [9] outbound reachability — closed networks break the rpm %post pip step
-    # ("ResolutionImpossible", 2026-06-09); two bounded HEAD requests, 5s cap each
+    # a closed network breaks the rpm %post pip step ("ResolutionImpossible")
     section "H. Outbound reachability (2 bounded HEAD requests, 5s cap each)"
     local _url
     for _url in https://repo.whatap.io https://pypi.org; do
@@ -1117,11 +1077,7 @@ run_report() {
         fi
     done
 
-    # [10] configuration — nmscore.conf keys named in past cases:
-    # MAX_REPETITIONS, IFX_32BIT_PPS_FALLBACK, ssl settings, syslog port.
-    # wtinitset is the official configuration tool (docs.whatap.io/nms/
-    # install-agent): -a sets the access key, -s the WhaTap server IP
-    # (multi-IP "a/b" form exists), -v prints the current configuration.
+    # wtinitset is the official configuration tool; -v prints the current one
     section "I. Configuration (verbatim)"
     subsection "wtinitset -v"
     probe_merged "wtinitset -v" wtinitset -v
@@ -1163,7 +1119,7 @@ EOF
         printf '%s\n' "$_cfgs" | while IFS= read -r _cf; do
             [ -e "$_cf" ] || { fact "$_cf: n/a (listed in package manifest, path not found on disk)"; continue; }
             fact "$_cf ($(file_meta "$_cf")):"
-            dump_file "$_cf" 400
+            _file_lines head "$_cf" 400
         done
         # keys of record, extracted flat in case a dump above hit its line cap:
         # MANAGER_WEB_PORT / MANAGER_HTTPS_* (UI port is configurable — FAQ),
@@ -1175,9 +1131,8 @@ EOF
         else fact "no *.conf discovered via package manifest, install root, or /etc/whatap-nms"; fi
     fi
 
-    # [11] logs & events — pkg-install-error.log is the first artifact support
-    # asks for on an install failure (2026-06-09); /var/log/nmscore/nmscore.log
-    # is the artifact the FAQ names for MIB module-load and engine issues
+    # pkg-install-error.log: install failures; /var/log/nmscore/nmscore.log:
+    # MIB module-load and engine issues (FAQ)
     section "J. Logs & recent events"
     local _logdir=/var/log/whatap-nms _lg_bad="" _lg_n=0 _lgd _lgf
     for _lgd in /var/log/whatap-nms /var/log/nmscore; do
@@ -1200,7 +1155,7 @@ EOF
         subsection "log inventory ($_logdir)"
         probe "ls" ls -la "$_logdir"
         subsection "pkg-install-error.log (last 60 lines)"
-        tail_file "$_logdir/pkg-install-error.log" 60
+        _file_lines tail "$_logdir/pkg-install-error.log" 60
         subsection "other *.log tails (last 25 lines each, first 8 files)"
         local _lf _cnt=0
         for _lf in "$_logdir"/*.log; do
@@ -1209,7 +1164,7 @@ EOF
             _cnt=$((_cnt + 1))
             [ "$_cnt" -gt 8 ] && { fact "(further *.log files not tailed: cap 8)"; break; }
             fact "$_lf ($(file_meta "$_lf")):"
-            tail_file "$_lf" 25
+            _file_lines tail "$_lf" 25
         done
         [ "$_cnt" = 0 ] && fact "no additional *.log file in $_logdir"
     else
@@ -1222,15 +1177,13 @@ EOF
         subsection "nms engine log inventory ($_coredir)"
         probe "ls" ls -la "$_coredir"
         subsection "nmscore.log (last 80 lines)"
-        tail_file "$_coredir/nmscore.log" 80
+        _file_lines tail "$_coredir/nmscore.log" 80
     else
         fact "$_coredir: n/a (path not found)"
     fi
     if have journalctl; then
-        local _u2 _ls2
-        for _u2 in $NMS_UNITS; do
-            _ls2="$(sd_show LoadState "$_u2")"
-            [ "$_ls2" = "loaded" ] || continue
+        local _u2
+        for _u2 in $NMS_LOADED; do
             subsection "journal: $_u2.service (last 60 lines)"
             probe "journalctl" journalctl -u "$_u2.service" -n 60 --no-pager -q
         done
@@ -1238,10 +1191,8 @@ EOF
         fact "journalctl: n/a (command not found: journalctl)"
     fi
 
-    # [12] Tier 2 — timed SNMP probe (opt-in). Field debugging showed the answer
-    # AND its arrival time both matter: a device answering in ~2-3s against a
-    # manager first-response timeout of ~3s collects nothing, while no answer at
-    # all points at device-side SNMP policy / filtering (2025-07-03 session).
+    # Tier 2, opt-in: the answer and its arrival time both matter, since the
+    # manager polls with a first-response timeout of about 3s
     if [ "$OPT_SNMP" = 1 ]; then
         section "K. SNMP probe (opt-in) — target $SNMP_HOST:$SNMP_PORT, SNMPv2c"
         if have snmpget; then
@@ -1330,4 +1281,3 @@ else
     _report_to_file "$OUTFILE" || exit 1
     progress "report written: $OUTFILE"
 fi
-_end_probe
