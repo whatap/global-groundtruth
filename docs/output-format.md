@@ -238,13 +238,26 @@ read and came back empty**. It is `missed` when any of them
 - was not run (the tool is absent, the run deadline had passed),
 - failed, was refused, or timed out.
 
-So a non-root run that finds no agent process but could not read other users'
-`/proc/<pid>/environ` is `missed`, with `_priv_hint`; "no WhatapAgent CR" from
+So a non-root run that finds no agent process but could not read the
+`/proc/<pid>/environ` of another user's candidate process is `missed`, with `_priv_hint`; "no WhatapAgent CR" from
 a forbidden or failed list call is `missed`; "no pools" from a `zpool list`
 that exited non-zero is `missed`. A missing tool is `missed` only when the
 thing it would inspect is there: no `zpool` binary on a host with no
 `/proc/spl` is still `na`, because `/proc/spl` was read and it answers the
 question.
+
+**Which inputs count.** The inputs are those of the candidates the run
+identified, not of everything on the host. A candidate is found from what any
+uid can read (a process's name, argv0 or command line, a fixed path the
+collector names; `/proc/<pid>/exe` adds what the run may resolve) and is then followed into what may need privilege (its
+environ, cwd, config files). An unreadable detail of a candidate is `missed`;
+a process that was never a candidate is not an input, so its unreadable
+environ changes nothing. Where the host routinely runs unrelated processes of
+the same runtime, the collector narrows its candidates to those with a WhaTap
+marker it can see, and says in the `na` reason how many unreadable processes
+it did not count, so the reader can judge the rest. apmpython does this today
+(a stock distribution runs root python daemons); the other apm collectors
+count every unreadable process of their runtime.
 
 Both directions are expensive. A collector that marks an ordinary environment
 INCOMPLETE teaches the field to ignore the line. A collector that marks a
