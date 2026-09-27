@@ -171,6 +171,30 @@ _scan_cmdlines() {
         *)   CMDLINE_SCAN_WHY="the /proc/<pid>/cmdline scan failed (xargs/grep exit $rc)" ;;
     esac
 }
+
+# _is_whatap_server PID CMDLINE -> true for a java process that runs a WhaTap
+# backend module: a whatap.server.*.jar / whatap.opslake.*.jar on its command
+# line, or the yard boot class. "whatap.server." alone is not enough: the
+# WhaTap Java agent passes -Dwhatap.server.host=..., and `tail -f
+# whatap.server.log` names it too. Patterns, not [[ =~ ]], so the block parses
+# under dash; the jar test is whatap.(server|opslake). followed by a run of
+# [A-Za-z0-9._-] that holds ".jar" after its first character.
+_is_whatap_server() {
+    local hit="" pfx s tok comm="" a0="${2%% *}"
+    case "$2" in *[A-Za-z0-9_].yard.boot*) hit=1 ;; esac
+    for pfx in whatap.server. whatap.opslake.; do
+        s="$2"
+        while [ -z "$hit" ]; do
+            case "$s" in *"$pfx"*) ;; *) break ;; esac
+            s="${s#*"$pfx"}"
+            tok="${s%%[!A-Za-z0-9._-]*}"
+            case "$tok" in ?*.jar*) hit=1 ;; esac
+        done
+    done
+    [ -n "$hit" ] || return 1
+    IFS= read -r comm < "/proc/$1/comm" 2>/dev/null
+    [ "$comm" = java ] || [ "${a0##*/}" = java ]
+}
 # ---- end collection-server: process scan
 
 # ---- collection-server: systemd cache — DO NOT EDIT -------------------------

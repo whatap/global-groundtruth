@@ -22,6 +22,9 @@
 export LC_ALL=C
 
 # ---- collector metadata -----------------------------------------------------
+# 0.11.2 _is_whatap_server moved into the collection-server process scan
+#        block, written with case patterns so the block parses under dash;
+#        report unchanged.
 # 0.11.1 Helpers moved into the collection-server group blocks; report
 #        unchanged. The blocks are copies of
 #        templates/groups/collection-server.sh.
@@ -60,7 +63,7 @@ export LC_ALL=C
 #        private directory; bad numeric options exit 2, a failed write exits 1;
 #        output is handed back under sudo. Needs bash.
 COLLECTOR_NAME="whatap-collserver"
-VERSION="0.11.1"
+VERSION="0.11.2"
 DOMAIN="collection-server"
 TARGET="collection-server/$(hostname 2>/dev/null || echo unknown)"   # refined after WHATAP_HOME is resolved
 
@@ -821,6 +824,30 @@ _scan_cmdlines() {
         *)   CMDLINE_SCAN_WHY="the /proc/<pid>/cmdline scan failed (xargs/grep exit $rc)" ;;
     esac
 }
+
+# _is_whatap_server PID CMDLINE -> true for a java process that runs a WhaTap
+# backend module: a whatap.server.*.jar / whatap.opslake.*.jar on its command
+# line, or the yard boot class. "whatap.server." alone is not enough: the
+# WhaTap Java agent passes -Dwhatap.server.host=..., and `tail -f
+# whatap.server.log` names it too. Patterns, not [[ =~ ]], so the block parses
+# under dash; the jar test is whatap.(server|opslake). followed by a run of
+# [A-Za-z0-9._-] that holds ".jar" after its first character.
+_is_whatap_server() {
+    local hit="" pfx s tok comm="" a0="${2%% *}"
+    case "$2" in *[A-Za-z0-9_].yard.boot*) hit=1 ;; esac
+    for pfx in whatap.server. whatap.opslake.; do
+        s="$2"
+        while [ -z "$hit" ]; do
+            case "$s" in *"$pfx"*) ;; *) break ;; esac
+            s="${s#*"$pfx"}"
+            tok="${s%%[!A-Za-z0-9._-]*}"
+            case "$tok" in ?*.jar*) hit=1 ;; esac
+        done
+    done
+    [ -n "$hit" ] || return 1
+    IFS= read -r comm < "/proc/$1/comm" 2>/dev/null
+    [ "$comm" = java ] || [ "${a0##*/}" = java ]
+}
 # ---- end collection-server: process scan
 
 get_listen_ports() {
@@ -930,18 +957,6 @@ _looks_like_home() {
 
 # ---- discovery (run once) ---------------------------------------------------
 # PIDS[] and MODS[] are parallel indexed arrays of discovered whatap JVMs.
-# _is_whatap_server PID CMDLINE -> true for a java process that runs a WhaTap
-# backend module: a whatap.server.*.jar / whatap.opslake.*.jar on its command
-# line, or the yard boot class. "whatap.server." alone is not enough: the
-# WhaTap Java agent passes -Dwhatap.server.host=..., and `tail -f
-# whatap.server.log` names it too.
-_is_whatap_server() {
-    [[ "$2" =~ whatap\.(server|opslake)\.[A-Za-z0-9._-]+\.jar || "$2" =~ [A-Za-z0-9_]\.yard\.boot ]] || return 1
-    local comm="" a0="${2%% *}"
-    IFS= read -r comm < "/proc/$1/comm" 2>/dev/null
-    [ "$comm" = java ] || [ "${a0##*/}" = java ]
-}
-
 PROC_SEEN=0          # /proc/<pid> entries looked at
 PROC_UNREAD=0        # of those, cmdline not readable by this uid
 discover_services() {
