@@ -5,6 +5,66 @@ change to the script bumps its `VERSION` and adds one entry at the top of this
 list (docs/authoring-guide.md, step 2); `tools/validate.sh` checks that the
 newest entry is the script's `VERSION`.
 
+- **0.12.0** — Collects what confirms a root cause, and drops views that
+  restated raw output already in the report (user decision 2026-09-27; no
+  option added or removed; no fact lost). Removed, and where the same fact is
+  now read: section C's six per-CR jsonpath extracts after the CR yaml (env
+  names, identity + master switches, targets, init image overrides) → the
+  `cr yaml` (managedFields write history stays: kubectl's yaml leaves it out);
+  section J's CR names, `named 'whatap'` check, targets and selectors → one
+  list in section C, `every whatapagent: name / targets / selectors`, over
+  every listed CR (the yaml stays capped at 3, and the CR named `whatap` is
+  always among them, first); section J's per-namespace, per-language and
+  init-image tallies → the instrumented-pod list, now uncapped (was first
+  100); section D's per-hook summary line and caBundle size → the webhook
+  yaml, the ready-address count → the endpoints table (3-way CA fingerprint
+  comparison, call counters and shared hook-name check unchanged). Section E
+  describes only pods with restarts or a container not ready (first two),
+  else one line says none qualified; its pod table gains not-ready count and
+  node; `--bundle` still writes the describe of the top-2 restart pods.
+  `--bundle` no longer writes the CR, operator, webhook and DaemonSet yaml,
+  the sa/secret tables and the image list (all in the report); it keeps the
+  CRD schema, `get rs -o wide` of the namespace, the pod table, describe,
+  logs, events, nodes, helm and the `--apm-target` originals.
+  Added, load-free and read-only, after the MEA case (2026-08, x509 on the
+  webhook call under `failurePolicy: Ignore`), whose cause was the
+  kube-apiserver's `https_proxy` with a `no_proxy` lacking `.svc` and the
+  cluster CIDRs, found only from a field screenshot, and whose serving chain
+  was measured by hand (`session-probe.sh`): section D **kube-apiserver proxy
+  environment** — per kube-apiserver pod in kube-system and container, env
+  entries named `http_proxy`/`https_proxy`/`no_proxy` in any case (verbatim),
+  envFrom sources, env count, or n/a naming why (no such pod: managed control
+  planes do not expose it; a refused list: its reason); section I reads the
+  proxy lines of the node's `/etc/kubernetes/manifests/kube-apiserver.yaml`
+  when an exec sample runs on a kube-apiserver node (the without-restarts
+  sample prefers such a node; no exec added). Section D **webhook serving
+  certificate chain as presented** — `openssl s_client -showcerts` from the
+  collector host to the first 2 ready endpoint addresses and the Service
+  ClusterIP, SNI `<svc>.<ns>.svc`, `-CAfile` = the hook's caBundle,
+  `-verify_hostname` where s_client has it (LibreSSL has not: the line says
+  so); per certificate subject, issuer, notAfter, sha256 fingerprint and SANs
+  (from `x509 -text`, as openssl 1.0.2 and LibreSSL have no `-ext`) and
+  `Verify return code`; min(CMD_TIMEOUT, 3) s per address, the rest not tried
+  after one timeout. Version facts (the supported-range check): the WhaTap
+  banner line of each app-container log head in section J (any case,
+  `whatap.*(v|ver|version)[ .]?<digit>`: `WhaTap Node Agent version 2.0.6`,
+  `WhaTap Kube Agent ver 1.9.10`); `imageID` in the
+  pod container status table and a `image imageID` list of the whatap
+  namespace pods (section H); the init containers' `command` and `args` in the
+  pod init-container table (the operator's init only copies whatap.conf,
+  which engineers checked by opening pods, #ask-dev-apm); with `--apm-exec`,
+  `readlink /proc/1/exe` with the runtime's `release` file (else the version
+  flag of java, node or python only; any other binary is not executed: a Go
+  app that ignores the flag started a second instance in the verifier's
+  repro), the agent `package.json` version and the first 5 lines of each agent
+  log. The kube-apiserver pod list is read once before the report.
+  Lab (kubeadm 1.32, 4 nodes, same host): report 1866 → 1634 lines, run
+  18 → 20 s (one 3 s s_client timeout: the pod network is not routed from the
+  analysis host); from the control-plane node both addresses presented
+  `CN=whatap-admission-controller.whatap-monitoring.svc` issued by
+  `CN=whatap-webhook-ca`, verify 0; the lab kube-apiserver has no env
+  entries. The chain code was also run under openssl 1.0.2g and LibreSSL with
+  bash 3.2.
 - **0.11.5** — Shortened long comment runs: the top-of-file block now points at
   README.md for section/tier detail instead of restating it; the merged-calls
   and deep-operator-log-tail algorithm rationale moved to a new README.md
