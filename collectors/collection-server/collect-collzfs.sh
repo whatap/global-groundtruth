@@ -15,20 +15,8 @@
 # The two reports are each self-contained; the MECE rule applies within a
 # report, not across collectors.
 #
-# What a reader typically wants to check, and where the facts for it live:
-#   * allocation-class routing      -> B (zfs_special_class_metadata_reserve_pct),
-#                                      C (per-vdev class usage), E (recordsize vs
-#                                      special_small_blocks, side by side)
-#   * block sizing                  -> E (property matrix incl. property source),
-#                                      J (request-size histograms), N (zdb -Lbbbs)
-#   * append / txg behaviour        -> B (zfs_txg_timeout, dirty-data throttle),
-#                                      H (txgs ring buffer, ZIL kstats), I (per-
-#                                      dataset objset write counters), O (every
-#                                      txg of a time window, --window)
-#   * free-space fragmentation      -> C/D (FRAG, CAP per vdev and per pool),
-#                                      B (metaslab_* parameters), N (zdb -mm)
-#   * rewrite / send-receive path   -> A (whether the rewrite subcommand exists),
-#                                      F (snapshot and clone space accounting)
+# Question -> report section map: see README.md, "Design notes" under this
+# collector.
 #
 # Tier 0 (the default report) reads kstats, properties and since-boot iostat
 # only: no pool traversal, no tree walk, no device wake-up. What costs wall-clock
@@ -48,7 +36,7 @@ export LC_ALL=C
 # ---- collector metadata -----------------------------------------------------
 # History: CHANGELOG.md, section collect-collzfs.sh (next to this file).
 COLLECTOR_NAME="whatap-collzfs"
-VERSION="0.8.7"
+VERSION="0.8.8"
 DOMAIN="collection-server"
 TARGET="collection-server-zfs/$(hostname 2>/dev/null || echo unknown)"   # refined after pool discovery
 
@@ -1888,11 +1876,9 @@ _rep_k() {
 _rep_l() {
     local p
     section "L. Pool events, errors & maintenance"
-    # The lists fold stderr in: for an unprivileged uid zpool prints its header
-    # and writes "permission denied" to stderr, which would read as "no events".
-    # The tally (when each class started and stopped, over the whole buffer)
-    # comes first: a recent-only view cannot answer that. It reads the short
-    # form (one line per event); the -v detail is bundled by zevents_split.
+    # Folds stderr in: an unprivileged uid's "permission denied" would else
+    # read as "no events". Tally first (why: README.md, section L), from the
+    # short form; the -v detail is bundled by zevents_split.
     probe_pipe_t 180 "zpool events: tally over the whole ring buffer (count, first, last)" zpool \
         "zpool events 2>/dev/null | awk '
             BEGIN { split(\"Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec\", mn, \" \")
@@ -2202,10 +2188,8 @@ EOF
 }
 
 # zevents_split DESTDIR -> split `zpool events -v` into a tally and a window.
-#
-# With a large zfs_zevent_len_max the -v dump is hundreds of MB, but a recent
-# window alone loses when each class started and stopped. So the stream is read
-# ONCE (a second pass costs the same minutes and sees a moved buffer) and split:
+# Why the tally covers the whole buffer: README.md, section L. Read ONCE (a
+# second pass costs the same minutes and sees a moved buffer) into:
 #   zpool-events-tally.tsv     class x date x vdev, counted over the whole buffer
 #   zpool-events-overview.tsv  class, count, first date, last date
 #   zpool-events-v.txt         full detail, but only for the last OPT_EVENT_DAYS
@@ -2271,21 +2255,9 @@ zevents_split() {
 # =============================================================================
 # Write-path window (--window; Tier 1: wall-clock, kstat file reads only)
 # =============================================================================
-# <pool>/txgs is a ring of the last zfs_txg_history txgs (OpenZFS
-# spa_stats.c: a row is added when the previous txg starts to quiesce and the
-# oldest is dropped past zfs_txg_history). A window longer than the span the
-# ring covers is therefore read more than once. The reads are merged by txg
-# number: a row is kept once, at its first completed ('C') sighting, or at its
-# last sighting when it left the ring before it completed. A txg number that
-# is in neither of two consecutive reads left the ring unseen: a gap, counted
-# and listed, never filled in. The next read comes after half the span the
-# ring covered at the last read (birth of the oldest row to the newest),
-# clamped to [WIN_IV_MIN, WIN_IV_MAX], so at a steady txg rate every txg is in
-# two reads. Nothing is written: a write to txgs clears it, and no tunable is
-# changed (zfs_txg_history is the operator's to raise).
-#
-# A read whose place in the ring was dropped between two read() calls fails
-# with EIO (spl-procfs-list.c); it is asked once more at once.
+# How the ring is read, merged, gapped and retried: README.md, "How the txgs
+# ring is read" (section O). WIN_IV_MIN/MAX below are that read interval's
+# clamp.
 WIN_IV_MIN=2
 WIN_IV_MAX=300
 WIN_ROW_CAP=20000       # merged rows kept per pool
@@ -2305,13 +2277,8 @@ WIN_IV_LO="" WIN_IV_HI=""   # the read intervals actually slept
 _win_sp=""
 
 # ---- interval jobs of the window (zpool iostat, iostat -x, histograms, arcstat)
-# zpool iostat and iostat -x measure the same writes at two layers (vdev queue
-# vs block device). Sampled one after the other they describe different
-# seconds, so they start together, as two bounded background jobs with the
-# same interval and count, each with its own timestamps (zpool -T d, iostat -t
-# with S_TIME_FORMAT=ISO) and a start time taken just before each fork.
-# Each job's stdout, stderr and exit status stay in its own files, so a job
-# that is capped or stopped early keeps what it wrote.
+# Why they start together at the same interval/count, and per-job output
+# files: README.md, section O.
 IOSTAT_FL=""         # the iostat -x flags this sysstat takes (_iostat_flags)
 IOSTAT_FL_NOTE=""    # what was dropped, and so what the output lacks
 
@@ -2722,12 +2689,8 @@ window_run() {
     fi
     WIN_PLAN=$((end - e0))
     progress "window: $(_win_hms $((end - e0))) from $(_win_local "$WIN_T0")"
-    # The interval jobs, started together: zpool iostat -vlq and iostat -x at
-    # the same interval (about 120 blocks each: a 30s window gets 1s blocks),
-    # zpool iostat -r / -w with one block for the whole window, and arcstat
-    # at the same interval when it is installed. They start first, at the
-    # window's start, and their count covers at most the window
-    # ((N - 1) x I <= its length), so they end with it whatever I is.
+    # The interval jobs (README.md, section O): about 120 blocks over the
+    # window, so (N - 1) x I <= its length and they end with it whatever I is.
     WIN_IO_IV=$(( (end - e0) / 120 ))
     [ "$WIN_IO_IV" -lt 1 ] && WIN_IO_IV=1
     [ "$WIN_IO_IV" -gt 60 ] && WIN_IO_IV=60

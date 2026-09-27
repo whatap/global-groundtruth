@@ -24,7 +24,7 @@ export LC_ALL=C
 # ---- collector metadata -----------------------------------------------------
 # History: CHANGELOG.md, section collect-collserver.sh (next to this file).
 COLLECTOR_NAME="whatap-collserver"
-VERSION="0.11.6"
+VERSION="0.11.7"
 DOMAIN="collection-server"
 TARGET="collection-server/$(hostname 2>/dev/null || echo unknown)"   # refined after WHATAP_HOME is resolved
 
@@ -1737,8 +1737,7 @@ collect_logs() {
     local dest="$1"
     [ -n "$WHOME" ] && _dir_ok "$WHOME/logs" || { warn "logs: not copied ($(home_why logs))"; return; }
 
-    # Two caps: one huge file and many large files are different failures (a
-    # per-file cap alone once gave a 393MB bundle, 99.95% logs).
+    # Two caps: one huge file and many large files are different failures.
     #   * per-file cap  — tail, so the newest end of a big log survives
     #   * total cap     — stop once all copied logs together reach it
     #   * rotated logs  — opt-in; current logs alone answer most questions

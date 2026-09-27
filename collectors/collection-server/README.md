@@ -695,6 +695,19 @@ Two habits worth keeping when extending it:
   `EXPANDSZ` / `DEDUP` columns over time, so the derived views locate columns from
   the header row.
 
+#### Design notes — ZFS
+
+**Question -> report section**, for a reader who knows what they want to check
+but not which section has it:
+
+| question | sections |
+|---|---|
+| allocation-class routing | B (`zfs_special_class_metadata_reserve_pct`), C (per-vdev class usage), E (`recordsize` vs `special_small_blocks`, side by side) |
+| block sizing | E (property matrix incl. property source), J (request-size histograms), N (`zdb -Lbbbs`) |
+| append / txg behaviour | B (`zfs_txg_timeout`, dirty-data throttle), H (txgs ring buffer, ZIL kstats), I (per-dataset objset write counters), O (every txg of a time window, `--window`) |
+| free-space fragmentation | C/D (FRAG, CAP per vdev and per pool), B (`metaslab_*` parameters), N (`zdb -mm`) |
+| rewrite / send-receive path | A (whether the rewrite subcommand exists), F (snapshot and clone space accounting) |
+
 #### Status notes / open items — ZFS
 
 - **0.8.0 on a ZFS VM, as root** (Ubuntu 26.04, zfs 2.4.1, TZ Asia/Jakarta, pool

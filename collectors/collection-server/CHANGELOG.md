@@ -7,6 +7,9 @@ one entry at the top of its section (docs/authoring-guide.md, step 2);
 
 ## collect-collserver.sh
 
+- **0.11.7** — collect_logs' cap comment no longer tells the field incident
+  (a per-file cap alone once gave a 393 MB bundle, 99.95% logs) behind the
+  two log caps. Comments only; report content unchanged.
 - **0.11.6** — Split run_report (439 lines) into one _rep_\<x> per section;
   the WHATAP_HOME na/missed ladder of D, F and G is _home_missed. Report
   content unchanged.
@@ -74,6 +77,11 @@ one entry at the top of its section (docs/authoring-guide.md, step 2);
 
 ## collect-collzfs.sh
 
+- **0.8.8** — The header's question-to-section map, and the write-path window's
+  ring/merge/gap rationale and interval-job rationale (repeated near
+  \_rep_l, zevents_split and the window's interval-job start), now point
+  to README.md's "Design notes" and "The time window (section O)"
+  instead of restating them. Comments only; report content unchanged.
 - **0.8.7** — Split _rep_o into txgs, counters and io parts; section B's named
   parameters are one loop per subsection. Report content unchanged.
 - **0.8.6** — Shared code in synced blocks (R2 refactor): the skeleton's emit
