@@ -13,9 +13,12 @@
 # associative arrays.
 #
 # Verbatim, no masking. `get secret -o yaml|json` is never used: secrets appear
-# as name/type tables, and the one Secret field read is the webhook certificate
-# Secret's public cert.pem, printed as a fingerprint only. README.md, "What the
-# report can contain", lists the other places a secret can arrive from.
+# as name/type tables, except the WhaTap credential Secrets (whatap-credentials
+# and the Secrets the WhatapAgent CRs name), whose WHATAP_* keys are printed
+# decoded (user decision 2026-09-27); the webhook certificate
+# Secret's public cert.pem is printed as a fingerprint only, its key never
+# read. README.md, "What the report can contain", lists the other places a
+# secret can arrive from.
 #
 # CONTRACT ../../CONTRACT.md, guidelines ../../docs/collector-engineering.md;
 # no set -e / set -u on purpose (the run must reach its footer).
@@ -33,7 +36,7 @@ export LC_ALL=C
 # ---- collector metadata -----------------------------------------------------
 COLLECTOR_NAME="whatap-k8s"
 # History: CHANGELOG.md (next to this file).
-VERSION="0.12.0"
+VERSION="0.12.1"
 DOMAIN="k8s"
 TARGET="k8s-cluster/unresolved"      # refined after CLI/context/namespace discovery
 
@@ -155,10 +158,11 @@ Environment: LOG_TAIL_LINES=N  Tier 0 log lines per container (default: 200)
 Section J runs even with no --apm-target: it always reports the cluster-wide
 inventory of pods carrying a whatap APM init container.
 
-Output is verbatim (framework policy: no masking). Secrets appear as
-name/type tables; the one Secret field read is the webhook certificate
-Secret's public cert.pem, printed as a fingerprint only. README.md, "What the
-report can contain", lists every place a secret can arrive from.
+Output is verbatim (framework policy: no masking). The WhaTap credential
+Secrets (whatap-credentials, and the Secrets the WhatapAgent CRs name) have
+their WHATAP_* keys printed decoded: license, host, port. Other Secrets appear as name/type tables; the webhook certificate
+Secret's public cert.pem is printed as a fingerprint only. README.md, "What
+the report can contain", lists every place a secret can arrive from.
 EOF
 }
 
@@ -926,8 +930,8 @@ emit_log_head_ns() {
         # the agent's version as its banner states it
         local bn
         bn="$(printf '%s\n' "$K_OUT" | grep -Ei 'whatap.*(v|ver|version)[ .]?[0-9]' | head -n 5)"
-        if [ -n "$bn" ]; then _emit_labeled "whatap agent banner in that head" "$bn"
-        else fact "whatap agent banner in that head: none (no line matching whatap.*(v|ver|version)[ .]?<digit>, any case)"; fi
+        if [ -n "$bn" ]; then _emit_labeled "WhaTap version lines in that head" "$bn"
+        else fact "WhaTap version lines in that head: none (no line matching whatap.*(v|ver|version)[ .]?<digit>, any case)"; fi
     else
         fact "log head $pod/$cont (first ${bytes}B): n/a ($(_k_reason))"
     fi
@@ -1997,6 +2001,73 @@ _rep_operator_metrics() {
     fi
 }
 
+# _rep_wa_secrets -> the WhaTap credential Secrets in NS: `whatap-credentials`
+# and the Secrets the WhatapAgent CRs name (a field ending in secretName, or
+# the name of a field ending in secretRef). Only keys WHATAP_* are decoded;
+# other keys are listed by name, and a key ending in .key or .pem is never
+# decoded. Which host, port and license the agents were given was a round trip
+# in the Finnet and MEA cases (user decision 2026-09-27).
+_rep_wa_secrets() {
+    local names="whatap-credentials" crwhy="" sec k v f nb dec other
+    if [ -n "$WA_CRD" ]; then
+        if run_k get "$WA_CRD" -A -o json; then
+            names="$names $(printf '%s\n' "$K_OUT" | awk '
+                /"[^"]*[sS]ecret[nN]ame": *"/ { l = $0; sub(/.*[sS]ecret[nN]ame": *"/, "", l); sub(/".*/, "", l); print l }
+                /"[^"]*[sS]ecret[rR]ef": *\{/ { inref = 1; if ($0 ~ /"name": *"/) { l = $0; sub(/.*"name": *"/, "", l); sub(/".*/, "", l); print l; inref = 0 }; next }
+                inref && /"name": *"/ { l = $0; sub(/.*"name": *"/, "", l); sub(/".*/, "", l); print l; inref = 0 }
+                inref && /\}/ { inref = 0 }')"
+        else crwhy="$(_k_reason)"; fi
+    fi
+    [ -n "$crwhy" ] && fact "secrets named by the whatapagent crs: n/a ($crwhy)"
+    # shellcheck disable=SC2086  # names, split on purpose
+    names="$(printf '%s\n' $names | grep -v '^$' | awk '!s[$0]++')"
+    f="$(_tmp wasec)"
+    for sec in $names; do
+        # one line per key: key, TAB, the base64 value
+        if ! run_k get secret "$sec" -n "$NS" -o 'go-template={{range $k, $v := .data}}{{$k}}{{"\t"}}{{$v}}{{"\n"}}{{end}}'; then
+            case "$(_k_reason)" in
+                "object not found"*) fact "secret $sec: none in $NS" ;;
+                *) fact "secret $sec: n/a ($(_k_reason))" ;;
+            esac
+            continue
+        fi
+        dec="" other=""
+        while IFS="$_tab" read -r k v; do
+            [ -n "$k" ] || continue
+            case "$k" in
+                *.key|*.pem) other="$other $k"; continue ;;
+            esac
+            case "$(printf '%s' "$k" | tr '[:lower:]' '[:upper:]')" in
+                WHATAP_*) ;;
+                *) other="$other $k"; continue ;;
+            esac
+            printf '%s' "$v" | base64 -d > "$f" 2>/dev/null
+            nb="$(wc -c < "$f" | tr -d ' ')"
+            dec="${dec}secret $sec $k=$(_sec_text "$f" "$nb")$_nl"
+        done <<EOF
+$K_OUT
+EOF
+        if [ -n "$dec" ]; then _emit_labeled "secret $sec: WHATAP_* keys, decoded (verbatim; \\n and \\r escaped)" "${dec%"$_nl"}"
+        else fact "secret $sec: no WHATAP_* key"; fi
+        [ -n "$other" ] && fact "secret $sec other keys (names only):$other"
+    done
+}
+# _sec_text FILE BYTES -> the content as text, a newline shown as \n and a CR
+# as \r; "<N bytes, not text>" when it holds another control character or is
+# not UTF-8 (unchecked UTF-8 counts as not text when it has a byte >= 0x80)
+_sec_text() {
+    local f="$1" nb="$2" ok=1
+    if LC_ALL=C tr -d '\n\r' < "$f" | LC_ALL=C grep -aq '[[:cntrl:]]'; then ok=0
+    elif [ "$(LC_ALL=C tr -d '\000-\177' < "$f" | wc -c | tr -d ' ')" != 0 ]; then
+        if have iconv; then iconv -f UTF-8 -t UTF-8 < "$f" > /dev/null 2>&1 || ok=0
+        else ok=0; fi
+    fi
+    [ "$ok" = 1 ] || { printf '<%s bytes, not text>' "$nb"; return; }
+    LC_ALL=C awk '{ gsub(/\r/, "\\r"); printf "%s%s", (NR > 1 ? "\\n" : ""), $0 }' "$f"
+    [ "$nb" -gt 0 ] && [ "$(tail -c 1 "$f" | wc -l | tr -d ' ')" = 1 ] && printf '\\n'
+    return 0
+}
+
 _rep_operator_rbac() {
     subsection "rbac & identity"
     if [ -n "$NS" ]; then
@@ -2010,7 +2081,8 @@ _rep_operator_rbac() {
             if run_k get sa "$dssa" -n "$NS"; then fact "daemonset serviceaccount object: present"
             else fact "daemonset serviceaccount object: n/a ($(_k_reason))"; fi
         fi
-        kprobe "secrets in ns (names/types only — values never fetched)" get secrets -n "$NS"
+        kprobe "secrets in ns (names/types; values only for the WhaTap credential secrets below)" get secrets -n "$NS"
+        _rep_wa_secrets
     else
         fact "rbac probes: n/a (not applicable: no whatap namespace discovered)"
     fi

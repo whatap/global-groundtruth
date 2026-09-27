@@ -5,6 +5,21 @@ change to the script bumps its `VERSION` and adds one entry at the top of this
 list (docs/authoring-guide.md, step 2); `tools/validate.sh` checks that the
 newest entry is the script's `VERSION`.
 
+- **0.12.1** — Section D ("rbac & identity") prints the WhaTap credential
+  Secrets decoded: `whatap-credentials` in the whatap namespace and the
+  Secrets the WhatapAgent CR spec names (a field ending in `secretName`, or
+  the `name` of a field ending in `secretRef`); pod env/envFrom references
+  are not followed. Only keys `WHATAP_*` (any case) are decoded, one
+  `secret <name> <key>=<value>` line each: UTF-8 text as is with newline
+  and CR escaped as `\n` / `\r`, else `<N bytes, not text>`; other keys are
+  listed by name, and a key ending in `.key` or `.pem` is never decoded. A
+  refused or failed read is `n/a (<reason>)`, an absent Secret `none`. User
+  decision 2026-09-27: WhaTap credentials are collected verbatim; the Finnet
+  and MEA cases took round trips to learn which host and port the agents
+  were given. Other Secrets stay name/type only. The section J line that follows each app log head is renamed
+  `WhaTap version lines` (the pattern also matches operator lines such as
+  `whatap-injection--v1-`). Lab: `whatap-credentials` WHATAP_HOST, LICENSE,
+  PORT printed; report 1634 → 1638 lines, run 20 s.
 - **0.12.0** — Collects what confirms a root cause, and drops views that
   restated raw output already in the report (user decision 2026-09-27; no
   option added or removed; no fact lost). Removed, and where the same fact is
