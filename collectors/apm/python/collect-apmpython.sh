@@ -25,7 +25,7 @@ export LC_ALL=C
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-apmpython"
 # History: CHANGELOG.md (next to this file).
-VERSION="0.10.7"
+VERSION="0.11.0"
 DOMAIN="apm"
 TARGET="host/$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || uname -n 2>/dev/null || echo unknown)"
 
@@ -1752,7 +1752,7 @@ _rep_host() {
     _cgroup_facts
     _container_facts
     probe "local time" date
-    probe "pid 1 command" sh -c "tr '\0' ' ' < /proc/1/cmdline | cut -c1-160"
+    probe "pid 1 command" _pid1_cmd
 }
 
 # [3] python runtimes + whatap-python package (per distinct interpreter)
@@ -1892,26 +1892,112 @@ _rep_pkgdirs() {
     done
 }
 
+# _u8cut N -> each stdin line cut to N bytes, then any UTF-8 sequence left
+# incomplete at its end dropped (cut -c and substr count bytes under LC_ALL=C,
+# and a cut inside a character makes the report invalid UTF-8). The byte
+# classes are looked up with index(), so mawk, busybox awk and gawk agree.
+_u8cut() {
+    awk -v n="$1" 'BEGIN {
+        for (i = 128; i < 192; i++) C = C sprintf("%c", i)
+        for (i = 192; i < 224; i++) L2 = L2 sprintf("%c", i)
+        for (i = 224; i < 240; i++) L3 = L3 sprintf("%c", i)
+        for (i = 240; i < 248; i++) L4 = L4 sprintf("%c", i) }
+    {   s = substr($0, 1, n); l = length(s); k = l
+        while (k > 0 && k > l - 3 && index(C, substr(s, k, 1))) k--
+        if (k > 0) {
+            b = substr(s, k, 1); w = 1
+            if (index(L2, b)) w = 2; else if (index(L3, b)) w = 3; else if (index(L4, b)) w = 4
+            if (w > 1 && l - k + 1 < w) s = substr(s, 1, k - 1)
+        }
+        print s }'
+}
+
+# _pid1_cmd -> pid 1's command line, NULs as spaces, first 160 bytes
+_pid1_cmd() { tr '\0' ' ' < /proc/1/cmdline | _u8cut 160; }
+
+# _entry_line PATH -> one `ls -l`-like line with the full mtime: stat -c where
+# it answers, else `ls -l` (minute precision)
+_entry_line() {
+    if have stat && stat -c '%A %h %U %G %s %y %N' -- "$1" 2>/dev/null; then return 0; fi
+    _head_of 1 ls -l -- "$1"
+}
+
+# _ls_full DIR N -> the first N entries of DIR (dot files first, as ls -a
+# sorts them; not . and ..), one stat -c line each with the full mtime, in one
+# stat call; `ls -la` (minute precision, N + 3 lines) where stat -c gives
+# nothing
+_ls_full() {
+    local d="$1" cap="$2" e c=0
+    set --
+    for e in "$d"/.[!.]* "$d"/..?* "$d"/*; do
+        case "$e" in
+            "$d/*"|"$d/.[!.]*"|"$d/..?*") [ -e "$e" ] || [ -L "$e" ] || continue ;;
+        esac
+        c=$((c + 1)); [ "$c" -gt "$cap" ] && break
+        set -- "$@" "$e"
+    done
+    [ "$#" -eq 0 ] && return 0
+    if have stat; then
+        stat -c '%A %h %U %G %s %y %N' -- "$@" > "$(_tmp lsfull.out)" 2>/dev/null
+        [ -s "$(_tmp lsfull.out)" ] && { cat "$(_tmp lsfull.out)"; return 0; }
+    fi
+    _ls_head "$d" "$((cap + 3))"
+}
+
+# _go_rows -> "pid state ppid" of every process whose comm starts with
+# whatap_python, from one read of /proc/<pid>/stat: zombies too, whose empty
+# cmdline keeps them out of the process table. Not state Z first, then by pid.
+# A comm may hold a newline or ') ', so a line that does not start a record
+# ("<pid> (") is joined to the one before, and the comm ends at the last ')'.
+_go_rows() {
+    cat /proc/[0-9]*/stat 2>/dev/null | awk '
+    function row(s,   i, j, k, f) {
+        j = 0
+        while ((k = index(substr(s, j + 1), ")")) > 0) j += k
+        i = index(s, "("); if (!i || j <= i) return
+        if (substr(s, i + 1, j - i - 1) !~ /^whatap_python/) return
+        split(substr(s, j + 2), f, " ")
+        print (f[1] == "Z" ? 1 : 0), substr(s, 1, index(s, " ") - 1), f[1], f[2]
+    }
+    /^[0-9]+ \(/ { if (s != "") row(s); s = $0; next }
+    { s = s "\n" $0 }
+    END { if (s != "") row(s) }' | sort -k1,1n -k2,2n | cut -d' ' -f2-
+}
+
 # [4] runtime processes
 _rep_procs() {
     section "Runtime processes"
-    local pid n
-    if [ -z "$D_GO_PIDS" ]; then
+    local pid n st pp rc _gf _ng _cap=20 shown
+    _gf="$(_tmp go.rows)"
+    _bounded _go_rows > "$_gf" 2>"$_errfile"; rc=$?
+    _ng="$( { wc -l < "$_gf"; } 2>/dev/null | tr -d ' ')"
+    if [ "$rc" -eq 124 ]; then
+        if _past_deadline; then fact "Go common module (whatap_python) processes: n/a (run deadline reached: ${RUN_DEADLINE}s)"
+        else fact "Go common module (whatap_python) processes: n/a (timed out reading /proc/<pid>/stat: ${CMD_TIMEOUT}s)"; fi
+    elif [ "${_ng:-0}" -eq 0 ]; then
         fact "Go common module (whatap_python) processes: none found in /proc"
     else
-        fact "Go common module (whatap_python) processes:"
-        for pid in $D_GO_PIDS; do
+        fact "Go common module (whatap_python) processes: $_ng (per state: $(awk '{ c[$2]++ } END { for (s in c) print s " " c[s] }' "$_gf" 2>/dev/null | sort | tr '\n' ',' | sed 's/,$//; s/,/, /g')); state Z listed last, detailing $( [ "$_ng" -gt "$_cap" ] && echo "first $_cap of $_ng" || echo "all $_ng")"
+        shown=0
+        while read -r pid st pp; do
+            shown=$((shown + 1))
+            [ "$shown" -gt "$_cap" ] && break
             [ -d "/proc/$pid" ] || { printf '        -- pid %s: n/a (process exited)\n' "$pid"; continue; }
-            printf '        -- pid %s\n' "$pid"
-            printf '           cmdline: %s\n' "$({ tr '\0' ' ' < "/proc/$pid/cmdline"; } 2>/dev/null | cut -c1-300)"
-            printf '           cwd: %s\n' "$(readlink -f "/proc/$pid/cwd" 2>/dev/null || echo "n/a (permission denied or gone)")"
+            printf '        -- pid %s (ppid %s)\n' "$pid" "$pp"
             printf '           uid/state: %s\n' "$(awk '/^Uid:/{u=$2} /^State:/{s=$2" "$3} END{print u" / "s}' "/proc/$pid/status" 2>/dev/null)"
+            if [ "$st" = Z ]; then
+                printf '           cmdline, cwd, environ: n/a (state Z)\n'
+                continue
+            fi
+            printf '           cmdline: %s\n' "$({ tr '\0' ' ' < "/proc/$pid/cmdline"; } 2>/dev/null | _u8cut 300)"
+            printf '           cwd: %s\n' "$(readlink -f "/proc/$pid/cwd" 2>/dev/null || echo "n/a (permission denied or gone)")"
             if [ -r "/proc/$pid/environ" ]; then
                 { tr '\0' '\n' < "/proc/$pid/environ"; } 2>/dev/null | grep -E '^(WHATAP_HOME|WHATAP_VERSION|whatap\.port|python\.version)=' | _indent '           env '
             else
                 printf '           env: n/a (permission denied: /proc/%s/environ)\n' "$pid"
             fi
-        done
+        done < "$_gf"
+        [ "$_ng" -gt "$_cap" ] && fact "-- remaining $((_ng - _cap)) whatap_python processes not detailed (cap: $_cap)"
     fi
     n="$(echo $D_APP_PIDS | wc -w | tr -d ' ')"
     if [ "${n:-0}" -eq 0 ]; then
@@ -1925,7 +2011,7 @@ _rep_procs() {
             [ -d "/proc/$pid" ] || { printf '        -- pid %s: n/a (process exited)\n' "$pid"; continue; }
             printf '        -- pid %s (ppid %s)\n' "$pid" "$(awk '/^PPid:/{print $2}' "/proc/$pid/status" 2>/dev/null)"
             printf '           exe: %s\n' "$(readlink -f "/proc/$pid/exe" 2>/dev/null || echo n/a)"
-            printf '           cmdline: %s\n' "$({ tr '\0' ' ' < "/proc/$pid/cmdline"; } 2>/dev/null | cut -c1-300)"
+            printf '           cmdline: %s\n' "$({ tr '\0' ' ' < "/proc/$pid/cmdline"; } 2>/dev/null | _u8cut 300)"
             if [ -r "/proc/$pid/environ" ]; then
                 # one read of the environ: the bootstrap line, then which
                 # python environment this process actually runs in, WHATAP_*
@@ -1935,7 +2021,7 @@ _rep_procs() {
                     /^(VIRTUAL_ENV|PYTHONPATH|PYTHONHOME)=/ { v = v "           env " substr($0, 1, 300) "\n" }
                     /^WHATAP_/ { w = w "           env " $0 "\n" }
                     /^OTEL_/ { o = o "           env " substr($0, 1, 200) "\n" }
-                    END { printf "           PYTHONPATH contains whatap/bootstrap: %s\n%s%s%s", (b ? "yes" : "no"), v, w, o }'
+                    END { printf "           PYTHONPATH contains whatap/bootstrap: %s\n%s%s%s", (b ? "yes" : "no"), v, w, o }' | _u8cut 1000000
             else
                 printf '           environ: n/a (permission denied: /proc/%s/environ)\n' "$pid"
             fi
@@ -1958,6 +2044,21 @@ _rep_procs() {
             fi
         done
     fi
+}
+
+# _entry_count DIR -> how many names DIR holds, dot files included, but not
+# . and .. (shell globs, no fork). An unmatched glob is skipped; in a DIR this
+# uid can read but not enter, -e fails on every entry, so only the literal
+# pattern itself is skipped.
+_entry_count() {
+    local n c=0
+    for n in "$1"/* "$1"/.[!.]* "$1"/..?*; do
+        case "$n" in
+            "$1/*"|"$1/.[!.]*"|"$1/..?*") [ -e "$n" ] || [ -L "$n" ] || continue ;;
+        esac
+        c=$((c + 1))
+    done
+    printf '%s' "$c"
 }
 
 # [5] agent homes and configuration
@@ -1991,9 +2092,14 @@ _rep_homes() {
             fi
             for pf in whatap_python.pid whatap_python.pid.llm whatap_python.pid.batch; do
                 if [ -f "$fshome/$pf" ]; then
+                    probe "   $pf entry" _entry_line "$fshome/$pf"
+                    if [ ! -r "$fshome/$pf" ]; then
+                        fact "   $pf: n/a (permission denied: $fshome/$pf)"
+                        continue
+                    fi
                     _pid="$(cat "$fshome/$pf" 2>/dev/null | tr -d ' \n')"
                     if [ -n "$_pid" ] && [ -d "/proc/$_pid" ]; then
-                        fact "   $pf: $_pid (process exists; comm: $(cat "/proc/$_pid/comm" 2>/dev/null))"
+                        fact "   $pf: $_pid (process exists; comm: $(cat "/proc/$_pid/comm" 2>/dev/null); state: $(awk '/^State:/{print $2" "$3}' "/proc/$_pid/status" 2>/dev/null); ppid: $(awk '/^PPid:/{print $2}' "/proc/$_pid/status" 2>/dev/null))"
                     else
                         fact "   $pf: ${_pid:-empty} (no process with this pid in this pid namespace)"
                     fi
@@ -2008,7 +2114,19 @@ _rep_homes() {
             else
                 fact "   logs dir: n/a (path not found: $fshome/logs)"
             fi
-            [ -d "$fshome/run" ] && fact "   run dir (agent sockets): present" || fact "   run dir (agent sockets): absent"
+            if [ ! -d "$fshome/run" ]; then
+                fact "   run dir (agent sockets): absent"
+            elif [ ! -r "$fshome/run" ]; then
+                fact "   run dir (agent sockets): present; listing n/a (permission denied: $fshome/run)"
+            else
+                _rn="$(_entry_count "$fshome/run")"
+                if [ "$_rn" -eq 0 ]; then
+                    fact "   run dir (agent sockets): present, 0 entries"
+                else
+                    if [ "$_rn" -gt 40 ]; then _rw="first 40 of $_rn entries"; else _rw="$_rn entries"; fi
+                    probe "   run dir (agent sockets) listing ($_rw)" _ls_full "$fshome/run" 40
+                fi
+            fi
             [ -d "$fshome/whatap-python-llm" ] && fact "   whatap-python-llm dir (LLM Go module): present" || fact "   whatap-python-llm dir (LLM Go module): absent"
         done
     fi
@@ -2081,7 +2199,7 @@ _rep_odoo() {
             [ -d "/proc/$opid" ] || { printf '        -- pid %s: n/a (process exited)\n' "$opid"; continue; }
             printf '        -- pid %s (ppid %s)\n' "$opid" "$(awk '/^PPid:/{print $2}' "/proc/$opid/status" 2>/dev/null)"
             printf '           comm: %s\n' "$(cat "/proc/$opid/comm" 2>/dev/null)"
-            printf '           cmdline: %s\n' "$({ tr '\0' ' ' < "/proc/$opid/cmdline"; } 2>/dev/null | cut -c1-300)"
+            printf '           cmdline: %s\n' "$({ tr '\0' ' ' < "/proc/$opid/cmdline"; } 2>/dev/null | _u8cut 300)"
             printf '           cwd: %s\n' "$(readlink -f "/proc/$opid/cwd" 2>/dev/null || echo "n/a (permission denied or gone)")"
             printf '           uid: %s\n' "$(awk '/^Uid:/{print $2}' "/proc/$opid/status" 2>/dev/null)"
         done

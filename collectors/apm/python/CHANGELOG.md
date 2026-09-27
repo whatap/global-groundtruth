@@ -5,6 +5,27 @@ first. Every change to the script bumps its `VERSION` and adds one entry at
 the top of this list (docs/authoring-guide.md, step 2); `tools/validate.sh`
 checks that the newest entry is the script's `VERSION`.
 
+- **0.11.0** — Section 4 lists the Go module (`whatap_python`) processes
+  from one read of `/proc/<pid>/stat`, so a zombie is listed too (its
+  cmdline is empty, and the process table skipped it: in
+  jjsong-ggt-apm-python:1 with 20,000 unreaped `whatap_python` children,
+  0.10.7 listed only the live one). The line gives the count found and the
+  count per state; the first 20 are detailed, state Z last, each with its
+  ppid (`-- pid N (ppid M)`); a zombie's detail is its uid/state line and
+  `cmdline, cwd, environ: n/a (state Z)`; the rest is
+  `-- remaining N whatap_python processes not detailed (cap: 20)`. With
+  2,000 live ones 0.10.7 detailed all 2,005 (10,353 report lines), 0.11.0
+  prints 493. Section 5 adds an entry line for each pid file next to its
+  content (mode, links, owner, size, full mtime and name from `stat -c`;
+  `ls -l`, minute precision, where stat gives nothing), the state and ppid of
+  the process it names, `permission denied` for an unreadable pid file (it
+  read `empty`), and lists `run/` the same way (first 40 of M entries, dot
+  files first and counted; `present, 0 entries` when empty) instead of
+  `present`. Command lines (pid 1, python, Go module, odoo processes) and the
+  environ lines of python processes are cut at a byte count that never ends
+  inside a UTF-8 sequence (`cut -c` and `substr` count bytes under
+  `LC_ALL=C`; a cut Korean argument made the report invalid UTF-8 on this
+  host). `WHATAP_*` environ lines stay uncut.
 - **0.10.7** — Comments only; report content unchanged. Shortened long
   comment runs in `_pyrun`, `_pyreport` and the process-scan comment; the
   batching rationale now points to README "How each interpreter is asked".
