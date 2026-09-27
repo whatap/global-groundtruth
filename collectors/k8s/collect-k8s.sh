@@ -39,7 +39,7 @@ export LC_ALL=C
 # ---- collector metadata -----------------------------------------------------
 COLLECTOR_NAME="whatap-k8s"
 # History: CHANGELOG.md (next to this file).
-VERSION="0.11.3"
+VERSION="0.11.4"
 DOMAIN="k8s"
 TARGET="k8s-cluster/unresolved"      # refined after CLI/context/namespace discovery
 
@@ -955,7 +955,10 @@ pod_exec_probe() { pod_exec_probe_ns "$NS" "$1" "$2" "$3" "$4"; }
 # km_get GROUP ARGS... -> `ARGS -o jsonpath=<KM_T joined>`, stored as one group
 #   record (KM_GN name, KM_GRC exit status, KM_GERR stderr, KM_GFB=1 on a template
 #   error: jsonpath named in stderr) and one segment per marker line met (KM_SK
-#   "GROUP/KEY", KM_SS the text after it). A new call of a group replaces it.
+#   KEY, KM_SS the text after it). A group's segments are contiguous, from
+#   index KM_GS for KM_GC entries, so a lookup reads only its own. A new call
+#   of a group replaces it: its old range is unset (the segment arrays are
+#   sparse; KM_SN is the next free index) and the new one starts at KM_SN.
 # A template carries its marker: _km_mark KEY, or per item of a range
 #   {"\n<marker> "}{.metadata.name}{"/KEY\n"} with the KEYs, in order, in KM_IKEYS.
 # The marker is random per run and a marker line counts only when it is the one
@@ -969,50 +972,52 @@ _km_rand=""
 _KM_M="@@ggt-seg-$_km_rand@@"
 KM_T=()
 KM_IKEYS=""
-KM_GN=() KM_GRC=() KM_GERR=() KM_GFB=()   # one entry per group
-KM_SK=() KM_SS=()                         # one entry per segment, in the order met
-_KM_GI=-1
+KM_GN=() KM_GRC=() KM_GERR=() KM_GFB=() KM_GS=() KM_GC=()   # one entry per group
+KM_SK=() KM_SS=() KM_SN=0                                   # the segments
+_KM_GI=-1 _KM_WI=-1
 _km_mark() { printf '{"\\n%s %s\\n"}' "$_KM_M" "$1"; }
-# _km_gi GROUP -> _KM_GI = the index of GROUP's record; 1 (and -1) when it has none
+# _km_gi GROUP -> _KM_GI = the index of GROUP's record; 1 when it has none.
+# The last one found is tried first, then the newest.
 _km_gi() {
-    _KM_GI=0
-    while [ "$_KM_GI" -lt "${#KM_GN[@]}" ]; do
+    [ "$_KM_GI" -ge 0 ] && [ "${KM_GN[$_KM_GI]}" = "$1" ] && return 0
+    _KM_GI=$((${#KM_GN[@]} - 1))
+    while [ "$_KM_GI" -ge 0 ]; do
         [ "${KM_GN[$_KM_GI]}" = "$1" ] && return 0
-        _KM_GI=$((_KM_GI + 1))
+        _KM_GI=$((_KM_GI - 1))
     done
-    _KM_GI=-1
     return 1
 }
-# _km_drop GROUP -> GROUP's segments removed (the arrays stay dense and in order)
-_km_drop() {
-    local i=0 nk ns
-    nk=(); ns=()
-    while [ "$i" -lt "${#KM_SK[@]}" ]; do
-        case "${KM_SK[$i]}" in
-            "$1/"*) ;;
-            *) nk[${#nk[@]}]="${KM_SK[$i]}"; ns[${#ns[@]}]="${KM_SS[$i]}" ;;
-        esac
-        i=$((i + 1))
-    done
-    KM_SK=("${nk[@]}"); KM_SS=("${ns[@]}")
-}
-# _km_reset GROUP RC ERR FB -> GROUP's record (created when new), with no segments
+# _km_reset GROUP RC ERR FB -> GROUP's record (created when new), with no
+# segments; _KM_WI = its index, where _seg_flush appends
 _km_reset() {
-    _km_drop "$1"
-    _km_gi "$1" || { _KM_GI=${#KM_GN[@]}; KM_GN[$_KM_GI]="$1"; }
+    local i e
+    if _km_gi "$1"; then
+        i=${KM_GS[$_KM_GI]}; e=$((i + ${KM_GC[$_KM_GI]}))
+        while [ "$i" -lt "$e" ]; do unset "KM_SK[$i]" "KM_SS[$i]"; i=$((i + 1)); done
+        [ "$e" = "$KM_SN" ] && KM_SN=${KM_GS[$_KM_GI]}
+    else
+        _KM_GI=${#KM_GN[@]}; KM_GN[$_KM_GI]="$1"
+    fi
     KM_GRC[$_KM_GI]="$2"; KM_GERR[$_KM_GI]="$3"; KM_GFB[$_KM_GI]="$4"
+    KM_GS[$_KM_GI]=$KM_SN; KM_GC[$_KM_GI]=0
+    _KM_WI=$_KM_GI
 }
-# _seg_flush GROUP/KEY TEXT -> TEXT, trailing newlines trimmed, appended as a segment
+# _seg_flush KEY TEXT -> TEXT, trailing newlines trimmed, appended as a segment
+# of the group _km_reset last set up
 _seg_flush() {
     local s="$2"
     while :; do case "$s" in *"$_nl") s="${s%"$_nl"}" ;; *) break ;; esac; done
-    KM_SK[${#KM_SK[@]}]="$1"; KM_SS[${#KM_SS[@]}]="$s"
+    KM_SK[$KM_SN]="$1"; KM_SS[$KM_SN]="$s"; KM_SN=$((KM_SN + 1))
+    KM_GC[$_KM_WI]=$((${KM_GC[$_KM_WI]} + 1))
 }
-# _km_seg GROUP/KEY -> 0 with KG_V = the first segment stored under it; else 1
+# _km_seg INDEX KEY -> 0 with KG_V = the first segment of group INDEX stored
+# under KEY; else 1
 _km_seg() {
-    local i=0
-    while [ "$i" -lt "${#KM_SK[@]}" ]; do
-        [ "${KM_SK[$i]}" = "$1" ] && { KG_V="${KM_SS[$i]}"; return 0; }
+    local i e
+    [ "$1" -ge 0 ] || return 1
+    i=${KM_GS[$1]}; e=$((i + ${KM_GC[$1]}))
+    while [ "$i" -lt "$e" ]; do
+        [ "${KM_SK[$i]}" = "$2" ] && { KG_V="${KM_SS[$i]}"; return 0; }
         i=$((i + 1))
     done
     return 1
@@ -1057,7 +1062,7 @@ km_get() {
                 fi ;;
         esac
         if [ -n "$want" ]; then
-            [ -n "$key" ] && _seg_flush "$g/$key" "$acc"
+            [ -n "$key" ] && _seg_flush "$key" "$acc"
             key="$want"; acc=""; n=0
             continue
         fi
@@ -1067,7 +1072,7 @@ km_get() {
     done <<EOF
 $K_OUT
 EOF
-    [ -n "$key" ] && _seg_flush "$g/$key" "$acc"
+    [ -n "$key" ] && _seg_flush "$key" "$acc"
     return 0
 }
 
@@ -1081,7 +1086,7 @@ _kg() {
         KG_RC="${KM_GRC[$_KM_GI]}"; KG_ERR="${KM_GERR[$_KM_GI]}"
         return 1
     fi
-    _km_seg "$1/$2" || return 2
+    _km_seg "$_KM_GI" "$2" || return 2
 }
 
 kg_run() {
@@ -1131,7 +1136,7 @@ kr_keep() {
     local err=""
     [ "$K_RC" -ne 0 ] && err="$(cat "$_errfile" 2>/dev/null)"
     _km_reset "$1" "$K_RC" "$err" 0
-    _seg_flush "$1/$2" "$K_OUT"
+    _seg_flush "$2" "$K_OUT"
     return 0
 }
 
@@ -1141,22 +1146,22 @@ kr_keep() {
 # stdout, N/err, the stderr, and N/rc with the exit status on the next line;
 # the marker is the per-run random one of km_get, passed as $1, and a marker
 # line counts only when it is the one expected next. Stored as the segments
-# of group PX (keys N/out, N/err, N/rc; N/start with an empty text);
+# of the reserved group "" (_PX_GI; keys N/out, N/err, N/rc; N/start with an empty text);
 # _pod_probe_emit N "label" CMD then reports CMD N as pod_exec_probe did.
 _PX_DRV='m=$1; shift; i=0; for c in "$@"; do i=$((i + 1)); echo "$m $i/start"; echo "$m $i/out"; { e=$( { sh -c "$c" 2>&1 1>&3 3>&-; } ); } 3>&1; r=$?; echo; echo "$m $i/err"; printf "%s\n" "$e"; echo "$m $i/rc"; echo "$r"; done'
-PX_POD="" PX_CONT="" PX_RERUN_TO=0
+PX_POD="" PX_CONT="" PX_RERUN_TO=0 _PX_GI=-1
 _pod_probes_run() {
     local pod="$1" cont="$2" l key="" acc="" n=0 ni=1 st=start
     shift 2
     PX_POD="$pod" PX_CONT="$cont" PX_RERUN_TO=0 PX_ERR=""
-    _km_drop PX
+    _km_reset "" 0 "" 0; _PX_GI=$_KM_WI
     run_k exec -n "$NS" "$pod" -c "$cont" -- sh -c "$_PX_DRV" sh "$_KM_M" "$@"
     PX_RC=$K_RC
     [ "$K_RC" -ne 0 ] && PX_ERR="$(cat "$_errfile" 2>/dev/null)"
     # a call cut short keeps what the probes before the cut printed
     while IFS= read -r l; do
         if [ "$l" = "$_KM_M $ni/$st" ]; then
-            [ -n "$key" ] && _seg_flush "PX/$key" "$acc"
+            [ -n "$key" ] && _seg_flush "$key" "$acc"
             key="$ni/$st"; acc=""; n=0
             case "$st" in
                 start) st=out ;; out) st=err ;; err) st=rc ;;
@@ -1170,9 +1175,9 @@ _pod_probes_run() {
     done <<EOF
 $K_OUT
 EOF
-    if [ -n "$key" ]; then _seg_flush "PX/$key" "$acc"; fi
+    if [ -n "$key" ]; then _seg_flush "$key" "$acc"; fi
 }
-_px() { KG_V=""; _km_seg "PX/$1"; }
+_px() { KG_V=""; _km_seg "$_PX_GI" "$1"; }
 # A probe with no status of its own: one that started and was cut off takes
 # the exec's reason (a timeout says timed out); when no probe started at all
 # the exec's reason stands for each, as each exec would have failed alike;

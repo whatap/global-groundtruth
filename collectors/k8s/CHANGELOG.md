@@ -5,6 +5,13 @@ change to the script bumps its `VERSION` and adds one entry at the top of this
 list (docs/authoring-guide.md, step 2); `tools/validate.sh` checks that the
 newest entry is the script's `VERSION`.
 
+- **0.11.4** — The batched-call store keeps each group's segments contiguous
+  (start KM_GS, count KM_GC per group; KM_SK holds KEY only), so a lookup reads
+  only that group's segments and a re-run unsets only its own range instead of
+  copying every segment; _km_drop is folded into _km_reset and the pod-probe
+  segments are the reserved group "" (_PX_GI). 500 pods × 10 keys: 50 small
+  km_get 19.7 s → 0.3 s, _pod_probes_run + _px ×20 9.0 s → 0.03 s (0.11.2:
+  0.3 s, 0.02 s). Report content unchanged.
 - **0.11.3** — Split _rep_operator and _rep_apm into per-subsection and
   per-level functions; the batched-call store uses flat arrays keyed GROUP/KEY
   instead of 14 evals over generated names; repeated code is _seg_flush,
