@@ -5,6 +5,40 @@ first. Every change to the script bumps its `VERSION` and adds one entry at
 the top of this list (docs/authoring-guide.md, step 2); `tools/validate.sh`
 checks that the newest entry is the script's `VERSION`.
 
+- **0.11.1** — The host section adds `/sys/class/dmi/id/product_uuid`: its
+  `ls -l` line and `dmi product_uuid readable by uid N:` (yes or no, from an
+  open and a read of the file); the value follows only when it was read (group
+  block `apm: report helpers`, `_product_uuid`). Command lines and environ
+  entries go through the new group block `apm: text helpers`: `_proc_words`
+  (NUL, newline and CR each a space) and `_proc_lines` (one entry per line, a
+  newline or CR inside an entry a space). A newline in an argument or a value
+  no longer puts the rest at column 0, where a crafted argument made a fake
+  `[5] Collection status` and failed `validate.sh --report`. `_u8cut` and
+  `_pid1_cmd` moved from this file into the group blocks unchanged in effect
+  (text helpers, report helpers), so all four members cut the same way.
+  Affected here: the cmdline and env lines of `whatap_python`, python and odoo
+  processes, the odoo `-c`/`ODOO_RC` read, and pid 1. The process table cuts
+  its cmdline on a UTF-8 boundary (it cut inside a character with `substr`,
+  and the report failed `validate.sh --report`), turns CR into a space, and
+  reads a command line holding a newline (where `head -n 1` stopped) again
+  whole. The same holds for comm (`_comm`, read builtin) and the exe and cwd
+  lines (`_link_text`). The process table read exe targets from `ls -l`, where
+  a target holding a newline printed a second line that could pose as another
+  pid's (a crafted exe path made pid 1 a python process); a line naming no
+  `/proc/<pid>/exe` or a pid named twice is detected. `_product_uuid` costs
+  one fork (ls) when the file reads. `dmi product_uuid readable by uid N:`
+  says `yes`, `no (open failed: <reason>)` or
+  `no (opened, read failed: <reason>)`, the reason from `cat`'s stderr, which
+  runs only then. The process table reads every comm in the same `head` pass
+  as before (`head -n 16`, lines joined by a space), with no fork per pid, and
+  re-reads with readlink only the exe of the pids a posing `ls -l` line
+  involves. A newline or CR inside an environ value is kept apart from the
+  variable boundaries and given back by `_env_pick`, so a `WHATAP_HOME`
+  holding one is listed quoted among the paths not followed (D_ODD, which now
+  also takes CR and lists each path once) instead of being looked up with
+  spaces. A relative argv0 is not joined to a cwd holding a newline or CR,
+  PYTHONPATH entries split on CR too, and the python environ lines are cut
+  with `u8cut` in the awk that builds them. Goals unchanged.
 - **0.11.0** — Section 4 lists the Go module (`whatap_python`) processes
   from one read of `/proc/<pid>/stat`, so a zombie is listed too (its
   cmdline is empty, and the process table skipped it: in

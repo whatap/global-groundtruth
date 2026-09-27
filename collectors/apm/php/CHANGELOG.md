@@ -5,6 +5,32 @@ Every change to the script bumps its `VERSION` and adds one entry at the top
 of this list (docs/authoring-guide.md, step 2); `tools/validate.sh` checks
 that the newest entry is the script's `VERSION`.
 
+- **0.8.1** — The host section adds `/sys/class/dmi/id/product_uuid`: its
+  `ls -l` line and `dmi product_uuid readable by uid N:` (yes or no, from an
+  open and a read of the file); the value follows only when it was read (group
+  block `apm: report helpers`, `_product_uuid`). Command lines and environ
+  entries go through the new group block `apm: text helpers`: `_proc_words`
+  (NUL, newline and CR each a space) and `_proc_lines` (one entry per line, a
+  newline or CR inside an entry a space). A newline in an argument or a value
+  no longer puts the rest at column 0, where a crafted argument made a fake
+  `[5] Collection status` and failed `validate.sh --report`. Cuts end on a
+  UTF-8 boundary (`_u8cut`, the awk `u8cut`, one text in the block). Affected
+  here: `_proc_cmd` (the cmdline of web, php and `whatap_php` processes, 300
+  bytes), the `WHATAP_*` environ line, `_proc_env`, and pid 1's command line
+  (`_pid1_cmd`, 160 bytes, one line). The process table (group block) turns CR
+  into a space too, and a command line holding a newline (where `head -n 1`
+  stopped) is read again whole, so argv0 and the words after the newline are
+  kept. The same holds for comm (`_comm`, read builtin, six lines) and the exe
+  and cwd lines. The process table read exe targets from `ls -l`, where a
+  target holding a newline printed a second line that could pose as another
+  pid's; a line naming no `/proc/<pid>/exe` or a pid named twice is detected.
+  `_product_uuid` costs one fork (ls) when the file reads.
+  `dmi product_uuid readable by uid N:` says `yes`,
+  `no (open failed: <reason>)` or `no (opened, read failed: <reason>)`, the
+  reason from `cat`'s stderr, which runs only then. The process table reads
+  every comm in the same `head` pass as before (`head -n 16`, lines joined by
+  a space), with no fork per pid, and re-reads with readlink only the exe of
+  the pids a posing `ls -l` line involves. Goals unchanged.
 - **0.8.0** — Derived views removed (CONTRACT rule 1, "Derived views"); every
   fact they carried is still in the report as read. Section 6 is "Tracer
   binding (module, ini, load state)" and no longer has one block per runtime:

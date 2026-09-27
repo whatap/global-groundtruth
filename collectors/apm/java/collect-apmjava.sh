@@ -32,7 +32,7 @@ export LC_ALL=C
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-apmjava"
 # History: CHANGELOG.md (next to this file).
-VERSION="0.15.0"
+VERSION="0.15.1"
 DOMAIN="apm"
 TARGET="host/$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || uname -n 2>/dev/null || echo unknown)"
 
@@ -782,6 +782,71 @@ _names() {
 }
 # ---- end apm: probe helpers
 
+# ---- apm: text helpers — DO NOT EDIT ----------------------------------------
+# members: apmjava apmnodejs apmphp apmpython
+# _U8CUT_AWK: the awk function u8cut(S, N) -> S cut to N bytes, then any UTF-8
+# sequence left incomplete at its end dropped (cut -c and substr count bytes
+# under LC_ALL=C, and a cut inside a character makes the report invalid
+# UTF-8). The byte classes are looked up with index(), so mawk, busybox awk
+# and gawk agree. One text for _u8cut and for the awk programs that cut a
+# field (the process table), so every cut in every member is the same.
+_U8CUT_AWK='function u8cut(s, n,   l, k, b, w, i) {
+    if (length(s) <= n) return s
+    if (!_u8n) {
+        for (i = 128; i < 192; i++) _u8c = _u8c sprintf("%c", i)
+        for (i = 192; i < 224; i++) _u8l2 = _u8l2 sprintf("%c", i)
+        for (i = 224; i < 240; i++) _u8l3 = _u8l3 sprintf("%c", i)
+        for (i = 240; i < 248; i++) _u8l4 = _u8l4 sprintf("%c", i)
+        _u8n = 1 }
+    s = substr(s, 1, n); l = length(s); k = l
+    while (k > 0 && k > l - 3 && index(_u8c, substr(s, k, 1))) k--
+    if (k > 0) {
+        b = substr(s, k, 1); w = 1
+        if (index(_u8l2, b)) w = 2; else if (index(_u8l3, b)) w = 3; else if (index(_u8l4, b)) w = 4
+        if (w > 1 && l - k + 1 < w) s = substr(s, 1, k - 1)
+    }
+    return s }'
+
+# _u8cut N -> each stdin line cut to N bytes on a UTF-8 boundary (u8cut above)
+_u8cut() { awk -v n="$1" "$_U8CUT_AWK"' { print u8cut($0, n) }'; }
+
+# /proc/<pid>/cmdline and environ are NUL-separated, and an entry may itself
+# hold a newline or a CR. Printed as read, a newline puts the rest of the
+# entry at column 0 of the report, where it reads as a section line of its
+# own (an argument "x\n[5] Collection status" made one); inside a
+# one-entry-per-line list it would read as one more entry. Every cmdline and
+# environ the members read goes through one of these two, so an entry is one
+# line of text.
+# _proc_words FILE -> FILE on one line: each NUL, newline and CR as a space
+# _proc_lines FILE -> one entry of FILE per line: each NUL as a newline, a
+#   newline or CR inside an entry as a space
+# Both print nothing (stderr silenced) when FILE cannot be read.
+_proc_words() { { tr '\000\n\r' '   ' < "$1"; } 2>/dev/null; }
+_proc_lines() { { tr '\000\n\r' '\n  ' < "$1"; } 2>/dev/null; }
+
+# The same holds for a process's comm and for the targets of its exe, cwd and
+# fd links: the process chose them. _oneline TEXT -> TEXT with each newline
+# and CR as a space; it forks only when TEXT holds one.
+_cr="$(printf '\r')"
+_oneline() {
+    case "$1" in
+        *"$_nl"*|*"$_cr"*) printf '%s' "$1" | tr '\n\r' '  ' ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+# _comm PID -> /proc/PID/comm on one line, its lines joined by a space (empty
+# when unreadable); read with the read builtin, no fork
+_comm() {
+    local l c=""
+    { while IFS= read -r l; do c="${c:+$c }$l"; done < "/proc/$1/comm"; } 2>/dev/null
+    _oneline "$c"
+}
+# _is_odd TEXT -> success when TEXT holds a newline or a CR
+_is_odd() { case "$1" in *"$_nl"*|*"$_cr"*) return 0 ;; esac; return 1; }
+# _link_text [-f] PATH -> readlink [-f] PATH on one line; fails as readlink does
+_link_text() { local o; o="$(readlink "$@" 2>/dev/null)" || return 1; _oneline "$o"; }
+# ---- end apm: text helpers
+
 # ---- apm: report helpers — DO NOT EDIT -------------------------------------
 # members: apmjava apmnodejs apmphp apmpython
 # _env_head -> the opening facts of the environment section: shell, uid,
@@ -828,6 +893,40 @@ _container_facts() {
         printf '        %-22s not set\n' "KUBERNETES_SERVICE_HOST"
     fi
     probe "self cgroup (first 5 lines)" head -n 5 /proc/self/cgroup
+}
+
+# _pid1_cmd -> pid 1's command line on one line (_proc_words), first 160 bytes
+# (_u8cut); for probe "pid 1 command"
+_pid1_cmd() { _proc_words /proc/1/cmdline | _u8cut 160; }
+
+# _product_uuid -> the `ls -l` line of /sys/class/dmi/id/product_uuid and
+# whether this run could read it, by opening and reading it (sysfs mode bits
+# alone do not say). The value is printed only when it was read, as read. The
+# open and the read are shell redirections and the uid is _note_privilege's,
+# so a readable file costs one fork (ls); `cat` runs only to name the error
+# of a failed open or read (its stderr, through _classify_err).
+_product_uuid() {
+    local f=/sys/class/dmi/id/product_uuid v="" l u="${_priv_uid:-?}"
+    if [ ! -e "$f" ]; then fact "dmi product_uuid: n/a (path not found: $f)"; return; fi
+    l="$(ls -l "$f" 2>/dev/null)"
+    fact "dmi product_uuid (ls -l): ${l:-n/a (ls -l printed nothing)}"
+    # `true`, not `:`: a redirection that fails on a special builtin ends a
+    # POSIX shell (dash exited here)
+    if ! { true < "$f"; } 2>/dev/null; then
+        cat "$f" >/dev/null 2>"$_errfile"
+        fact "dmi product_uuid readable by uid $u: no (open failed: $(_classify_err))"
+        return
+    fi
+    { IFS= read -r v < "$f"; } 2>/dev/null
+    if [ -n "$v" ]; then
+        fact "dmi product_uuid readable by uid $u: yes"
+        fact "dmi product_uuid: $(_oneline "$v")"
+    elif cat "$f" >/dev/null 2>"$_errfile"; then
+        fact "dmi product_uuid readable by uid $u: yes"
+        fact "dmi product_uuid: (empty file)"
+    else
+        fact "dmi product_uuid readable by uid $u: no (opened, read failed: $(_classify_err))"
+    fi
 }
 # ---- end apm: report helpers
 
@@ -1350,13 +1449,13 @@ weaving_lines() {
 _proc_env() {
     local t l
     if [ -z "$_tmp_dir" ]; then
-        tr '\0' '\n' 2>/dev/null < "/proc/$1/environ" | _K="$2" awk 'BEGIN { k = ENVIRON["_K"] "=" }
+        _proc_lines "/proc/$1/environ" | _K="$2" awk 'BEGIN { k = ENVIRON["_K"] "=" }
             index($0, k) == 1 { print substr($0, length(k) + 1); exit }'
         return 0
     fi
     t="$_tmp_dir/env.$1"
     # a name holding a tab could not be told apart from its value: skipped
-    [ -f "$t" ] || tr '\0' '\n' 2>/dev/null < "/proc/$1/environ" | awk '
+    [ -f "$t" ] || _proc_lines "/proc/$1/environ" | awk '
         { i = index($0, "="); if (i < 2) next; n = substr($0, 1, i - 1)
           if (index(n, "\t") || (n in v)) next; v[n] = 1
           printf "%s\t%s\n", n, substr($0, i + 1) }' > "$t" 2>/dev/null
@@ -1380,7 +1479,7 @@ _jvm_args_read() {
     local pid="$1"
     _proc_env "$pid" JAVA_TOOL_OPTIONS | tr ' ' '\n'
     _proc_env "$pid" JDK_JAVA_OPTIONS | tr ' ' '\n'
-    tr '\0' '\n' 2>/dev/null < "/proc/$pid/cmdline"
+    _proc_lines "/proc/$pid/cmdline"
     _proc_env "$pid" _JAVA_OPTIONS | tr ' ' '\n'
     [ -n "$_tmp_dir" ] && [ -f "$(_tmp "jcmdargs.$pid")" ] && cat "$(_tmp "jcmdargs.$pid")" 2>/dev/null
     return 0
@@ -1421,7 +1520,7 @@ _jvm_opt_val() {
 
 # _link_or_na PATH -> the target of the symlink PATH (a /proc link), or n/a
 _link_or_na() {
-    readlink "$1" 2>/dev/null || echo 'n/a (permission denied or gone)'
+    _link_text "$1" || echo 'n/a (permission denied or gone)'
 }
 
 # ---- Tier 2 argument recovery (opt-in: --jcmd) --------------------------------
@@ -1519,7 +1618,7 @@ _NOTCONF="not confirmed as a JVM: no libjvm or libj9vm mapping was read in /proc
 _whatap_attached() {
     local pid="$1"
     _all_jvm_args "$pid" | grep -qiE '^-javaagent:.*whatap|^-Dwhatap\.' && return 0
-    tr '\0' '\n' 2>/dev/null < "/proc/$pid/environ" | grep -qiE '^(WHATAP_|whatap\.|license=)' && return 0
+    _proc_lines "/proc/$pid/environ" | grep -qiE '^(WHATAP_|whatap\.|license=)' && return 0
     return 1
 }
 
@@ -1646,6 +1745,8 @@ _rview() {
         /*) ;;
         *)  c="$(readlink "/proc/$pid/cwd" 2>/dev/null)"
             [ -n "$c" ] || return 1
+            # a working directory holding a newline or CR is not followed
+            _is_odd "$c" && return 1
             if [ "$ns" = other ]; then
                 # the link text is the working directory as the collector's
                 # root names it; below a chroot it carries the root's path, which
@@ -1689,9 +1790,13 @@ _rwhy() {
                 else echo "path not found: /proc/$pid (the process exited)"; fi
                 return
             fi ;;
-        *)  if ! readlink "/proc/$pid/cwd" >/dev/null 2>&1; then
+        *)  if ! v="$(readlink "/proc/$pid/cwd" 2>/dev/null)"; then
                 if [ -e "/proc/$pid" ]; then echo "permission denied: /proc/$pid/cwd (the working directory the relative path $p is joined to)"
                 else echo "path not found: /proc/$pid (the process exited)"; fi
+                return
+            fi
+            if _is_odd "$v"; then
+                echo "not followed: the working directory of pid $pid, which the relative path $p is joined to, holds a newline or CR ($(_oneline "$v"), each shown as a space)"
                 return
             fi ;;
     esac
@@ -1890,8 +1995,26 @@ _jvm_walk() {
     # no single exec carries one argument per process (ARG_MAX on a large host)
     printf '%s\n' /proc/[0-9]*/exe > "$(_tmp d.exelist)" 2>/dev/null
     printf '%s\n' /proc/[0-9]*/cmdline > "$(_tmp d.cmdlist)" 2>/dev/null
-    _bounded_in "$(_tmp d.exelist)" xargs ls -l 2>/dev/null \
-        | sed -n 's|^.* /proc/\([0-9][0-9]*\)/exe -> \(.*\)$|\1 \2|p' > "$f_exe"
+    # `ls -l` prints a link target holding a newline over two lines, and the
+    # second can pose as the line of another pid: a line naming no
+    # /proc/<pid>/exe, or a pid named twice, makes the exe of the pids involved
+    # (that one, and the one whose line came before) be read again with
+    # readlink, newlines and CRs as spaces (rare; the common case stays one ls
+    # per xargs batch)
+    _bounded_in "$(_tmp d.exelist)" xargs ls -l 2>/dev/null | awk '{
+        gsub(/\r/, " "); i = index($0, " -> "); q = ""
+        for (f = 1; f <= NF; f++) if ($f ~ /^\/proc\/[0-9]+\/exe$/) { split($f, a, "/"); q = a[3]; break }
+        if (q == "" || (q in s)) { if (pq != "") print "R " pq; if (q != "") print "R " q; next }
+        s[q] = 1; pq = q; if (i) print q " " substr($0, i + 4) }' > "$f_exe"
+    if grep -q '^R ' "$f_exe"; then
+        grep '^R ' "$f_exe" | cut -d' ' -f2 | sort -u > "$(_tmp d.exere)"
+        grep -v '^R ' "$f_exe" | awk -v r="$(_tmp d.exere)" 'BEGIN { while ((getline l < r) > 0) x[l] = 1 }
+            { i = index($0, " "); if (!(substr($0, 1, i - 1) in x)) print }' > "$(_tmp d.exe2)"
+        while IFS= read -r pid; do
+            exe="$(_link_text "/proc/$pid/exe")" && printf '%s %s\n' "$pid" "$exe"
+        done < "$(_tmp d.exere)" >> "$(_tmp d.exe2)"
+        cat "$(_tmp d.exe2)" > "$f_exe"
+    fi
     if printf 'a\000-Xmx1\000' | grep -qz '^-Xmx' 2>/dev/null; then
         zok=1
         _bounded_in "$(_tmp d.cmdlist)" xargs grep -laz -E '^-(javaagent:|Xmx|Xms|XX:|Dcatalina\.|Djava\.|Dwhatap\.)' 2>/dev/null \
@@ -1938,7 +2061,7 @@ _jvm_walk() {
     # grep -z absent (an old busybox): the argument test per remaining process
     if [ "$zok" = 0 ]; then
         grep '^U|' "$f_out" | while IFS='|' read -r kind pid c exe; do
-            tr '\0' '\n' 2>/dev/null < "/proc/$pid/cmdline" \
+            _proc_lines "/proc/$pid/cmdline" \
                 | grep -qE '^-(javaagent:|Xmx|Xms|XX:|Dcatalina\.|Djava\.|Dwhatap\.)' \
                 && printf 'J|%s|a JVM-only whole argument on the command line\n' "$pid"
         done > "$(_tmp d.out2)"
@@ -2066,7 +2189,7 @@ discover() {
 
     # the binary of every JVM; only a java launcher is ever executed
     for pid in $D_JVM_PIDS; do
-        exe="$(readlink "/proc/$pid/exe" 2>/dev/null)"
+        exe="$(_link_text "/proc/$pid/exe")"
         if [ -z "$exe" ]; then
             [ -e "/proc/$pid" ] && D_JAVA_NOEXE="$D_JAVA_NOEXE $pid"
             continue
@@ -2085,7 +2208,7 @@ discover() {
         _is_java_launcher "$exe" || lib="$(_jvm_maps_lib "$pid")"
         # the name it was invoked under is argv[0]: a symlink named vshell
         # that points at java is a vshell to this collector, and is not run
-        a="$(tr '\0' '\n' 2>/dev/null < "/proc/$pid/cmdline" | head -n 1)"
+        a="$(_proc_lines "/proc/$pid/cmdline" | head -n 1)"
         if [ -n "$a" ] && ! _is_java_launcher "$a" && _is_java_launcher "$exe"; then
             case "$D_JAVA_OTHER" in *"$_nl$exe|binary of pid $pid"*) ;; *)
                 D_JAVA_OTHER="$D_JAVA_OTHER$_nl$exe|binary of pid $pid, invoked as $a|$(_jvm_maps_lib "$pid")|$pid" ;; esac
@@ -2404,6 +2527,7 @@ _rep_host() {
     probe "kernel" uname -srm
     read_proc "os-release" /etc/os-release
     probe "cpu count (nproc)" nproc
+    _product_uuid
     _mem="$(grep -E '^(MemTotal|MemAvailable|SwapTotal)' /proc/meminfo 2>/dev/null)"
     if [ -n "$_mem" ]; then
         fact "memory (/proc/meminfo):"
@@ -2416,7 +2540,7 @@ _rep_host() {
     _container_facts
     if [ -d /var/run/secrets/kubernetes.io ]; then fact "/var/run/secrets/kubernetes.io: present"; else fact "/var/run/secrets/kubernetes.io: absent"; fi
     read_proc "container hostname (/etc/hostname)" /etc/hostname
-    probe "pid 1 command" sh -c "tr '\0' ' ' < /proc/1/cmdline | cut -c1-160"
+    probe "pid 1 command" _pid1_cmd
     probe "local time" date
     probe "UTC time" date -u
     probe "timedatectl" timedatectl
@@ -2457,7 +2581,7 @@ EOF
     _a0res=0
     for _np in $D_JAVA_NOEXE; do
         fact "-- binary of pid $_np: n/a (permission denied: /proc/$_np/exe)"
-        _a0="$(tr '\0' '\n' 2>/dev/null < "/proc/$_np/cmdline" | head -n 1)"
+        _a0="$(_proc_lines "/proc/$_np/cmdline" | head -n 1)"
         case "$_a0" in
             /*) ;;
             '') fact "   argv[0]: n/a (cmdline not readable)"; continue ;;
@@ -2613,11 +2737,11 @@ _rep_jvms() {
                     printf '           exe: %s\n' "$(_link_or_na "/proc/$pid/exe")"
                     _jvm_program "$pid"
                     printf '           cmdline (verbatim):\n'
-                    tr '\0' '\n' 2>/dev/null < "/proc/$pid/cmdline" | _indent '             '
+                    _proc_lines "/proc/$pid/cmdline" | _indent '             '
                     _jvm_noargs_line "$pid"
                     continue ;;
             esac
-            printf '           comm: %s\n' "$(cat "/proc/$pid/comm" 2>/dev/null)"
+            printf '           comm: %s\n' "$(_comm "$pid")"
             printf '           exe: %s\n' "$(_link_or_na "/proc/$pid/exe")"
             printf '           root and mount namespace: %s\n' "$(case "$(_ns_of "$pid")" in (same) echo "the collector's own" ;; (other) echo "not the collector's (root $(readlink "/proc/$pid/root" 2>/dev/null); paths are read through /proc/$pid/root)" ;; (*) echo "n/a (/proc/$pid/root not readable)" ;; esac)"
             _pst="${_pst#*|}"
@@ -2629,7 +2753,7 @@ _rep_jvms() {
             printf '           stdout (fd 1) -> %s\n' "$(_link_or_na "/proc/$pid/fd/1")"
             printf '           stderr (fd 2) -> %s\n' "$(_link_or_na "/proc/$pid/fd/2")"
             printf '           cmdline (verbatim):\n'
-            tr '\0' '\n' 2>/dev/null < "/proc/$pid/cmdline" | _indent '             '
+            _proc_lines "/proc/$pid/cmdline" | _indent '             '
             if ! _env_readable "$pid"; then
                 printf '           environ: n/a (permission denied: /proc/%s/environ); JAVA_TOOL_OPTIONS, JDK_JAVA_OPTIONS and _JAVA_OPTIONS of this process were not read\n' "$pid"
             fi
@@ -2689,12 +2813,12 @@ _jvm_program() {
     if [ -n "$_jarv" ]; then
         printf '           program: executable jar %s\n' "$_jarv"
     else
-        _mc="$(tr '\0' '\n' 2>/dev/null < "/proc/$pid/cmdline" | awk '
+        _mc="$(_proc_lines "/proc/$pid/cmdline" | awk '
             NR==1 {p=$0; next}
             (p=="-cp"||p=="-classpath"||p=="--class-path"||p=="-p"||p=="--module-path"||p=="-jar"||p=="-m"||p=="--module"||p=="--add-opens"||p=="--add-exports") {p=$0; next}
             substr($0,1,1)=="-" {p=$0; next}
             {print; exit}')"
-        printf '           program: main class %s\n' "$(printf '%s' "${_mc:-n/a (no main class on the command line)}" | cut -c1-200)"
+        printf '           program: main class %s\n' "$(printf '%s\n' "${_mc:-n/a (no main class on the command line)}" | _u8cut 200)"
     fi
 }
 
@@ -2876,7 +3000,7 @@ _hs_err_files() {
     local pid="$1" ef ed="" ep="" mk m
     ef="$(_all_jvm_args "$pid" | sed -n 's/^-XX:ErrorFile=//p' | tail -n 1)"
     printf '           fatal error logs (ls -l; content not read; -XX:ErrorFile %s):\n' "${ef:-not set}"
-    _hs_err_dir "$pid" . 'hs_err_pid*.log' "working directory$(readlink "/proc/$pid/cwd" 2>/dev/null | sed 's/^/ /')"
+    _hs_err_dir "$pid" . 'hs_err_pid*.log' "working directory$(_link_text "/proc/$pid/cwd" | sed 's/^/ /')"
     if [ -n "$ef" ]; then
         case "$ef" in */*) ed="${ef%/*}"; [ -n "$ed" ] || ed=/ ;; *) ed=. ;; esac
         # %p is the pid, %% a literal %
@@ -2986,9 +3110,9 @@ _rep_conf() {
         fi
         # whatap-related environment of THIS process, verbatim
         if [ "$_envok" = 1 ]; then
-            _wenv="$(tr '\0' '\n' 2>/dev/null < "/proc/$pid/environ" \
+            _wenv="$(_proc_lines "/proc/$pid/environ" \
                 | grep -iE '^(WHATAP|whatap\.|license=|accesskey=|OKIND=|PODNAME=|POD_NAME=|NODE_NAME=|NODE_IP=)' \
-                | cut -c1-400)"
+                | _u8cut 400)"
             if [ -n "$_wenv" ]; then
                 fact "   whatap-related environment variables of this process:"
                 printf '%s\n' "$_wenv" | _indent '             '
@@ -2996,7 +3120,7 @@ _rep_conf() {
                 fact "   whatap-related environment variables of this process: none set"
             fi
             _we="$(_proc_env "$pid" whatap.env)"
-            if [ -n "$_we" ]; then fact "   env whatap.env: $(printf '%s' "$_we" | cut -c1-400)"; fi
+            if [ -n "$_we" ]; then fact "   env whatap.env: $(printf '%s\n' "$_we" | _u8cut 400)"; fi
         else
             fact "   environ: n/a (permission denied: /proc/$pid/environ)"
         fi

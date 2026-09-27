@@ -5,6 +5,37 @@ first. Every change to the script bumps its `VERSION` and adds one entry at
 the top of this list (docs/authoring-guide.md, step 2); `tools/validate.sh`
 checks that the newest entry is the script's `VERSION`.
 
+- **0.15.1** — The host section adds `/sys/class/dmi/id/product_uuid`: its
+  `ls -l` line and `dmi product_uuid readable by uid N:` (yes or no, from an
+  open and a read of the file); the value follows only when it was read (group
+  block `apm: report helpers`, `_product_uuid`). Command lines and environ
+  entries go through the new group block `apm: text helpers`: `_proc_words`
+  (NUL, newline and CR each a space) and `_proc_lines` (one entry per line, a
+  newline or CR inside an entry a space). A newline in an argument or a value
+  no longer puts the rest at column 0, where a crafted argument made a fake
+  `[5] Collection status` and failed `validate.sh --report`. Affected here:
+  the verbatim cmdline (one argument per line), argv[0], the JVM argument list
+  read for `-javaagent` and `-D` (an argument holding a newline no longer
+  reads as two), the whatap-related environ lines and `_proc_env`, and pid 1's
+  command line (`_pid1_cmd`, shared: one line of 160 bytes instead of 160
+  bytes of each of its lines). Cuts end on a UTF-8 boundary (`_u8cut`, the awk
+  `u8cut`, one text in the block). The `program: main class` line and the
+  environ lines (400) are cut that way instead of by `cut -c`. The same holds
+  for the comm line (`_comm`, read builtin) and the exe, cwd and fd link
+  targets (`_link_or_na` and the JVM binary via `_link_text`: a newline or CR
+  as a space). The /proc walk read exe targets from `ls -l`, where a target
+  holding a newline printed a second line that could pose as another pid's; a
+  line naming no `/proc/<pid>/exe` or a pid named twice is detected (the
+  common case stays one `ls` per xargs batch). `_product_uuid` costs one fork
+  (ls) when the file reads. `dmi product_uuid readable by uid N:` says `yes`,
+  `no (open failed: <reason>)` or `no (opened, read failed: <reason>)`, the
+  reason from `cat`'s stderr, which runs only then. The /proc walk re-reads
+  with readlink only the exe of the pids a posing `ls -l` line involves. A
+  working directory holding a newline or CR is not followed: a relative path
+  joined to it (config, logs, home, hs_err, the working-directory listings)
+  reads
+  `not followed: the working directory of pid N ... holds a newline or CR (<path with spaces>)`.
+  Goals unchanged.
 - **0.15.0** — The default run prints the version facts that place an
   environment in or out of the supported range; no flag added, goals
   unchanged. Section D, per attached JVM (and per JVM whose environ was not

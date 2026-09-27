@@ -81,7 +81,7 @@ Container notes:
 | # | Section | Answers the recurring question |
 | --- | --- | --- |
 | 1 | Collection environment | which tools were available to this collection |
-| 2 | Host / platform | OS, arch, container markers (they decide daemon-vs-foreground master agent), cgroup CPU/memory limits (the agent reports host-view CPU from the Node `os` module, so container-vs-host metric questions need these) |
+| 2 | Host / platform | OS, arch, `ls -l` of `/sys/class/dmi/id/product_uuid` and whether this run could read it (the value only when it could; see [../README.md](../README.md)), container markers (they decide daemon-vs-foreground master agent), cgroup CPU/memory limits (the agent reports host-view CPU from the Node `os` module, so container-vs-host metric questions need these) |
 | 3 | Node.js runtimes and whatap package installs | every node binary with `--version`; every `whatap` install found via process cwds (pnpm symlinks resolved), NODE_PATH, `npm root -g` (run once), `<prefix>/lib/node_modules` of each node binary (found without npm), `/whatap-agent` — per install: package.json `version`/`releaseDate`/`engines` (the 0.5.x-vs-2.x fork), `build.txt` (master-agent build id), bundled `agent/<os>/<arch>/whatap_nodejs` binaries (none on the 0.5.x line, which has no master agent), **instrumentation surface** (`lib/observers` list, differs per version), conf template, `paramkey.txt` presence |
 | 4 | Runtime processes | `whatap_nodejs` master agents (none on the 0.5.x line; 1.x/2.x spawn one per agent home) with cmdline (`-t 2 -d 1`, `--llm`), cwd, and env (`NODEJS_PARENT_APP_PID` links master → app; `APP_IDENTIFIER` is the `<id8>` in file names); node processes (matched by comm, argv0 or `/proc/<pid>/exe`, since pm2 and next-server rename the process title; whatap-marked ones detailed first) with `-r/--require` detection, `NODE_OPTIONS`/`WHATAP_*`/`POD_NAME`/PM2 env, and `cwd/node_modules/whatap` resolution; for each whatap-marked process, the **installed versions** of express, next, @nestjs/core, koa, fastify and whatap (see "Installed package versions" below) |
 | 5 | Agent homes and configuration | every WHATAP_HOME candidate (env, port registry, process cwd/environ, `/whatap-agent`), and per home: `whatap.conf` verbatim **plus byte facts (size, CR 0x0D count — Windows-edited conf files are a recurring support case)**, alternate `WHATAP_CONF` names, `container.conf` (written by the k8s node agent), `whatap_nodejs` symlink resolution, pid-file liveness (`agent-<id8>.pid` vs legacy `whatap_nodejs.pid` — they differ by design after daemonization), lock files, `whatap_port_<pid>`, `run/`, `security.conf` / `paramkey.txt` presence and size, `logs/` inventory. A home that cannot be read says `path not found` or `permission denied` |
@@ -148,7 +148,8 @@ this list. Every place a secret can arrive from:
   `NODE_OPTIONS`, `NODE_PATH`, `NODE_ENV`, `APP_NAME`, `PM2_*`, `pm_id`,
   `name`, `instances`, `POD_NAME`, `NODE_NAME`, `NODE_IP`.
 - Command lines of node, `whatap_nodejs` and pm2 processes and of pid 1
-  (first 200-300 characters).
+  (first 160-300 bytes, NULs, newlines and CRs as spaces).
+- `/sys/class/dmi/id/product_uuid`, when this run can read it.
 - `ecosystem.config.js` / `.cjs` / `.json` / `ecosystem.json` of each app root,
   **verbatim**, first 120 lines: pm2 files commonly carry `env` blocks with
   database passwords and API keys.

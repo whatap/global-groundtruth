@@ -62,7 +62,7 @@ Container notes (all verified against real images):
 | # | Section | Answers the recurring question |
 | --- | --- | --- |
 | 1 | Collection environment | which tools were available to this collection |
-| 2 | Host / platform | OS, arch (amd64/arm64), container markers, cgroup CPU/memory limits (container-vs-host metric questions) |
+| 2 | Host / platform | OS, arch (amd64/arm64), `ls -l` of `/sys/class/dmi/id/product_uuid` and whether this run could read it (the value only when it could; see [../README.md](../README.md)), container markers, cgroup CPU/memory limits (container-vs-host metric questions) |
 | 3 | Python runtimes and whatap-python package | every interpreter (those of whatap-marked processes first, so the detail cap of 8 does not fill with unrelated ones) (multiple versions and **virtualenvs are kept distinct** — identity is the invocation path, not the resolved binary), whatap-python version/location per interpreter, the `whatap_python-*` metadata dirs next to the package (`.dist-info` = wheel install, `.egg-info`/`.egg` = setup.py-era install), `sys.prefix` / `base_prefix` (they differ inside a virtualenv), setuptools / `pkg_resources` import facts (Python 3.12 install issues), bundled Go module binaries per arch, `bootstrap/sitecustomize.py`, console scripts on PATH, **application library inventory** — the `.dist-info`/`.egg-info`/`.egg`/`.egg-link` names in every `sys.path` directory of each interpreter (see "Library inventory" below; then `pip list` per interpreter), plus a no-exec fallback (the same names next to each whatap package dir seen in process environ), plus the **instrumentation surface of the installed agent** (`trace/mod` tree, grouped: application/database/httpc/amqp/...) which differs across agent versions |
 | 4 | Runtime processes | Go common module (`whatap_python`) processes, zombies included, read from `/proc/<pid>/stat`: the count found and per state, then the first 20 (state Z last) with ppid, uid/state and cwd/env; python app processes (matched by comm, argv0 or `/proc/<pid>/exe`, see below; whatap-marked ones first) with argv0, `PYTHONPATH contains whatap/bootstrap`, `VIRTUAL_ENV`, `WHATAP_*`, `OTEL_*` (co-instrumentation); **libraries the process actually loaded** — C-extension packages and the real `site-packages` path from `/proc/<pid>/maps` (pure-Python imports do not appear there) |
 | 5 | Agent homes and configuration | every `WHATAP_HOME` candidate (env, port registry `/tmp/whatap-python.lock`, process cwd/environ, `/whatap-agent`), and per home: `whatap.conf` / `container.conf` verbatim, `whatap_python` symlink resolution, pid files (entry with the full mtime from `stat -c`, else `ls -l`; content, and whether that pid exists, with its state and ppid), `security.conf` / `paramkey.txt` presence and size, `logs/` inventory, `run/` listing (one `stat -c` line per entry with the full mtime, else `ls -la`; first 40 entries and the count), LLM module dir. A home that cannot be read says `path not found` or `permission denied` |
@@ -180,8 +180,9 @@ can arrive from:
   and `OTEL_*` variable (OTLP headers can carry tokens), `PYTHONPATH`,
   `VIRTUAL_ENV`, `PYTHONHOME`.
 - Command lines of python, `whatap_python` and odoo processes and of pid 1
-  (first 300 characters): an argument such as `--db_password=...` appears as
-  given.
+  (first 160-300 bytes, NULs, newlines and CRs as spaces): an argument such
+  as `--db_password=...` appears as given.
+- `/sys/class/dmi/id/product_uuid`, when this run can read it.
 - The installed-distribution names (package names and versions), and the
   `pip list` output.
 - `odoo.conf`, verbatim, **except** the `db_password` and `admin_passwd` lines,

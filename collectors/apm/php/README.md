@@ -140,7 +140,7 @@ Notes:
 | # | Section | Answers the recurring question |
 | --- | --- | --- |
 | 1 | Collection environment | which tools were available to this collection |
-| 2 | Host / platform | OS, kernel, arch, **libc** (glibc vs musl decides `whatap_php` vs `whatap_php_static`), cgroup limits, container markers, clock (agent time-sync questions) |
+| 2 | Host / platform | OS, kernel, arch, **libc** (glibc vs musl decides `whatap_php` vs `whatap_php_static`), `ls -l` of `/sys/class/dmi/id/product_uuid` and whether this run could read it (the value only when it could; see [../README.md](../README.md)), cgroup limits, container markers, clock (agent time-sync questions) |
 | 3 | PHP runtimes and SAPIs | every php / php-fpm / php-cgi binary found (PATH, per-version install paths of every common layout, running processes — detail cap 10): version, **SAPI**, **PHP API**, **Thread Safety**, build strings, `extension_dir`, the ini paths it parses, opcache/JIT settings, the **`whatap.*` directives as that binary actually resolves them (local => master)**, the loaded module list (`php -m`: co-resident APM/profiler extensions such as newrelic, ddtrace, opentelemetry, xdebug are read there), what `php`/`php-fpm` on PATH resolve to, and the `update-alternatives` entries |
 | 4 | Web server / application server layer | Apache binary + `-V` (**MPM prefork/worker/event** — decides whether a `_zts` module is required) and its php/mpm modules; php-fpm version, config and pool files; **per-version FPM systemd units**; nginx; every web/php process (matched by comm, argv0 or `/proc/<pid>/exe`, so a script started from `#!/usr/bin/php` and `lsphp` count) with cmdline, exe and uid; **persistent-worker runtimes** (Swoole/Laravel Octane, RoadRunner, FrankenPHP, Workerman, php-pm) whose request cycle is not the per-request PHP model the tracer hooks, so per-request extension hooks do not bound it the same way. They are matched on the executable (`frankenphp`, `rr`, `roadrunner`), or on the command line of a PHP executable (`octane`, `swoole`, `workerman`, `php-pm`, `artisan queue|horizon`) — an editor or `tail` naming swoole is not one |
 | 5 | WhaTap PHP agent installation on disk | agent home candidates and their source; home listing; `whatap_php` / `whatap_php_static` with size, mtime and **sha256**; `whatap_php version` (`ver <x.y.z.date>, buildno <commit>`); ChangeLog head (shipped version); `template.ini`; `install.sh` (ls, sha256 — its `get_php_api_version()` holds the PHP-version → PHP API table the installer used; read it in the package of that sha256); the shipped tracer module inventory per arch; package manager records (rpm/dpkg/apk — the Alpine tarball leaves none by design) |
@@ -181,8 +181,9 @@ this list. Every place a secret can arrive from:
   lines): they carry `WHATAP_CONFIG_HOME` and any `Environment=` line.
 - The `WHATAP_*` environment of `whatap_php`, web and php processes.
 - Command lines of web, php, persistent-worker and `whatap_php` processes and
-  of pid 1 (first 160-300 characters): an argument carrying a secret appears as
-  given.
+  of pid 1 (first 160-300 bytes, NULs, newlines and CRs as spaces): an
+  argument carrying a secret appears as given.
+- `/sys/class/dmi/id/product_uuid`, when this run can read it.
 - php-fpm `www.conf` pool settings without comments (first 60 lines):
   `env[...]` entries can carry secrets.
 - The last 300 lines of each known web server / php-fpm error log, filtered to

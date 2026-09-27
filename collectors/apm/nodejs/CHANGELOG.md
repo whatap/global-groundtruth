@@ -5,6 +5,40 @@ first. Every change to the script bumps its `VERSION` and adds one entry at
 the top of this list (docs/authoring-guide.md, step 2); `tools/validate.sh`
 checks that the newest entry is the script's `VERSION`.
 
+- **0.9.3** — The host section adds `/sys/class/dmi/id/product_uuid`: its
+  `ls -l` line and `dmi product_uuid readable by uid N:` (yes or no, from an
+  open and a read of the file); the value follows only when it was read (group
+  block `apm: report helpers`, `_product_uuid`). Command lines and environ
+  entries go through the new group block `apm: text helpers`: `_proc_words`
+  (NUL, newline and CR each a space) and `_proc_lines` (one entry per line, a
+  newline or CR inside an entry a space). A newline in an argument or a value
+  no longer puts the rest at column 0, where a crafted argument made a fake
+  `[5] Collection status` and failed `validate.sh --report`. Cuts end on a
+  UTF-8 boundary (`_u8cut`, the awk `u8cut`, one text in the block). Affected
+  here: the cmdline of `whatap_nodejs`, node and pm2 processes (300, 200
+  bytes), their env lines (300, 200), the `-r/--require` test,
+  `NODE_PATH`/`PM2_HOME` reads, and pid 1's command line (`_pid1_cmd`, 160
+  bytes, one line). The process table (group block) turns CR into a space too,
+  and a command line holding a newline (where `head -n 1` stopped) is read
+  again whole, so argv0 and the words after the newline are kept. The same
+  holds for comm (`_comm`, read builtin) and the exe and cwd lines
+  (`_link_text`). The process table read exe targets from `ls -l`, where a
+  target holding a newline printed a second line that could pose as another
+  pid's (a crafted exe path made pid 1 read as a runtime); a line naming no
+  `/proc/<pid>/exe` or a pid named twice is detected. `_product_uuid` costs
+  one fork (ls) when the file reads. `dmi product_uuid readable by uid N:`
+  says `yes`, `no (open failed: <reason>)` or
+  `no (opened, read failed: <reason>)`, the reason from `cat`'s stderr, which
+  runs only then. The process table reads every comm in the same `head` pass
+  as before (`head -n 16`, lines joined by a space), with no fork per pid, and
+  re-reads with readlink only the exe of the pids a posing `ls -l` line
+  involves. A newline or CR inside an environ value is kept apart from the
+  variable boundaries and given back by `_env_pick`, so a `WHATAP_HOME`
+  holding one is listed quoted among the paths not followed (D_ODD, which now
+  also takes CR and lists each path once) instead of being looked up with
+  spaces. A node process cwd holding a newline or CR is not followed (listed
+  with the odd paths; its `cwd:` and `installed packages:` lines say so), and
+  NODE_PATH entries split on CR too. Goals unchanged.
 - **0.9.2** — The version reader folds its input to 512-byte lines and keeps
   the first 256 bytes of each string; busybox awk spent 47-50 s per
   package.json holding one long single-line string inside the 256 KiB read,

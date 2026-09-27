@@ -55,6 +55,36 @@ The `--out` check is the group block `apm: output directory`
 ([templates/groups/apm.sh](../../templates/groups/apm.sh)). An option that
 takes a value and is given none ends the run with exit 2.
 
+## Facts the four Linux collectors print the same way
+
+- **`/sys/class/dmi/id/product_uuid`**, once, in the host section: its
+  `ls -l` line and `dmi product_uuid readable by uid N: yes`,
+  `no (open failed: <reason>)` or `no (opened, read failed: <reason>)`, from
+  an open and a read by the shell (sysfs mode bits alone do not say; one fork,
+  the `ls`, when it reads). The value is
+  printed, as read, only when it was read. In #ask-dev-apm (C08U55BRDLJ,
+  threads p1755497006226229, p1780549458250729, p1781840924638839) a
+  root-only `product_uuid` went with an agent that counted the host's CPU
+  cores twice, and the file's mode was checked by hand with `docker run ... cat`.
+  Group block `apm: report helpers` (`_product_uuid`).
+- **Command lines and environ values** (`/proc/<pid>/cmdline`, `environ`) are
+  NUL-separated, and an entry can itself hold a newline or a CR. Every one
+  the collectors print or parse goes through `_proc_words` (the whole file on
+  one line, each NUL, newline and CR as a space) or `_proc_lines` (one entry
+  per line, a newline or CR inside an entry as a space); printed as read, a
+  newline put the rest of an argument at column 0, where it read as a report
+  line of its own (a crafted argument made a fake `[5] Collection status`).
+  A cut (`first N bytes`) never ends inside a UTF-8 character: `_u8cut` and
+  the awk function `u8cut` share one text. The same holds for a process's
+  comm (`_comm`) and the exe, cwd and fd link targets (`_link_text`, `_oneline`),
+  which the process also chose. The process table reads exe targets from one
+  `ls -l`; a target holding a newline prints a second line that can pose as
+  another pid's, so a line naming no `/proc/<pid>/exe`, or a pid named twice,
+  makes it read the exe of the pids involved again with readlink. A cwd or an
+  environ value (`WHATAP_HOME`) holding a newline or CR is an odd path, as in
+  the python / nodejs / php list below: listed quoted, never followed. Group
+  block `apm: text helpers`.
+
 ## Behaviour the Linux python / nodejs / php collectors share
 
 Same situation, same outcome and the same words in all three:
@@ -86,7 +116,7 @@ Same situation, same outcome and the same words in all three:
   a cap 1..999999. A value that fails is reported as a fact ("ignored") and
   not used. Path lists are split on newlines only and never globbed; a
   relative path is never read against the collector's own cwd.
-- **Odd paths.** A candidate path holding a newline or `|` is reported quoted
+- **Odd paths.** A candidate path holding a newline, a CR or `|` is reported quoted
   and counted as not followed (`missed`), never split. A relative
   `WHATAP_HOME` is resolved against its process's cwd; when that cwd cannot be
   read the process is an unread input while it lives, and a fact once it has
