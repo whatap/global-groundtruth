@@ -45,6 +45,15 @@ export LC_ALL=C
 
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-apmnodejs"
+# 0.8.2  The node processes this run starts (node --version, npm root -g,
+#        npm/pm2 --version) run without NODE_OPTIONS. Run by kubectl exec in
+#        an operator-injected pod, the shell inherits NODE_OPTIONS=-r whatap,
+#        and npm root -g loaded the agent: it initialised, tried to rewrite
+#        whatap.conf, opened a UDP channel to the running whatap_nodejs and
+#        wrote its start-up to the pod's hook log, and its console lines
+#        became the "global node_modules" value (lab container, 2026-09-27).
+#        Report: [1] says whether NODE_OPTIONS was removed and whether it
+#        named whatap; section 3 gets the real npm root -g.
 # 0.8.1  main is the apm group block `apm: main`; report unchanged. A --file run
 #        on a host without hostname(1) names the report after
 #        /proc/sys/kernel/hostname, else `uname -n`, and so does Target (both
@@ -70,9 +79,21 @@ COLLECTOR_NAME="whatap-apmnodejs"
 #        reused by the report, and the detail list reads each environ once.
 #        The report is unchanged; 8.4 s -> 4.9 s on a host with 168 node
 #        processes, 18.3 s -> 9.5 s with 300 more (2026-09-25).
-VERSION="0.8.1"
+VERSION="0.8.2"
 DOMAIN="apm"
 TARGET="host/$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || uname -n 2>/dev/null || echo unknown)"
+
+# A node started with NODE_OPTIONS=-r whatap (the operator's injection, which
+# kubectl exec inherits) loads and starts the WhaTap agent, npm included. The
+# node processes this run starts run without NODE_OPTIONS.
+_SELF_NODEOPTS="not set"
+if [ -n "${NODE_OPTIONS+x}" ]; then
+    case "$NODE_OPTIONS" in
+        *whatap*) _SELF_NODEOPTS="removed (it named whatap)" ;;
+        *)        _SELF_NODEOPTS="removed (it did not name whatap)" ;;
+    esac
+    unset NODE_OPTIONS
+fi
 
 # ---- CLI harness — DO NOT EDIT ----------------------------------------------
 OPT_FILE=0        # write the report to a .txt file
@@ -1374,6 +1395,7 @@ _rep_env() {
     fact "privilege: $PRIV_WHY"
     _note_boot
     fact "collector cwd: $(pwd 2>/dev/null || echo unknown)"
+    fact "NODE_OPTIONS of the node processes this run starts: $_SELF_NODEOPTS"
     fact "tools:"
     for t in node npm pnpm yarn pm2 ss netstat lsof readlink timeout file stat awk tr; do
         if command -v "$t" >/dev/null 2>&1; then printf '        %-12s present (%s)\n' "$t" "$(command -v "$t")"

@@ -1,6 +1,12 @@
 # collectors/apm/nodejs — WhaTap Node.js APM agent collector
 
-> **Status: SEEDED (v0).** `collect-apmnodejs.sh` is a working Tier-0
+> **Status: SEEDED (v0; validated at `collect-apmnodejs.sh` 0.8.2 on
+> 2026-09-27 against the real `whatap` npm agent 2.0.6 (`require('whatap')` in
+> the app, master `whatap_nodejs` in a Node 22 container) and the operator's
+> `apm-init-nodejs` copy (`NODE_OPTIONS=-r whatap`, `/whatap-agent`); as root,
+> as the app's user and as another user, bash and `sh -s`; no collection
+> server was reachable, so no TCP session to :6600 was seen).**
+> `collect-apmnodejs.sh` is a working Tier-0
 > collector seeded by the Global team (CONTRACT rule 4 — interim ownership).
 > Ongoing ownership belongs to the Node.js agent developers once handed over.
 
@@ -140,7 +146,11 @@ only processes executed are standard tools plus `node --version` and one
 `package.json` of the package each command's entry script resolves to (the
 report line names the file); `npm --version` / `pm2 --version`, each of which
 starts node, run only when no such file gives the version, and the report line
-then names the command. The whatap module is never loaded. No
+then names the command. The whatap module is never loaded: every node this
+run starts runs without `NODE_OPTIONS` (the operator injects `-r whatap`
+there, the `kubectl exec` shell inherits it, and `npm root -g` then started
+the agent in npm, which tried to rewrite `whatap.conf`); `[1]` says whether it
+was removed and whether it named whatap. No
 `--bundle` tier yet; copy the bundle plumbing from `collect-collserver.sh` if
 the domain team needs raw log artifacts.
 
