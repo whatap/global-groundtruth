@@ -385,6 +385,34 @@ printf 'echo after-main\n' >> "$R/collectors/apm/nodejs/collect-apmnodejs.sh"
 check "an apm: main that is not the last block is reported OUT OF PLACE" '"$R/tools/sync-shared-block.sh" --check | grep -q "^OUT OF PLACE .*collect-apmnodejs.sh .*block apm: main"'
 "$R/tools/sync-shared-block.sh" --apply >/dev/null
 check "--apply moves it back to the end" '"$R/tools/sync-shared-block.sh" --check >/dev/null && [ "$(tail -n 1 "$R/collectors/apm/nodejs/collect-apmnodejs.sh")" = "# ---- end apm: main" ] && bash -n "$R/collectors/apm/nodejs/collect-apmnodejs.sh"'
+# one_blank FILE: exactly one blank line separates apm: main from the text before it
+one_blank() {
+    awk '/^# ---- apm: main — DO NOT EDIT/ { exit !(NR > 2 && p1 == "" && p2 ~ /[^[:space:]]/) } { p2 = p1; p1 = $0 }' "$1"
+}
+check "the re-inserted and the moved apm: main follow one blank line" \
+    'one_blank "$R/collectors/apm/php/collect-apmphp.sh" && one_blank "$R/collectors/apm/nodejs/collect-apmnodejs.sh"'
+# what follows an out-of-place block is named: blank lines, or the first other text
+printf '\n\n' >> "$R/collectors/apm/python/collect-apmpython.sh"
+check "trailing blank lines are OUT OF PLACE, counted" \
+    '"$R/tools/sync-shared-block.sh" --check | grep -q "^OUT OF PLACE .*collect-apmpython.sh .*block apm: main) — not the last lines of the file: followed by 2 blank line(s)$"'
+printf '\n# trailing comment\n' >> "$R/collectors/apm/java/collect-apmjava.sh"
+# shellcheck disable=SC2034  # read inside check's eval
+jl="$(awk 'END { print NR }' "$R/collectors/apm/java/collect-apmjava.sh")"
+check "a trailing comment is OUT OF PLACE, with its line" \
+    '"$R/tools/sync-shared-block.sh" --check | grep -q "^OUT OF PLACE .*collect-apmjava.sh .*followed by other text at line $jl$"'
+# a missing final newline is its own finding, not OUT OF PLACE
+f="$R/collectors/apm/php/collect-apmphp.sh"; printf '%s' "$(cat "$f")" > "$f.x" && mv "$f.x" "$f"
+out="$("$R/tools/sync-shared-block.sh" --check | grep 'collect-apmphp.sh .*block apm: main')"
+check "no final newline is NO EOL, not OUT OF PLACE" \
+    '[ "$(printf "%s\n" "$out" | grep -c "^NO EOL .*— no newline at the end of the file$")" = 1 ] && ! printf "%s\n" "$out" | grep -q "OUT OF PLACE"' "$out"
+"$R/tools/sync-shared-block.sh" --apply >/dev/null
+check "--apply fixes all three" \
+    '"$R/tools/sync-shared-block.sh" --check >/dev/null && [ -z "$(tail -c 1 "$f")" ] && ( for m in java php python; do [ "$(tail -n 1 "$R/collectors/apm/$m/collect-apm$m.sh")" = "# ---- end apm: main" ] && one_blank "$R/collectors/apm/$m/collect-apm$m.sh" && bash -n "$R/collectors/apm/$m/collect-apm$m.sh" || exit 1; done )'
+check "--apply keeps the trailing comment" 'grep -qx "# trailing comment" "$R/collectors/apm/java/collect-apmjava.sh"'
+# shellcheck disable=SC2034  # read inside check's eval
+before="$(cat "$R"/collectors/apm/*/collect-apm*.sh | cksum)"
+"$R/tools/sync-shared-block.sh" --apply >/dev/null
+check "a second --apply changes nothing" '[ "$(cat "$R"/collectors/apm/*/collect-apm*.sh | cksum)" = "$before" ]'
 sed -i 's/^# members: apmjava apmnodejs apmphp apmpython$/# members:   /' "$R/templates/groups/apm.sh"
 check "a members line with no stem fails the run" '"$R/tools/sync-shared-block.sh" --check >/dev/null 2>&1; [ $? = 2 ]'
 # the repo's group owners parse under bash and dash (the apm members run under both)

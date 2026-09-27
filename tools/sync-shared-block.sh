@@ -22,7 +22,10 @@
 #     is then the last lines of every member (the apm collectors' main, which
 #     runs the collector and must come after every function it calls). --apply
 #     inserts a missing one at the end of the file and moves one found
-#     elsewhere to the end; --check reports the latter OUT OF PLACE.
+#     elsewhere to the end, one blank line after the text before it; --check
+#     reports the latter OUT OF PLACE and says what follows the block (blank
+#     lines count too), and a block that ends the file without a final newline
+#     NO EOL (--apply adds the newline).
 #     The owner file is the only list of the blocks and of their members;
 #     nothing here names them. A collector that is not a member but carries the
 #     banner is reported STRAY and left unchanged.
@@ -88,6 +91,10 @@ syntax_ok() {
         *) bash -n "$1" 2>/dev/null ;;
     esac
 }
+# trim_tail [FILE] -> FILE (or stdin) without its trailing blank lines, every
+# line ending in a newline; a block put at the end then follows one blank line,
+# as the owner separates its blocks
+trim_tail() { awk '{ l[NR] = $0 } /[^[:space:]]/ { n = NR } END { for (i = 1; i <= n; i++) print l[i] }' "$@"; }
 # replace FILE: FILE.tmp becomes FILE; a shell collector stays executable
 replace() { mv "$1.tmp" "$1" && case "$1" in *.sh) chmod +x "$1" ;; esac; }
 
@@ -112,7 +119,7 @@ sync_block() {
                 printf 'BROKEN   %-52s (block %s) — banner or end line missing or repeated\n' "$short" "$name"; rc=1; continue
             fi
             if [ "$PLACE_END" = 1 ] && [ "$mode" = --apply ]; then
-                { cat "$f"; printf '\n%s\n' "$src"; } > "$f.tmp" && replace "$f"
+                { trim_tail "$f"; printf '\n%s\n' "$src"; } > "$f.tmp" && replace "$f"
                 if syntax_ok "$f"; then printf 'inserted %-52s (block %s, at the end)\n' "$short" "$name"
                 else printf 'BROKEN   %-52s (block %s) — syntax error after insert\n' "$short" "$name"; rc=1; fi
                 continue
@@ -133,14 +140,25 @@ sync_block() {
             else printf 'BROKEN   %-52s (block %s) — syntax error after insert\n' "$short" "$name"; rc=1; fi
             continue
         fi
-        if [ "$PLACE_END" = 1 ] && [ "${r#* }" -ne "$(wc -l < "$f")" ]; then
+        # awk counts a last line that has no newline; wc -l would not
+        if [ "$PLACE_END" = 1 ] && [ "${r#* }" -ne "$(awk 'END { print NR }' "$f")" ]; then
             if [ "$mode" = --check ]; then
-                printf 'OUT OF PLACE %-48s (block %s) — not the last lines of the file\n' "$short" "$name"; rc=1; continue
+                after="$(awk -v e="${r#* }" 'NR > e && /[^[:space:]]/ { print "other text at line " NR; t = 1; exit }
+                    END { if (!t) print NR - e " blank line(s)" }' "$f")"
+                printf 'OUT OF PLACE %-48s (block %s) — not the last lines of the file: followed by %s\n' "$short" "$name" "$after"; rc=1; continue
             fi
-            { sed "${r% *},${r#* }d" "$f"; printf '%s\n' "$src"; } > "$f.tmp" && replace "$f"
+            { sed "${r% *},${r#* }d" "$f" | trim_tail; printf '\n%s\n' "$src"; } > "$f.tmp" && replace "$f"
             if syntax_ok "$f"; then printf 'moved    %-52s (block %s, to the end)\n' "$short" "$name"
             else printf 'BROKEN   %-52s (block %s) — syntax error after move\n' "$short" "$name"; rc=1; fi
             continue
+        fi
+        # the block ends the file, but its last line has no newline
+        if [ "$PLACE_END" = 1 ] && [ -n "$(tail -c 1 "$f")" ]; then
+            if [ "$mode" = --check ]; then
+                printf 'NO EOL   %-52s (block %s) — no newline at the end of the file\n' "$short" "$name"; rc=1; continue
+            fi
+            printf '\n' >> "$f"
+            printf 'fixed    %-52s (block %s, added the newline at the end of the file)\n' "$short" "$name"
         fi
         if [ "$(sed -n "${r% *},${r#* }p" "$f")" = "$src" ]; then
             printf 'ok       %-52s (block %s)\n' "$short" "$name"
