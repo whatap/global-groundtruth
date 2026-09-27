@@ -7,6 +7,48 @@ one entry at the top of its section (docs/authoring-guide.md, step 2);
 
 ## collect-db.sh
 
+- **0.9.0** — Derived views removed (CONTRACT rule 1, "Derived views"); every
+  fact they gave is in raw output or in a count of what was read. Sections
+  F and H: the WA/ORA/JDBC code histograms become, per code in order of
+  first appearance, `WA123 (M occurrences): <first line holding it>` (M
+  counted as grep -o counted, over the same 5000-line window, so the
+  numbers are the old ones); the line counts become `label (M lines): <first
+  matching line>` (the old grep -c numbers); the old samples stay as the
+  first 3 lines (`exception sample lines`, `Exception|SQLException`;
+  `AWS credential/role sample lines`), printed whole as in 0.8.4. A new
+  first line (per code, per pattern) is cut at 400 bytes on a UTF-8 boundary with "(first N of M bytes)", and a line already printed
+  in the same list is named instead ("(the line shown for WA777)"). One awk
+  pass per log window replaces a grep per pattern. F and H give `ls -l` of
+  the log they read (the "log files (newest 15)" listing can leave it out);
+  H names that log. "last log line" (the tail's last line) is gone.
+  Section H: "engine-relevant conf lines" (whatap.conf is in section D) and
+  the dmx/prx block (ps rss/etime is in section E, prx.conf rss_limit in D)
+  are gone. Section D: a file longer than the 400 lines shown also gets its
+  later lines that are not blank or `#` comments, with line numbers, so
+  every key stays in D. Section K: the handshake summary, the "session:
+  none negotiated" parse and the x509 parses give way to the whole
+  `s_client -showcerts` output (stdout and stderr) verbatim but for its
+  PEM blocks and its per-connection random values (the TLS session ticket
+  hex dump, Session-ID, Session-ID-ctx, Master-Key, Resumption PSK, Start
+  Time: 16 lines per TLS 1.2 handshake), including openssl's own reasons ("MySQL server does not
+  support SSL.", the usage text of an openssl that refuses -starttls); an
+  output identical to one printed for an instance above is named instead.
+  Each chain certificate is given by the raw output of `openssl x509
+  -noout -subject -issuer -dates -fingerprint -sha256 -ext subjectAltName
+  -text -certopt ...` (-certopt leaves only the signature algorithm line of
+  -text); an openssl whose x509 refuses -ext (1.0.2, LibreSSL 3.7) is run
+  without it and prints every extension. Section G: the re-printed conf
+  values (dbms, db_ip/db_port, whatap.server.host/port, connect_option,
+  db_ssl; all in D), "connect_option keys", "db endpoint class" and "db
+  endpoint domain" are gone; getent still runs for a DNS name, and an unset
+  db_ip or whatap.server.host says so on the probe line. Section B: "host
+  role by discovery" is gone and the title is "B. Component discovery".
+  Section C: "orai18n jar" (in the jdbc drivers listing) is gone. Section I:
+  the two counts over the slow-query file's last 200 lines become the same
+  pattern lines. Measured on the lab mock tree (3 instances, MySQL 8.0 and
+  PostgreSQL 16 with TLS): 570 lines / 28.3 kB -> 627 lines / 32.7 kB
+  (section K 40 -> 118 lines, the s_client output); with a 210 kB log line
+  in the window, 249 kB -> 50 kB (2026-09-27).
 - **0.8.4** — Shortened the top-of-file comment block: kept the asymmetric
   agent-host/DB-host rationale, pointed the field-procedure and CONTRACT/secret
   detail at README.md instead of restating it. Comments only; report content
@@ -65,6 +107,24 @@ one entry at the top of its section (docs/authoring-guide.md, step 2);
 
 ## windows/collect-db-mssql.ps1
 
+- **0.7.0** — Derived views removed (CONTRACT rule 1): section F's WA code
+  histogram becomes, per code in order of first appearance, `WA123 (M
+  occurrences): <first line holding it>` (counted as -AllMatches counted,
+  case-insensitive as Select-String is, so the numbers are the old ones),
+  the exception count keeps its first 3 lines (the old sample), and the
+  TLS/SSL/login count gives its first line. The 3 sample lines are printed
+  whole as in 0.6.0; a new first line (per code, per pattern) is cut at 400
+  UTF-8 bytes on a character boundary with "(first N of M bytes)", and a
+  line already printed in the list is named instead. "last log line" (the
+  tail's last line) is gone; "newest agent log" gives its size and mtime.
+  Section D: a whatap.conf longer than the 400 lines shown also gets its
+  later lines that are not blank or `#` comments. Section G no longer
+  re-prints dbms, db_ip/db_port and whatap.server.host/port (whatap.conf is
+  in section D); an unset db_ip/db_port or whatap.server.host says so on
+  the probe line. Section B's title is "B. Component discovery". Run on
+  the lab host beside 0.6.0 under both PowerShells, elevated: 177 -> 172
+  lines; with a 210 kB log line, 237 kB -> 28 kB; every report passes
+  validate.sh --report (2026-09-27).
 - **0.6.0** — Section B gives, per SQL Server instance installed on this host,
   Version, PatchLevel and Edition from
   `HKLM\SOFTWARE\Microsoft\Microsoft SQL Server\<instance id>\Setup` (ids

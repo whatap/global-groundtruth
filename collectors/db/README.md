@@ -1,9 +1,9 @@
 # collectors/db — WhaTap DB-monitoring collector
 
-> **Status: v0 implemented** (2026-07-16; validated at `collect-db.sh` 0.1.x
-> on mock install trees and live PostgreSQL 16 / MySQL 8.4 — see "Verification
-> status"; the script's own `VERSION` is the current one; `collect-db-mssql.ps1`
-> validated at 0.6.0 on Windows Server 2022). Owned by the DB domain team once
+> **Status: v0 implemented** (2026-07-16; validated at `collect-db.sh` 0.9.0
+> on a mock install tree against live PostgreSQL 16 / MySQL 8.0 — see
+> "Verification status"; the script's own `VERSION` is the current one;
+> `collect-db-mssql.ps1` validated at 0.7.0 on Windows Server 2022). Owned by the DB domain team once
 > handed over (CONTRACT rule 4); until then managed by the Global team.
 > Scope grounded in a full read of #ext-db-모니터링-기술문의 (2025-04 → 2026-07,
 > ~282 field questions) plus deep-reads of the four longest support threads.
@@ -103,7 +103,7 @@ that cannot be written stops the run before it collects.
 ## Report sections and goals
 
 `collect-db.sh` sections, in emission order: `[1]` Collection environment,
-A. Host & platform, B. Component discovery & host role, C. Agent home
+A. Host & platform, B. Component discovery, C. Agent home
 inventory, D. Configuration (verbatim), E. Runtime processes, F. Agent logs,
 G. Topology & network, H. Engine-specific facts, I. XOS / DB-host side facts,
 J. SQL pack per instance, K. TLS handshake probe, then the opt-in L. SQL pack
@@ -132,9 +132,54 @@ jshell/jrunscript, a connect error, or an endpoint whose section G connect
 probe failed) is `missed`. Section K sends no handshake to an endpoint whose
 section G connect probe failed and says so; without openssl it says that.
 
-Reading the report: `db endpoint class` says whether `db_ip` is loopback, an
-address of this host, a DNS name, or none of this host's addresses; loopback
-or a local address means the DB is co-located with the agent. The ms after
+Reading the report: the collector prints raw output once and builds no view
+on it (CONTRACT rule 1, "Derived views"). `whatap.conf` is in section D
+verbatim, and sections G, H and K name only the target each probe used; to
+see whether the DB is co-located, compare `db_ip` in D with `local ip
+addresses` in G. A whatap.conf longer than the 400 lines D shows also gets
+its later lines that are not blank or `#` comments. Sections F and H print
+log lines with a count of what was read, not tables: over the newest agent
+log's last 5000 lines, per pattern `label (M lines): <first matching line>`
+(a `sample lines` pattern gives its first 3), and per WA code, in order of
+first appearance, `WA123 (M occurrences): <first line holding it>`; F then
+gives the last 200 lines verbatim, and H does the same for each instance's
+log with that engine's patterns (ORA and JDBC codes one line per code),
+naming the log with its `ls -l`. The 3 sample lines are printed whole; a
+first line per code or per pattern is cut at 400 bytes on a UTF-8 boundary ("(first N of M bytes)"), and a line already printed in the
+same list is named ("(the line shown for WA777)"). The labels and the extended regular expressions behind them (the
+Windows collector's F uses the .NET forms in its own rows):
+
+| Section / dbms | Label | Pattern |
+|---|---|---|
+| F | WA code lines (per code) | `[(]WA[0-9][0-9][0-9][)]` (Windows `\(WA\d{3}\)`) |
+| F | exception lines | `Exception\|SQLException\|Error:` (Windows `Exception\|SQLException`, first 3 lines) |
+| F (Linux) | exception sample lines (first 3) | `Exception\|SQLException` |
+| F | connection error lines | `CONNECTION ERROR\|openConnection error\|Communications link failure` |
+| F | activate/inactivate lines | `inactivated\|activated` |
+| F (Windows only) | TLS/SSL/login lines | `TLS\|SSL\|Login failed` |
+| H postgresql | PgStatements.process lines | `PgStatements[.]process` |
+| H postgresql | PgObject.process lines | `PgObject[.]process` |
+| H postgresql | timeout lines | `[Tt]imeout` |
+| H postgresql | pg_stat_statements missing-relation lines | `pg_stat_statements.*does not exist` |
+| H postgresql | authentication-type lines | `authentication type .* not supported` |
+| H mysql/mariadb | WA310 lines | `WA310` |
+| H mysql/mariadb | denied/permission lines | `command denied\|Access denied` |
+| H mysql/mariadb | sys.innodb_lock_waits lines | `innodb_lock_waits` |
+| H mysql/mariadb | replication warning lines | `Replication may have been broken\|replication` |
+| H oracle | ORA code lines (per code) | `ORA-[0-9]+` |
+| H oracle | timeout lines | `[Tt]ime[d]? out\|ORA-01013` |
+| H mssql | TLS/SSL negotiation lines | `TLS\|SSL\|encrypt` |
+| H mssql | login/permission lines | `Login failed\|permission` |
+| H tibero | JDBC code lines (per code) | `JDBC-[0-9]+` |
+| H tibero | read-timeout / connection-closed lines | `Read time.?out\|Connection closed` |
+| H redis/valkey | jedis/pool error lines | `Jedis\|resource from the pool\|SocketTimeout` |
+| H mongo* | mongo timeout/format lines | `MongoTimeout\|numberFormatException` |
+| H cloud_watch / aws_arn set | AWS credential/role lines | `AssumeRole\|sts\|security token\|expired` |
+| H cloud_watch / aws_arn set | AWS credential/role sample lines (first 3) | `AssumeRole\|sts\|security token.*expired` |
+| I | lines with SQLSTATE prefix '00000:' | `00000:` |
+| I | lines containing bytes outside printable ASCII | `[^ -~]` (C locale) |
+
+The ms after
 each section G `tcp connect` is the wall time of one bounded child bash that
 opens the socket. Process start dominates it (about 10-130 ms measured to a
 same-host container whose network round trip is under 1 ms), so it is not a
@@ -171,8 +216,8 @@ live in four different places — the collector puts them side by side:
 
 | # | Fact | Where it lives | Collected by |
 |---|---|---|---|
-| 1 | what the DB requires/offers (TLS versions, cert, `require_secure_transport`/`ssl`) | DB server | section K handshake probe (openssl s_client, `-starttls mysql/postgres`; server TLS version, cipher, key size, cert dates + signature algorithm) + SQL pack server variables |
-| 2 | what the agent requests | `whatap.conf` | `connect_option` verbatim + key-name breakdown (misspelled keys are silently ignored by drivers — the raw spelling IS the fact), `db_ssl` |
+| 1 | what the DB requires/offers (TLS versions, cert, `require_secure_transport`/`ssl`) | DB server | section K handshake probe (openssl s_client, `-starttls mysql/postgres`: its protocol, cipher, key size, verify lines verbatim, and openssl x509 subject, issuer, dates, sha256 fingerprint, SAN and signature algorithm per chain certificate) + SQL pack server variables |
+| 2 | what the agent requests | `whatap.conf` | `connect_option` and `db_ssl` in section D verbatim (misspelled keys are silently ignored by drivers — the raw spelling IS the fact) |
 | 3 | what the runtime permits | agent-host JDK + driver | `jdk.tls.disabledAlgorithms` from the runtime's `java.security` (per discovered java), JDBC driver jar name/version (defaults flip across versions) |
 | 4 | what actually gets negotiated | the live session | SQL pack `[6b]`/`[3b]`: `pg_stat_ssl` / `Ssl_version` for THIS session — and since `--sql` reuses the agent's own `connect_option`, this measures the agent's negotiation, not an approximation |
 
@@ -188,10 +233,22 @@ each; at MySQL `log_error_verbosity=3` one `Got an error reading
 communication packets` note each; MySQL `Aborted_connects` +1 each, and the
 handshake also adds 1 to `Ssl_accepts` / `Ssl_finished_accepts`; nothing in
 the MySQL general log for either. A run therefore opens two connections per
-TLS-probeable instance. A server that negotiates no TLS (PostgreSQL
-`ssl=off`, MySQL without TLS) is reported as `session: none negotiated`
-with openssl's own message; the verification lines openssl prints without a
-certificate are left out. Not probeable this way: MSSQL (TLS inside TDS
+TLS-probeable instance. Since 0.9.0 nothing is parsed out of the s_client
+output: all of it (stdout and stderr) is printed verbatim but for the PEM
+blocks and the per-connection random values (session ticket hex dump,
+Session-ID, Session-ID-ctx, Master-Key, Resumption PSK, Start Time), openssl's own reasons included ("MySQL server does not support
+SSL.", or the usage text of an openssl such as 1.0.2 or LibreSSL that
+refuses `-starttls postgres`); an output identical to one printed for an
+instance above is named instead. Each certificate of the chain (`-showcerts`) is given by `openssl x509 -noout
+-subject -issuer -dates -fingerprint -sha256 -ext subjectAltName -text
+-certopt ...` (the -certopt list leaves only the signature algorithm line
+of -text; an openssl whose x509 refuses `-ext` is run without it and
+prints every extension), output raw. The Windows collector's F patterns
+are case-insensitive (as Select-String was); the shell's are not. A session exists only where openssl
+names a protocol and a cipher (`New, TLSv1.3, Cipher is ...`); against a
+server that negotiates no TLS
+(PostgreSQL `ssl=off`, MySQL without TLS) openssl can still print
+`Verify return code: 0 (ok)` with no certificate. Not probeable this way: MSSQL (TLS inside TDS
 prelogin) and Oracle TCPS — noted as reasoned absence.
 
 Collection-server-side facts (server version, metrics categories) belong to
@@ -206,6 +263,26 @@ Collection-server-side facts (server version, metrics categories) belong to
   co-located / remote / AWS-endpoint topologies, engine dispatch for
   postgresql·oracle·mysql, WA-code histogram, XOS slow-query file cross-check
   (SQLSTATE `00000:` prefix and non-ASCII locale detection).
+- 0.9.0 (derived views removed) ran beside 0.8.4 on 2026-09-27 as root on
+  the lab docker VM (jjsong-ggt-docker, Ubuntu 24.04, OpenSSL 3.0.13), with
+  `--home` on a mock tree (a 6000-line agent log with WA/ORA/AWS lines before
+  the tail, an instance log of 122 lines, instances for mysql → the
+  jjsong-ggt-mysql-primary fixture 8.0.46, postgresql → jjsong-ggt-postgres
+  16.15 with `ssl=on`, oracle → an unresolvable RDS name, an xos.conf
+  slow-query file), and under `bash:3.2` (busybox awk, no openssl). A
+  second run added a 210 kB log line, a 427-line whatap.conf, 17 newer
+  files in the log dir, MariaDB 10.11 without TLS, PostgreSQL with
+  `ssl=off`, MySQL 5.7, and the images `jjsong-ggt-dbv-ossl102:1` (OpenSSL
+  1.0.2g, mawk) and `jjsong-ggt-dbv-libressl:1` (LibreSSL 3.7.3, busybox):
+  per-code occurrences and line counts equal the 0.8.4 numbers, the F
+  pattern lines are the same under gawk, mawk and busybox awk, the long line
+  is cut on a UTF-8 boundary, D gives the keys after line 400, and K prints
+  openssl's own reason or usage text (once per identical output). Every
+  code the 0.8.4 histograms named (WA111, WA310, WA777, WA888 on one line;
+  ORA-01013, ORA-12170) is printed with its line count and first line; the
+  MySQL handshake gives both chain certificates (server and CA) and the
+  PostgreSQL one its self-signed certificate through openssl x509; both
+  reports pass `validate.sh --report`. `--sql` was not run (no java on that host).
 - The TLS probe (then `--tls`) ran against a live SSL-enabled PostgreSQL 16 (self-signed cert:
   TLSv1.3/cipher/2048-bit key, cert dates, sha256 signature, verify-code 18
   all captured) and MySQL 8.4 (auto-generated cert captured); session-TLS
@@ -221,7 +298,7 @@ Collection-server-side facts (server version, metrics categories) belong to
   `oracle.sql` and `windows/mssql.sql` are syntax-reviewed only — first field
   runs double as their validation. The Nashorn (JDK 8 jrunscript) runner path
   is untested on a live JDK 8.
-- `collect-db-mssql.ps1`: validated at 0.6.0 (0.5.0 first) on Windows Server 2022 Standard
+- `collect-db-mssql.ps1`: validated at 0.7.0 (0.5.0 first) on Windows Server 2022 Standard
   Evaluation 10.0.20348 (lab VM jjsong-ggt-win) under Windows PowerShell
   5.1.20348.558 and pwsh 7.6.6, 2026-09-26: SQL Server 2022 Express
   16.0.1000.6 with two instances (`SQLEXPRESS` on 1433, `DBX2` on 14330) and
@@ -242,6 +319,15 @@ Collection-server-side facts (server version, metrics categories) belong to
   (`Version=16.0.1000.6 PatchLevel=16.0.1000.6 Edition=Express Edition`,
   sqlservr.exe `FileVersion=2022.0160.1000.06 ((SQL22_RTM).221008-0913)`,
   32-bit view `none`); every report passes `validate.sh --report`.
+  0.7.0 (2026-09-27, same host) was run beside 0.6.0 under both PowerShells,
+  elevated: the differences are the removed lines and the new section F
+  pattern lines. With an extra `-AgentHome` (a 702-line log holding
+  `(wa310)` in lower case, `(WA999)(WA999)` on one line and a 210 kB line;
+  a 426-line whatap.conf with db_ip/db_port after line 400) the per-code
+  occurrences equal the 0.6.0 histogram (140, 70, 70, 2, 1) and the
+  exception count its 142, the long line is cut at 400 bytes, and D gives
+  the two keys past line 400; identical under both PowerShells. Every
+  report passes `validate.sh --report`.
 - `windows/mssql.sql` ran against both instances through `sqlcmd -S
   localhost,<port> -E -i mssql.sql` as a sysadmin and as a Windows login
   holding only VIEW SERVER STATE and VIEW ANY DEFINITION: every batch ran
@@ -260,10 +346,10 @@ Collection-server-side facts (server version, metrics categories) belong to
 Configuration and logs are quoted verbatim (framework policy: no masking). A
 secret can arrive from:
 
-- **`whatap.conf`** (section D, and key lines in G/H): the license key,
+- **`whatap.conf`** (section D): the license key,
   `db_user`, `aws_access_key` / **`aws_secret_key`**, `aws_arn`, and
-  `connect_option`, which is printed verbatim in section G and as part of the
-  JDBC URL in section L; a driver option string can carry `password=` or a
+  `connect_option`, which is also printed as part of the JDBC URL in
+  section L; a driver option string can carry `password=` or a
   keystore password.
 - **`dbx.conf`, `prx.conf`, dbxc `config.yaml`, `xos.conf`** (sections D and
   I), dumped verbatim.
@@ -271,17 +357,23 @@ secret can arrive from:
   agent or the DB server was started with.
 - **Cron entries** (section E): lines of `/etc/crontab` and `/etc/cron.d/*`
   that mention whatap, which can carry credentials passed to a job.
-- **Agent logs** (section F, a 200-line tail and samples) and the
-  **slow-query file** named by `xos.conf` (section I, last 3 lines): SQL text
-  and bind values as the DB logged them.
+- **Agent logs** (section F, a 200-line tail and the first 1 or 3 matching
+  lines per pattern and the first line per WA code from the last 5000,
+  first lines cut at 400 bytes, samples whole; section H, the same per instance log) and the
+  **slow-query file** named by `xos.conf` (section I, last 3 lines and the
+  first matching line per pattern from the last 200): SQL text and bind
+  values as the DB logged them.
 - **SQL pack output** (section L): result rows of the monitoring views,
   including session and query text.
-- **Server certificates** (section K): subject and issuer of the certificate
-  each DB endpoint presents, which name hosts and the organisation.
+- **Server certificates** (section K): subject, issuer and SAN of each
+  certificate in the chain each DB endpoint presents, which name hosts and
+  the organisation.
 - **Credentials for `--sql`** are not printed (the user name is). They reach
   the JDBC runner through its environment only, never its command line.
 
 Windows (`collect-db-mssql.ps1`): `whatap.conf` verbatim, agent process command
 lines (first 180 characters), `sqlservr` command lines, the path and account of
 services named whatap/dbx, the names of scheduled tasks named whatap/dbx, and
-the agent log tail.
+the agent log tail with the first matching lines per pattern and per WA code
+from the last 5000 lines (first lines cut at 400 bytes, the 3 exception
+sample lines whole).

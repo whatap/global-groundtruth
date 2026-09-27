@@ -28,7 +28,7 @@ export LC_ALL=C
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-db"
 # History: CHANGELOG.md, section collect-db.sh (next to this file).
-VERSION="0.8.4"
+VERSION="0.9.0"
 DOMAIN="db"
 TARGET="db-host/$(hostname 2>/dev/null || echo unknown)"
 
@@ -128,8 +128,8 @@ explicit action flag so nothing starts by accident.
                                     (repeatable; useful when no agent process is running)
 
 Every run also sends one TLS handshake (openssl s_client) to each instance's
-DB endpoint whose TCP connect succeeded: server TLS version, cipher,
-certificate dates/signature (section K).
+DB endpoint whose TCP connect succeeded; its output is printed verbatim,
+server certificate included (section K).
 
   Tier 2 (opt-in — announced on stderr before anything is sent):
   $(basename "$0") --file --sql   run the read-only SQL pack over JDBC using the
@@ -767,6 +767,13 @@ dump_file() {
     total="$(_bounded wc -l "$path" 2>/dev/null | awk '{print $1}')"
     fact "$label (verbatim, $total lines$( [ "${total:-0}" -gt "$max" ] && printf ', first %s shown' "$max" )):"
     _bounded head -n "$max" "$path" 2>/dev/null | _indent '        '
+    # past the cap, every line that can set a key: not blank, not a # comment
+    if [ "${total:-0}" -gt "$max" ]; then
+        local rest
+        rest="$(_bounded awk -v m="$max" 'NR > m && !/^[[:space:]]*(#|$)/ { print NR ": " $0 }' "$path" 2>/dev/null)"
+        if [ -n "$rest" ]; then fact "$label, lines after line $max that are not blank or # comments (line: text):"; printf '%s\n' "$rest" | _indent '        '
+        else fact "$label, lines after line $max that are not blank or # comments: none"; fi
+    fi
 }
 
 # conf_get VAR FILE KEY -> sets VAR to the value of the last non-comment
@@ -1383,28 +1390,79 @@ _rtt_split() {
 
 # ---- log window helpers --------------------------------------------------------
 LOG_TAIL_LINES=200      # verbatim tail of the newest agent log
-LOG_SCAN_LINES=5000     # bounded window for pattern counting (never whole logs)
+LOG_SCAN_LINES=5000     # bounded window the pattern lines are taken from (never whole logs)
 _logwin=""              # set by _init_probe, inside the run's private directory
 
 newest_matching() { # DIR GLOB -> newest matching file path (mtime), or empty
     _bounded ls -1t "$1"/$2 2>/dev/null | head -n1
 }
 
-load_logwin() { # FILE -> fills $_logwin with its last LOG_SCAN_LINES lines
+load_logwin() { # FILE [LINES] -> fills $_logwin with its last LINES (LOG_SCAN_LINES) lines
     : > "$_logwin" 2>/dev/null
-    [ -n "$1" ] && [ -r "$1" ] && _bounded tail -n "$LOG_SCAN_LINES" "$1" > "$_logwin" 2>/dev/null
+    [ -n "$1" ] && [ -r "$1" ] && _bounded tail -n "${2:-$LOG_SCAN_LINES}" "$1" > "$_logwin" 2>/dev/null
 }
 
-count_in_win() { # LABEL ERE
-    local n
-    n="$(grep -cE "$2" "$_logwin" 2>/dev/null)"
-    fact "$1: ${n:-0} line(s) in last $LOG_SCAN_LINES log lines"
-}
-
-sample_in_win() { # LABEL ERE [N] -> first N matching lines, verbatim
-    local out
-    out="$(grep -E "$2" "$_logwin" 2>/dev/null | head -n "${3:-3}")"
-    if [ -n "$out" ]; then _emit_labeled "$1 (sample)" "$out"; else fact "$1 (sample): n/a (no matching lines)"; fi
+# log_lines SCOPE SPEC -> for each "LABEL<tab>ERE[<tab>MODE]" line of SPEC,
+# what $_logwin holds that matches ERE: with MODE a number N (default 1) the
+# number of matching lines and the first N of them; with MODE "code" the
+# number of ERE matches (occurrences, as grep -o counts them) and, per
+# distinct match (a WA/ORA/JDBC code) in order of first appearance, its
+# occurrences and the first line holding it. Such a first line is cut at
+# LOG_LINE_BYTES on a UTF-8 boundary, and one already printed in this call
+# is named instead of printed again; the N sample lines (N > 1, the 0.8.4
+# samples) are printed whole. One awk pass for the whole SPEC.
+LOG_LINE_BYTES=400
+log_lines() {
+    _LL_SPEC="$2" LC_ALL=C awk -v scope="$1" -v cap="$LOG_LINE_BYTES" '
+        function cut(l,   s) {
+            if (length(l) <= cap) return l
+            s = substr(l, 1, cap)
+            while (length(s) > 0 && substr(l, length(s) + 1, 1) ~ cont) s = substr(s, 1, length(s) - 1)
+            return s " (first " length(s) " of " length(l) " bytes)"
+        }
+        function show(l, tag) {
+            if (l in shown) return "(the line shown for " shown[l] ")"
+            shown[l] = tag
+            return cut(l)
+        }
+        BEGIN {
+            cont = "^[\200-\277]$"
+            ng = split(ENVIRON["_LL_SPEC"], s, "\n")
+            for (i = 1; i <= ng; i++) {
+                split(s[i], f, "\t"); lab[i] = f[1]; re[i] = f[2]; md[i] = f[3]
+                if (md[i] == "") md[i] = 1
+            }
+        }
+        {
+            t++
+            for (i = 1; i <= ng; i++) {
+                if ($0 !~ re[i]) continue
+                if (md[i] == "code") {
+                    r = $0
+                    while (match(r, re[i])) {
+                        v = substr(r, RSTART, RLENGTH); r = substr(r, RSTART + RLENGTH)
+                        gsub(/[()]/, "", v); k = i SUBSEP v
+                        if (!(k in n1)) { cd[i, ++nc[i]] = v; l1[k] = $0 }
+                        n1[k]++; c[i]++
+                    }
+                } else if (++c[i] <= md[i]) o[i, c[i]] = $0
+            }
+        }
+        END {
+            printf "    lines read for the patterns below: %d (%s)\n", t, scope
+            for (i = 1; i <= ng; i++) {
+                if (!c[i]) { printf "    %s: none\n", lab[i]; continue }
+                if (md[i] == "code") {
+                    printf "    %s (%d occurrences); per code, its occurrences and the first line holding it:\n", lab[i], c[i]
+                    for (j = 1; j <= nc[i]; j++) { v = cd[i, j]; printf "        %s (%d occurrences): %s\n", v, n1[i SUBSEP v], show(l1[i SUBSEP v], v) }
+                } else if (md[i] == 1) printf "    %s (%d lines): %s\n", lab[i], c[i], show(o[i, 1], lab[i])
+                else {
+                    n = (c[i] < md[i]) ? c[i] : md[i]
+                    printf "    %s (%d lines), first %d:\n", lab[i], c[i], n
+                    for (j = 1; j <= n; j++) printf "        %s\n", o[i, j]
+                }
+            }
+        }' "$_logwin" 2>/dev/null
 }
 
 # ---- report body ----------------------------------------------------------------
@@ -1455,9 +1513,9 @@ _rep_host() {
     if have java; then java_tls_policy "java on PATH security file" "$(command -v java)"; fi
 }
 
-# B. discovery result and host role
+# B. discovery result
 _rep_discovery() {
-    section "B. Component discovery & host role"
+    section "B. Component discovery"
     local i n_dbx n_dmx n_prx n_xos n_xcub n_dbxc
     n_dbx="$(_count_kind dbx)"; n_dmx="$(_count_kind dmx)"; n_prx="$(_count_kind prx)"
     n_xos="$(_count_kind xos)"; n_xcub="$(_count_kind xcub)"; n_dbxc="$(_count_kind dbxc)"
@@ -1474,11 +1532,6 @@ _rep_discovery() {
         fact "db process: pid=${DBP_PIDS[$i]} engine=${DBP_KINDS[$i]} comm=$(cat "/proc/${DBP_PIDS[$i]}/comm" 2>/dev/null || echo n/a)"
         i=$((i + 1))
     done
-    # role statement, derived only from what was found
-    local role_agent="no" role_dbhost="no"
-    [ $((n_dbx + n_dmx + n_prx + n_dbxc)) -gt 0 ] && role_agent="yes"
-    { [ $((n_xos + n_xcub)) -gt 0 ] || [ "${#DBP_PIDS[@]}" -gt 0 ]; } && role_dbhost="yes"
-    fact "host role by discovery: dbx-agent-side=$role_agent db-host-side=$role_dbhost"
     if [ -n "$UNRES_HOME" ]; then
         fact "install dir of process(es) $UNRES_HOME: n/a ($UNRES_WHY)"
     fi
@@ -1521,8 +1574,6 @@ _rep_inventory() {
         else fact "whatap component files: n/a (no whatap.agent.* under $h at depth 1)"; fi
         if [ -d "$h/jdbc" ]; then
             probe "jdbc drivers" ls -1 "$h/jdbc"
-            if _has_glob "$h/jdbc"/orai18n*; then fact "orai18n jar: present in jdbc/"
-            else fact "orai18n jar: not present in jdbc/"; fi
         else
             fact "jdbc drivers: n/a (path not found: $h/jdbc)"
         fi
@@ -1630,26 +1681,22 @@ _rep_logs() {
         probe "log files (newest 15)" sh -c 'ls -lt "$1" 2>/dev/null | head -n 16' sh "$ldir"
         local nlog; nlog="$(newest_matching "$ldir" 'whatap*.log')"
         if [ -n "$nlog" ]; then
-            fact "newest agent log: $nlog"
-            fact "newest agent log mtime: $(_bounded ls -l "$nlog" 2>/dev/null | awk '{print $6" "$7" "$8}')"
-            fact "last log line (verbatim): $(_bounded tail -n1 "$nlog" 2>/dev/null | cut -c1-200)"
+            probe "newest agent log (ls -l)" ls -l "$nlog"
             fact "system time at collection: $(date '+%Y-%m-%d %H:%M:%S %Z(%z)' 2>/dev/null)"
             load_logwin "$nlog"
-            local wa
-            wa="$(grep -oE '\(WA[0-9]{3}\)' "$_logwin" 2>/dev/null | sort | uniq -c | sort -rn | head -n 15)"
-            if [ -n "$wa" ]; then _emit_labeled "WA code histogram (last $LOG_SCAN_LINES lines)" "$wa"
-            else fact "WA code histogram: n/a (no WA codes in last $LOG_SCAN_LINES lines)"; fi
-            count_in_win "exception lines" 'Exception|SQLException|Error:'
-            sample_in_win "exception lines" 'Exception|SQLException' 3
-            count_in_win "connection error lines" 'CONNECTION ERROR|openConnection error|Communications link failure'
-            count_in_win "activate/inactivate transitions" 'inactivated|activated'
+            log_lines "the last $LOG_SCAN_LINES lines of the log; the last $LOG_TAIL_LINES of them follow verbatim" \
+"WA codes	[(]WA[0-9][0-9][0-9][)]	code
+exception lines	Exception|SQLException|Error:
+exception sample lines	Exception|SQLException	3
+connection error lines	CONNECTION ERROR|openConnection error|Communications link failure
+activate/inactivate lines	inactivated|activated"
             subsection "verbatim tail ($LOG_TAIL_LINES lines): $nlog"
-            _bounded tail -n "$LOG_TAIL_LINES" "$nlog" 2>/dev/null | _indent '        '
+            tail -n "$LOG_TAIL_LINES" "$_logwin" 2>/dev/null | _indent '        '
         fi
         local plog; plog="$(newest_matching "$ldir" 'prx*.log')"
         if [ -n "$plog" ]; then
             subsection "oracle-pro prx log: $plog"
-            fact "prx log mtime: $(_bounded ls -l "$plog" 2>/dev/null | awk '{print $6" "$7" "$8}')"
+            probe "prx log (ls -l)" ls -l "$plog"
             probe "prx rss / restart lines (last 30 matches)" sh -c 'tail -n "$2" "$1" 2>/dev/null | grep -iE "rss|restart|start" | tail -n 30 | grep . || echo none' sh "$plog" "$LOG_SCAN_LINES"
         fi
         i=$((i + 1))
@@ -1671,66 +1718,34 @@ _rep_network() {
     while [ "$i" -lt "${#INST_DIRS[@]}" ]; do
         local idir="${INST_DIRS[$i]}" cf="${INST_DIRS[$i]}/whatap.conf"
         subsection "instance: $idir"
-        local dbms dbip dbport whost wport
-        conf_get dbms "$cf" dbms
+        # the keys are in section D (verbatim); each probe line names its target
+        local dbip dbport whost wport
         conf_get dbip "$cf" db_ip
         conf_get dbport "$cf" db_port
         conf_get whost "$cf" 'whatap\.server\.host'
         conf_get wport "$cf" 'whatap\.server\.port'
-        fact "dbms: ${dbms:-n/a (key not set in whatap.conf)}"
-        fact "db_ip: ${dbip:-n/a (key not set)}   db_port: ${dbport:-n/a (key not set)}"
-        fact "whatap.server.host: ${whost:-n/a (key not set)}   whatap.server.port: ${wport:-not set (the connect probe below uses 6600)}"
-        # connection options, verbatim + key names split out — misspelled keys
-        # are silently ignored by JDBC drivers, so the raw spelling is the fact
-        local copt3 dbssl3
-        conf_get copt3 "$cf" connect_option
-        conf_get dbssl3 "$cf" db_ssl
-        if [ -n "$copt3" ]; then
-            fact "connect_option (verbatim): $copt3"
-            fact "connect_option keys: $(printf '%s' "${copt3#\?}" | tr '&' '\n' | cut -d= -f1 | tr '\n' ',' | sed 's/,$//;s/,/, /g')"
-        else
-            fact "connect_option: not set"
-        fi
-        [ -n "$dbssl3" ] && fact "db_ssl: $dbssl3"
-        # classify db_ip: loopback / one of this host's addresses / remote / DNS name
-        if [ -n "$dbip" ]; then
-            case "$dbip" in
-                127.*|localhost|::1)
-                    fact "db endpoint class: loopback" ;;
-                *[a-zA-Z]*)
-                    fact "db endpoint class: DNS name"
-                    probe "db endpoint resolution" getent hosts "$dbip"
-                    case "$dbip" in
-                        *rds.amazonaws.com|*docdb.amazonaws.com|*cache.amazonaws.com|*redshift.amazonaws.com)
-                            fact "db endpoint domain: AWS managed endpoint pattern ($dbip)" ;;
-                        *database.azure.com|*windows.net)
-                            fact "db endpoint domain: Azure managed endpoint pattern ($dbip)" ;;
-                        *rds.aliyuncs.com|*ncloud.com|*ntruss.com)
-                            fact "db endpoint domain: managed-cloud endpoint pattern ($dbip)" ;;
-                    esac ;;
-                *)
-                    if [ -n "$myips" ] && printf '%s' " $myips " | grep -q " $dbip "; then
-                        fact "db endpoint class: an address of this host"
-                    else
-                        fact "db endpoint class: not an address of this host"
-                    fi ;;
-            esac
-            tcp_probe "db reachability" "$dbip" "${dbport:-}"
-        fi
+        case "$dbip" in
+            localhost)  ;;
+            *[a-zA-Z]*) probe "db endpoint resolution" getent hosts "$dbip" ;;
+        esac
+        tcp_probe "db reachability" "$dbip" "${dbport:-}"
         if [ -n "$whost" ]; then
             local wh
             for wh in $(printf '%s' "$whost" | tr '/,' '  '); do
                 tcp_probe "collection server reachability" "$wh" "${wport:-6600}"
             done
+        else
+            fact "collection server reachability: n/a (not applicable: whatap.server.host not set)"
         fi
         i=$((i + 1))
     done
     fact "proxy env: http_proxy=${http_proxy:-unset} https_proxy=${https_proxy:-unset} no_proxy=${no_proxy:-unset}"
 }
 
-# H. engine-specific facts, driven by dbms= of each instance
+# H. engine-specific log lines, driven by dbms= of each instance: verbatim
+# lines of the instance's newest agent log that match that engine's patterns
 _rep_engine() {
-    local i
+    local i seen="" spec
     section "H. Engine-specific facts (per instance)"
     if [ "${#INST_DIRS[@]}" -eq 0 ]; then
         fact "n/a (no instance dir discovered)"
@@ -1741,95 +1756,59 @@ _rep_engine() {
         local dbms nlog2 ldir2=""
         conf_get dbms "$cf" dbms
         subsection "instance: $idir (dbms=${dbms:-unset})"
-        # engine-relevant conf keys, verbatim lines (value + spelling as-is)
-        # grep exit 1 (no line) is "none"; exit 2 (unreadable) stays an error
-        probe "engine-relevant conf lines" sh -c 'grep -E "^[[:space:]]*(statements|statements_min_row|min_row|slow_query_log|connect_option|db_ssl|metalock|deadlock_interval|conn_fail_count|replication_name|skip_user|skip_whatap_session|cloud_watch|cloud_watch_metrics|cloud_watch_instance|aws_arn|aws_access_key|aws_secret_key|redis_autoscale|mslog|oname|whatap\.name|db=|db_user|plan_db|xos=|xos_port)" "$1"; r=$?; [ "$r" = 1 ] && { echo none; exit 0; }; exit "$r"' sh "$cf"
-        # locate this instance's log window (instance logs/ first, then home)
-        for ldir2 in "$idir/logs" "$idir" "$(dirname "$idir")/logs"; do
-            _has_glob "$ldir2"/whatap*.log && break
-            ldir2=""
-        done
-        nlog2=""
-        [ -n "$ldir2" ] && nlog2="$(newest_matching "$ldir2" 'whatap*.log')"
-        if [ -n "$nlog2" ]; then load_logwin "$nlog2"; else : > "$_logwin" 2>/dev/null; fi
+        spec=""
         case "$dbms" in
-            postgres*|pg)
-                count_in_win "PgStatements.process lines" 'PgStatements\.process'
-                count_in_win "PgObject.process lines" 'PgObject\.process'
-                count_in_win "timeout lines" '[Tt]imeout'
-                count_in_win "pg_stat_statements missing-relation lines" 'pg_stat_statements.*does not exist'
-                count_in_win "authentication-type lines" 'authentication type .* not supported'
-                ;;
-            mysql|mariadb)
-                count_in_win "WA310 lines" 'WA310'
-                count_in_win "denied/permission lines" 'command denied|Access denied'
-                count_in_win "sys.innodb_lock_waits lines" 'innodb_lock_waits'
-                count_in_win "replication warning lines" 'Replication may have been broken|replication'
-                ;;
-            oracle)
-                local oh
-                oh="$(grep -oE 'ORA-[0-9]+' "$_logwin" 2>/dev/null | sort | uniq -c | sort -rn | head -n 10)"
-                if [ -n "$oh" ]; then _emit_labeled "ORA code histogram (last $LOG_SCAN_LINES lines)" "$oh"
-                else fact "ORA code histogram: n/a (no ORA codes in window)"; fi
-                count_in_win "timeout lines" '[Tt]ime[d]? out|ORA-01013'
-                ;;
-            mssql)
-                count_in_win "TLS/SSL negotiation lines" 'TLS|SSL|encrypt'
-                count_in_win "login/permission lines" 'Login failed|permission'
-                ;;
-            tibero)
-                local th
-                th="$(grep -oE 'JDBC-[0-9]+' "$_logwin" 2>/dev/null | sort | uniq -c | sort -rn | head -n 10)"
-                if [ -n "$th" ]; then _emit_labeled "JDBC code histogram (last $LOG_SCAN_LINES lines)" "$th"
-                else fact "JDBC code histogram: n/a (no JDBC codes in window)"; fi
-                count_in_win "read-timeout / connection-closed lines" 'Read time.?out|Connection closed'
-                ;;
-            redis|valkey)
-                count_in_win "jedis/pool error lines" 'Jedis|resource from the pool|SocketTimeout'
-                ;;
-            mongo*)
-                count_in_win "mongo timeout/format lines" 'MongoTimeout|numberFormatException'
-                ;;
-            cubrid)
-                fact "engine-specific facts: none collected for dbms=cubrid"
-                ;;
-            "")
-                fact "engine-specific facts: n/a (dbms key not set in whatap.conf)"
-                ;;
-            *)
-                fact "engine-specific facts: none collected for dbms=$dbms"
-                ;;
+            postgres*|pg) spec="PgStatements.process lines	PgStatements[.]process
+PgObject.process lines	PgObject[.]process
+timeout lines	[Tt]imeout
+pg_stat_statements missing-relation lines	pg_stat_statements.*does not exist
+authentication-type lines	authentication type .* not supported" ;;
+            mysql|mariadb) spec="WA310 lines	WA310
+denied/permission lines	command denied|Access denied
+sys.innodb_lock_waits lines	innodb_lock_waits
+replication warning lines	Replication may have been broken|replication" ;;
+            oracle) spec="ORA codes	ORA-[0-9]+	code
+timeout lines	[Tt]ime[d]? out|ORA-01013" ;;
+            mssql) spec="TLS/SSL negotiation lines	TLS|SSL|encrypt
+login/permission lines	Login failed|permission" ;;
+            tibero) spec="JDBC codes	JDBC-[0-9]+	code
+read-timeout / connection-closed lines	Read time.?out|Connection closed" ;;
+            redis|valkey) spec="jedis/pool error lines	Jedis|resource from the pool|SocketTimeout" ;;
+            mongo*) spec="mongo timeout/format lines	MongoTimeout|numberFormatException" ;;
+            cubrid) fact "engine-specific facts: none collected for dbms=cubrid" ;;
+            "")     fact "engine-specific facts: n/a (dbms key not set in whatap.conf)" ;;
+            *)      fact "engine-specific facts: none collected for dbms=$dbms" ;;
         esac
         # cloud overlay: CloudWatch / IAM traces regardless of engine
         local cw arn
         conf_get cw "$cf" cloud_watch
         arn=""; [ -n "$cw" ] || conf_get arn "$cf" aws_arn
         if [ -n "$cw" ] || [ -n "$arn" ]; then
-            count_in_win "AWS credential/role lines" 'AssumeRole|sts|security token|expired'
-            sample_in_win "AWS credential/role lines" 'AssumeRole|sts|security token.*expired' 3
+            spec="${spec:+$spec$_nl}AWS credential/role lines	AssumeRole|sts|security token|expired
+AWS credential/role sample lines	AssumeRole|sts|security token.*expired	3"
         fi
+        if [ -z "$spec" ]; then i=$((i + 1)); continue; fi
+        # this instance's newest log: instance logs/ first, then the home's
+        for ldir2 in "$idir/logs" "$idir" "$(dirname "$idir")/logs"; do
+            _has_glob "$ldir2"/whatap*.log && break
+            ldir2=""
+        done
+        nlog2=""
+        [ -n "$ldir2" ] && nlog2="$(newest_matching "$ldir2" 'whatap*.log')"
+        if [ -z "$nlog2" ]; then
+            fact "agent log: n/a (no whatap*.log in $idir/logs, $idir or $(dirname "$idir")/logs)"
+            i=$((i + 1)); continue
+        fi
+        probe "agent log (ls -l)" ls -l "$nlog2"
+        case "$seen" in
+            *"|$nlog2 $spec|"*) fact "log lines: as printed for an instance above (same log, same patterns)"
+                                i=$((i + 1)); continue ;;
+        esac
+        seen="$seen|$nlog2 $spec|"
+        load_logwin "$nlog2"
+        log_lines "the last $LOG_SCAN_LINES lines of the log" "$spec"
         i=$((i + 1))
     done
-    # oracle-pro watchdog pair (dmx/prx) — process-level, not per instance
-    if [ "$(_count_kind dmx)" -gt 0 ] || [ "$(_count_kind prx)" -gt 0 ]; then
-        subsection "oracle-pro dmx/prx pair"
-        i=0
-        while [ "$i" -lt "${#AG_PIDS[@]}" ]; do
-            case "${AG_KINDS[$i]}" in
-                dmx|prx) probe "${AG_KINDS[$i]} rss/etime" ps -o pid=,rss=,etime=,args= -p "${AG_PIDS[$i]}" ;;
-            esac
-            i=$((i + 1))
-        done
-        local rl
-        i=0
-        while [ "$i" -lt "${#HOME_DIRS[@]}" ]; do
-            if [ -f "${HOME_DIRS[$i]}/prx.conf" ]; then
-                conf_get rl "${HOME_DIRS[$i]}/prx.conf" rss_limit
-                fact "prx.conf rss_limit: $rl"
-            fi
-            i=$((i + 1))
-        done
-    fi
 }
 
 # I. XOS / DB-host side: only when this host runs the DB or XOS
@@ -1854,9 +1833,13 @@ _rep_xos() {
                 fact "slow_query target: $sq"
                 if [ -r "$sq" ]; then
                     fact "slow_query target file: readable ($(_bounded ls -l "$sq" 2>/dev/null | awk '{print $5" bytes, mtime "$6" "$7" "$8}'))"
-                    probe "slow_query target last 3 lines (verbatim)" tail -n 3 "$sq"
-                    fact "lines with SQLSTATE prefix '00000:' in last 200: $(_bounded tail -n 200 "$sq" 2>/dev/null | grep -c '00000:' 2>/dev/null)"
-                    fact "lines containing non-ASCII bytes in last 200: $(_bounded tail -n 200 "$sq" 2>/dev/null | grep -c '[^ -~]' 2>/dev/null)"
+                    load_logwin "$sq" 200
+                    local sq3; sq3="$(tail -n 3 "$_logwin" 2>/dev/null)"
+                    if [ -n "$sq3" ]; then _emit_labeled "slow_query target last 3 lines (verbatim)" "$sq3"
+                    else fact "slow_query target last 3 lines (verbatim): n/a (empty output)"; fi
+                    log_lines "the last 200 lines of the file" \
+"lines with SQLSTATE prefix '00000:'	00000:
+lines containing bytes outside printable ASCII	[^ -~]"
                 elif [ -e "$sq" ]; then
                     fact "slow_query target file: n/a (permission denied: $sq)"
                 else
@@ -1923,9 +1906,13 @@ _rep_packs() {
     fi
 }
 
-# K. TLS handshake probe: what the SERVER offers (TLS version, cipher,
-# certificate dates and signature algorithm), the counterpart to the runtime
-# policy in sections A/E and the connect_option in section G
+# per chain certificate: identity, validity, fingerprint, SAN and the
+# signature algorithm (-text limited by -certopt to that line)
+X509_OPTS="-noout -subject -issuer -dates -fingerprint -sha256 -ext subjectAltName -text -certopt no_header,no_version,no_serial,no_subject,no_issuer,no_validity,no_pubkey,no_extensions,no_sigdump,no_aux"
+X509_OPTS_OLD="-noout -subject -issuer -dates -fingerprint -sha256 -text -certopt no_header,no_version,no_serial,no_subject,no_issuer,no_validity,no_pubkey,no_sigdump,no_aux"
+# K. TLS handshake probe: what the SERVER offers, as openssl s_client prints
+# it (protocol, cipher, certificate), the counterpart to the runtime policy in
+# sections A/E and the connect_option in section D
 _rep_tls() {
     local i
     section "K. TLS handshake probe"
@@ -1935,13 +1922,15 @@ _rep_tls() {
         fact "n/a (no instance dir discovered)"
     else
         fact "openssl: $(_bounded openssl version 2>/dev/null)"
+        fact "per chain certificate: openssl x509 $X509_OPTS"
         # every handshake of the run shares TLS_BUDGET seconds, each at most 15
         local TLS_BUDGET=30 tls_t0="$SECONDS" tls_left tls_cap tls_f
+        local tls_seen_body=() tls_seen_inst=()
         tls_f="$(_tmp tls.out)"
         i=0
         while [ "$i" -lt "${#INST_DIRS[@]}" ]; do
             local idir="${INST_DIRS[$i]}" cf="${INST_DIRS[$i]}/whatap.conf"
-            local dbms dbip dbport dbssl copt st out certinfo sig
+            local dbms dbip dbport dbssl copt st out
             conf_get dbms "$cf" dbms
             conf_get dbip "$cf" db_ip
             conf_get dbport "$cf" db_port
@@ -1983,43 +1972,57 @@ _rep_tls() {
             tls_cap=15; [ "$CMD_TIMEOUT" -lt "$tls_cap" ] && tls_cap="$CMD_TIMEOUT"
             [ "$tls_left" -lt "$tls_cap" ] && tls_cap="$tls_left"
             progress "sending 1 TLS handshake to $dbip:$dbport ($dbms)"
-            local trc summ
+            local trc ncert k xo xrc
             # shellcheck disable=SC2086
-            out="$(CMD_TIMEOUT="$tls_cap" _bounded_in /dev/null openssl s_client $st -connect "$dbip:$dbport" 2>&1)"; trc=$?
+            out="$(CMD_TIMEOUT="$tls_cap" _bounded_in /dev/null openssl s_client -showcerts $st -connect "$dbip:$dbport" 2>&1)"; trc=$?
             if [ "$trc" -eq 124 ]; then
                 fact "handshake: n/a (timed out: ${tls_cap}s)"
                 i=$((i + 1)); continue
             fi
-            # A session exists only when openssl names a protocol and a cipher.
-            # Without one, its verification lines ("Verification: OK", "Verify
-            # return code: 0") describe no certificate and are left out, and
-            # openssl's own reason is kept.
-            if printf '%s\n' "$out" | grep -aqE '^New, (TLS|SSL)|^ *Protocol *: *(TLS|SSL)' \
-               && printf '%s\n' "$out" | grep -aqE 'Cipher( is| *:) *[A-Z0-9]' \
-               && ! printf '%s\n' "$out" | grep -aqE 'Cipher( is| *:) *(\(NONE\)|0000)'; then
-                summ="$(printf '%s\n' "$out" \
-                    | grep -aE '^New, |Protocol *:|Cipher *(is|:)|Server public key|Verification|Verify return code|verify error|error|alert ' \
-                    | head -n 10)"
-            else
-                local tmsg
-                tmsg="$(printf '%s\n' "$out" | grep -avE '^(CONNECTED|---|Verif|New, |Secure Renegotiation|Compression|Expansion|No ALPN|Early data|No client certificate|SSL handshake has read)' \
-                    | grep -a -m1 . | cut -c1-160)"
-                fact "session: none negotiated (${tmsg:-openssl exit $trc, no message})"
-                summ="$(printf '%s\n' "$out" | grep -aE '^New, |Protocol *:|Cipher *(is|:)|error|alert ' | head -n 10)"
+            if [ -z "$out" ]; then
+                fact "openssl s_client -showcerts ${st:+$st }-connect $dbip:$dbport: n/a (empty output, exit $trc)"
+                i=$((i + 1)); continue
             fi
-            if [ -n "$summ" ]; then _emit_labeled "handshake summary" "$summ"
-            else _emit_labeled "handshake: no session lines; openssl output (first 5 lines, exit $trc)" "$(printf '%s\n' "$out" | head -n 5)"; fi
-            # the parses read the handshake output from a private file, bounded
-            certinfo=""
-            printf '%s\n' "$out" >"$tls_f" 2>/dev/null \
-                && certinfo="$(_bounded_in "$tls_f" openssl x509 -noout -subject -issuer -dates 2>/dev/null)"
-            if [ -n "$certinfo" ]; then
-                _emit_labeled "server certificate" "$certinfo"
-                sig="$(_bounded_in "$tls_f" openssl x509 -noout -text 2>/dev/null | grep -m1 'Signature Algorithm' | sed 's/^ *//')"
-                [ -n "$sig" ] && fact "certificate signature: $sig"
+            # verbatim but for the PEM blocks, which openssl x509 gives below
+            # per chain certificate
+            printf '%s\n' "$out" >"$tls_f" 2>/dev/null
+            local body j same=""
+            # left out as well: the per-connection random values (session
+            # ticket hex dump, Session-ID, Master-Key, Resumption PSK, Start Time)
+            body="$(awk '/-----BEGIN CERTIFICATE-----/ { s = 1 }
+                /^[[:space:]]*(TLS session ticket|Session-ID|Session-ID-ctx|Master-Key|Resumption PSK|Start Time):/ { next }
+                /^[[:space:]]*[0-9a-f][0-9a-f][0-9a-f][0-9a-f] - [0-9a-f][0-9a-f][ -]/ { next }
+                !s { print } /-----END CERTIFICATE-----/ { s = 0 }' "$tls_f")"
+            # an output already printed for an instance above (openssl's
+            # usage text, say) is named instead of printed again
+            j=0
+            while [ "$j" -lt "${#tls_seen_body[@]}" ]; do
+                [ "${tls_seen_body[$j]}" = "$st|$trc|$body" ] && { same="${tls_seen_inst[$j]}"; break; }
+                j=$((j + 1))
+            done
+            if [ -n "$same" ]; then
+                fact "openssl s_client -showcerts ${st:+$st }-connect $dbip:$dbport (exit $trc): the same output as for instance $same above"
             else
-                fact "server certificate: n/a (no certificate in handshake output)"
+                tls_seen_body[${#tls_seen_body[@]}]="$st|$trc|$body"; tls_seen_inst[${#tls_seen_inst[@]}]="$idir"
+                _emit_labeled "openssl s_client -showcerts ${st:+$st }-connect $dbip:$dbport (exit $trc, stdout and stderr verbatim, PEM blocks and per-connection random values left out)" "$body"
             fi
+            rm -f "$tls_f".cert* 2>/dev/null
+            ncert="$(awk -v p="$tls_f.cert" '/-----BEGIN CERTIFICATE-----/ { n++; f = p n } f { print > f } /-----END CERTIFICATE-----/ { close(f); f = "" } END { print n + 0 }' "$tls_f" 2>/dev/null)"
+            k=1
+            while [ "$k" -le "${ncert:-0}" ]; do
+                # shellcheck disable=SC2086
+                xo="$(_bounded openssl x509 -in "$tls_f.cert$k" $X509_OPTS 2>&1)"; xrc=$?
+                if [ "$xrc" -ne 0 ] && [ "$xrc" -ne 124 ]; then
+                    # openssl without x509 -ext: every extension, from -text
+                    # shellcheck disable=SC2086
+                    xo="$(_bounded openssl x509 -in "$tls_f.cert$k" $X509_OPTS_OLD 2>&1)"; xrc=$?
+                    _emit_labeled "certificate $k of $ncert (exit $xrc; -ext not accepted, run as: openssl x509 $X509_OPTS_OLD)" "$xo"
+                else
+                    _emit_labeled "certificate $k of $ncert (exit $xrc)" "$xo"
+                fi
+                k=$((k + 1))
+            done
+            [ "${ncert:-0}" -eq 0 ] && fact "server certificate: n/a (no certificate in the s_client output)"
             i=$((i + 1))
         done
     fi
@@ -2160,7 +2163,7 @@ _rep_goals() {
     # components: na only when the process scan could see every process
     if [ "${#AG_PIDS[@]}" -gt 0 ]; then got components
     elif [ -n "$PROC_HIDDEN" ]; then missed components "no whatap component process visible, and the process scan was incomplete ($PROC_HIDDEN)$(_priv_hint)"
-    else na components "no dbx/dmx/prx/xos/xcub/dbxc process in the /proc scan; section B states the host role it does have"; fi
+    else na components "no dbx/dmx/prx/xos/xcub/dbxc process in the /proc scan; section B lists the DB server processes it found"; fi
     # home: every component process mapped to a readable install dir
     # a --home that resolved stands in for the processes /proc could not map
     if [ -n "$OPT_HOME_BAD" ]; then

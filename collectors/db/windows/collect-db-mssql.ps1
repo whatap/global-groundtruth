@@ -49,7 +49,7 @@ param(
 
 $COLLECTOR_NAME = "whatap-db-mssql"
 # History: ../CHANGELOG.md, section windows/collect-db-mssql.ps1 (next to the db README).
-$VERSION        = "0.6.0"
+$VERSION        = "0.7.0"
 $DOMAIN         = "db"
 $CompName = $env:COMPUTERNAME; if (-not $CompName) { $CompName = [Environment]::MachineName }
 $TARGET         = "db-host/$CompName"
@@ -727,7 +727,57 @@ function DumpFile([string]$label, [string]$path, [int]$max = 400) {
         if ($script:ReadNote) { $shown += ", $($script:ReadNote)" }
         Fact "$label (verbatim, $total lines$shown):"
         @($content)[0..([Math]::Min($total, $max) - 1)] | ForEach-Object { Emit ("        " + $_) }
+        # past the cap, every line that can set a key: not blank, not a # comment
+        if ($total -gt $max) {
+            $all = @($content)
+            $rest = @(for ($k = $max; $k -lt $total; $k++) { if ($all[$k] -notmatch '^\s*(#|$)') { "$($k + 1): $($all[$k])" } })
+            if ($rest.Count -gt 0) { Fact "$label, lines after line $max that are not blank or # comments (line: text):"; $rest | ForEach-Object { Emit ("        " + $_) } }
+            else { Fact "$label, lines after line $max that are not blank or # comments: none" }
+        }
     } catch { Fact "${label}: n/a (permission denied or unreadable: $path)" }
+}
+# Log-Lines LINES SCOPE SPECS -> for each pattern of SPECS (@(label, regex,
+# mode), case-insensitive as Select-String is) what LINES hold: with mode a
+# number N the number of matching lines and the first N of them; with mode
+# "code" the number of matches (occurrences, as -AllMatches counts them) and,
+# per distinct match (a WA code) in order of first appearance, its
+# occurrences and the first line holding it. Such a first line is cut at
+# 400 UTF-8 bytes on a character boundary, and one already printed in this
+# call is named instead; the N sample lines (N > 1, the 0.6.0 samples) are
+# printed whole.
+function Cut-Line([string]$l) {
+    $b = [System.Text.Encoding]::UTF8.GetBytes($l)
+    if ($b.Length -le 400) { return $l }
+    $n = 400; while ($n -gt 0 -and ($b[$n] -band 0xC0) -eq 0x80) { $n-- }
+    return ([System.Text.Encoding]::UTF8.GetString($b, 0, $n) + " (first $n of $($b.Length) bytes)")
+}
+function Log-Lines($lines, [string]$scope, $specs) {
+    Fact "lines read for the patterns below: $(@($lines).Count) ($scope)"
+    $shown = @{}
+    $show = { param($l, $tag) if ($shown.ContainsKey($l)) { "(the line shown for $($shown[$l]))" } else { $shown[$l] = $tag; Cut-Line $l } }
+    foreach ($sp in $specs) {
+        $re = New-Object System.Text.RegularExpressions.Regex($sp[1], [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+        $c = 0; $firsts = New-Object System.Collections.Generic.List[string]
+        $codes = New-Object System.Collections.Generic.List[string]; $n = @{}; $l1 = @{}
+        foreach ($l in $lines) {
+            if (-not $re.IsMatch($l)) { continue }
+            if ($sp[2] -ne 'code') { $c++; if ($firsts.Count -lt [int]$sp[2]) { $firsts.Add($l) }; continue }
+            foreach ($m in $re.Matches($l)) {
+                $v = ($m.Value -replace '[()]', '').ToUpperInvariant()
+                if (-not $n.ContainsKey($v)) { $codes.Add($v); $n[$v] = 0; $l1[$v] = $l }
+                $n[$v]++; $c++
+            }
+        }
+        if ($c -eq 0) { Fact "$($sp[0]): none"; continue }
+        if ($sp[2] -eq 'code') {
+            Fact "$($sp[0]) ($c occurrences); per code, its occurrences and the first line holding it:"
+            foreach ($v in $codes) { Emit ("        {0} ({1} occurrences): {2}" -f $v, $n[$v], (& $show $l1[$v] $v)) }
+        } elseif ([int]$sp[2] -eq 1) { Fact "$($sp[0]) ($c lines): $(& $show $firsts[0] $sp[0])" }
+        else {
+            Fact "$($sp[0]) ($c lines), first $($firsts.Count):"
+            foreach ($l in $firsts) { Emit ("        " + $l) }
+        }
+    }
 }
 # TcpProbe: one TCP connect, bounded like any other call. It is timed and
 # logged as "tcp-connect", honours RUN_DEADLINE, and a connect that gets no
@@ -857,7 +907,7 @@ Fact "system time: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz') (timezone: $([T
 Fact "system time (UTC): $((Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss'))"
 TryFact "java on PATH" { Invoke-Bounded java @("-version") }
 
-Section "B. Component discovery & host role"
+Section "B. Component discovery"
 if ($null -eq $allProc) { Fact "process inventory: n/a (Win32_Process query failed: $procErr)"; Fact "whatap agent processes found: n/a (process inventory not read)" }
 else { Fact "whatap agent processes found: $($agentProcs.Count)" }
 Fact "java processes whose command line was not readable: $($javaUnread.Count)"
@@ -979,18 +1029,13 @@ foreach ($h in $homes) {
         Emit ""; Emit "    -- log dir: $ld --"
         FactBlock "log files (newest 15)" ($logs | Select-Object -First 15 | ForEach-Object { "{0}  {1}  {2}" -f $_.Name, $_.Length, (Fmt-Time $_.LastWriteTime) })
         $n = $logs[0]
-        Fact "newest agent log: $($n.FullName) (mtime $(Fmt-Time $n.LastWriteTime))"
+        Fact "newest agent log: $($n.FullName)  $($n.Length) bytes  mtime $(Fmt-Time $n.LastWriteTime)"
         $win = @(Get-Content -LiteralPath $n.FullName -Tail 5000 -Encoding UTF8 -ErrorAction SilentlyContinue)
-        Fact "last log line (verbatim): $(@($win)[-1])"
         Fact "system time at collection: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz')"
-        $wa = $win | Select-String -Pattern '\(WA\d{3}\)' -AllMatches |
-              ForEach-Object { $_.Matches } | ForEach-Object { $_.Value } |
-              Group-Object | Sort-Object Count -Descending | Select-Object -First 15
-        if ($wa) { FactBlock "WA code histogram (last 5000 lines)" ($wa | ForEach-Object { "{0,7} {1}" -f $_.Count, $_.Name }) }
-        else { Fact "WA code histogram: n/a (no WA codes in last 5000 lines)" }
-        Fact "exception lines: $(@($win | Select-String -Pattern 'Exception|SQLException').Count) line(s) in last 5000 log lines"
-        Fact "TLS/SSL/login lines: $(@($win | Select-String -Pattern 'TLS|SSL|Login failed').Count) line(s) in last 5000 log lines"
-        FactBlock "exception lines (sample)" (@($win | Select-String -Pattern 'Exception|SQLException' | Select-Object -First 3 | ForEach-Object { $_.Line }))
+        Log-Lines $win "the last 5000 lines of the log; the last 200 of them follow verbatim" @(
+            @('WA codes', '\(WA\d{3}\)', 'code'),
+            @('exception lines', 'Exception|SQLException', '3'),
+            @('TLS/SSL/login lines', 'TLS|SSL|Login failed', '1'))
         Emit ""; Emit "    -- verbatim tail (200 lines): $($n.FullName) --"
         @($win | Select-Object -Last 200) | ForEach-Object { Emit ("        " + $_) }
         break
@@ -1011,15 +1056,14 @@ foreach ($i in $instances) {
     $cf = Join-Path $i "whatap.conf"
     try { $null = Get-Content -LiteralPath $cf -TotalCount 1 -ErrorAction Stop }
     catch { Fact "whatap.conf: n/a (not readable: $cf)"; continue }
-    $dbms  = ConfGet $cf "dbms";  $dbip = ConfGet $cf "db_ip"
-    $dbport = ConfGet $cf "db_port"; $whost = ConfGet $cf "whatap\.server\.host"
-    $wport = ConfGet $cf "whatap\.server\.port"
-    Fact "dbms: $(if ($dbms) { $dbms } else { 'n/a (key not set)' })"
-    Fact "db_ip: $(if ($dbip) { $dbip } else { 'n/a' })   db_port: $(if ($dbport) { $dbport } else { 'n/a' })"
-    Fact "whatap.server.host: $(if ($whost) { $whost } else { 'n/a (key not set)' })   whatap.server.port: $(if ($wport) { $wport } elseif ($whost) { 'not set (the connect probe below uses 6600)' } else { 'not set' })"
+    # the keys are in section D (verbatim); each probe line names its target
+    $dbip = ConfGet $cf "db_ip"; $dbport = ConfGet $cf "db_port"
+    $whost = ConfGet $cf "whatap\.server\.host"; $wport = ConfGet $cf "whatap\.server\.port"
     $wp = 6600; if ($wport -match '^\d+$') { $wp = [int]$wport }
     if ($dbip -and $dbport -match '^\d+$') { TcpProbe "db reachability" $dbip ([int]$dbport) }
+    else { Fact "db reachability: n/a (not applicable: db_ip / numeric db_port not set)" }
     if ($whost) { foreach ($w in ($whost -split '[/,]')) { if ($w.Trim()) { TcpProbe "collection server reachability" $w.Trim() $wp } } }
+    else { Fact "collection server reachability: n/a (not applicable: whatap.server.host not set)" }
 }
 
 Section "H. SQL pack"
