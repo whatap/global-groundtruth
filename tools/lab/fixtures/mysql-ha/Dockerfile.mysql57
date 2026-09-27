@@ -1,0 +1,9 @@
+# Oracle's mysql:5.7.32 (Debian buster), the 5.7 line the collector was first
+# run against. procps/sysstat added from the Debian archive (buster is EOL).
+FROM mysql:5.7.32
+RUN rm -f /etc/apt/sources.list.d/mysql.list \
+ && echo 'deb http://archive.debian.org/debian buster main' > /etc/apt/sources.list \
+ && apt-get -o Acquire::Check-Valid-Until=false update \
+ && apt-get install -y --no-install-recommends procps sysstat iproute2 \
+ && rm -rf /var/lib/apt/lists/*
+COPY mysqld-ggt57.cnf /etc/mysql/conf.d/zz-ggt.cnf

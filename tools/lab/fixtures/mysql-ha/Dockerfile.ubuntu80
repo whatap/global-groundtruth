@@ -1,0 +1,17 @@
+# Ubuntu 22.04's own mysql-server-8.0 package, the way the smartfren/XLSMART
+# backend hosts install it (requester, 2026-09-24): root@localhost is
+# auth_socket, config under /etc/mysql, error log /var/log/mysql/error.log.
+# sudo, procps and sysstat are there so the collector sees what a host has.
+FROM ubuntu:22.04
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends mysql-server-8.0 mysql-client-8.0 \
+        sudo procps sysstat iproute2 \
+ && rm -rf /var/lib/apt/lists/* \
+ && rm -f /var/lib/mysql/auto.cnf \
+ && useradd -m -s /bin/bash op \
+ && echo 'op ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/op && chmod 440 /etc/sudoers.d/op
+COPY mysqld-ggt80.cnf /etc/mysql/mysql.conf.d/zz-ggt.cnf
+COPY entry-ubuntu80.sh /usr/local/bin/entry.sh
+RUN chmod 755 /usr/local/bin/entry.sh
+ENTRYPOINT ["/usr/local/bin/entry.sh"]
