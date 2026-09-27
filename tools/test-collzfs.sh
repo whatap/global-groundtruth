@@ -542,6 +542,13 @@ for a in "--window=5" "--window=25h" "--window=1x" "--window=10@25:00" "--window
   err="$("$C" --stdout $a </dev/null 2>&1 >/dev/null)"; rc=$?
   chk "$a exits 2" "2" "$rc"
 done
+# 0.8.1: a value option with no value, or with the next option taken for it
+for a in "--out" "--out=" "--home=" "--filesizes=" "--home --file" "--window --file" "--out -x"; do
+  # shellcheck disable=SC2086
+  err="$("$C" --stdout $a </dev/null 2>&1 >/dev/null)"; rc=$?
+  chk "$a exits 2" "2" "$rc"
+  has "$a names the option" "$err" "missing value for ${a%%[ =]*}"
+done
 err="$("$C" --stdout "--window=10@$(date -d '+2 days' '+%Y-%m-%dT%H:%M')" </dev/null 2>&1 >/dev/null)"; rc=$?
 chk "a start more than 24h away exits 2" "2" "$rc"
 has "and says so" "$err" "is more than 24h away"
@@ -596,6 +603,12 @@ out="$(IOSTAT_MODE=hang IOLOG="$L21" COLLZFS_KSTAT_DIR="$K21" PATH="$S16" "$C" -
 t1=$(date +%s)
 has "a hanging iostat is stopped at the window end and said" "$out" "iostat -x -N -t 1 11: stopped at"
 has "the zpool job beside it still delivers" "$out" "tank  1.27G  45.2G"
+hasnt "0.8.1: a stopped iostat -x does not block the window goal" "$(printf '%s\n' "$out" | grep -A3 'blocked (running')" "iostat -x"
+S21n="$ROOT/stub21n"; stub_clone "$S16" "$S21n"; rm -f "$S21n/iostat"
+out="$(COLLZFS_KSTAT_DIR="$K21" PATH="$S21n" "$C" --stdout --window=10 </dev/null 2>/dev/null)"
+has "0.8.1: no sysstat: a fact line in section O" "$out" "not delivered: iostat -x: command not found (sysstat)"
+hasnt "and not a reason of the window goal" "$(printf '%s\n' "$out" | grep -A3 'blocked (running')" "sysstat"
+has "zpool iostat still runs over the window" "$out" "zpool iostat -T d -vlq 1 11 (per vdev"
 [ $((t1 - t0)) -le 60 ] && ok "the run ends ($((t1 - t0))s)" || bad "the run ends" "<= 60s" "$((t1 - t0))s"
 out="$(ZIO_MODE=hang IOLOG="$L21" COLLZFS_KSTAT_DIR="$K21" PATH="$S16" "$C" --stdout --window=10 </dev/null 2>/dev/null)"
 has "window: a zpool iostat that outlives the window is stopped and said" "$out" ": the window ended (output up to then below)"
@@ -676,12 +689,12 @@ has "and [1] names the default length" "$out" "window=15s (default)"
 [ $((t1 - t0)) -ge 15 ] && ok "it took the 15s ($((t1 - t0))s)" || bad "took the 15s" ">= 15s" "$((t1 - t0))s"
 out="$(RUN_DEADLINE=100 COLLZFS_KSTAT_DIR="$K24" PATH="$S16" "$C" --stdout </dev/null 2>/dev/null)"
 has "a caller's deadline with no room: not run, and why" "$out" "window: not run (RUN_DEADLINE=100 leaves no time for the 15s window"
-has "and the goal is blocked" "$out" "time window (every txg, counters, zpool iostat -vlq with iostat -x, -r/-w) — not run: RUN_DEADLINE=100"
+has "and the goal is blocked" "$out" "time window (every txg, counters, zpool iostat -vlq, -r/-w) — not run: RUN_DEADLINE=100"
 out="$(RUN_DEADLINE=130 COLLZFS_KSTAT_DIR="$K24" PATH="$S16" "$C" --stdout </dev/null 2>/dev/null)"
 has "one that cuts it: cut, and said" "$out" "ended early: the run deadline (130s, 120s kept for the report) cut it to"
 K24e="$ROOT/k24e"; mkdir -p "$K24e"
 out="$(COLLZFS_KSTAT_DIR="$K24e" PATH="$S0" "$C" --stdout </dev/null 2>/dev/null)"
-has "a kstat tree with no pool: window n/a" "$out" "time window (every txg, counters, zpool iostat -vlq with iostat -x, -r/-w) — no <pool>/txgs under $K24e and no pool listed by zpool"
+has "a kstat tree with no pool: window n/a" "$out" "time window (every txg, counters, zpool iostat -vlq, -r/-w) — no <pool>/txgs under $K24e and no pool listed by zpool"
 
 echo; echo "PASS=$PASS FAIL=$FAIL SKIP=$SKIP"
 [ "$FAIL" -eq 0 ]

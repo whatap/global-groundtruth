@@ -46,6 +46,12 @@
 export LC_ALL=C
 
 # ---- collector metadata -----------------------------------------------------
+# 0.8.1  --out, --home, --window and --filesizes= with an empty value, or
+#        with the next option taken for it (`--out --file`), exit 2 naming
+#        the option. iostat -x in the window only adds detail: absent (no
+#        sysstat), failed or stopped, it is a "not delivered:" fact line in
+#        section O and no longer blocks the window goal, whose inputs are the
+#        txgs, the kstat deltas and zpool iostat.
 # 0.8.0  A time window runs in every run (15s; --window=DUR[@START] sets its
 #        length and start) and replaces --sample. Section O keeps every txg of
 #        the window (the txgs ring re-read before it
@@ -75,7 +81,7 @@ export LC_ALL=C
 #        df -i of every WhaTap path is in the report and df-i.txt in the
 #        bundle, so the file count is there without a walk.
 COLLECTOR_NAME="whatap-collzfs"
-VERSION="0.8.0"
+VERSION="0.8.1"
 DOMAIN="collection-server"
 TARGET="collection-server-zfs/$(hostname 2>/dev/null || echo unknown)"   # refined after pool discovery
 
@@ -192,31 +198,36 @@ ARGC=$#              # 0 args -> usage (handled in main, below)
 # _removed MESSAGE -> an option that no longer exists: exit 2, naming what
 # replaced it (fd 3 is not open yet, so stderr)
 _removed() { printf '!! %s\n' "$1" >&2; exit 2; }
+# _optval NAME VALUE -> exit 2 when VALUE is empty or starts with '-' (then
+# the next option was taken for the value: `--out --file`)
+_optval() {
+    case "$2" in ''|-*) printf -- 'missing value for %s\n' "$1" >&2; exit 2 ;; esac
+}
 while [ $# -gt 0 ]; do
     case "$1" in
         --file) OPT_FILE=1 ;;
         --stdout) OPT_STDOUT=1 ;;
         --bundle) OPT_BUNDLE=1 ;;
         --quiet) OPT_QUIET=1 ;;
-        --out) OPT_OUT="$2"; shift ;;
-        --out=*) OPT_OUT="${1#*=}" ;;
-        --home) OPT_HOME="$2"; shift ;;
-        --home=*) OPT_HOME="${1#*=}" ;;
+        --out) _optval --out "${2:-}"; OPT_OUT="$2"; shift ;;
+        --out=*) _optval --out "${1#*=}"; OPT_OUT="${1#*=}" ;;
+        --home) _optval --home "${2:-}"; OPT_HOME="$2"; shift ;;
+        --home=*) _optval --home "${1#*=}"; OPT_HOME="${1#*=}" ;;
         --hours|--hours=*)
             _removed "--hours was removed: set JOURNAL_HOURS=N in the environment (default 24)" ;;
         --sample|--sample=*)
             _removed "--sample was merged into --window: use --window=30s (or --window=DUR for a longer span)" ;;
         --zdb) OPT_ZDB=1 ;;
         --filesizes) OPT_FILESIZES=1 ;;
-        --filesizes=*) OPT_FILESIZES=1; FILESIZES_PATH="${1#*=}" ;;
+        --filesizes=*) _optval --filesizes= "${1#*=}"; OPT_FILESIZES=1; FILESIZES_PATH="${1#*=}" ;;
         --no-filesizes)
             _removed "--no-filesizes was removed: the file-size walk runs only when --filesizes is given" ;;
         --filesizes-secs|--filesizes-secs=*)
             _removed "--filesizes-secs was removed: set FILESIZES_SECS=N in the environment (default 300)" ;;
         --event-days|--event-days=*)
             _removed "--event-days was removed: set EVENT_DAYS=N in the environment (default 30; 0 keeps everything)" ;;
-        --window) WIN_GIVEN=1; WIN_SPEC="${2:-}"; [ $# -gt 1 ] && shift ;;
-        --window=*) WIN_GIVEN=1; WIN_SPEC="${1#*=}" ;;
+        --window) _optval --window "${2:-}"; WIN_GIVEN=1; WIN_SPEC="$2"; shift ;;
+        --window=*) _optval --window "${1#*=}"; WIN_GIVEN=1; WIN_SPEC="${1#*=}" ;;
         --window-start|--window-start=*)
             _removed "--window-start was merged into --window: use --window=DUR@HH:MM or --window=DUR@YYYY-MM-DDTHH:MM" ;;
         -h|--help) usage; exit 0 ;;
@@ -2317,11 +2328,14 @@ _bg_emit() {
 }
 
 # _pair_start DIR IV N CAP -> zpool iostat -T d -vlq IV N and iostat -x IV N,
-# started back to back (zpool first); PAIR_WHY names a tool that was not run
+# started back to back (zpool first); PAIR_WHY names a zpool iostat that was
+# not run. iostat -x only adds the block-device view: what it did not deliver
+# (absent, failed, stopped) goes to PAIR_IO_NOTE, a fact line, never the goal.
 PAIR_WHY=""
+PAIR_IO_NOTE=""
 _pair_start() {
     local d="$1" iv="$2" n="$3" cap="$4"
-    PAIR_WHY=""
+    PAIR_WHY=""; PAIR_IO_NOTE=""
     mkdir -p "$d" 2>/dev/null
     have iostat && _iostat_flags
     if ! have zpool; then PAIR_WHY="zpool iostat: command not found"
@@ -2330,7 +2344,7 @@ _pair_start() {
     if have iostat; then
         # shellcheck disable=SC2086  # IOSTAT_FL is a list of flags
         _bg_start "$d" iostat "$cap" iostat $IOSTAT_FL "$iv" "$n"
-    else PAIR_WHY="${PAIR_WHY:+$PAIR_WHY; }iostat -x: command not found (sysstat)"; fi
+    else PAIR_IO_NOTE="iostat -x: command not found (sysstat)"; fi
 }
 
 # _pair_kill DIR -> stop every job still running under DIR
@@ -2357,9 +2371,10 @@ _pair_emit() {
     if [ -f "$d/iostat.t0" ]; then
         [ -n "$IOSTAT_FL_NOTE" ] && fact "iostat flags: $IOSTAT_FL ($IOSTAT_FL_NOTE)"
         _bg_emit "$d" iostat "iostat $IOSTAT_FL $iv $n (per device: r/s w/s rkB/s wkB/s r_await w_await aqu-sz %util):" "$cap"
-        [ -n "$BG_WHY" ] && PAIR_WHY="${PAIR_WHY:+$PAIR_WHY; }$BG_WHY"
+        [ -n "$BG_WHY" ] && PAIR_IO_NOTE="$BG_WHY"
     fi
     [ -n "$PAIR_WHY" ] && fact "not delivered: $PAIR_WHY"
+    [ -n "$PAIR_IO_NOTE" ] && fact "not delivered: $PAIR_IO_NOTE"
 }
 
 # _win_secs DUR -> seconds for N, Ns, Nm or Nh (10 .. 86400); 1 when not one
@@ -2753,7 +2768,7 @@ _win_delta() {
 _win_saved() { awk -F'\t' -v k="$2" '$1 == k { print $2 }' "$WIN_DIR/$1/params" 2>/dev/null; }
 
 # -- O. Write-path window (--window) ---------------------------------------
-WIN_GOAL="time window (every txg, counters, zpool iostat -vlq with iostat -x, -r/-w)"
+WIN_GOAL="time window (every txg, counters, zpool iostat -vlq, -r/-w)"
 _rep_o() {
     section "O. Time window (every run; --window sets its length and start)"
     goal window "$WIN_GOAL"
