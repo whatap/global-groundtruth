@@ -49,6 +49,16 @@
 # later one in the collector goes after the last earlier one it carries, or
 # after the skeleton's last block (group helpers come after the skeleton's).
 #
+# A skeleton block may also name, as a fourth BLOCKS field, a line it must come
+# before: the emit helpers hold `_optval`, which the option loop calls while the
+# file is still being read, so they must precede the first `^ARGC=$#` line (the
+# start of option parsing, in the skeleton and every collector; the `# ---- CLI
+# harness` banner is not in all of them). --apply inserts a missing emit block
+# just before that line, not before the privilege block (which follows the
+# loop: the collector then died with `_optval: command not found`), and moves
+# one found after it there; --check reports the latter OUT OF PLACE. A file
+# without such a line is not checked for it.
+#
 # Collectors are LF. A file with a CRLF line is reported CRLF for each block and
 # left unchanged by --apply: its end lines match no end regex, so every block
 # would otherwise read BROKEN.
@@ -58,9 +68,10 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SKELETON="$ROOT/templates/collector-skeleton/collector-skeleton.sh"
 GROUPS_DIR="$ROOT/templates/groups"
 
-# name|banner regex|end regex, in skeleton order
+# name|banner regex|end regex[|regex of the line the block must come before],
+# in skeleton order
 BLOCKS=(
-    'emit|^# ---- emit helpers — DO NOT EDIT|^# ---- end emit helpers$'
+    'emit|^# ---- emit helpers — DO NOT EDIT|^# ---- end emit helpers$|^ARGC=\$#'
     'privilege|^# ---- privilege — DO NOT EDIT|^# ---- end privilege$'
     'boot|^# ---- boot time — DO NOT EDIT|^# ---- end boot time$'
     'run|^# ---- run helpers — DO NOT EDIT|^# ---- end run helpers$'
@@ -110,10 +121,11 @@ replace() { mv "$1.tmp" "$1" && case "$1" in *.sh) chmod +x "$1" ;; esac; }
 # OWNER, one block in each FILE. NEXT: regex of the later blocks' banners (a
 # missing block goes before the first one found); PREV: regex of the earlier
 # blocks' end lines (else it goes after the last one found). PLACE_END=1: the
-# block must end the file (inserted, or moved, there)
-PLACE_END=0
+# block must end the file (inserted, or moved, there). PLACE_BEFORE=REGEX: the
+# block must end before the first line matching REGEX (inserted, or moved, there)
+PLACE_END=0 PLACE_BEFORE=""
 sync_block() {
-    local name="$1" banner="$2" endre="$3" owner="$4" nextbanner="$5" prevend="$6" sr src f short r at after
+    local name="$1" banner="$2" endre="$3" owner="$4" nextbanner="$5" prevend="$6" sr src f short r at after pb
     shift 6
     sr="$(block_range "$owner" "$banner" "$endre")" || {
         echo "FAIL  block '$name' not found (once) in ${owner#"$ROOT"/}" >&2; exit 2; }
@@ -122,6 +134,8 @@ sync_block() {
     for f in "$@"; do
         [ "$f" = "$owner" ] && continue
         short="${f#"$ROOT"/}"
+        pb=""
+        [ -n "$PLACE_BEFORE" ] && pb="$(grep -nE "$PLACE_BEFORE" "$f" | head -1 | cut -d: -f1)"
         # a CRLF file matches no end line; say so instead of BROKEN, change nothing
         if grep -q "$(printf '\r')\$" "$f"; then
             printf 'CRLF     %-52s (block %s) — convert to LF first\n' "$short" "$name"; rc=1; continue
@@ -138,6 +152,7 @@ sync_block() {
             fi
             at=""
             [ -n "$nextbanner" ] && at="$(grep -nE "$nextbanner" "$f" | head -1 | cut -d: -f1)"
+            [ -n "$pb" ] && { [ -z "$at" ] || [ "$pb" -lt "$at" ]; } && at="$pb"
             after=""
             [ -z "$at" ] && [ -n "$prevend" ] && after="$(grep -nE "$prevend" "$f" | tail -1 | cut -d: -f1)"
             if [ "$mode" = --check ] || [ -z "$at$after" ]; then
@@ -150,6 +165,21 @@ sync_block() {
             fi && replace "$f"
             if syntax_ok "$f"; then printf 'inserted %-52s (block %s)\n' "$short" "$name"
             else printf 'BROKEN   %-52s (block %s) — syntax error after insert\n' "$short" "$name"; rc=1; fi
+            continue
+        fi
+        # the block starts after the line it must precede: move it before that line,
+        # with the blank line that followed it (a PLACE_BEFORE line inside the block
+        # is drift, synced below)
+        if [ -n "$pb" ] && [ "${r% *}" -gt "$pb" ]; then
+            if [ "$mode" = --check ]; then
+                printf 'OUT OF PLACE %-48s (block %s) — must come before line %s (the first %s), ends at line %s\n' \
+                    "$short" "$name" "$pb" "$PLACE_BEFORE" "${r#* }"; rc=1; continue
+            fi
+            { upto $((pb - 1)) "$f"; printf '%s\n\n' "$src"
+              sed -n "$pb,\$p" "$f" | awk -v s=$((${r% *} - pb + 1)) -v e=$((${r#* } - pb + 1)) \
+                  'NR >= s && NR <= e { next } NR == e + 1 && $0 == "" { next } { print }'; } > "$f.tmp" && replace "$f"
+            if syntax_ok "$f"; then printf 'moved    %-52s (block %s, before line %s)\n' "$short" "$name" "$pb"
+            else printf 'BROKEN   %-52s (block %s) — syntax error after move\n' "$short" "$name"; rc=1; fi
             continue
         fi
         # awk counts a last line that has no newline; wc -l would not
@@ -192,7 +222,7 @@ sync_block() {
 # ---- skeleton blocks: every collector
 # shellcheck disable=SC2086  # $ALL: one path per line, no spaces in repo paths
 for bi in "${!BLOCKS[@]}"; do
-    IFS='|' read -r name banner endre <<EOF
+    IFS='|' read -r name banner endre PLACE_BEFORE <<EOF
 ${BLOCKS[$bi]}
 EOF
     # the banner of the next block, where a missing block is inserted
@@ -232,7 +262,7 @@ EOF
             echo "FAIL  block '$group: $name' in ${owner#"$ROOT"/}: the line after the banner is not '# members: <stem> ...'" >&2
             exit 2 ;;
         esac
-        PLACE_END=0
+        PLACE_END=0 PLACE_BEFORE=""
         [ "$(sed -n "$((s + 2))p" "$owner")" = "# place: end" ] && PLACE_END=1
         members=() others="$pool"
         for stem in ${mline#"# members: "}; do

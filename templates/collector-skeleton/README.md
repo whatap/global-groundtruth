@@ -94,7 +94,11 @@ guideline 5 (one opt-in per feature, caps through the environment).
 `_classify_err` they rely on are the collector's own (the reasoned-absence
 helpers below them): keep, trim, or extend them for your domain. See
 guideline 4. The emit helpers come before the CLI harness, because the option
-loop calls `_optval`.
+loop calls `_optval`: in every collector the emit block must end before the
+first `ARGC=$#` line, where option parsing starts. `sync-shared-block.sh
+--apply` inserts a missing emit block just before that line and moves one
+found after it; `--check` reports that one OUT OF PLACE. Keep `ARGC=$#` as
+the first line of your option parsing.
 
 Five blocks are **synced**, not just copied: emit helpers, privilege, boot
 time, run helpers and collection completeness. Each runs from its `# ---- <name> — DO NOT EDIT`

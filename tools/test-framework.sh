@@ -293,6 +293,8 @@ done
 # ---- 2. sync-shared-block ---------------------------------------------------
 echo "== 2. sync-shared-block =="
 check "--check passes on the repo" '"$ROOT/tools/sync-shared-block.sh" --check >/dev/null'
+R0="$T/repo0"; mkdir -p "$R0"
+cp -R "$ROOT/tools" "$ROOT/templates" "$ROOT/collectors" "$R0/"
 M="$T/mini"; mkdir -p "$M/tools" "$M/templates/collector-skeleton" "$M/collectors/x"
 cp "$ROOT/tools/sync-shared-block.sh" "$M/tools/"
 cp "$SK" "$M/templates/collector-skeleton/"
@@ -319,6 +321,30 @@ check "--apply undoes it, keeps the one-liner after it" '"$M/tools/sync-shared-b
 sed -i '/^# ---- emit helpers — DO NOT EDIT/,/^# ---- end emit helpers$/d' "$M/collectors/x/collect-x.sh"
 "$M/tools/sync-shared-block.sh" --apply >/dev/null
 check "--apply inserts missing emit helpers"  '"$M/tools/sync-shared-block.sh" --check >/dev/null && bash -n "$M/collectors/x/collect-x.sh"'
+# the option loop calls _optval (emit helpers), so the emit block must precede
+# ARGC=: inserted before the privilege block, it followed the loop and --help
+# died with `_optval: command not found` while --check said ok (found 2026-09-27)
+before_argc() { [ "$(grep -n '^# ---- end emit helpers$' "$1" | cut -d: -f1)" -lt "$(grep -n '^ARGC=' "$1" | head -1 | cut -d: -f1)" ]; }
+k="$R0/collectors/k8s/collect-k8s.sh"
+sed -i '/^# ---- emit helpers — DO NOT EDIT/,/^# ---- end emit helpers$/d' "$k"
+"$R0/tools/sync-shared-block.sh" --apply >/dev/null
+out="$(bash "$k" --out "$T" --help 2>&1 >/dev/null; echo "rc=$?")"
+check "a missing emit block goes in before ARGC=, and --help works" \
+    '"$R0/tools/sync-shared-block.sh" --check >/dev/null && before_argc "$k" && [ "$out" = rc=0 ]' "$out"
+# the block after the option loop (where the old insert put it)
+awk '/^# ---- emit helpers — DO NOT EDIT/ { h = 1 } h { b = b $0 "\n"; if (/^# ---- end emit helpers$/) { h = 0; skip = 1 } next }
+     skip && $0 == "" { skip = 0; next } { skip = 0 }
+     /^# ---- privilege — DO NOT EDIT/ { printf "%s\n", b } { print }' "$k" > "$k.x" && mv "$k.x" "$k"
+check "an emit block after ARGC= is reported OUT OF PLACE" \
+    '! before_argc "$k" && "$R0/tools/sync-shared-block.sh" --check | grep -q "^OUT OF PLACE .*collect-k8s.sh .*(block emit) — must come before line "'
+"$R0/tools/sync-shared-block.sh" --apply >/dev/null
+out="$(bash "$k" --out "$T" --help 2>&1 >/dev/null; echo "rc=$?")"
+check "--apply moves it before ARGC=, and --help works" \
+    '"$R0/tools/sync-shared-block.sh" --check >/dev/null && before_argc "$k" && [ "$out" = rc=0 ] && [ "$(grep -c "^# ---- emit helpers — DO NOT EDIT" "$k")" = 1 ]' "$out"
+# shellcheck disable=SC2034  # read inside check's eval
+ksum="$(cat "$R0"/collectors/*/collect-*.sh "$R0"/collectors/*/*/collect-*.sh | cksum)"
+"$R0/tools/sync-shared-block.sh" --apply >/dev/null
+check "a second --apply changes nothing" '[ "$(cat "$R0"/collectors/*/collect-*.sh "$R0"/collectors/*/*/collect-*.sh | cksum)" = "$ksum" ]'
 # group blocks: one owner under templates/groups, member x, non-member y
 mkdir -p "$M/templates/groups" "$M/collectors/y"
 cp "$M/collectors/x/collect-x.sh" "$M/collectors/y/collect-y.sh"
