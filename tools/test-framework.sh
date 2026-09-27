@@ -374,6 +374,17 @@ sed -i '/^# ---- apm: probe helpers — DO NOT EDIT/,/^# ---- end apm: probe hel
 "$R/tools/sync-shared-block.sh" --apply >/dev/null
 check "--apply re-inserts php's last block (numbers)" '"$R/tools/sync-shared-block.sh" --check | grep -q "^ok .*collect-apmphp.sh .*block apm: numbers"'
 check "--apply re-inserts java's only group block" '"$R/tools/sync-shared-block.sh" --check >/dev/null && bash -n "$R/collectors/apm/java/collect-apmjava.sh"'
+# a `# place: end` block (apm: main) comes back at the end of the file, where it
+# runs after every function is defined; one that is not last is OUT OF PLACE
+sed -i '/^# ---- apm: main — DO NOT EDIT/,/^# ---- end apm: main$/d' "$R/collectors/apm/php/collect-apmphp.sh"
+"$R/tools/sync-shared-block.sh" --apply >/dev/null
+check "--apply re-inserts php's apm: main at the end" '"$R/tools/sync-shared-block.sh" --check >/dev/null && [ "$(tail -n 1 "$R/collectors/apm/php/collect-apmphp.sh")" = "# ---- end apm: main" ]'
+out="$(cd "$T" && timeout 400 bash "$R/collectors/apm/php/collect-apmphp.sh" --stdout 2>&1 </dev/null | grep -c "^==== WhaTap Global Groundtruth Collection ====$")"
+check "and php runs to a report again" '[ "$out" = 1 ]' "$out"
+printf 'echo after-main\n' >> "$R/collectors/apm/nodejs/collect-apmnodejs.sh"
+check "an apm: main that is not the last block is reported OUT OF PLACE" '"$R/tools/sync-shared-block.sh" --check | grep -q "^OUT OF PLACE .*collect-apmnodejs.sh .*block apm: main"'
+"$R/tools/sync-shared-block.sh" --apply >/dev/null
+check "--apply moves it back to the end" '"$R/tools/sync-shared-block.sh" --check >/dev/null && [ "$(tail -n 1 "$R/collectors/apm/nodejs/collect-apmnodejs.sh")" = "# ---- end apm: main" ] && bash -n "$R/collectors/apm/nodejs/collect-apmnodejs.sh"'
 sed -i 's/^# members: apmjava apmnodejs apmphp apmpython$/# members:   /' "$R/templates/groups/apm.sh"
 check "a members line with no stem fails the run" '"$R/tools/sync-shared-block.sh" --check >/dev/null 2>&1; [ $? = 2 ]'
 # the repo's group owners parse under bash and dash (the apm members run under both)
@@ -410,6 +421,14 @@ for g in "$ROOT"/templates/groups/*.sh; do
     done < "$g"
 done
 check "each group-block function is defined once per member" '[ -z "$gdups" ]' "$gdups"
+# apm: main runs the collector, so it must be each member's last block: code
+# after it would run after the report, or never (an exit in main)
+mlast=""
+for stem in $(sed -n '/^# ---- apm: main — DO NOT EDIT/{n;s/^# members: //p;}' "$ROOT/templates/groups/apm.sh"); do
+    f="$(cd "$ROOT" && git ls-files "collectors/*collect-$stem.sh")"
+    [ -n "$f" ] && [ "$(tail -n 1 "$ROOT/$f")" = "# ---- end apm: main" ] || mlast="$mlast $stem"
+done
+check "apm: main is the last block of each member" '[ -z "$mlast" ]' "$mlast"
 # PowerShell group blocks: owner templates/groups/pg.ps1, member collect-x.ps1,
 # non-member collect-y.ps1; the shell collect-x.sh shares the stem and is not
 # a member (an owner's members are collectors of its own language)
@@ -553,6 +572,29 @@ else
         check "$(basename "$c" .sh): an unwritable --file exits non-zero and says so" \
               '[ "$rc" -ne 0 ] && grep -q "^!! the report was not written" "$R/ro.err" && ! grep -q "report written" "$R/ro.err"'
     done
+    # --file on a host without hostname(1): the apm main names the report after
+    # /proc/sys/kernel/hostname. PATH is every command on it but hostname.
+    if [ -r /proc/sys/kernel/hostname ]; then
+        mkdir -p "$R/nohost/bin" "$R/nohost/out"
+        for d in $(printf '%s' "$PATH" | tr ':' ' '); do
+            for x in "$d"/*; do
+                [ -x "$x" ] && [ ! -e "$R/nohost/bin/${x##*/}" ] && ln -s "$x" "$R/nohost/bin/${x##*/}"
+            done
+        done 2>/dev/null
+        rm -f "$R/nohost/bin/hostname"
+        # shellcheck disable=SC2034  # read inside check's eval
+        kh="$(cat /proc/sys/kernel/hostname)"
+        (cd "$R/nohost/out" && PATH="$R/nohost/bin" timeout 400 bash "$ROOT/collectors/apm/php/collect-apmphp.sh" --file </dev/null >/dev/null 2>&1)
+        # shellcheck disable=SC2034  # read inside check's eval
+        nf="$(cd "$R/nohost/out" && ls)"
+        check "apmphp: without hostname(1) the --file report is named after /proc/sys/kernel/hostname" \
+              '! PATH="$R/nohost/bin" command -v hostname >/dev/null && case "$nf" in "whatap-apmphp-$kh-"*.txt) true ;; *) false ;; esac' "$nf"
+        check "apmphp: and that report passes --report (Target: host/<the same name>)" \
+              '"$V" --report "$R/nohost/out/$nf" >/dev/null && grep -qx "Target:         host/$kh" "$R/nohost/out/$nf"' \
+              "$("$V" --report "$R/nohost/out/$nf" 2>&1 | sed -n 2,3p | tr '\n' ' ')"
+    else
+        skip "no /proc/sys/kernel/hostname: the hostname fallback is not tested"
+    fi
 fi
 
 echo

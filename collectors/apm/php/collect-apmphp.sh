@@ -56,6 +56,11 @@ export LC_ALL=C
 
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-apmphp"
+# 0.7.1  main is the apm group block `apm: main`; report unchanged. A --file run
+#        on a host without hostname(1) names the report after
+#        /proc/sys/kernel/hostname, else `uname -n`, and so does Target (both
+#        were: unknown, and validate.sh --report refused Target: host/unknown);
+#        the file name reuses the name Target resolved.
 # 0.7.0  --out DIR puts the --file report in DIR (an unwritable one ends the
 #        run before collecting); the help names APM_INTERP_CAP. A probe
 #        error line over 100 bytes keeps its start and its end; report
@@ -74,9 +79,9 @@ COLLECTOR_NAME="whatap-apmphp"
 # 0.5.2  A directory this uid can read but not enter lists its names again
 #        (the refactor's _names dropped them; ls did not).
 # 0.5.1  Readability refactor; report unchanged.
-VERSION="0.7.0"
+VERSION="0.7.1"
 DOMAIN="apm"
-TARGET="host/$(hostname 2>/dev/null || echo unknown)"
+TARGET="host/$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || uname -n 2>/dev/null || echo unknown)"
 
 # ---- CLI harness — DO NOT EDIT ----------------------------------------------
 OPT_FILE=0        # write the report to a .txt file
@@ -2135,11 +2140,19 @@ _rep_k8s() {
     read_proc "container hostname (/etc/hostname)" /etc/hostname
 }
 
-# ---- main — DO NOT EDIT --------------------------------------------------------
+# ---- apm: main — DO NOT EDIT ------------------------------------------------
+# members: apmjava apmnodejs apmphp apmpython
+# place: end
+# The run itself; the last lines of every member. fd 3 = the terminal, saved
+# before any redirection so progress() reaches the operator even in --file mode
+# (which redirects both stdout and stderr). A member's own option checks that
+# need warn go in its _init_probe, which runs before anything is collected.
 exec 3>&2
 
+# No arguments -> print help and stop; a collection needs an explicit action flag.
 [ "$ARGC" -eq 0 ] && { usage; exit 0; }
 
+# Modifiers alone (e.g. --quiet) are not an action — say so and show help.
 if [ "$OPT_FILE" = 0 ] && [ "$OPT_STDOUT" = 0 ]; then
     printf 'no action flag given — need --file or --stdout\n' >&2
     usage >&2
@@ -2154,10 +2167,11 @@ if [ "$OPT_STDOUT" = 1 ]; then
     run_report
     progress "done."
 else
-    HOST="$(hostname 2>/dev/null || echo unknown)"
+    HOST="${TARGET#host/}"   # the name TARGET already resolved, not a second lookup
     TS="$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null || echo unknown)"
     OUTFILE="${OPT_OUT:-.}/$COLLECTOR_NAME-$HOST-$TS.txt"
     progress "collecting facts (read-only) -> writing $OUTFILE"
     _report_to_file "$OUTFILE" || exit 1
     progress "report written: $OUTFILE"
 fi
+# ---- end apm: main

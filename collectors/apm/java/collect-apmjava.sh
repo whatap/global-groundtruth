@@ -89,9 +89,14 @@ COLLECTOR_NAME="whatap-apmjava"
 #         every shell; --threads=N takes a whole number 1..999999 only.
 #         --library patterns are matched with globbing off. A
 #         probe error line over 100 bytes keeps its start and its end.
-VERSION="0.13.0"
+# 0.13.1  main is the apm group block `apm: main`; report unchanged. The
+#         warning for --class without --library comes from _init_probe, right
+#         after the private temp directory is made (was: right before).
+#         Without hostname(1) and /proc, Target and the --file name take
+#         `uname -n` (was: unknown); the file name reuses Target's name.
+VERSION="0.13.1"
 DOMAIN="apm"
-TARGET="host/$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || echo unknown)"
+TARGET="host/$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || uname -n 2>/dev/null || echo unknown)"
 
 # ---- CLI harness — DO NOT EDIT ----------------------------------------------
 OPT_FILE=0        # write the report to a .txt file
@@ -679,7 +684,15 @@ EOF
 _errfile=""
 CMD_TIMEOUT="${CMD_TIMEOUT:-15}"
 # Call after _run_init: the error file lives in the run's private directory.
-_init_probe() { _errfile="$(_tmp probe.err)"; }
+# _init_probe -> the probe error file, and the option checks that need warn
+# (the shared main calls it before anything is collected): a combination that
+# collects nothing is named, not silently ignored
+_init_probe() {
+    _errfile="$(_tmp probe.err)"
+    [ -n "$OPT_CLASSES" ] && [ -z "$OPT_LIBS" ] && [ "$OPT_LIBALL" = 0 ] \
+        && warn "--class is not used without --library: member signatures are read from the jars --library details (--library '*' for every jar)"
+    return 0
+}
 
 # _rmtmp PATH... -> remove paths this run made under its own directory. A no-op
 # when no directory could be made: _tmp then returns /dev/null, which a root
@@ -3889,20 +3902,24 @@ run_report() {
     emit_footer
 }
 
-# ---- main — DO NOT EDIT --------------------------------------------------------
+# ---- apm: main — DO NOT EDIT ------------------------------------------------
+# members: apmjava apmnodejs apmphp apmpython
+# place: end
+# The run itself; the last lines of every member. fd 3 = the terminal, saved
+# before any redirection so progress() reaches the operator even in --file mode
+# (which redirects both stdout and stderr). A member's own option checks that
+# need warn go in its _init_probe, which runs before anything is collected.
 exec 3>&2
 
+# No arguments -> print help and stop; a collection needs an explicit action flag.
 [ "$ARGC" -eq 0 ] && { usage; exit 0; }
 
+# Modifiers alone (e.g. --quiet) are not an action — say so and show help.
 if [ "$OPT_FILE" = 0 ] && [ "$OPT_STDOUT" = 0 ]; then
     printf 'no action flag given — need --file or --stdout\n' >&2
     usage >&2
     exit 2
 fi
-
-# a combination that collects nothing is named, not silently ignored
-[ -n "$OPT_CLASSES" ] && [ -z "$OPT_LIBS" ] && [ "$OPT_LIBALL" = 0 ] \
-    && warn "--class is not used without --library: member signatures are read from the jars --library details (--library '*' for every jar)"
 
 _run_init
 _init_probe
@@ -3912,10 +3929,11 @@ if [ "$OPT_STDOUT" = 1 ]; then
     run_report
     progress "done."
 else
-    HOST="$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || echo unknown)"
+    HOST="${TARGET#host/}"   # the name TARGET already resolved, not a second lookup
     TS="$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null || echo unknown)"
     OUTFILE="${OPT_OUT:-.}/$COLLECTOR_NAME-$HOST-$TS.txt"
     progress "collecting facts (read-only) -> writing $OUTFILE"
     _report_to_file "$OUTFILE" || exit 1
     progress "report written: $OUTFILE"
 fi
+# ---- end apm: main

@@ -93,7 +93,9 @@ here, in the skeleton, and run `--apply`; `--check` reports drift.
 Helpers only some collectors share are **group blocks**, owned by
 `../groups/<group>.sh` (banner `# ---- <group>: <name> — DO NOT EDIT`, a
 `# members:` line, end `# ---- end <group>: <name>`); the same tool syncs them
-into the members it names and nowhere else. A `../groups/<group>.ps1` owner
+into the members it names and nowhere else (the apm collectors' `main` is
+one: `apm: main`, owned by `../groups/apm.sh`; the other collectors' mains
+start as copies of the one here and carry their own steps). A `../groups/<group>.ps1` owner
 does the same for the `collect-<stem>.ps1` collectors (`ps1.ps1` holds the
 PowerShell port of these blocks). Then run
 `tools/test-framework.sh`: it tests the blocks under bash and dash, and runs

@@ -355,7 +355,8 @@ The shared blocks (emit helpers, privilege, boot time, run helpers, completeness
 identical in every shell collector and owned by the skeleton. Each runs from
 its `# ---- <name> — DO NOT EDIT` banner to its `# ---- end <name>` line.
 Group blocks do the same for helpers a few sibling collectors share (the apm
-collectors' `probe`, `/proc` table scan, environ readers, port checks): each is
+collectors' `probe`, `/proc` table scan, environ readers, port checks, and
+their `main`, the run's last lines): each is
 owned by `templates/groups/<group>.sh`, runs from `# ---- <group>: <name> — DO
 NOT EDIT` to `# ---- end <group>: <name>`, and names its members on the next
 line, `# members: <stem> ...` (`collect-<stem>.sh`). The owner file is copied,

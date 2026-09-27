@@ -26,6 +26,12 @@
 #   environ readers:  D_UNREAD, and the _ev_<NAME> variables it sets
 #   numbers:          _pl, _plab, _pbad (the caller's port accumulators)
 #   output directory: OPT_OUT, OPT_STDOUT (the CLI harness), warn, _bounded
+#   main:             ARGC, OPT_FILE, OPT_STDOUT, OPT_OUT, COLLECTOR_NAME,
+#                     TARGET (host/<name>, the name of the --file report), usage,
+#                     _init_probe, run_report (the member's), _run_init,
+#                     progress, _report_to_file (skeleton), _out_check (above).
+#                     It is each member's last block (`# place: end`): nothing
+#                     may follow it.
 # Shell: bash 3.2+ and POSIX sh/dash (no [[, arrays, ${v//}, process
 # substitution).
 # -----------------------------------------------------------------------------
@@ -356,3 +362,39 @@ _out_check() {
     return 0
 }
 # ---- end apm: output directory
+
+# ---- apm: main — DO NOT EDIT ------------------------------------------------
+# members: apmjava apmnodejs apmphp apmpython
+# place: end
+# The run itself; the last lines of every member. fd 3 = the terminal, saved
+# before any redirection so progress() reaches the operator even in --file mode
+# (which redirects both stdout and stderr). A member's own option checks that
+# need warn go in its _init_probe, which runs before anything is collected.
+exec 3>&2
+
+# No arguments -> print help and stop; a collection needs an explicit action flag.
+[ "$ARGC" -eq 0 ] && { usage; exit 0; }
+
+# Modifiers alone (e.g. --quiet) are not an action — say so and show help.
+if [ "$OPT_FILE" = 0 ] && [ "$OPT_STDOUT" = 0 ]; then
+    printf 'no action flag given — need --file or --stdout\n' >&2
+    usage >&2
+    exit 2
+fi
+
+_run_init
+_init_probe
+_out_check || exit 1
+if [ "$OPT_STDOUT" = 1 ]; then
+    progress "collecting facts (read-only) -> stdout"
+    run_report
+    progress "done."
+else
+    HOST="${TARGET#host/}"   # the name TARGET already resolved, not a second lookup
+    TS="$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null || echo unknown)"
+    OUTFILE="${OPT_OUT:-.}/$COLLECTOR_NAME-$HOST-$TS.txt"
+    progress "collecting facts (read-only) -> writing $OUTFILE"
+    _report_to_file "$OUTFILE" || exit 1
+    progress "report written: $OUTFILE"
+fi
+# ---- end apm: main

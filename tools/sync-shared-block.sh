@@ -18,6 +18,11 @@
 #     collectors the block names. Banner `# ---- <group>: <name> — DO NOT EDIT`,
 #     end line `# ---- end <group>: <name>`, and the line right after the banner
 #     is `# members: <stem> ...`, where a member is collectors/**/collect-<stem>.sh.
+#     A group block may say `# place: end` on the line after `# members:`: it
+#     is then the last lines of every member (the apm collectors' main, which
+#     runs the collector and must come after every function it calls). --apply
+#     inserts a missing one at the end of the file and moves one found
+#     elsewhere to the end; --check reports the latter OUT OF PLACE.
 #     The owner file is the only list of the blocks and of their members;
 #     nothing here names them. A collector that is not a member but carries the
 #     banner is reported STRAY and left unchanged.
@@ -89,7 +94,9 @@ replace() { mv "$1.tmp" "$1" && case "$1" in *.sh) chmod +x "$1" ;; esac; }
 # sync_block NAME BANNER ENDRE OWNER NEXT PREV FILE... -> check, or re-copy from
 # OWNER, one block in each FILE. NEXT: regex of the later blocks' banners (a
 # missing block goes before the first one found); PREV: regex of the earlier
-# blocks' end lines (else it goes after the last one found)
+# blocks' end lines (else it goes after the last one found). PLACE_END=1: the
+# block must end the file (inserted, or moved, there)
+PLACE_END=0
 sync_block() {
     local name="$1" banner="$2" endre="$3" owner="$4" nextbanner="$5" prevend="$6" sr src f short r at after
     shift 6
@@ -103,6 +110,12 @@ sync_block() {
         if ! r="$(block_range "$f" "$banner" "$endre")"; then
             if grep -qE "$banner|$endre" "$f"; then
                 printf 'BROKEN   %-52s (block %s) — banner or end line missing or repeated\n' "$short" "$name"; rc=1; continue
+            fi
+            if [ "$PLACE_END" = 1 ] && [ "$mode" = --apply ]; then
+                { cat "$f"; printf '\n%s\n' "$src"; } > "$f.tmp" && replace "$f"
+                if syntax_ok "$f"; then printf 'inserted %-52s (block %s, at the end)\n' "$short" "$name"
+                else printf 'BROKEN   %-52s (block %s) — syntax error after insert\n' "$short" "$name"; rc=1; fi
+                continue
             fi
             at=""
             [ -n "$nextbanner" ] && at="$(grep -nE "$nextbanner" "$f" | head -1 | cut -d: -f1)"
@@ -118,6 +131,15 @@ sync_block() {
             fi && replace "$f"
             if syntax_ok "$f"; then printf 'inserted %-52s (block %s)\n' "$short" "$name"
             else printf 'BROKEN   %-52s (block %s) — syntax error after insert\n' "$short" "$name"; rc=1; fi
+            continue
+        fi
+        if [ "$PLACE_END" = 1 ] && [ "${r#* }" -ne "$(wc -l < "$f")" ]; then
+            if [ "$mode" = --check ]; then
+                printf 'OUT OF PLACE %-48s (block %s) — not the last lines of the file\n' "$short" "$name"; rc=1; continue
+            fi
+            { sed "${r% *},${r#* }d" "$f"; printf '%s\n' "$src"; } > "$f.tmp" && replace "$f"
+            if syntax_ok "$f"; then printf 'moved    %-52s (block %s, to the end)\n' "$short" "$name"
+            else printf 'BROKEN   %-52s (block %s) — syntax error after move\n' "$short" "$name"; rc=1; fi
             continue
         fi
         if [ "$(sed -n "${r% *},${r#* }p" "$f")" = "$src" ]; then
@@ -180,6 +202,8 @@ EOF
             echo "FAIL  block '$group: $name' in ${owner#"$ROOT"/}: the line after the banner is not '# members: <stem> ...'" >&2
             exit 2 ;;
         esac
+        PLACE_END=0
+        [ "$(sed -n "$((s + 2))p" "$owner")" = "# place: end" ] && PLACE_END=1
         members=() others="$pool"
         for stem in ${mline#"# members: "}; do
             m="$(printf '%s\n' "$pool" | grep -E "/collect-$stem\.$ext\$")"
