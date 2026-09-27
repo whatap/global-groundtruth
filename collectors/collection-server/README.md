@@ -290,45 +290,55 @@ One `.txt` report, MECE domains `[1]` + A..O:
   `zpool.cache`. Also **asks the installed binary which subcommands and flags it
   has** (`zfs rewrite`, `zpool iostat -r/-w`, `zpool status -t`) rather than
   inferring capability from a version string.
-- **B. ZFS module parameters** — the tunables that govern allocation-class
-  routing, block-size limits, the txg/dirty-data write throttle, the metaslab
-  allocator, the ZIL, ARC/L2ARC, prefetch, aggregation and scrub/trim, each
-  called out by name; then **every** file under `/sys/module/{zfs,spl}/parameters`
-  as `name = value`; then the **persisted** values in `/etc/modprobe.d/*zfs*` and
-  the kernel cmdline. Runtime and persisted values are reported separately
-  because they can differ.
+- **B. ZFS module parameters** — **every** file under
+  `/sys/module/{zfs,spl}/parameters` as `name = value` (the tunables of
+  allocation-class routing, block-size limits, the txg/dirty-data write
+  throttle, the metaslab allocator, the ZIL, ARC/L2ARC, prefetch, aggregation
+  and scrub/trim are rows of it; a tunable this build lacks is absent from it),
+  then the **persisted** values in `/etc/modprobe.d/*zfs*` and the kernel
+  cmdline. Runtime and persisted values are reported separately because they
+  can differ. Before 0.9.0 a list of about 70 named tunables was printed ahead
+  of the full dump.
 - **C. Pool topology & allocation classes** — raw `zpool list -v` (asked once:
-  the same output feeds the derived views, section H and the bundle's
-  `zpool-list-v.txt`), plus a derived
-  **per-top-level-vdev view grouped by allocation class** (data / special / logs /
-  cache / dedup) carrying SIZE/ALLOC/FREE/FRAG/CAP/HEALTH, and the redundancy
-  shape per class (mirror / raidz / draid / single-device / indirect). `zpool
-  status -vt`, `-x`, leaf device paths, and the `metaslab_stats` kstat.
+  the same output is the bundle's `zpool-list-v.txt`). Its lines carry each
+  top-level vdev's SIZE/ALLOC/FREE/FRAG/CAP/HEALTH, the allocation class it sits
+  under (a `special` / `logs` / `cache` / `dedup` line; none means data) and its
+  shape in its name (`mirror-N`, `raidzP-N`, `draid*`, `indirect-N`; a bare
+  device is a single-device vdev). `zpool status -vt`, `-x`, leaf device paths,
+  and the `metaslab_stats` kstat. Before 0.9.0 C also printed a per-class
+  view and a shape count derived from these lines, and H a SLOG line.
 - **D. Pool properties, features & capacity** — `zpool list`, `zpool get all` per
   pool (ashift, fragmentation, capacity, every `feature@*`), `zfs list -o space`.
-- **E. Dataset block size & compression** — a matrix over every filesystem and
-  volume with **`recordsize` and `special_small_blocks` adjacent**, plus
-  compression/compressratio/logbias/sync/primarycache/atime/volblocksize. Each
-  value carries its **property source** (`l` local, `d` default, `i` inherited) —
-  a deliberately set value and an inherited one are different facts. Then the
-  volume list (`volblocksize` is fixed at creation), every locally-set property,
-  and the `zstd` runtime kstat.
-- **F. Snapshots, clones & space accounting** — a matrix of where used space sits
-  (`usedbysnapshots` / `usedbydataset` / `usedbychildren` / `usedbyrefreservation`
-  / `written` / `logicalused` / quota / reservation / origin), snapshot counts per
-  dataset, oldest/newest snapshot, snapshots under a user hold, **snapshots pinned
-  by a clone**, and the `brtstats` block-cloning kstat.
+- **E. Dataset block size & compression** — the `zfs get` rows (NAME PROPERTY
+  VALUE SOURCE) of `type`, `recordsize`, `special_small_blocks`, `volblocksize`,
+  `compression`, `compressratio`, `logbias`, `sync`, `primarycache` and `atime`
+  for every filesystem and volume, from discovery's one `zfs get -Hp all`: exact
+  values, each with its **property source** (`local`, `default`, `inherited
+  from X`) — a deliberately set value and an inherited one are different facts.
+  Then the volume list (`volblocksize` is fixed at creation), every locally-set
+  property, and the `zstd` runtime kstat. Before 0.9.0 the same properties were
+  a one-line-per-dataset matrix of human-readable values.
+- **F. Snapshots, clones & space accounting** — where used space sits: `used`,
+  `avail` and `usedby*` are D's `zfs list -o space`, and F adds the `zfs get`
+  rows of `referenced`, `logicalused`, `logicalreferenced`, `written`, `quota`
+  and `refquota`; `origin` is the clone-origin list. Then snapshot counts per
+  dataset, oldest/newest snapshot, snapshots under a user hold, **snapshots
+  pinned by a clone**, and the `brtstats` block-cloning kstat. The snapshot
+  summaries stay: the snapshot list itself is only in the bundle
+  (`zfs-list-snapshots.tsv`).
 - **G. ARC / L2ARC / memory** — `arcstats` verbatim, `arc_summary`, a 1s `arcstat`
   sample, `dbufstats` / `abdstats` / `zfetchstats` / `dnodestats`, and
   `/proc/meminfo` as the context those numbers are read against.
 - **H. Write path: transaction groups & ZIL** — the **`txgs` ring buffer**
   (per-txg `ndirty`, `nwritten`, and time in each state — the per-transaction-group
   ingest measurement), `dmu_tx_assign`, `zil`, `state`, `iostats`, `reads`,
-  `multihost` per pool, and SLOG vdev presence.
-- **I. Per-dataset I/O counters** — the `objset-<id>` kstats: cumulative
-  writes / bytes written / reads / bytes read / unlinks **per dataset**, which is
-  the only per-dataset byte counter available without instrumenting the
-  application. Plus an inventory of every kstat entry not inlined.
+  `multihost` per pool.
+- **I. Per-dataset I/O counters** — every `objset-<id>` kstat verbatim
+  (`dataset_name`, cumulative writes / bytes written / reads / bytes read /
+  unlinks, the `zil_*` counters) **per dataset**, which is the only per-dataset
+  byte counter available without instrumenting the application. Plus an
+  inventory of every kstat entry not inlined. Before 0.9.0 I printed a
+  one-line view of five of those counters instead.
 - **J. I/O request size & latency distribution** — `zpool iostat -v`, `-lv`,
   `-qv`, and the **`-r` request-size** and **`-w` latency histograms**,
   cumulative since boot (instant kstat reads). The same views over a span of
@@ -338,7 +348,9 @@ One `.txt` report, MECE domains `[1]` + A..O:
   write_cache), `/dev/disk/by-id` links, `iostat -x`.
 - **L. Pool events, errors & maintenance** — a **tally of `zpool events` over the
   whole ring buffer** (count, first date, last date per class), then the last 100
-  events, `zpool history` per pool, the `fm` kstat, zfs-filtered `dmesg`, the
+  events, both from **one read of the ring** (`zpool events` in a report run,
+  `zpool events -v` in a bundle run, whose files `zfs/zpool-events-*` are the
+  same read), `zpool history` per pool, the `fm` kstat, zfs-filtered `dmesg`, the
   `dbgmsg` ring, journal for zfs-* units, and scrub/trim/snapshot automation
   (systemd timers, cron, sanoid / syncoid / zrepl / zed presence).
 
@@ -353,7 +365,10 @@ One `.txt` report, MECE domains `[1]` + A..O:
   because the full `-v` dump of that buffer was 192MB.
 - **M. WhaTap collection-server paths → dataset mapping** — for `WHATAP_HOME`,
   `yardbase`, `logs`, `conf`, `db`, `keeperbase`, `logsink`: which filesystem and
-  which **dataset** each lives on, that dataset's full property set, and `df`.
+  which **dataset** each lives on, that dataset's `zfs get` rows of `mounted`,
+  `mountpoint`, `canmount`, `secondarycache`, `relatime`, `dedup`, `checksum`,
+  `copies`, `reservation`, `refreservation` and `snapdir` (its block-size,
+  compression and space properties are its rows in D, E and F), and `df`.
   This is the only WhaTap-specific section; backend services, configs and logs
   are `collect-collserver.sh`'s job.
 
@@ -362,7 +377,10 @@ One `.txt` report, MECE domains `[1]` + A..O:
   count without a walk. `Inodes` and `IFree` are derived from the free space and
   move with it; read them as estimates, not as a limit (추정 — to be checked on a
   real ZFS host).
-- **N. Deep block & metaslab statistics** — `zdb` is opt-in (see tiers). The
+- **N. Deep block & metaslab statistics** — `zdb` is opt-in (see tiers). Each
+  zdb call runs once: in a report run N prints its first 400-500 lines; in a
+  bundle run its whole output goes to `zdb/zdb-<C|Lbbbs|mm>-<pool>.txt` and N
+  names each file with its size and exit status. The
   **file-size histogram is opt-in (`--filesizes`, Tier 2)** since 0.6.2. It walks
   the whole tree reading metadata (`find -printf '%s'`); on a yard of ~10^8 files
   that loads the device holding the metadata (a special vdev) and the ARC, and it
@@ -374,8 +392,8 @@ One `.txt` report, MECE domains `[1]` + A..O:
 - **O. Time window** — in every run, 15 s by default (`--window=DUR[@START]`
   sets the length, 10 s to 24 h, and a start time). It collects the following
   over the same span:
-  - every txg of the window from the `txgs` ring, with the distribution of
-    `otime` / `qtime` / `wtime` / `stime`, `ndirty`, `nwritten` and `writes`;
+  - every txg of the window from the `txgs` ring (`otime` / `qtime` / `wtime` /
+    `stime`, `ndirty`, `nwritten` and `writes` per txg);
   - start, end and delta of `dmu_tx`, `arcstats` and each `objset-*`;
   - `zpool iostat -vlq` beside `iostat -x`, started together at the same
     interval, with timestamps;
@@ -402,9 +420,9 @@ changes its length and start. Section O of the report holds:
   txg (`txg birth state ndirty nread nwritten reads writes otime qtime wtime stime`,
   the kernel's own columns, unchanged), from the txg open when the window starts
   to the txg open when it ends.
-- **A distribution** per pool over the completed rows (state `C`): count, min, p50,
-  p90, p99 and max (nearest rank) of `otime`, `qtime`, `wtime`, `stime` in ms, and of
-  `ndirty`, `nwritten` and `writes`.
+- How many rows were seen completed (state `C`). Before 0.9.0 a per-pool
+  count/min/p50/p90/p99/max table of those rows' columns followed; the rows
+  themselves are printed in full below it.
 - **Counters at start and end, and the delta**: the global `dmu_tx` kstat
   (`dmu_tx_assigned`, `dmu_tx_delay`, `dmu_tx_dirty_delay`, `dmu_tx_dirty_over_max`,
   `dmu_tx_dirty_frees_delay`, ...) and every dataset's `objset-*` kstat (`writes`,
@@ -669,7 +687,8 @@ under the shared `_bounded` cap. Unless `RUN_DEADLINE` is set, the run deadline
 - the time window: its length plus 60 s, plus the wait for its `START`. The
   120 s the window leaves for the rest of the report come out of the base 300 s;
 - the file-size walk;
-- `--zdb`: per pool, 3,720 s in the report and 7,500 s more in the bundle;
+- `--zdb`: 280 s plus, per pool, 3,720 s in a report run or 7,500 s in a bundle
+  run (zdb runs once, in one or the other);
 - the bundle.
 
 `[1]` prints the deadline the run used. The bundle journal keeps the newest 20,000 lines per unit. The bundle
@@ -698,8 +717,8 @@ Two habits worth keeping when extending it:
   is probed by running the command; a build that lacks a property simply omits it
   from `zfs get all`, and that omission is reported as a fact.
 - **Parse by column name, not by position.** `zpool list -v` gained `CKPOINT` /
-  `EXPANDSZ` / `DEDUP` columns over time, so the derived views locate columns from
-  the header row.
+  `EXPANDSZ` / `DEDUP` columns over time, so a parser locates columns from the
+  header row.
 
 #### Design notes — ZFS
 
@@ -708,8 +727,8 @@ but not which section has it:
 
 | question | sections |
 |---|---|
-| allocation-class routing | B (`zfs_special_class_metadata_reserve_pct`), C (per-vdev class usage), E (`recordsize` vs `special_small_blocks`, side by side) |
-| block sizing | E (property matrix incl. property source), J (request-size histograms), N (`zdb -Lbbbs`) |
+| allocation-class routing | B (`zfs_special_class_metadata_reserve_pct`), C (`zpool list -v`: usage per vdev under its class), E (`recordsize` and `special_small_blocks` rows per dataset) |
+| block sizing | E (`zfs get` rows with property source), J (request-size histograms), N (`zdb -Lbbbs`) |
 | append / txg behaviour | B (`zfs_txg_timeout`, dirty-data throttle), H (txgs ring buffer, ZIL kstats), I (per-dataset objset write counters), O (every txg of a time window, `--window`) |
 | free-space fragmentation | C/D (FRAG, CAP per vdev and per pool), B (`metaslab_*` parameters), N (`zdb -mm`) |
 | rewrite / send-receive path | A (whether the rewrite subcommand exists), F (snapshot and clone space accounting) |
@@ -747,8 +766,7 @@ but not which section has it:
   are now reported with their reason, but the success path is unexercised.
   Run once as **root** on a small pool to close this.
 - **Not yet seen**: a pool with a **logs** vdev. A special vdev was seen on the
-  0.8.0 VM. Before that, the derived allocation-class view was exercised on `data`
-  (plus `indirect`) only.
+  0.8.0 VM.
 - Portability target: bash 3.2+, `/proc`+`/sys` first, column-name parsing,
   command fallback chains. Verified on GNU awk 5.2 / bash 5.2; re-check `awk`
   user-function support and `find -printf` on the oldest OS you must support
@@ -1114,8 +1132,8 @@ It does not read WhaTap `conf/*.conf`. What can carry something sensitive:
   with properties).
 - **Configuration files named in L** are reported as present/absent only; their
   content is not read.
-- **`--bundle`** adds the journal of zfs units, `dmesg`, the kstat tree and
-  `zpool events -v`.
+- **`--bundle`** adds the journal of zfs units, `dmesg`, the kstat tree,
+  `zpool events -v` and, with `--zdb`, zdb's whole output.
 - **Section O (the time window)** adds dataset and pool names (from
   `objset-*`), txg numbers and counters, the `zpool iostat` vdev names and the
   `iostat -x` device names. It reads no file content, no configuration and no

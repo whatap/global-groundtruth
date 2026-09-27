@@ -346,7 +346,7 @@ done
 hasnt "and none for a path that is not there" "$out" "df -i $H13/db"
 chk "one df -i per distinct present path" "4" "$(printf '%s\n' "$out" | grep -c '^    df -i ')"
 
-echo "== 14. 0.7.0: zpool list -v is asked once, for the raw lines, the views and the bundle =="
+echo "== 14. 0.7.0: zpool list -v is asked once, for the raw lines and the bundle =="
 S14="$ROOT/stub14"; stub_clone "$S" "$S14"; ZC14="$ROOT/zcalls14"; : >| "$ZC14"
 p14="$(type -P gzip 2>/dev/null)" && [ -n "$p14" ] && ln -sf "$p14" "$S14/gzip"   # tar -z
 stub_write "$S14/zpool" <<STUB
@@ -366,7 +366,8 @@ STUB
 out="$(PATH="$S14" "$C" --stdout </dev/null 2>/dev/null)"
 chk "--stdout: one zpool list -v" "1" "$(grep -cx 'zpool list -v' "$ZC14")"
 has "the raw lines are printed" "$out" "zpool list -v (raw):"
-has "and the class view is derived from the same output" "$out" "raidz2-0"
+has "the raw lines carry the vdev" "$out" "raidz2-0"
+hasnt "0.9.0: no derived class view beside them" "$out" "per-top-level-vdev usage by allocation class"
 B14="$ROOT/b14"; mkdir -p "$B14"; : >| "$ZC14"
 ( cd "$B14" && PATH="$S14" "$C" --bundle --out . </dev/null >/dev/null 2>&1 )
 chk "--bundle: still one zpool list -v" "1" "$(grep -cx 'zpool list -v' "$ZC14")"
@@ -375,6 +376,74 @@ if [ -n "$t14" ]; then
   f14="$(tar -xOzf "$t14" --wildcards '*/zfs/zpool-list-v.txt' 2>/dev/null)"
   has "and zpool-list-v.txt holds the report's answer" "$f14" "  raidz2-0 7.27T"
 else bad "a bundle is written" "one .tar.gz" "none"; fi
+
+echo "== 14b. 0.9.0: the zevent ring, zfs get, the snapshot list and zdb are each read once =="
+S14b="$ROOT/stub14b"; stub_clone "$S14" "$S14b"; ZC14b="$ROOT/zcalls14b"; : >| "$ZC14b"
+stub_write "$S14b/zpool" <<STUB
+#!/bin/sh
+echo "zpool \$*" >> "$ZC14b"
+case "\$*" in
+  "list -H -o name") echo tank ;;
+  events) echo "TIME                           CLASS"
+          echo "Jul  3 2026 00:44:15.230790956 ereport.fs.zfs.deadman"
+          echo "Sep 20 2026 01:00:00.000000000 sysevent.fs.zfs.history_event" ;;
+  "events -v") echo "TIME                           CLASS"
+          printf 'Jul  3 2026 00:44:15.230790956 ereport.fs.zfs.deadman\n        vdev_path = "/dev/sda1"\n\n'
+          printf 'Sep 20 2026 01:00:00.000000000 sysevent.fs.zfs.history_event\n        history_hostname = "h"\n\n' ;;
+  "iostat -v") echo "tank iostat-v-answer" ;;
+esac
+exit 0
+STUB
+stub_write "$S14b/zfs" <<STUB
+#!/bin/sh
+echo "zfs \$*" >> "$ZC14b"
+case "\$*" in
+  get*) printf 'tank\trecordsize\t131072\tlocal\ntank\tcompression\tlz4\tdefault\n' ;;
+  "list -H -p -t snapshot"*) printf 'tank@a\t100\t200\t1780000000\t0\t5\t-\n' ;;
+esac
+exit 0
+STUB
+stub_write "$S14b/zdb" <<STUB
+#!/bin/sh
+echo "zdb \$*" >> "$ZC14b"
+echo "zdb answer \$*"
+STUB
+out="$(PATH="$S14b" "$C" --stdout </dev/null 2>/dev/null)"
+chk "--stdout: the ring is read once" "1" "$(grep -c '^zpool events' "$ZC14b")"
+chk "in its short form" "1" "$(grep -cx 'zpool events' "$ZC14b")"
+has "L gives each class with its count, first and last date" "$out" "ereport.fs.zfs.deadman                                1  2026-07-03  2026-07-03"
+has "and the ring's event count" "$out" "# events in the ring buffer: 2"
+has "and the last events from the same read" "$out" "Sep 20 2026 01:00:00.000000000 sysevent.fs.zfs.history_event"
+has "E prints the zfs get rows with their source" "$out" "recordsize                 131072                 local"
+B14b="$ROOT/b14b"; mkdir -p "$B14b"; : >| "$ZC14b"
+( cd "$B14b" && PATH="$S14b" "$C" --bundle --zdb --out . </dev/null >/dev/null 2>&1 )
+chk "--bundle: the ring is read once" "1" "$(grep -c '^zpool events' "$ZC14b")"
+chk "with -v, for the detail" "1" "$(grep -cx 'zpool events -v' "$ZC14b")"
+chk "zfs get all is asked once" "1" "$(grep -c '^zfs get' "$ZC14b")"
+chk "the snapshot list once" "1" "$(grep -c '^zfs list -H -p -t snapshot' "$ZC14b")"
+chk "zpool iostat -v once" "1" "$(grep -cx 'zpool iostat -v' "$ZC14b")"
+for z in "-C tank" "-Lbbbs tank" "-mm tank"; do chk "zdb $z once" "1" "$(grep -cx -- "zdb $z" "$ZC14b")"; done
+t14b="$(ls "$B14b"/*.tar.gz 2>/dev/null | head -1)"
+if [ -n "$t14b" ]; then
+  r14b="$(tar -xOzf "$t14b" ./report.txt 2>/dev/null)"
+  has "N names the bundle file and its exit" "$r14b" "zdb -Lbbbs tank: zdb/zdb-Lbbbs-tank.txt, "
+  has "the deadline adds the bundle's zdb once: 300 + 900 + 75 + 280 + 7500" "$r14b" "run deadline(s): 9055"
+  has "the zdb file holds zdb's whole answer" "$(tar -xOzf "$t14b" ./zdb/zdb-Lbbbs-tank.txt 2>/dev/null)" "zdb answer -Lbbbs tank"
+  has "the overview file is the one L printed" "$(tar -xOzf "$t14b" ./zfs/zpool-events-overview.tsv 2>/dev/null)" "# events in the ring buffer: 2"
+  has "the vdev tally comes from the same -v read" "$(tar -xOzf "$t14b" ./zfs/zpool-events-tally.tsv 2>/dev/null)" "/dev/sda1"
+  has "zfs-get-all-parsable.tsv is discovery's answer" "$(tar -xOzf "$t14b" ./zfs/zfs-get-all-parsable.tsv 2>/dev/null)" "recordsize"
+  has "zpool-iostat-v.txt is the report's answer" "$(tar -xOzf "$t14b" ./zfs/zpool-iostat-v.txt 2>/dev/null)" "iostat-v-answer"
+else bad "a bundle is written" "one .tar.gz" "none"; fi
+stub_write "$S14b/zpool" <<'STUB'
+#!/bin/sh
+case "$*" in
+  "list -H -o name") echo tank ;;
+  events) echo "cannot get event: permission denied" >&2; exit 1 ;;
+esac
+exit 0
+STUB
+out="$(PATH="$S14b" "$C" --stdout </dev/null 2>/dev/null)"
+has "a refused read says zpool's words" "$out" "zpool events: exit 1: cannot get event: permission denied"
 
 echo "== 15. 0.7.0: a feature check or unit journal cut by the run deadline says so =="
 # zpool iostat -r and journalctl never answer; systemctl says zfs-zed is loaded.
@@ -472,7 +541,7 @@ has "a ring that outlasts the interval: no txg unseen" "$out" "txgs never seen (
 has "the reads are more than start and end" "$out" "pool tank: "
 n16="$(printf '%s\n' "$out" | sed -n 's/.*pool tank: \([0-9]*\) reads.*/\1/p')"
 [ "${n16:-0}" -ge 3 ] && ok "the ring is re-read inside the window ($n16 reads)" || bad "re-read inside the window" ">= 3 reads" "${n16:-none}"
-has "the distribution line for otime" "$out" "otime(ms)"
+hasnt "0.9.0: no percentile table beside the rows kept" "$out" "otime(ms)"
 has "an objset counter's delta" "$out" "tank/objset-0x36 (tank/data):"
 has "and an unchanged counter is named with its value" "$out" "unchanged: dmu_tx_assigned=100, dmu_tx_dirty_frees_delay=5"
 has "zpool iostat -vlq ran over the window, 1s blocks for a 12s window" "$out" "zpool iostat -T d -vlq 1 13 (per vdev"

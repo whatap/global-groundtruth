@@ -36,7 +36,7 @@ export LC_ALL=C
 # ---- collector metadata -----------------------------------------------------
 # History: CHANGELOG.md, section collect-collzfs.sh (next to this file).
 COLLECTOR_NAME="whatap-collzfs"
-VERSION="0.8.8"
+VERSION="0.9.0"
 DOMAIN="collection-server"
 TARGET="collection-server-zfs/$(hostname 2>/dev/null || echo unknown)"   # refined after pool discovery
 
@@ -1073,15 +1073,6 @@ sd_state() { _sd "$1" "$2"; }
 unit_loaded() { [ "$(sd_show LoadState "$1")" = "loaded" ]; }
 # ---- end collection-server: systemd
 
-# param NAME -> "NAME = value" from /sys/module/zfs/parameters, with a reason.
-# A tunable that is absent is a fact about this build, not a collection failure.
-param() {
-    local n="$1" p="/sys/module/zfs/parameters/$1"
-    if [ ! -e "$p" ]; then fact "$n = n/a (path not found: not present in this zfs build)"; return; fi
-    if [ ! -r "$p" ]; then fact "$n = n/a (permission denied)"; return; fi
-    fact "$n = $(head -n1 "$p" 2>/dev/null)"
-}
-
 # dump_param_dir DIR -> "name = value" for every readable parameter file
 dump_param_dir() {
     local d="$1" f v n=0
@@ -1100,8 +1091,8 @@ dump_param_dir() {
 # =============================================================================
 ZPOOLS=""            # space-separated pool names
 ZPOOL_COUNT=0
-_ZGETALL=""          # temp file: name<TAB>property<TAB>value<TAB>source (fs+vol)
-_ZSNAP=""            # temp file: name<TAB>used<TAB>creation(epoch)<TAB>userrefs
+_ZGETALL=""          # temp file: name<TAB>property<TAB>value<TAB>source (fs+vol, -p exact values)
+_ZSNAP=""            # temp file: name used referenced creation(epoch) userrefs written clones, TAB-separated
 DS_COUNT=0
 SNAP_COUNT=0
 # COLLZFS_KSTAT_DIR is a test hook (tools/test-collzfs.sh): a machine without
@@ -1138,12 +1129,13 @@ discover_zfs() {
         # One pass over every filesystem/volume property, WITH its source
         # (local / inherited / default). Asking for `all` instead of a property
         # list means a version that lacks a property simply does not report it —
-        # no command-wide failure, and the absence itself becomes a fact.
+        # no command-wide failure, and the absence itself becomes a fact. -p:
+        # exact values; the bundle's zfs-get-all-parsable.tsv is this file.
         _ZGETALL="$(_tmp zget.tsv)"
         local _ge; _ge="$(_tmp zget.err)"
         # Caps scale with CMD_TIMEOUT: 90s and 120s at the default 20s.
         local _gcap=$(( CMD_TIMEOUT * 9 / 2 )) _scap=$(( CMD_TIMEOUT * 6 ))
-        CMD_TIMEOUT="$_gcap" _bounded zfs get -H -o name,property,value,source -t filesystem,volume all > "$_ZGETALL" 2>"$_ge"
+        CMD_TIMEOUT="$_gcap" _bounded zfs get -Hp -o name,property,value,source -t filesystem,volume all > "$_ZGETALL" 2>"$_ge"
         ZGET_RC=$?; ZGET_ERR="$(head -n1 "$_ge" 2>/dev/null | cut -c1-160)"
         if [ "$ZGET_RC" -eq 124 ]; then
             HUNG="$HUNG zfs"; HUNG_ZFS_WHY="zfs get did not answer within ${_gcap}s"
@@ -1154,11 +1146,12 @@ discover_zfs() {
         # appears in the filesystem/volume dump above), so it is collected here:
         # a snapshot with a clone attached cannot be destroyed to reclaim space.
         # Bounded: a yard with an aggressive snapshot policy holds tens of thousands.
+        # The bundle's zfs-list-snapshots.tsv is this file.
         _ZSNAP="$(_tmp zsnap.tsv)"
         local _se; _se="$(_tmp zsnap.err)"
         if _hung zfs; then ZSNAP_RC=124
         else
-            CMD_TIMEOUT="$_scap" _bounded zfs list -H -p -t snapshot -o name,used,creation,userrefs,clones > "$_ZSNAP" 2>"$_se"
+            CMD_TIMEOUT="$_scap" _bounded zfs list -H -p -t snapshot -o name,used,referenced,creation,userrefs,written,clones > "$_ZSNAP" 2>"$_se"
             ZSNAP_RC=$?
         fi
         ZSNAP_CAP="$_scap"; ZSNAP_ERR="$(head -n1 "$_se" 2>/dev/null | cut -c1-160)"
@@ -1166,12 +1159,6 @@ discover_zfs() {
     fi
     [ -z "$DS_COUNT" ] && DS_COUNT=0
     [ -z "$SNAP_COUNT" ] && SNAP_COUNT=0
-}
-
-# zprop DATASET PROPERTY -> value, or empty when absent
-zprop() {
-    [ -n "$_ZGETALL" ] && [ -s "$_ZGETALL" ] || return
-    awk -F'\t' -v d="$1" -v p="$2" '$1==d && $2==p {print $3; exit}' "$_ZGETALL" 2>/dev/null
 }
 
 # has_property PROPERTY -> 0 when this zfs build reported the property at all
@@ -1237,163 +1224,32 @@ EOF
 }
 
 # =============================================================================
-# Derived views (re-projections of command output — no interpretation added)
+# Raw rows of what discovery and section C already fetched
 # =============================================================================
 
-# `zpool list -v`, read once in section C (the raw probe) for both views
-# below, H and the bundle's zpool-list-v.txt. ZLIST_V_RC: its exit status.
-ZLIST_V=""; ZLIST_V_RC=""
-
-# Per-top-level-vdev usage grouped by allocation class, from `zpool list -v` on
-# stdin. The raw output is emitted next to this, so nothing is lost if a future
-# layout defeats the parser. Columns are located by HEADER NAME, not by
-# position, because zpool grew CKPOINT/EXPANDSZ/DEDUP columns over time.
-zpool_class_view() {
-    awk '
-        NR==1 { for (i=1; i<=NF; i++) col[$i]=i; next }
-        {
-            ind = 0
-            if (match($0, /^ +/)) ind = RLENGTH
-            name = $1
-            if (ind == 0) {
-                if (pool != "" && (name=="special" || name=="logs" || name=="log" || \
-                                   name=="cache" || name=="spare" || name=="spares" || name=="dedup")) {
-                    cls = name; next
-                }
-                pool = name; cls = "data"
-                printf "pool  %-24s size=%-8s alloc=%-8s free=%-8s frag=%-6s cap=%-6s health=%s\n", \
-                       name, g("SIZE"), g("ALLOC"), g("FREE"), g("FRAG"), g("CAP"), g("HEALTH")
-                next
-            }
-            if (ind == 2) {
-                printf "  vdev  class=%-8s %-22s size=%-8s alloc=%-8s free=%-8s frag=%-6s cap=%-6s health=%s\n", \
-                       cls, name, g("SIZE"), g("ALLOC"), g("FREE"), g("FRAG"), g("CAP"), g("HEALTH")
-            }
-        }
-        function g(c) { return (c in col && col[c] <= NF) ? $(col[c]) : "-" }
-    '
+# zget_rows PROPS [DATASET...] -> the rows of discovery's `zfs get all` whose
+# property is one of PROPS (space-separated), for every dataset or for the
+# DATASETs named, in zfs's own order: NAME PROPERTY VALUE SOURCE. Empty when
+# no row matched.
+zget_rows() {
+    local props="$1" ds=""; shift
+    [ -n "$_ZGETALL" ] && [ -s "$_ZGETALL" ] || return 1
+    [ "$#" -gt 0 ] && ds="$_tab$(printf '%s\t' "$@")"
+    awk -F'\t' -v P=" $props " -v D="$ds" '
+        index(P, " " $2 " ") && (D == "" || index(D, "\t" $1 "\t")) {
+            if (!h++) printf "%-38s %-26s %-22s %s\n", "NAME", "PROPERTY", "VALUE", "SOURCE"
+            printf "%-38s %-26s %-22s %s\n", $1, $2, $3, $4
+        }' "$_ZGETALL" 2>/dev/null
 }
 
-# Redundancy shape per allocation class, from the same output on stdin. A vdev
-# named mirror-N / raidzP-N / draid* carries its own shape in the name; a bare
-# device name means a single-device top-level vdev.
-zpool_class_shape() {
-    awk '
-        NR==1 { next }
-        {
-            ind = 0
-            if (match($0, /^ +/)) ind = RLENGTH
-            name = $1
-            if (ind == 0) {
-                if (pool != "" && (name=="special" || name=="logs" || name=="log" || \
-                                   name=="cache" || name=="spare" || name=="spares" || name=="dedup")) {
-                    cls = name; next
-                }
-                if (pool != "") flush()
-                pool = name; cls = "data"; delete shape; delete cnt; n = 0
-                next
-            }
-            if (ind == 2) {
-                s = "single-device"
-                if (name ~ /^mirror/)        s = "mirror"
-                else if (name ~ /^raidz/)    s = "raidz"
-                else if (name ~ /^draid/)    s = "draid"
-                else if (name ~ /^indirect/) s = "indirect (mapping left by a zpool remove)"
-                else if (name ~ /^spare-/)   s = "spare-in-use"
-                else if (name ~ /^replacing/) s = "replacing"
-                k = cls "/" s
-                if (!(k in cnt)) { order[++n] = k }
-                cnt[k]++
-            }
-        }
-        END { if (pool != "") flush() }
-        function flush() {
-            for (i = 1; i <= n; i++) {
-                k = order[i]
-                printf "%s: %s -> %d top-level vdev(s)\n", pool, k, cnt[k]
-            }
-        }
-    '
-}
-
-# The block-sizing matrix: recordsize and special_small_blocks side by side, with
-# each value''s property source, for every filesystem and volume.
-dataset_blocksize_matrix() {
-    [ -n "$_ZGETALL" ] && [ -s "$_ZGETALL" ] || return
-    awk -F'\t' '
-        !($1 in seen) { seen[$1] = 1; order[++n] = $1 }
-        { v[$1 SUBSEP $2] = $3; s[$1 SUBSEP $2] = $4 }
-        END {
-            fmt = "%-38s %-10s %-13s %-13s %-14s %-8s %-11s %-12s %-14s %-8s %-12s\n"
-            printf fmt, "DATASET","TYPE","RECORDSIZE","SPECIAL_SB","COMPRESSION","RATIO","LOGBIAS","SYNC","PRIMARYCACHE","ATIME","VOLBLOCK"
-            for (i = 1; i <= n; i++) {
-                d = order[i]
-                printf fmt, d, g(d,"type"), gs(d,"recordsize"), gs(d,"special_small_blocks"), \
-                       gs(d,"compression"), g(d,"compressratio"), gs(d,"logbias"), gs(d,"sync"), \
-                       gs(d,"primarycache"), gs(d,"atime"), gs(d,"volblocksize")
-            }
-        }
-        function g(d,p)  { k = d SUBSEP p; return (k in v) ? v[k] : "-" }
-        function gs(d,p) { k = d SUBSEP p; if (!(k in v)) return "-"; return v[k] "(" sm(s[k]) ")" }
-        function sm(x) {
-            if (x == "local")     return "l"
-            if (x == "default")   return "d"
-            if (x == "temporary") return "t"
-            if (x == "received")  return "r"
-            if (substr(x,1,9) == "inherited") return "i"
-            if (x == "-" || x == "") return "-"
-            return substr(x,1,1)
-        }
-    ' "$_ZGETALL" 2>/dev/null
-}
-
-# Space accounting per dataset: where the used space actually sits (dataset vs
-# snapshots vs children vs refreservation) plus quota/reservation and origin.
-dataset_space_matrix() {
-    [ -n "$_ZGETALL" ] && [ -s "$_ZGETALL" ] || return
-    awk -F'\t' '
-        !($1 in seen) { seen[$1] = 1; order[++n] = $1 }
-        { v[$1 SUBSEP $2] = $3 }
-        END {
-            fmt = "%-38s %-9s %-9s %-9s %-9s %-9s %-9s %-9s %-9s %-9s %-9s %s\n"
-            printf fmt, "DATASET","USED","REFER","USEDSNAP","USEDDS","USEDCHILD","USEDRESRV","WRITTEN","LOGUSED","QUOTA","REFQUOTA","ORIGIN"
-            for (i = 1; i <= n; i++) {
-                d = order[i]
-                printf fmt, d, g(d,"used"), g(d,"referenced"), g(d,"usedbysnapshots"), \
-                       g(d,"usedbydataset"), g(d,"usedbychildren"), g(d,"usedbyrefreservation"), \
-                       g(d,"written"), g(d,"logicalused"), g(d,"quota"), g(d,"refquota"), g(d,"origin")
-            }
-        }
-        function g(d,p) { k = d SUBSEP p; return (k in v) ? v[k] : "-" }
-    ' "$_ZGETALL" 2>/dev/null
-}
-
-# Per-dataset write/read counters from the objset-<objsetid> kstats. This is the
-# only place a per-DATASET (not per-pool) byte counter is available without
-# instrumenting the application.
-objset_kstat_view() {
-    local f any=0
-    for f in "$KSTAT_DIR"/*/objset-*; do
-        [ -f "$f" ] || continue
-        [ -r "$f" ] || continue
-        any=1
-        awk -v src="$f" '
-            $1 == "dataset_name" { d = $3 }
-            $1 == "writes"       { w = $3 }
-            $1 == "nwritten"     { nw = $3 }
-            $1 == "reads"        { r = $3 }
-            $1 == "nread"        { nr = $3 }
-            $1 == "nunlinks"     { nu = $3 }
-            $1 == "nunlinked"    { nud = $3 }
-            END {
-                n = split(src, a, "/"); k = a[n]
-                printf "%-38s %-16s writes=%-12s nwritten=%-16s reads=%-12s nread=%-16s nunlinks=%s/%s\n", \
-                       (d == "" ? "-" : d), k, w, nw, r, nr, nu, nud
-            }
-        ' "$f" 2>/dev/null
-    done
-    [ "$any" = 0 ] && return 1
-    return 0
+# _keep NAME -> the last probe's output, kept for the bundle when it answered
+_keep() { [ "$PROBE_RC" = 0 ] && [ -n "$PROBE_OUT" ] && printf '%s\n' "$PROBE_OUT" > "$(_tmp "keep-$1")" 2>/dev/null; }
+# _reuse NAME FILE SECS CMD... -> FILE from what the report kept under NAME, or
+# from CMD when the report's call did not answer
+_reuse() {
+    local k; k="$(_tmp "keep-$1")"; shift
+    if [ -s "$k" ]; then cp "$k" "$1" 2>/dev/null
+    else local f="$1"; shift; run_bounded "$@" > "$f"; fi
 }
 
 # File-size histogram (Tier 2 --filesizes). Buckets chosen at the power-of-two
@@ -1566,52 +1422,7 @@ _rep_b() {
     # The runtime value of a tunable and the value persisted in modprobe.d can
     # differ (a live `echo > /sys/module/...` is lost on reboot; a modprobe.d
     # entry added after boot is not yet active). Both are reported.
-    local p
     section "B. ZFS module parameters (runtime + persisted)"
-    subsection "allocation class routing"
-    for p in zfs_special_class_metadata_reserve_pct zfs_ddt_data_is_special \
-        zfs_user_indirect_is_special zfs_dmu_offset_next_sync; do
-        param "$p"
-    done
-    subsection "block size limits"
-    for p in zfs_max_recordsize zfs_default_bs zfs_default_ibs zvol_volmode; do param "$p"; done
-    subsection "transaction group & dirty-data write throttle"
-    for p in zfs_txg_timeout zfs_txg_history zfs_dirty_data_max zfs_dirty_data_max_max \
-        zfs_dirty_data_max_percent zfs_dirty_data_sync_percent \
-        zfs_delay_min_dirty_percent zfs_delay_scale \
-        zfs_vdev_async_write_active_min_dirty_percent \
-        zfs_vdev_async_write_active_max_dirty_percent; do
-        param "$p"
-    done
-    subsection "metaslab & allocator"
-    for p in metaslab_df_free_pct metaslab_df_alloc_threshold metaslab_force_ganging \
-        metaslab_force_ganging_pct metaslab_aliquot metaslab_debug_load \
-        metaslab_debug_unload metaslab_unload_delay metaslab_preload_enabled \
-        zfs_metaslab_switch_threshold zfs_metaslab_fragmentation_threshold \
-        zfs_mg_fragmentation_threshold zfs_mg_noalloc_threshold \
-        zfs_metaslab_sm_blksz_no_log zfs_metaslab_sm_blksz_with_log; do
-        param "$p"
-    done
-    subsection "ZIL / sync write path"
-    for p in zil_slog_bulk zil_nocacheflush zfs_immediate_write_sz zfs_commit_timeout_pct; do param "$p"; done
-    subsection "ARC / L2ARC"
-    for p in zfs_arc_max zfs_arc_min zfs_arc_meta_limit zfs_arc_meta_limit_percent \
-        zfs_arc_meta_balance zfs_arc_dnode_limit_percent zfs_compressed_arc_enabled \
-        zfs_abd_scatter_enabled l2arc_write_max l2arc_write_boost l2arc_noprefetch \
-        l2arc_rebuild_enabled l2arc_exclude_special; do
-        param "$p"
-    done
-    subsection "prefetch & vdev aggregation"
-    for p in zfs_prefetch_disable zfetch_max_distance zfetch_max_streams \
-        zfs_vdev_aggregation_limit zfs_vdev_aggregation_limit_non_rotating \
-        zfs_vdev_read_gap_limit zfs_vdev_write_gap_limit; do
-        param "$p"
-    done
-    subsection "scrub / resilver / trim"
-    for p in zfs_scan_vdev_limit zfs_resilver_min_time_ms zfs_scrub_min_time_ms \
-        zfs_trim_extent_bytes_min zfs_trim_txg_batch zfs_rebuild_scrub_enabled; do
-        param "$p"
-    done
     subsection "all /sys/module/zfs/parameters (name = value)"
     dump_param_dir /sys/module/zfs/parameters
     subsection "all /sys/module/spl/parameters (name = value)"
@@ -1631,18 +1442,10 @@ _rep_b() {
 # -- C. Pool topology & allocation classes --------------------------------
 _rep_c() {
     section "C. Pool topology & allocation classes"
-    zprobe "zpool list -v (raw)" zpool list -v
-    ZLIST_V="$PROBE_OUT"; ZLIST_V_RC="$PROBE_RC"
-    subsection "per-top-level-vdev usage by allocation class (derived from zpool list -v)"
-    local cv; cv="$(printf '%s\n' "$ZLIST_V" | zpool_class_view)"
-    if [ -n "$cv" ]; then printf '%s\n' "$cv" | while IFS= read -r _l; do blk "$_l"; done
-    elif _hung zpool; then fact "n/a ($(_skip_why zpool))"
-    else fact "n/a (empty output or layout not parsed — see the raw zpool list -v above)"; fi
-    subsection "redundancy shape per allocation class (derived from zpool list -v)"
-    local cs; cs="$(printf '%s\n' "$ZLIST_V" | zpool_class_shape)"
-    if [ -n "$cs" ]; then printf '%s\n' "$cs" | while IFS= read -r _l; do blk "$_l"; done
-    elif _hung zpool; then fact "n/a ($(_skip_why zpool))"
-    else fact "n/a (empty output or layout not parsed)"; fi
+    # One call: the raw lines here are also the bundle's zpool-list-v.txt.
+    # The class of a top-level vdev (special / logs / cache / dedup) and its
+    # shape (mirror-N / raidzP-N / draid) are in these lines.
+    zprobe "zpool list -v (raw)" zpool list -v; _keep zpool-list-v
     subsection "zpool status"
     # -v and -t combined in one call: -t only annotates the same vdev tree with
     # trim state, so two separate calls would print the tree twice. The answer
@@ -1684,8 +1487,7 @@ _rep_d() {
 
 # -- E. Dataset block size & compression ----------------------------------
 _rep_e() {
-    # recordsize and special_small_blocks are printed adjacently and each value
-    # carries its property source, because an inherited or default value and a
+    # Each row carries its property source: an inherited or default value and a
     # deliberately set one are different facts.
     section "E. Dataset block size & compression"
     fact "datasets (filesystem+volume): ${DS_COUNT:-0}"
@@ -1694,10 +1496,9 @@ _rep_e() {
     else
         fact "special_small_blocks property: not reported by this zfs build (or no dataset enumerated)"
     fi
-    fact "property source marker: l=local d=default i=inherited t=temporary r=received -=absent"
-    subsection "block-size / compression matrix"
-    local bm; bm="$(dataset_blocksize_matrix)"
-    if [ -n "$bm" ]; then printf '%s\n' "$bm" | while IFS= read -r _l; do blk "$_l"; done
+    subsection "block size & compression properties, every filesystem and volume (zfs get rows)"
+    local r; r="$(zget_rows "type recordsize special_small_blocks volblocksize compression compressratio logbias sync primarycache atime")"
+    if [ -n "$r" ]; then printf '%s\n' "$r" | _indent '        '
     else fact "n/a (no dataset property dump — zfs get returned nothing)"; fi
     subsection "volumes (volblocksize is set at creation time)"
     probe_t 60 "zfs list -t volume" zfs list -t volume -o name,volsize,volblocksize,used,referenced,compression,compressratio,sync,logbias
@@ -1716,9 +1517,10 @@ _rep_e() {
 _rep_f() {
     local p
     section "F. Snapshots, clones & space accounting"
-    subsection "space accounting matrix (where used space sits)"
-    local sm_; sm_="$(dataset_space_matrix)"
-    if [ -n "$sm_" ]; then printf '%s\n' "$sm_" | while IFS= read -r _l; do blk "$_l"; done
+    # used / avail / usedby* are D's zfs list -o space; these are the rest
+    subsection "space properties not in zfs list -o space (zfs get rows)"
+    local r; r="$(zget_rows "referenced logicalused logicalreferenced written quota refquota")"
+    if [ -n "$r" ]; then printf '%s\n' "$r" | _indent '        '
     else fact "n/a (no dataset property dump)"; fi
     subsection "snapshot inventory"
     if [ -n "$ZSNAP_RC" ] && [ "$ZSNAP_RC" -eq 0 ]; then fact "snapshot count (all pools): ${SNAP_COUNT:-0}"
@@ -1731,8 +1533,8 @@ _rep_f() {
         probe_pipe "snapshot count per dataset (top 30 by count)" awk \
             "printf '%-52s %10s %20s\n' DATASET SNAPSHOTS USED_BYTES; awk -F'\t' '{split(\$1,a,\"@\"); c[a[1]]++; u[a[1]]+=\$2} END{for(d in c) printf \"%-52s %10d %20d\n\", d, c[d], u[d]}' '$_ZSNAP' | sort -k2,2nr | head -n 30 || true"
         local _old _new
-        _old="$(awk -F'\t' 'NR==1{m=$3;s=$1} $3+0<m+0{m=$3;s=$1} END{if(NR)printf "%s\t%s", s, m}' "$_ZSNAP" 2>/dev/null)"
-        _new="$(awk -F'\t' 'NR==1{m=$3;s=$1} $3+0>m+0{m=$3;s=$1} END{if(NR)printf "%s\t%s", s, m}' "$_ZSNAP" 2>/dev/null)"
+        _old="$(awk -F'\t' 'NR==1{m=$4;s=$1} $4+0<m+0{m=$4;s=$1} END{if(NR)printf "%s\t%s", s, m}' "$_ZSNAP" 2>/dev/null)"
+        _new="$(awk -F'\t' 'NR==1{m=$4;s=$1} $4+0>m+0{m=$4;s=$1} END{if(NR)printf "%s\t%s", s, m}' "$_ZSNAP" 2>/dev/null)"
         if [ -n "$_old" ]; then
             fact "oldest snapshot: $(printf '%s' "$_old" | cut -f1) (creation $(_epoch_iso "$(printf '%s' "$_old" | cut -f2)"))"
             fact "newest snapshot: $(printf '%s' "$_new" | cut -f1) (creation $(_epoch_iso "$(printf '%s' "$_new" | cut -f2)"))"
@@ -1740,9 +1542,9 @@ _rep_f() {
             fact "oldest / newest snapshot: n/a (empty output)"
         fi
         probe_pipe "snapshots holding a user hold (userrefs > 0)" awk \
-            "awk -F'\t' '\$4+0>0 {n++; if(n<=20) printf \"%s userrefs=%s\n\", \$1, \$4} END{printf \"total_with_holds=%d\n\", n+0}' '$_ZSNAP' || true"
+            "awk -F'\t' '\$5+0>0 {n++; if(n<=20) printf \"%s userrefs=%s\n\", \$1, \$5} END{printf \"total_with_holds=%d\n\", n+0}' '$_ZSNAP' || true"
         probe_pipe "snapshots with a clone attached (first 30)" awk \
-            "awk -F'\t' '\$5!=\"-\" && \$5!=\"\" {n++; if(n<=30) printf \"%s  clones=%s\n\", \$1, \$5} END{printf \"total_snapshots_with_clones=%d\n\", n+0}' '$_ZSNAP' || true"
+            "awk -F'\t' '\$7!=\"-\" && \$7!=\"\" {n++; if(n<=30) printf \"%s  clones=%s\n\", \$1, \$7} END{printf \"total_snapshots_with_clones=%d\n\", n+0}' '$_ZSNAP' || true"
     else
         if [ -z "$ZSNAP_RC" ]; then fact "snapshot detail: n/a (command not found: zfs)"
         elif [ "$ZSNAP_RC" -eq 124 ] && _hung zfs; then fact "snapshot detail: n/a ($(_skip_why zfs))"
@@ -1806,20 +1608,18 @@ _rep_h() {
     subsection "global write-path kstats"
     read_proc "dmu_tx" "$KSTAT_DIR/dmu_tx"
     read_proc "zil (global)" "$KSTAT_DIR/zil"
-    subsection "separate log (SLOG) vdev presence"
-    local shp; shp="$(printf '%s\n' "$ZLIST_V" | zpool_class_shape | grep -E '/(logs|log)/' || true)"
-    if [ -n "$shp" ]; then printf '%s\n' "$shp" | while IFS= read -r _l; do blk "$_l"; done
-    elif _hung zpool; then fact "separate log vdev: n/a ($(_skip_why zpool))"
-    else fact "no vdev in the logs allocation class was parsed from zpool list -v"; fi
 }
 
 # -- I. Per-dataset I/O counters (objset kstats) --------------------------
 _rep_i() {
     section "I. Per-dataset I/O counters (objset kstats)"
     fact "source: $KSTAT_DIR/<pool>/objset-<objsetid>; counters are cumulative since pool import"
-    local ov; ov="$(objset_kstat_view)"
-    if [ -n "$ov" ]; then printf '%s\n' "$ov" | while IFS= read -r _l; do blk "$_l"; done
-    else fact "n/a (no objset-* kstat file found or readable under $KSTAT_DIR)"; fi
+    local f any=0
+    for f in "$KSTAT_DIR"/*/objset-*; do
+        [ -f "$f" ] || continue
+        any=1; read_proc "${f#"$KSTAT_DIR"/}" "$f"
+    done
+    [ "$any" = 0 ] && fact "n/a (no objset-* kstat file found under $KSTAT_DIR)"
     subsection "other kstat entries present but not inlined above"
     if [ -d "$KSTAT_DIR" ]; then
         # dbufs is deliberately never read: it enumerates every dbuf in the ARC
@@ -1838,13 +1638,15 @@ _rep_j() {
     # Interval values over a span of time are --window's (section O).
     section "J. I/O request size & latency distribution"
     subsection "cumulative since boot (instant kstat read)"
-    zprobe "zpool iostat -v" zpool iostat -v
-    zprobe "zpool iostat -lv (latency)" zpool iostat -lv
-    zprobe "zpool iostat -qv (queue depth, instantaneous)" zpool iostat -qv
+    # Each answer is kept for the bundle's zfs/zpool-iostat-*.txt (_reuse).
+    # -r / -w: the whole output is kept (tee), the first 400 lines printed.
+    zprobe "zpool iostat -v" zpool iostat -v; _keep zpool-iostat-v
+    zprobe "zpool iostat -lv (latency)" zpool iostat -lv; _keep zpool-iostat-lv
+    zprobe "zpool iostat -qv (queue depth, instantaneous)" zpool iostat -qv; _keep zpool-iostat-qv
     probe_pipe "zpool iostat -r (request size histogram, first 400 lines)" zpool \
-        "zpool iostat -r 2>/dev/null | head -n 400 || true"
+        "zpool iostat -r 2>/dev/null | tee '$(_tmp keep-zpool-iostat-r)' | awk 'NR <= 400' || true"
     probe_pipe "zpool iostat -w (latency histogram, first 400 lines)" zpool \
-        "zpool iostat -w 2>/dev/null | head -n 400 || true"
+        "zpool iostat -w 2>/dev/null | tee '$(_tmp keep-zpool-iostat-w)' | awk 'NR <= 400' || true"
 }
 
 # -- K. Underlying block devices ------------------------------------------
@@ -1868,7 +1670,7 @@ _rep_k() {
         blk "$line"
     done
     probe_pipe "device id links (/dev/disk/by-id)" ls "ls -l /dev/disk/by-id 2>/dev/null | awk 'NF>=9 {print \$9\" -> \"\$NF}' || true"
-    probe_pipe "iostat -x (cumulative since boot)" iostat "iostat -x 2>/dev/null | head -n 60 || true"
+    probe_pipe "iostat -x (cumulative since boot)" iostat "iostat -x 2>/dev/null | tee '$(_tmp keep-iostat-x)' | awk 'NR <= 60' || true"
     fact "multipath: $( have multipath && echo 'command present (multipath -ll not run in this report)' || echo 'n/a (command not found: multipath)' )"
 }
 
@@ -1876,26 +1678,27 @@ _rep_k() {
 _rep_l() {
     local p
     section "L. Pool events, errors & maintenance"
-    # Folds stderr in: an unprivileged uid's "permission denied" would else
-    # read as "no events". Tally first (why: README.md, section L), from the
-    # short form; the -v detail is bundled by zevents_split.
-    probe_pipe_t 180 "zpool events: tally over the whole ring buffer (count, first, last)" zpool \
-        "zpool events 2>/dev/null | awk '
-            BEGIN { split(\"Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec\", mn, \" \")
-                    for (i = 1; i <= 12; i++) M[mn[i]] = i }
-            NF >= 5 && \$3 ~ /^[0-9][0-9][0-9][0-9]\$/ && (\$1 in M) {
-                d = sprintf(\"%04d-%02d-%02d\", \$3, M[\$1], \$2); t++
-                n[\$5]++
-                if (!(\$5 in f) || d < f[\$5]) f[\$5] = d
-                if (!(\$5 in l) || d > l[\$5]) l[\$5] = d
-            }
-            END {
-                if (t == 0) { print \"(no event parsed)\"; exit }
-                printf \"%10s  %-10s %-10s  %s\n\", \"COUNT\", \"FIRST\", \"LAST\", \"CLASS\"
-                for (c in n) printf \"%10d  %-10s %-10s  %s\n\", n[c], f[c], l[c], c
-                printf \"%10d  %-10s %-10s  %s\n\", t, \"\", \"\", \"(total)\"
-            }' | sort -rn || true"
-    probe_pipe_t 60 "zpool events (last 100, stderr folded in)" zpool "zpool events 2>&1 | tail -n 100 || true"
+    # One read of the ring (zevents_split; why the whole of it: README.md,
+    # section L). A bundle run keeps its files in zfs/.
+    if ! have zpool; then fact "zpool events: n/a (command not found: zpool)"
+    elif _hung zpool; then fact "zpool events: n/a ($(_skip_why zpool))"
+    else
+        [ -n "$ZEV_DIR" ] || ZEV_DIR="$(_tmp zevents)"
+        if ! mkdir -p "$ZEV_DIR" 2>/dev/null; then fact "zpool events: n/a (no private temp directory for its output)"
+        else
+            zevents_split "$ZEV_DIR"
+            case "$ZEV_RC" in
+                0) ;;
+                124) if _past_deadline; then fact "zpool events: stopped (run deadline reached: ${RUN_DEADLINE}s); the lines below cover the part read"
+                     else fact "zpool events: stopped at the ${ZEV_CAP}s cap; the lines below cover the part read"; fi ;;
+                *) fact "zpool events: exit $ZEV_RC${ZEV_ERR:+: $ZEV_ERR}$(_priv_hint)" ;;
+            esac
+            _emit_labeled "zpool events$( [ "$ZEV_V" = 1 ] && echo ' -v'): per class over the whole ring buffer" \
+                "$(awk -F'\t' '/^#/ { print; next } { printf "%-44s %10s  %-10s  %s\n", $1, $2, $3, $4 }' "$ZEV_DIR/zpool-events-overview.tsv" 2>/dev/null)"
+            if [ -s "$(_tmp zevents-last.txt)" ]; then _emit_labeled "zpool events: the last 100 events" "$(cat "$(_tmp zevents-last.txt)")"
+            else fact "zpool events: the last 100 events: none"; fi
+        fi
+    fi
     for p in $ZPOOLS; do
         probe_pipe_t 60 "$p: zpool history (last 200, stderr folded in)" zpool "zpool history '$p' 2>&1 | tail -n 200 || true"
     done
@@ -1944,24 +1747,29 @@ _rep_n() {
             # zdb opens the pool devices directly; stderr is folded in so a
             # non-root "can't open '<pool>': Permission denied" stays visible.
             fact "uid for this run: $(id -u 2>/dev/null || echo unknown) ($( [ "$(id -u 2>/dev/null)" = 0 ] && echo root || echo non-root )) — zdb opens the pool devices directly"
-            for p in $ZPOOLS; do
-                subsection "$p (zdb)"
-                warn "[Tier2] zdb -C $p — reads the pool configuration"
-                progress "zdb -C $p ..."
-                probe_pipe_t 120 "zdb -C $p (config; per-vdev ashift and allocation class)" zdb \
-                    "zdb -C '$p' 2>&1 | head -n 400 || true"
-                warn "[Tier2] zdb -Lbbbs $p — traverses pool metadata; takes minutes on a large pool and reads the data disks"
-                progress "zdb -Lbbbs $p (block statistics; this is the long one) ..."
-                # Its \r-separated "estimated time remaining" progress on stderr
-                # is split and dropped; the rest of stderr is kept.
-                probe_pipe_t 1800 "zdb -Lbbbs $p (block/psize/lsize histogram, measured compression; first 500 lines)" zdb \
-                    "zdb -Lbbbs '$p' 2>&1 | tr '\r' '\n' | grep -v 'estimated time remaining' | head -n 500 || true"
-                warn "[Tier2] zdb -mm $p — loads metaslab space maps"
-                progress "zdb -mm $p (metaslab free-space histograms) ..."
-                probe_pipe_t 1800 "zdb -mm $p (metaslab free-space histograms; first 500 lines)" zdb \
-                    "zdb -mm '$p' 2>&1 | head -n 500 || true"
-            done
-            [ -z "$ZPOOLS" ] && fact "zdb: n/a ($(_nopool_why))"
+            # A bundle run writes zdb's whole output to zdb/ instead (_zdb_bundle):
+            # one run of each zdb call, never both.
+            if [ -n "$BUNDLE_WORK" ]; then _zdb_bundle "$BUNDLE_WORK/zdb"
+            else
+                for p in $ZPOOLS; do
+                    subsection "$p (zdb)"
+                    warn "[Tier2] zdb -C $p — reads the pool configuration"
+                    progress "zdb -C $p ..."
+                    probe_pipe_t 120 "zdb -C $p (config; per-vdev ashift and allocation class)" zdb \
+                        "zdb -C '$p' 2>&1 | head -n 400 || true"
+                    warn "[Tier2] zdb -Lbbbs $p — traverses pool metadata; takes minutes on a large pool and reads the data disks"
+                    progress "zdb -Lbbbs $p (block statistics; this is the long one) ..."
+                    # Its \r-separated "estimated time remaining" progress on stderr
+                    # is split and dropped; the rest of stderr is kept.
+                    probe_pipe_t 1800 "zdb -Lbbbs $p (block/psize/lsize histogram, measured compression; first 500 lines)" zdb \
+                        "zdb -Lbbbs '$p' 2>&1 | tr '\r' '\n' | grep -v 'estimated time remaining' | head -n 500 || true"
+                    warn "[Tier2] zdb -mm $p — loads metaslab space maps"
+                    progress "zdb -mm $p (metaslab free-space histograms) ..."
+                    probe_pipe_t 1800 "zdb -mm $p (metaslab free-space histograms; first 500 lines)" zdb \
+                        "zdb -mm '$p' 2>&1 | head -n 500 || true"
+                done
+                [ -z "$ZPOOLS" ] && fact "zdb: n/a ($(_nopool_why))"
+            fi
         fi
     else
         fact "zdb block/metaslab statistics: n/a (not applicable: --zdb not given)"
@@ -2157,19 +1965,15 @@ report_whatap_paths() {
         [ -n "$p" ] || continue
         case " $done_ds " in *" $sr "*) continue ;; esac
         done_ds="$done_ds $sr"
-        fact "$sr (mounted at or containing $p):"
-        local pr v
-        for pr in type mounted mountpoint recordsize special_small_blocks compression compressratio \
-                  logbias sync primarycache secondarycache atime relatime dedup checksum copies \
-                  quota refquota reservation refreservation used available referenced \
-                  usedbysnapshots usedbydataset usedbychildren logicalused written snapdir canmount; do
-            v="$(zprop "$sr" "$pr")"
-            [ -z "$v" ] && v="n/a (property not reported for this dataset)"
-            blk "$(printf '%-24s %s' "$pr" "$v")"
-        done
+        fact "$sr (mounted at or containing $p)"
     done <<EOF
 $zmap
 EOF
+    # Their other properties are rows of D (zfs list -o space), E and F.
+    local r=""
+    # shellcheck disable=SC2086  # a dataset name is one word
+    [ -n "$done_ds" ] && r="$(zget_rows "mounted mountpoint canmount secondarycache relatime dedup checksum copies reservation refreservation snapdir" $done_ds)"
+    [ -n "$r" ] && printf '%s\n' "$r" | _indent '        '
     [ -z "$done_ds" ] && fact "no WhaTap path resolved to a ZFS dataset"
     subsection "capacity as the filesystem reports it"
     for p in $paths; do
@@ -2187,24 +1991,37 @@ EOF
     fi
 }
 
-# zevents_split DESTDIR -> split `zpool events -v` into a tally and a window.
-# Why the tally covers the whole buffer: README.md, section L. Read ONCE (a
-# second pass costs the same minutes and sees a moved buffer) into:
+# zevents_split DESTDIR -> split one read of `zpool events` into a tally and a
+# window. Why the tally covers the whole buffer: README.md, section L. Read ONCE
+# (a second pass costs the same minutes and sees a moved buffer) into:
 #   zpool-events-tally.tsv     class x date x vdev, counted over the whole buffer
-#   zpool-events-overview.tsv  class, count, first date, last date
+#   zpool-events-overview.tsv  class, count, first date, last date (section L)
 #   zpool-events-v.txt         full detail, but only for the last OPT_EVENT_DAYS
+# A bundle run reads `zpool events -v` for the detail; a report run reads the
+# short form (the event lines only: no vdev, no detail file). ZEV_RC / ZEV_ERR:
+# the read's exit status and first stderr line.
+ZEV_DIR="" ZEV_V=0 ZEV_RC="" ZEV_ERR="" ZEV_CAP=180
+BUNDLE_WORK=""       # the bundle's work dir while do_bundle runs the report
 zevents_split() {
-    local d="$1" cut=""
-    if [ "$OPT_EVENT_DAYS" -gt 0 ] 2>/dev/null; then
-        # No GNU date -> cut stays empty -> the detail window is "everything".
-        # That is the old behaviour, which is safe, and the tally still works.
-        cut="$(date -u -d "$OPT_EVENT_DAYS days ago" +%Y-%m-%d 2>/dev/null || true)"
+    local d="$1" cut="" err detail=/dev/null
+    err="$(_tmp zevents.err)"
+    if [ "$ZEV_V" = 1 ]; then
+        ZEV_CAP=600; detail="$d/zpool-events-v.txt"
+        if [ "$OPT_EVENT_DAYS" -gt 0 ] 2>/dev/null; then
+            # No GNU date -> cut stays empty -> the detail window is "everything".
+            # That is the old behaviour, which is safe, and the tally still works.
+            cut="$(date -u -d "$OPT_EVENT_DAYS days ago" +%Y-%m-%d 2>/dev/null || true)"
+        fi
+        progress "zfs: reading the zevent ring buffer (tally over all of it, detail for ${OPT_EVENT_DAYS}d) ..."
+    else
+        progress "zfs: reading the zevent ring buffer (tally over all of it) ..."
     fi
-    progress "zfs: reading the zevent ring buffer (tally over all of it, detail for ${OPT_EVENT_DAYS}d) ..."
-    run_bounded 600 zpool events -v 2>/dev/null | awk -v CUT="$cut" \
+    # shellcheck disable=SC2046  # -v or nothing
+    CMD_TIMEOUT="$ZEV_CAP" _bounded zpool events $( [ "$ZEV_V" = 1 ] && echo -v ) 2>"$err" | awk -v CUT="$cut" \
         -v TALLY="$d/zpool-events-tally.tsv" \
         -v OVER="$d/zpool-events-overview.tsv" \
-        -v DETAIL="$d/zpool-events-v.txt" '
+        -v DETAIL="$detail" -v V="$ZEV_V" \
+        -v LAST="$(_tmp zevents-last.txt)" '
         BEGIN {
             split("Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec", mn, " ")
             for (i = 1; i <= 12; i++) M[mn[i]] = i
@@ -2227,7 +2044,8 @@ zevents_split() {
             flush()
             date = sprintf("%04d-%02d-%02d", $3, M[$1], $2)
             cls = $5; vdev = "-"; seen++
-            keep = (CUT == "" || date >= CUT)
+            ring[seen % 100] = $0
+            keep = V && (CUT == "" || date >= CUT)
             buf = $0 "\n"; inev = 1
             next
         }
@@ -2242,14 +2060,23 @@ zevents_split() {
             printf "class\tcount\tfirst\tlast\n" > OVER
             for (c in n) printf "%s\t%d\t%s\t%s\n", c, n[c], first[c], last[c] > OVER
             printf "# events in the ring buffer: %d\n", seen > OVER
-            printf "# detail kept in zpool-events-v.txt: %d", kept > OVER
-            if (CUT != "") printf " (since %s)\n", CUT > OVER; else printf " (all)\n" > OVER
+            if (V) {
+                printf "# detail kept in zpool-events-v.txt: %d", kept > OVER
+                if (CUT != "") printf " (since %s)\n", CUT > OVER; else printf " (all)\n" > OVER
+            }
+            for (i = (seen > 100 ? seen - 99 : 1); i <= seen; i++) print ring[i % 100] > LAST
         }
     '
+    ZEV_RC="${PIPESTATUS[0]}"
+    ZEV_ERR="$(head -n1 "$err" 2>/dev/null | cut -c1-160)"
+    # the classes by count, largest first
+    local o="$d/zpool-events-overview.tsv"
+    [ -f "$o" ] && { head -n 1 "$o"; sed '1d; /^#/d' "$o" | sort -t "$_tab" -k2,2nr; grep '^#' "$o"; } > "$o.s" 2>/dev/null && mv -f "$o.s" "$o"
     # A pool with no events at all leaves no files; say so rather than leaving a
     # reader to wonder whether the collector skipped the step.
     [ -f "$d/zpool-events-overview.tsv" ] || printf 'class\tcount\tfirst\tlast\n# no events returned (empty buffer, or permission denied for this uid)\n' > "$d/zpool-events-overview.tsv"
-    [ -f "$d/zpool-events-v.txt" ] || : > "$d/zpool-events-v.txt"
+    [ "$ZEV_V" = 1 ] && { [ -f "$d/zpool-events-v.txt" ] || : > "$d/zpool-events-v.txt"; }
+    return 0
 }
 
 # =============================================================================
@@ -2741,25 +2568,6 @@ window_run() {
     _win_restore_traps
 }
 
-# _win_dist ROWS -> count/min/p50/p90/p99/max of the completed rows' columns
-# (nearest rank), one line per column
-_win_dist() {
-    local rows="$1" c
-    printf '        %-14s %7s %14s %14s %14s %14s %14s\n' "column" "count" "min" "p50" "p90" "p99" "max"
-    for c in "9 otime(ms) 1e6" "10 qtime(ms) 1e6" "11 wtime(ms) 1e6" "12 stime(ms) 1e6" "4 ndirty(B) 1" "6 nwritten(B) 1" "8 writes 1"; do
-        set -- $c
-        awk -v c="$1" '$1 ~ /^[0-9]+$/ && $3 == "C" { print $c }' "$rows" 2>/dev/null | sort -n | \
-        awk -v lab="$2" -v sc="$3" '
-            { v[NR] = $1 }
-            function at(q,  i) { i = int(q * NR); if (i < q * NR) i++; if (i < 1) i = 1; return v[i] / sc }
-            END {
-                if (NR == 0) { printf "        %-14s %7d %14s\n", lab, 0, "-"; exit }
-                f = (sc == 1) ? "%14.0f" : "%14.1f"
-                printf "        %-14s %7d " f " " f " " f " " f " " f "\n", lab, NR, at(0), at(0.5), at(0.9), at(0.99), v[NR] / sc
-            }'
-    done
-}
-
 # _win_delta START END -> one line per numeric counter that changed (start,
 # end, delta) and one line naming the unchanged ones; a kstat recreated in
 # between (its crtime changed) and a counter that went down are said as such
@@ -2892,8 +2700,6 @@ _rep_o_txgs() {
             fact "  $KSTAT_DIR/$pn/txgs: not found at the read of $(_win_local "$g0"); the last read with rows was at $( [ -n "$g1" ] && _win_local "$g1" || echo n/a ), newest txg $w_last; txgs after it are not in this report"
             _o_why "pool $pn: $KSTAT_DIR/$pn/txgs not found from $(_win_local "$g0") on"
         fi
-        fact "  distribution over the rows seen completed (nearest rank):"
-        _win_dist "$p/rows"
     done
     if [ "$np" = 0 ]; then
         fact "no <pool>/txgs under $KSTAT_DIR at the start"
@@ -2993,18 +2799,13 @@ bundle_window() {
 bundle_zfs() {
     local d="$1" p; mkdir -p "$d" 2>/dev/null
     if have zpool; then
-        # the report's own call, when it answered; asked again only when it did not
-        if [ "$ZLIST_V_RC" = 0 ] && [ -n "$ZLIST_V" ]; then printf '%s\n' "$ZLIST_V" > "$d/zpool-list-v.txt"
-        else run_bounded 30 zpool list -v     > "$d/zpool-list-v.txt"; fi
+        # the report's own calls, when they answered; asked again only when not.
+        # The zpool-events-* files are already here: section L wrote them.
+        _reuse zpool-list-v "$d/zpool-list-v.txt" 30 zpool list -v
         run_bounded 30 zpool status -v        > "$d/zpool-status-v.txt"
         run_bounded 30 zpool status -t        > "$d/zpool-status-t.txt"
         run_bounded 60 zpool status -D        > "$d/zpool-status-D.txt"
-        run_bounded 30 zpool iostat -v        > "$d/zpool-iostat-v.txt"
-        run_bounded 30 zpool iostat -lv       > "$d/zpool-iostat-lv.txt"
-        run_bounded 30 zpool iostat -qv       > "$d/zpool-iostat-qv.txt"
-        run_bounded 30 zpool iostat -r        > "$d/zpool-iostat-r.txt"
-        run_bounded 30 zpool iostat -w        > "$d/zpool-iostat-w.txt"
-        zevents_split "$d"
+        for p in v lv qv r w; do _reuse "zpool-iostat-$p" "$d/zpool-iostat-$p.txt" 30 zpool iostat "-$p"; done
         for p in $ZPOOLS; do
             run_bounded 30 zpool get all "$p" > "$d/zpool-get-all-$p.txt"
             run_bounded 60 zpool history "$p" > "$d/zpool-history-$p.txt"
@@ -3012,11 +2813,13 @@ bundle_zfs() {
         done
     fi
     if have zfs; then
-        run_bounded 90  zfs get -H -o name,property,value,source -t filesystem,volume all > "$d/zfs-get-all.tsv"
-        run_bounded 90  zfs get -Hp -o name,property,value,source -t filesystem,volume all > "$d/zfs-get-all-parsable.tsv"
+        # discovery's zfs get all (-Hp) and snapshot list, as they were read
+        if [ "$ZGET_RC" = 0 ]; then cp "$_ZGETALL" "$d/zfs-get-all-parsable.tsv" 2>/dev/null
+        else run_bounded 90 zfs get -Hp -o name,property,value,source -t filesystem,volume all > "$d/zfs-get-all-parsable.tsv"; fi
         run_bounded 60  zfs list -o space          > "$d/zfs-list-space.txt"
         run_bounded 60  zfs list -t filesystem,volume > "$d/zfs-list.txt"
-        run_bounded 120 zfs list -H -p -t snapshot -o name,used,referenced,creation,userrefs,written > "$d/zfs-list-snapshots.tsv"
+        if [ "$ZSNAP_RC" = 0 ]; then cp "$_ZSNAP" "$d/zfs-list-snapshots.tsv" 2>/dev/null
+        else run_bounded 120 zfs list -H -p -t snapshot -o name,used,referenced,creation,userrefs,written,clones > "$d/zfs-list-snapshots.tsv"; fi
         run_bounded 60  zfs list -t bookmark       > "$d/zfs-list-bookmarks.txt"
         run_bounded 30  zfs version                > "$d/zfs-version.txt"
     fi
@@ -3063,7 +2866,7 @@ bundle_host() {
     have findmnt && _bounded findmnt > "$d/findmnt.txt" 2>/dev/null
     have df && _bounded df -T > "$d/df-T.txt" 2>/dev/null
     cat /proc/self/mountinfo > "$d/mountinfo.txt" 2>/dev/null
-    have iostat && _bounded iostat -x > "$d/iostat-x.txt" 2>/dev/null
+    have iostat && _reuse iostat-x "$d/iostat-x.txt" "$CMD_TIMEOUT" iostat -x
     have multipath && _bounded multipath -ll > "$d/multipath.txt" 2>&1
     _bounded dmesg 2>&1 | tail -n 500 > "$d/dmesg-tail.txt" 2>/dev/null
     ( for b in /sys/block/*; do
@@ -3103,17 +2906,28 @@ bundle_whatap() {
     progress "whatap: path-to-dataset map written"
 }
 
-bundle_zdb() {
-    local d="$1" p; mkdir -p "$d" 2>/dev/null
-    have zdb || { warn "[Tier2] zdb: command not found"; return; }
+# _zdb_bundle DIR -> section N in a bundle run: zdb -C / -Lbbbs / -mm per pool,
+# each written whole (stderr folded in) to DIR, and one fact line per file
+_zdb_bundle() {
+    local d="$1" p c t rc f
+    mkdir -p "$d" 2>/dev/null
     for p in $ZPOOLS; do
-        warn "[Tier2] zdb -C $p (bundle)"
-        run_bounded 300  zdb -C "$p"      > "$d/zdb-C-$p.txt" 2>&1
-        warn "[Tier2] zdb -Lbbbs $p (bundle) — traverses pool metadata"
-        run_bounded 3600 zdb -Lbbbs "$p"  > "$d/zdb-Lbbbs-$p.txt" 2>&1
-        warn "[Tier2] zdb -mm $p (bundle) — loads metaslab space maps"
-        run_bounded 3600 zdb -mm "$p"     > "$d/zdb-mm-$p.txt" 2>&1
+        subsection "$p (zdb, written whole to the bundle's zdb/)"
+        for c in "C 300 reads the pool configuration" "Lbbbs 3600 traverses pool metadata; takes minutes on a large pool and reads the data disks" "mm 3600 loads metaslab space maps"; do
+            # shellcheck disable=SC2086  # "flag cap impact" into $1 $2 $3...
+            set -- $c; t="$2"; f="$d/zdb-$1-$p.txt"
+            warn "[Tier2] zdb -$1 $p — ${c#* * }"
+            progress "zdb -$1 $p ..."
+            CMD_TIMEOUT="$t" _bounded zdb "-$1" "$p" > "$f" 2>&1; rc=$?
+            case "$rc" in
+                0)   rc="exit 0" ;;
+                124) if _past_deadline; then rc="stopped: run deadline reached (${RUN_DEADLINE}s)"; else rc="stopped at the ${t}s cap"; fi ;;
+                *)   rc="exit $rc" ;;
+            esac
+            fact "zdb -$1 $p: zdb/${f##*/}, $( { wc -c < "$f"; } 2>/dev/null | tr -d ' ') bytes, $rc"
+        done
     done
+    [ -z "$ZPOOLS" ] && fact "zdb: n/a ($(_nopool_why))"
     progress "zdb: written"
 }
 
@@ -3124,6 +2938,10 @@ do_bundle() {
     work="$(_tmp bundle)"
     case "$work" in /dev/null) warn "the bundle was not written: no private temp directory could be created under ${TMPDIR:-/tmp}"; return 1 ;; esac
     mkdir -p "$work" 2>/dev/null || { warn "the bundle was not written: cannot create $work"; return 1; }
+    # Section L's one read of the zevent ring and section N's zdb write their
+    # files straight into the bundle.
+    BUNDLE_WORK="$work"; ZEV_DIR="$work/zfs"; ZEV_V=1
+    mkdir -p "$ZEV_DIR" 2>/dev/null
     run_report > "$work/report.txt" 2>/dev/null
     progress "report: written to bundle"
     bundle_zfs    "$work/zfs"
@@ -3132,7 +2950,6 @@ do_bundle() {
     bundle_host   "$work/host"
     bundle_whatap "$work/whatap"
     bundle_window "$work/window"
-    [ "$OPT_ZDB" = 1 ] && bundle_zdb "$work/zdb"
 
     tarball="$OPT_OUT/$BASENAME.tar.gz"
     have tar || { warn "the bundle was not written: tar: command not found"; return 1; }
@@ -3215,14 +3032,11 @@ else
 fi
 
 # The run deadline is raised to fit what was asked for, unless the caller set
-# one: the file-size walk (FILESIZES_SECS), --window (below), --zdb
-# (up to 1800s per zdb call in the report, 3600s in the bundle) and the
-# bundle's zpool events dump (600s).
+# one: the file-size walk (FILESIZES_SECS), --window (below), the bundle's
+# zpool events -v read (600s) and, after discovery, --zdb.
 if [ -z "$_RUN_DEADLINE_ENV" ]; then
     [ "$OPT_FILESIZES" = 1 ] && RUN_DEADLINE=$((RUN_DEADLINE + FILESIZES_SECS))
-    [ "$OPT_ZDB" = 1 ] && RUN_DEADLINE=$((RUN_DEADLINE + 4000))
     [ "$OPT_BUNDLE" = 1 ] && RUN_DEADLINE=$((RUN_DEADLINE + 900))
-    [ "$OPT_BUNDLE" = 1 ] && [ "$OPT_ZDB" = 1 ] && RUN_DEADLINE=$((RUN_DEADLINE + 7500))
     # the wait for the window's START, the window, and its last reads
     RUN_DEADLINE=$((RUN_DEADLINE + WIN_SECS + 60))
     [ -n "$WIN_START_EPOCH" ] && RUN_DEADLINE=$((RUN_DEADLINE + WIN_START_EPOCH - $(date +%s)))
@@ -3252,12 +3066,13 @@ fi
 
 progress "discovering pools, datasets and snapshots ..."
 discover_zfs
-# --zdb runs per pool (report: 120s + 1800s + 1800s; bundle: 300s + 3600s +
-# 3600s). The fixed raise above covers one pool; each further pool adds its own
-# share, so pool 2 onward is not cut off by the deadline.
-if [ -z "$_RUN_DEADLINE_ENV" ] && [ "$OPT_ZDB" = 1 ] && [ "${ZPOOL_COUNT:-0}" -gt 1 ] 2>/dev/null; then
-    RUN_DEADLINE=$((RUN_DEADLINE + (ZPOOL_COUNT - 1) * 3720))
-    [ "$OPT_BUNDLE" = 1 ] && RUN_DEADLINE=$((RUN_DEADLINE + (ZPOOL_COUNT - 1) * 7500))
+# --zdb runs once per pool, in section N: 120s + 1800s + 1800s in a report,
+# or 300s + 3600s + 3600s written whole into a bundle. 280s on top, and at
+# least one pool's share, so pool 2 onward is not cut off by the deadline.
+if [ -z "$_RUN_DEADLINE_ENV" ] && [ "$OPT_ZDB" = 1 ]; then
+    _zn="${ZPOOL_COUNT:-0}"; [ "$_zn" -ge 1 ] 2>/dev/null || _zn=1
+    if [ "$OPT_BUNDLE" = 1 ]; then _zc=7500; else _zc=3720; fi
+    RUN_DEADLINE=$((RUN_DEADLINE + 280 + _zn * _zc))
 fi
 # every unit sd_show will be asked about, in one call (the zfs units are asked
 # as <name>.service, zfs.target included, as section A always has)

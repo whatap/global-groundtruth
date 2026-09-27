@@ -85,6 +85,38 @@ one entry at the top of its section (docs/authoring-guide.md, step 2);
 
 ## collect-collzfs.sh
 
+- **0.9.0** — Views that re-summarised raw output in the same report go, and
+  calls made twice are made once. No fact is lost; each is read where it
+  now stands:
+  - B: the list of about 70 named tunables is gone; each is a row of the
+    full `/sys/module/{zfs,spl}/parameters` dump that followed it (a
+    tunable this build lacks is absent from the dump).
+  - C: the per-class vdev view and the shape count go, and so does H's
+    SLOG line; the class, shape and SIZE..HEALTH of every vdev are C's raw
+    `zpool list -v` lines.
+  - E, F, M: the block-size matrix, the space matrix and M's per-dataset
+    property loop become `zfs get` rows (NAME PROPERTY VALUE SOURCE)
+    filtered from discovery's one `zfs get all`, which is now `-Hp` (exact
+    values; "local" / "inherited from X" in place of l/i). F keeps the
+    properties `zfs list -o space` (D) lacks; M keeps those not in D, E, F.
+  - I: the one-line objset view becomes each `objset-*` kstat verbatim.
+  - O: the p50/p90/p99 table goes; the txgs rows it summarised are printed.
+  - L: the zevent ring is read once (zevents_split, in every run): L's own
+    tally and `tail -100` calls go, and L prints the overview and the last
+    100 events of that read, with zpool's exit status and stderr. A report
+    run reads `zpool events`; a bundle run reads `zpool events -v` once and
+    its zfs/zpool-events-* files are that read. EVENT_DAYS unchanged.
+  - N: with `--bundle --zdb`, zdb runs once, into zdb/ (whole output,
+    stderr kept), and N names each file with its size and exit status;
+    before, it ran in N and again in the bundle. The deadline adds zdb once
+    (280 s + per pool 3,720 s, or 7,500 s in a bundle): 12,775 s became
+    9,055 s for one pool with `--bundle --zdb`.
+  - Bundle: `zfs-get-all-parsable.tsv` and `zfs-list-snapshots.tsv` are
+    discovery's files (the snapshot list now has `referenced`, `written`
+    and `clones`), `zpool-iostat-{v,lv,qv,r,w}.txt` and `host/iostat-x.txt`
+    are the report's answers; `zfs-get-all.tsv` (human-readable) is gone.
+  The snapshot summaries in F stay: the snapshot list is not in the report.
+
 - **0.8.8** — The header's question-to-section map, and the write-path window's
   ring/merge/gap rationale and interval-job rationale (repeated near
   \_rep_l, zevents_split and the window's interval-job start), now point
