@@ -25,6 +25,9 @@
 export LC_ALL=C
 
 # ---- collector metadata -----------------------------------------------------
+# 0.10.1 Helpers moved into the collection-server group blocks; report
+#        unchanged. The blocks are copies of
+#        templates/groups/collection-server.sh.
 # 0.10.0 Every run samples: section J runs iostat -x and vmstat together for
 #        a 15s window (6 reports each, at a fifth of the window), and
 #        --window=DUR (N, Ns, Nm or Nh, 10s .. 24h) sets its length. It
@@ -83,7 +86,7 @@ export LC_ALL=C
 #        SHOW BINARY LOGS, a failed or capped decode, a NULL log_bin_basename and
 #        no local mysqld without arguments are gaps with reasons. Needs bash.
 COLLECTOR_NAME="whatap-collmysql"
-VERSION="0.10.0"
+VERSION="0.10.1"
 DOMAIN="collection-server"
 TARGET="collection-server-mysql/$(hostname 2>/dev/null || echo unknown)"
 
@@ -175,6 +178,8 @@ EOF
 }
 
 ARGC=$#
+# ---- collection-server: options — DO NOT EDIT -------------------------------
+# members: collmysql collserver collzfs
 # _removed MESSAGE -> an option that no longer exists: exit 2, naming what
 # replaced it (fd 3 is not open yet, so stderr)
 _removed() { printf '!! %s\n' "$1" >&2; exit 2; }
@@ -183,6 +188,7 @@ _removed() { printf '!! %s\n' "$1" >&2; exit 2; }
 _optval() {
     case "$2" in ''|-*) printf -- 'missing value for %s\n' "$1" >&2; exit 2 ;; esac
 }
+# ---- end collection-server: options
 # _clientval VALUE -> exit 2 when the --mysql-args value is empty or is one
 # of this collector's own options (`--mysql-args --file`). A leading '-' is
 # its normal form: the value is the client's own arguments ("-h HOST -u USER").
@@ -253,9 +259,6 @@ have()       { command -v "$1" >/dev/null 2>&1; }
 # ---- end emit helpers
 
 sub()  { printf '        %s\n' "$1"; }
-
-_errfile=""
-_init_probe() { _errfile="$(_tmp probe.err)"; }
 
 # ---- privilege — DO NOT EDIT ------------------------------------------------
 # What a run can read depends on the privilege it was given: a fact about this
@@ -679,6 +682,47 @@ EOF
 }
 # ---- end collection completeness
 
+# ---- collection-server: probe helpers — DO NOT EDIT -------------------------
+# members: collmysql collserver collzfs
+# _init_probe -> _errfile, the private file (after _run_init) a probe's stderr
+# goes to; the member's _classify_err reads it.
+_errfile=""
+_init_probe() { _errfile="$(_tmp probe.err)"; }
+
+# _emit_labeled LABEL BODY -> "LABEL: BODY" for a one-line BODY; else "LABEL:"
+# and BODY's lines under it, indented
+_emit_labeled() {
+    local label="$1" body="$2" n
+    n="$(printf '%s\n' "$body" | wc -l | tr -d ' ')"
+    if [ "${n:-0}" -le 1 ]; then
+        fact "$label: $body"
+    else
+        fact "$label:"
+        printf '%s\n' "$body" | while IFS= read -r _l || [ -n "$_l" ]; do printf '        %s\n' "$_l"; done
+    fi
+}
+
+# _why_124 -> why a bounded call returned 124: the run deadline, or its own cap
+# (the same two wordings as probe)
+_why_124() {
+    if _past_deadline; then printf 'run deadline reached: %ss' "$RUN_DEADLINE"
+    else printf 'timed out: %ss' "$CMD_TIMEOUT"; fi
+}
+
+# read_proc "label" PATH [LINES] -> a /proc or /sys file's content (its last
+# LINES lines when LINES is given), or "label: n/a (<why>)".
+read_proc() {
+    local label="$1" path="$2" cap="${3:-0}"
+    if [ ! -e "$path" ]; then fact "$label: n/a (path not found: $path)"; return; fi
+    if [ ! -r "$path" ]; then fact "$label: n/a (permission denied: $path)"; return; fi
+    local out
+    if [ "$cap" -gt 0 ] 2>/dev/null; then out="$(tail -n "$cap" "$path" 2>"$_errfile")"
+    else out="$(cat "$path" 2>"$_errfile")"; fi
+    if [ -z "$out" ]; then fact "$label: n/a (empty output)"; return; fi
+    _emit_labeled "$label" "$out"
+}
+# ---- end collection-server: probe helpers
+
 _classify_err() {
     local txt=""
     [ -f "$_errfile" ] && txt="$(cat "$_errfile" 2>/dev/null)"
@@ -700,14 +744,6 @@ _classify_err() {
     else echo "nonzero exit"; fi
 }
 
-_emit_labeled() {
-    local label="$1" body="$2" n
-    n="$(printf '%s\n' "$body" | wc -l | tr -d ' ')"
-    if [ "${n:-0}" -le 1 ]; then fact "$label: $body"
-    else fact "$label:"; printf '%s\n' "$body" | while IFS= read -r _l || [ -n "$_l" ]; do sub "$_l"; done
-    fi
-}
-
 # probe "label" CMD... -> output as facts, or "label: n/a (<why>)". Bounded by
 # _bounded (run helpers) at CMD_TIMEOUT and the run deadline.
 probe() {
@@ -721,15 +757,6 @@ probe() {
         return
     fi
     [ "$rc" -ne 0 ] && { fact "$label: n/a ($(_classify_err))"; return; }
-    [ -z "$out" ] && { fact "$label: n/a (empty output)"; return; }
-    _emit_labeled "$label" "$out"
-}
-
-read_proc() {
-    local label="$1" path="$2" out
-    [ -e "$path" ] || { fact "$label: n/a (path not found: $path)"; return; }
-    [ -r "$path" ] || { fact "$label: n/a (permission denied: $path)"; return; }
-    out="$(cat "$path" 2>/dev/null)"
     [ -z "$out" ] && { fact "$label: n/a (empty output)"; return; }
     _emit_labeled "$label" "$out"
 }
@@ -970,12 +997,6 @@ sqlv() {
     _emit_labeled "$label" "$out"
 }
 
-# _why_124 -> why a bounded call returned 124: the run deadline, or its own cap
-_why_124() {
-    if _past_deadline; then printf 'run deadline reached: %ss' "$RUN_DEADLINE"
-    else printf 'timed out: %ss' "$CMD_TIMEOUT"; fi
-}
-
 # one scalar value, empty on failure (used for discovery, not for output)
 mysql_val() {
     [ "$MYSQL_OK" = 1 ] || return 1
@@ -1212,6 +1233,8 @@ _bl_newest() {
 
 # ---- report body ------------------------------------------------------------
 # ---- the window (section J) -----------------------------------------------
+# ---- collection-server: window — DO NOT EDIT --------------------------------
+# members: collmysql collzfs
 # _win_secs DUR -> seconds for N, Ns, Nm or Nh (10 .. 86400); 1 when not one
 _win_secs() {
     local v="$1" n u
@@ -1227,6 +1250,7 @@ _win_secs() {
     [ "$n" -ge 10 ] && [ "$n" -le 86400 ] || return 1
     printf '%s' "$n"
 }
+# ---- end collection-server: window
 
 # _window -> section J. iostat -x and vmstat measure the same seconds only when
 # they run at the same time, so both start together as bounded background
@@ -1793,6 +1817,28 @@ EOF
     emit_footer
 }
 
+# ---- collection-server: main helpers — DO NOT EDIT --------------------------
+# members: collmysql collserver collzfs
+# _need_int NAME VALUE -> exit 2 unless VALUE is a non-negative integer
+_need_int() {
+    case "$2" in
+        ''|*[!0-9]*) warn "$1 takes a non-negative integer; got '$2'"; exit 2 ;;
+    esac
+}
+
+# _out_dir_check -> creates the output directory OPT_OUT when missing and fails,
+# saying so on the operator stream, when this uid cannot write into it. Called
+# before anything is collected, so an unwritable one fails at once rather than
+# after a full run.
+_out_dir_check() {
+    mkdir -p "$OPT_OUT" 2>/dev/null
+    if [ ! -d "$OPT_OUT" ] || [ ! -w "$OPT_OUT" ] || [ ! -x "$OPT_OUT" ]; then
+        warn "the report was not written: output directory $OPT_OUT is not writable by uid $(id -u 2>/dev/null || echo '?')"
+        return 1
+    fi
+}
+# ---- end collection-server: main helpers
+
 # ---- main -------------------------------------------------------------------
 exec 3>&2
 [ -n "$_CAP_BAD" ] && warn "ignored from the environment (not a whole number 1..999999 without leading zeros):$_CAP_BAD; the defaults are used"
@@ -1805,9 +1851,6 @@ if [ "$OPT_FILE" = 0 ] && [ "$OPT_STDOUT" = 0 ]; then
     exit 2
 fi
 
-_need_int() {
-    case "$2" in ''|*[!0-9]*) warn "$1 takes a non-negative integer; got '$2'"; exit 2 ;; esac
-}
 _need_int --binlog "$BINLOG_FILES"
 [ "$BINLOG_FILES" -lt 1 ] && BINLOG_FILES=1
 if [ "$WIN_GIVEN" = 1 ]; then
@@ -1833,11 +1876,7 @@ _resolve_mysql
 # The output directory is checked before collecting, so an unwritable one
 # fails at once rather than after a full run.
 if [ "$OPT_STDOUT" != 1 ]; then
-    mkdir -p "$OPT_OUT" 2>/dev/null
-    if [ ! -d "$OPT_OUT" ] || [ ! -w "$OPT_OUT" ] || [ ! -x "$OPT_OUT" ]; then
-        warn "the report was not written: output directory $OPT_OUT is not writable by uid $(id -u 2>/dev/null || echo '?')"
-        exit 1
-    fi
+    _out_dir_check || exit 1
 fi
 # An identity only. Whether the login worked is the status section's business.
 TARGET="collection-server-mysql/$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || echo unknown)"

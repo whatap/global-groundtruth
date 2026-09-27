@@ -46,6 +46,9 @@
 export LC_ALL=C
 
 # ---- collector metadata -----------------------------------------------------
+# 0.8.2  Helpers moved into the collection-server group blocks; report
+#        unchanged. The blocks are copies of
+#        templates/groups/collection-server.sh.
 # 0.8.1  --out, --home, --window and --filesizes= with an empty value, or
 #        with the next option taken for it (`--out --file`), exit 2 naming
 #        the option. iostat -x in the window only adds detail: absent (no
@@ -81,7 +84,7 @@ export LC_ALL=C
 #        df -i of every WhaTap path is in the report and df-i.txt in the
 #        bundle, so the file count is there without a walk.
 COLLECTOR_NAME="whatap-collzfs"
-VERSION="0.8.1"
+VERSION="0.8.2"
 DOMAIN="collection-server"
 TARGET="collection-server-zfs/$(hostname 2>/dev/null || echo unknown)"   # refined after pool discovery
 
@@ -195,6 +198,8 @@ EOF
 }
 
 ARGC=$#              # 0 args -> usage (handled in main, below)
+# ---- collection-server: options — DO NOT EDIT -------------------------------
+# members: collmysql collserver collzfs
 # _removed MESSAGE -> an option that no longer exists: exit 2, naming what
 # replaced it (fd 3 is not open yet, so stderr)
 _removed() { printf '!! %s\n' "$1" >&2; exit 2; }
@@ -203,6 +208,7 @@ _removed() { printf '!! %s\n' "$1" >&2; exit 2; }
 _optval() {
     case "$2" in ''|-*) printf -- 'missing value for %s\n' "$1" >&2; exit 2 ;; esac
 }
+# ---- end collection-server: options
 while [ $# -gt 0 ]; do
     case "$1" in
         --file) OPT_FILE=1 ;;
@@ -268,9 +274,6 @@ have()       { command -v "$1" >/dev/null 2>&1; }
 blk() { printf '        %s\n' "$1"; }
 
 # ---- reasoned-absence helpers (see docs/collector-engineering.md) -----------
-_errfile=""
-_init_probe() { _errfile="$(_tmp probe.err)"; }
-
 _classify_err() {
     # reads a stderr file, prints a short classified reason
     local txt=""
@@ -712,17 +715,95 @@ EOF
 }
 # ---- end collection completeness
 
+# ---- collection-server: probe helpers — DO NOT EDIT -------------------------
+# members: collmysql collserver collzfs
+# _init_probe -> _errfile, the private file (after _run_init) a probe's stderr
+# goes to; the member's _classify_err reads it.
+_errfile=""
+_init_probe() { _errfile="$(_tmp probe.err)"; }
+
+# _emit_labeled LABEL BODY -> "LABEL: BODY" for a one-line BODY; else "LABEL:"
+# and BODY's lines under it, indented
 _emit_labeled() {
-    # $1 label ; $2 body (may be multi-line)
     local label="$1" body="$2" n
     n="$(printf '%s\n' "$body" | wc -l | tr -d ' ')"
     if [ "${n:-0}" -le 1 ]; then
         fact "$label: $body"
     else
         fact "$label:"
-        printf '%s\n' "$body" | while IFS= read -r _l || [ -n "$_l" ]; do blk "$_l"; done
+        printf '%s\n' "$body" | while IFS= read -r _l || [ -n "$_l" ]; do printf '        %s\n' "$_l"; done
     fi
 }
+
+# _why_124 -> why a bounded call returned 124: the run deadline, or its own cap
+# (the same two wordings as probe)
+_why_124() {
+    if _past_deadline; then printf 'run deadline reached: %ss' "$RUN_DEADLINE"
+    else printf 'timed out: %ss' "$CMD_TIMEOUT"; fi
+}
+
+# read_proc "label" PATH [LINES] -> a /proc or /sys file's content (its last
+# LINES lines when LINES is given), or "label: n/a (<why>)".
+read_proc() {
+    local label="$1" path="$2" cap="${3:-0}"
+    if [ ! -e "$path" ]; then fact "$label: n/a (path not found: $path)"; return; fi
+    if [ ! -r "$path" ]; then fact "$label: n/a (permission denied: $path)"; return; fi
+    local out
+    if [ "$cap" -gt 0 ] 2>/dev/null; then out="$(tail -n "$cap" "$path" 2>"$_errfile")"
+    else out="$(cat "$path" 2>"$_errfile")"; fi
+    if [ -z "$out" ]; then fact "$label: n/a (empty output)"; return; fi
+    _emit_labeled "$label" "$out"
+}
+# ---- end collection-server: probe helpers
+
+# ---- collection-server: file helpers — DO NOT EDIT --------------------------
+# members: collserver collzfs
+# dump_file PATH [LINES] -> a file's first LINES lines (default 4000), indented,
+# or a reason.
+dump_file() {
+    local path="$1" cap="${2:-4000}"
+    if [ ! -e "$path" ]; then fact "n/a (path not found: $path)"; return; fi
+    if [ ! -r "$path" ]; then fact "n/a (permission denied: $path)"; return; fi
+    if [ ! -s "$path" ]; then fact "(empty file)"; return; fi
+    head -n "$cap" "$path" 2>/dev/null | while IFS= read -r _l || [ -n "$_l" ]; do printf '        %s\n' "$_l"; done
+}
+
+# fstype_of PATH / source_of PATH -> the filesystem type / the source (device
+# or dataset) of the mount PATH is on; empty when neither tool answers
+fstype_of() {
+    local p="$1"
+    if have findmnt; then _bounded findmnt -no FSTYPE -T "$p" 2>/dev/null && return; fi
+    if have stat; then _bounded stat -f -c '%T' "$p" 2>/dev/null && return; fi
+    echo ""
+}
+
+source_of() {
+    local p="$1"
+    if have findmnt; then _bounded findmnt -no SOURCE -T "$p" 2>/dev/null && return; fi
+    echo ""
+}
+
+# _dir_ok DIR -> true when this uid can list DIR (read + search)
+_dir_ok() { [ -d "$1" ] && [ -r "$1" ] && [ -x "$1" ]; }
+
+# _path_state P -> ok (listable), absent (the nearest existing ancestor was
+# searched and P is not there), notdir, dangling:TARGET, or unlistable
+_path_state() {
+    local p="$1" a t
+    _dir_ok "$p" && { printf ok; return; }
+    if [ -e "$p" ]; then [ -d "$p" ] && printf unlistable || printf notdir; return; fi
+    if [ -L "$p" ]; then
+        t="$(readlink "$p")"; a="$t"
+        case "$a" in /*) ;; *) a="$(dirname "$p")/$a" ;; esac
+        a="$(dirname "$a")"
+        if [ -d "$a" ] && [ -x "$a" ]; then printf 'dangling:%s' "$t"; else printf unlistable; fi
+        return
+    fi
+    a="$(dirname "$p")"
+    while [ ! -e "$a" ] && [ "$a" != / ] && [ "$a" != . ]; do a="$(dirname "$a")"; done
+    if [ -x "$a" ]; then printf absent; else printf unlistable; fi
+}
+# ---- end collection-server: file helpers
 
 # probe "label" CMD [ARGS...] -> emits output as facts, or "label: n/a (<why>)".
 # Every call goes through _bounded (run helpers): a pool that hangs costs at most
@@ -765,13 +846,6 @@ probe() {
     _emit_labeled "$label" "$out"
 }
 
-# _why_124 -> why a bounded call returned 124: the run deadline, or its own cap
-# (the same two wordings as probe)
-_why_124() {
-    if _past_deadline; then printf 'run deadline reached: %ss' "$RUN_DEADLINE"
-    else printf 'timed out: %ss' "$CMD_TIMEOUT"; fi
-}
-
 # probe_t SECS "label" CMD... -> probe capped at SECS (bash restores the
 # prefix assignment when the function returns)
 probe_t() { local t="$1"; shift; CMD_TIMEOUT="$t" probe "$@"; }
@@ -788,18 +862,6 @@ probe_pipe() {
 }
 
 probe_pipe_t() { local t="$1"; shift; CMD_TIMEOUT="$t" probe_pipe "$@"; }
-
-# read_proc "label" PATH -> emits a /proc or /sys file's content with a reason.
-read_proc() {
-    local label="$1" path="$2" cap="${3:-0}"
-    if [ ! -e "$path" ]; then fact "$label: n/a (path not found: $path)"; return; fi
-    if [ ! -r "$path" ]; then fact "$label: n/a (permission denied: $path)"; return; fi
-    local out
-    if [ "$cap" -gt 0 ] 2>/dev/null; then out="$(tail -n "$cap" "$path" 2>"$_errfile")"
-    else out="$(cat "$path" 2>"$_errfile")"; fi
-    if [ -z "$out" ]; then fact "$label: n/a (empty output)"; return; fi
-    _emit_labeled "$label" "$out"
-}
 
 # read_kstat_tail "label" PATH LINES -> like read_proc with a cap, but keeps the
 # kstat column header (line 1) and says how many records were omitted. The txgs
@@ -825,15 +887,6 @@ _epoch_iso() {
     date -u -d "@$1" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || printf 'epoch=%s' "$1"
 }
 
-# dump_file PATH [LINES] -> emits a file's content (bounded), or a reason.
-dump_file() {
-    local path="$1" cap="${2:-2000}"
-    if [ ! -e "$path" ]; then fact "n/a (path not found: $path)"; return; fi
-    if [ ! -r "$path" ]; then fact "n/a (permission denied: $path)"; return; fi
-    if [ ! -s "$path" ]; then fact "(empty file)"; return; fi
-    head -n "$cap" "$path" 2>/dev/null | while IFS= read -r _l || [ -n "$_l" ]; do blk "$_l"; done
-}
-
 # run_bounded SECS CMD... -> stdout only, capped at SECS by _bounded (which also
 # honours the run deadline and works without timeout(1)). Returns 124 on a cap.
 run_bounded() {
@@ -843,19 +896,8 @@ run_bounded() {
 }
 
 # ---- portable helpers -------------------------------------------------------
-fstype_of() {
-    local p="$1"
-    if have findmnt; then _bounded findmnt -no FSTYPE -T "$p" 2>/dev/null && return; fi
-    if have stat; then _bounded stat -f -c '%T' "$p" 2>/dev/null && return; fi
-    echo ""
-}
-
-source_of() {
-    local p="$1"
-    if have findmnt; then _bounded findmnt -no SOURCE -T "$p" 2>/dev/null && return; fi
-    echo ""
-}
-
+# ---- collection-server: process scan — DO NOT EDIT --------------------------
+# members: collserver collzfs
 # cmdline_of PID -> sets _CL to the process's argv joined by spaces (the bytes
 # `tr '\0' ' '` gives), with builtins only: no fork per process.
 _CL=""
@@ -894,14 +936,33 @@ _scan_cmdlines() {
         *)   CMDLINE_SCAN_WHY="the /proc/<pid>/cmdline scan failed (xargs/grep exit $rc)" ;;
     esac
 }
+# ---- end collection-server: process scan
 
 
-# One `systemctl show` for every unit this run asks about, not one per question.
-# It prints one block per unit (blank-line separated, properties in systemd's
-# order); each block is filed under its Id. sd_show answers from here and asks
-# systemctl only for a unit that was not prefetched.
+# ---- collection-server: systemd cache — DO NOT EDIT -------------------------
+# members: collserver collzfs
+# What the member's _sd_prefetch read with one `systemctl show` for every unit
+# the run asks about: sd_show answers from here and asks systemctl only for a
+# unit that was not prefetched.
 _SD_CACHE=""   # lines: <unit><TAB><Prop>=<value>
 _SD_KNOWN=" "  # units the prefetch answered for
+# _sd_cached PROP UNIT -> the prefetched value; false when UNIT was not prefetched
+_sd_cached() {
+    case "$_SD_KNOWN" in *" $2 "*) ;; *) return 1 ;; esac
+    local l
+    while IFS= read -r l; do
+        case "$l" in "$2$_tab$1="*) printf '%s\n' "${l#*=}"; return 0 ;; esac
+    done <<EOF
+$_SD_CACHE
+EOF
+    return 0
+}
+# ---- end collection-server: systemd cache
+
+# _sd_prefetch UNIT... -> one `systemctl show` for every unit this run asks
+# about, not one per question, into _SD_CACHE. It prints one block per unit
+# (blank-line separated, properties in systemd's order); each block is filed
+# under its Id.
 _sd_prefetch() {
     have systemctl || return 0
     local out line id="" blk=""
@@ -927,17 +988,6 @@ EOB
 $out
 
 EOF
-}
-# _sd_cached PROP UNIT -> the prefetched value; false when UNIT was not prefetched
-_sd_cached() {
-    case "$_SD_KNOWN" in *" $2 "*) ;; *) return 1 ;; esac
-    local l
-    while IFS= read -r l; do
-        case "$l" in "$2$_tab$1="*) printf '%s\n' "${l#*=}"; return 0 ;; esac
-    done <<EOF
-$_SD_CACHE
-EOF
-    return 0
 }
 _sdq() { _bounded systemctl "$@" 2>/dev/null; }
 sd_show() {
@@ -2036,28 +2086,6 @@ _resolve_datasets() {
     else na datasets "zfs get ran and listed no filesystem or volume"; fi
 }
 
-# _dir_ok and _path_state are copies of collect-collserver.sh's, kept
-# identical so they can become a shared block.
-_dir_ok() { [ -d "$1" ] && [ -r "$1" ] && [ -x "$1" ]; }
-
-# _path_state P -> ok (listable), absent (the nearest existing ancestor was
-# searched and P is not there), notdir, dangling:TARGET, or unlistable
-_path_state() {
-    local p="$1" a t
-    _dir_ok "$p" && { printf ok; return; }
-    if [ -e "$p" ]; then [ -d "$p" ] && printf unlistable || printf notdir; return; fi
-    if [ -L "$p" ]; then
-        t="$(readlink "$p")"; a="$t"
-        case "$a" in /*) ;; *) a="$(dirname "$p")/$a" ;; esac
-        a="$(dirname "$a")"
-        if [ -d "$a" ] && [ -x "$a" ]; then printf 'dangling:%s' "$t"; else printf unlistable; fi
-        return
-    fi
-    a="$(dirname "$p")"
-    while [ ! -e "$a" ] && [ "$a" != / ] && [ "$a" != . ]; do a="$(dirname "$a")"; done
-    if [ -x "$a" ]; then printf absent; else printf unlistable; fi
-}
-
 # Section M body — also used in the "no ZFS on this host" short path.
 report_whatap_paths() {
     fact "WHATAP_HOME: ${WHOME:-n/a (not resolved)}"
@@ -2377,6 +2405,8 @@ _pair_emit() {
     [ -n "$PAIR_IO_NOTE" ] && fact "not delivered: $PAIR_IO_NOTE"
 }
 
+# ---- collection-server: window — DO NOT EDIT --------------------------------
+# members: collmysql collzfs
 # _win_secs DUR -> seconds for N, Ns, Nm or Nh (10 .. 86400); 1 when not one
 _win_secs() {
     local v="$1" n u
@@ -2392,6 +2422,7 @@ _win_secs() {
     [ "$n" -ge 10 ] && [ "$n" -le 86400 ] || return 1
     printf '%s' "$n"
 }
+# ---- end collection-server: window
 
 # _win_local EPOCH -> "YYYY-MM-DD HH:MM:SS TZ (UTC ...Z)"
 _win_local() {
@@ -3102,6 +3133,30 @@ do_bundle() {
     fi
 }
 
+# ---- collection-server: main helpers — DO NOT EDIT --------------------------
+# members: collmysql collserver collzfs
+# _need_int NAME VALUE -> exit 2 unless VALUE is a non-negative integer
+_need_int() {
+    case "$2" in
+        ''|*[!0-9]*) warn "$1 takes a non-negative integer; got '$2'"; exit 2 ;;
+    esac
+}
+
+# _out_dir_check -> creates the output directory OPT_OUT when missing and fails,
+# saying so on the operator stream, when this uid cannot write into it. Called
+# before anything is collected, so an unwritable one fails at once rather than
+# after a full run.
+_out_dir_check() {
+    mkdir -p "$OPT_OUT" 2>/dev/null
+    if [ ! -d "$OPT_OUT" ] || [ ! -w "$OPT_OUT" ] || [ ! -x "$OPT_OUT" ]; then
+        warn "the report was not written: output directory $OPT_OUT is not writable by uid $(id -u 2>/dev/null || echo '?')"
+        return 1
+    fi
+}
+# ---- end collection-server: main helpers
+
+# ---- collection-server: give back — DO NOT EDIT -----------------------------
+# members: collserver collzfs
 # _give_back FILE -> under sudo, hand FILE to the account that ran sudo, so the
 # operator can move and delete the file they came for
 _give_back() {
@@ -3109,13 +3164,7 @@ _give_back() {
         chown "$SUDO_UID:${SUDO_GID:-$SUDO_UID}" "$1" 2>/dev/null
     fi
 }
-
-# _need_int NAME VALUE -> exit 2 unless VALUE is a non-negative integer
-_need_int() {
-    case "$2" in
-        ''|*[!0-9]*) warn "$1 takes a non-negative integer; got '$2'"; exit 2 ;;
-    esac
-}
+# ---- end collection-server: give back
 
 # =============================================================================
 # main
@@ -3183,11 +3232,7 @@ fi
 # The output directory is checked before collecting, so an unwritable one
 # fails at once rather than after a full run.
 if [ "$OPT_STDOUT" != 1 ] || [ "$OPT_BUNDLE" = 1 ]; then
-    mkdir -p "$OPT_OUT" 2>/dev/null
-    if [ ! -d "$OPT_OUT" ] || [ ! -w "$OPT_OUT" ] || [ ! -x "$OPT_OUT" ]; then
-        warn "the report was not written: output directory $OPT_OUT is not writable by uid $(id -u 2>/dev/null || echo '?')"
-        exit 1
-    fi
+    _out_dir_check || exit 1
 fi
 
 progress "discovering pools, datasets and snapshots ..."
