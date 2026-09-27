@@ -144,8 +144,17 @@ if [ -n "$t" ]; then
 else bad "bundle written" "a .tar.gz" "none"; fi
 B2="$ROOT/b2"; mkdir -p "$B2"; ( cd "$B2" && "$C" --home "$H" --bundle --with-rotated --out . >/dev/null 2>&1 )
 chk "--with-rotated includes it" "1" "$(tar tzf "$B2"/*.tar.gz 2>/dev/null | grep -c '20260901')"
-B3="$ROOT/b3"; mkdir -p "$B3"; ( cd "$B3" && "$C" --home "$H" --bundle --max-total-mb 0 --out . >/dev/null 2>&1 )
-has "the total cap binds" "$(tar xzf "$B3"/*.tar.gz -O ./logs/SELECTION.txt 2>/dev/null)" "total cap"
+# 0.11.0: the caps come from the environment (LOG_TOTAL_MB, LOG_FILE_MB)
+B3="$ROOT/b3"; mkdir -p "$B3"; ( cd "$B3" && LOG_TOTAL_MB=1 "$C" --home "$H" --bundle --with-rotated --out . >/dev/null 2>&1 )
+has "the total cap (LOG_TOTAL_MB=1) binds" "$(tar xzf "$B3"/*.tar.gz -O ./logs/SELECTION.txt 2>/dev/null)" "total cap 1MB reached"
+B3b="$ROOT/b3b"; mkdir -p "$B3b"; ( cd "$B3b" && LOG_FILE_MB=1 "$C" --home "$H" --bundle --with-rotated=30 --out . >/dev/null 2>&1 )
+has "the per-file cap (LOG_FILE_MB=1) binds" "$(tar xzf "$B3b"/*.tar.gz -O ./logs/SELECTION.txt 2>/dev/null)" "per-file cap 1MB, tail kept"
+has "--with-rotated=DAYS sets the window" "$(tar xzf "$B3b"/*.tar.gz -O ./logs/SELECTION.txt 2>/dev/null)" "included (last 30d)"
+B3c="$ROOT/b3c"; mkdir -p "$B3c"
+err="$( cd "$B3c" && LOG_TOTAL_MB=0 LOG_FILE_MB=x "$C" --home "$H" --bundle --out . 2>&1 >/dev/null )"
+has "LOG_TOTAL_MB=0 is named and the default used" "$err" "LOG_TOTAL_MB=0 ignored (not a whole number 1..999999 without leading zeros), using 100"
+has "LOG_FILE_MB=x is named and the default used" "$err" "LOG_FILE_MB=x ignored (not a whole number 1..999999 without leading zeros), using 5"
+has "and the bundle keeps the default caps" "$(tar xzf "$B3c"/*.tar.gz -O ./logs/SELECTION.txt 2>/dev/null)" "caps: 5MB per file, 100MB total"
 echo "== 5. a log filename containing a space =="
 H2="$ROOT/home2"; mkhome "$H2"; cp "$H2/logs/yard.log" "$H2/logs/my service.log"
 has "listed in the inventory" "$("$C" --home "$H2" --stdout 2>/dev/null)" "my service.log"
@@ -210,15 +219,36 @@ if [ "$(id -u)" != 0 ]; then
   chmod 644 "$H3/conf/proxy.conf"
 else skip "the unreadable-directory cases (this account is root, which reads them)"; fi
 echo "== 11. numeric options are checked before the run =="
-for o in "--max-log-mb 0.5" "--max-total-mb x" "--hours -1" "--log-days 1e3" "--threads=two"; do
+# each case: the arguments, then (after |) what stderr must say
+for o in "--hours x1|--hours takes a non-negative integer" \
+         "--with-rotated=1e3|--with-rotated=DAYS takes a non-negative integer" \
+         "--with-rotated=0|--with-rotated=DAYS takes a whole number of days, 1..999999 without leading zeros" \
+         "--with-rotated=010|--with-rotated=DAYS takes a whole number of days, 1..999999 without leading zeros" \
+         "--threads=two|--threads takes a non-negative integer" \
+         "--hours -1|missing value for --hours" \
+         "--out|missing value for --out" "--out=|missing value for --out" \
+         "--home --file|missing value for --home" "--threads=|missing value for --threads=" \
+         "--time-ref=|missing value for --time-ref=" "--with-rotated=|missing value for --with-rotated=" \
+         "--max-log-mb 1|--max-log-mb is no longer an option: set LOG_FILE_MB=N in the environment" \
+         "--max-total-mb=1|--max-total-mb is no longer an option: set LOG_TOTAL_MB=N in the environment" \
+         "--log-days 3|--log-days was merged into --with-rotated: use --with-rotated=DAYS"; do
+  a="${o%%|*}"; want="${o#*|}"
   B6="$ROOT/b6"; T6="$ROOT/t6"; rm -rf "$B6" "$T6"; mkdir -p "$B6" "$T6"
   # shellcheck disable=SC2086
-  err="$( cd "$B6" && TMPDIR="$T6" "$C" --home "$H" --bundle $o --out . 2>&1 >/dev/null )"; rc=$?
-  chk "$o exits 2" "2" "$rc"
-  has "$o names the option" "$err" "${o%%[ =]*} takes a non-negative integer"
+  err="$( cd "$B6" && TMPDIR="$T6" "$C" --home "$H" --bundle --out . $a 2>&1 >/dev/null )"; rc=$?
+  chk "$a exits 2" "2" "$rc"
+  has "$a names the option" "$err" "$want"
   # 0.8.1 left its mktemp work dir behind in TMPDIR when the arithmetic aborted.
-  chk "$o leaves nothing behind, in --out or in TMPDIR" "" "$(find "$B6" "$T6" -mindepth 1 2>/dev/null | head -3)"
+  chk "$a leaves nothing behind, in --out or in TMPDIR" "" "$(find "$B6" "$T6" -mindepth 1 2>/dev/null | head -3)"
 done
+echo "== 11b. 0.11.0: a bundle-only option without --bundle is named, not ignored =="
+err="$("$C" --home "$H" --stdout --threads=2 --du --with-rotated </dev/null 2>&1 >/dev/null)"; rc=$?
+chk "the run still completes" "0" "$rc"
+has "the terminal names what was not run" "$err" "!! not run: --threads --du --with-rotated (bundle only; add --bundle to collect them)"
+out="$("$C" --home "$H" --stdout --heap </dev/null 2>/dev/null)"
+has "and the deadline is not raised for it" "$out" "s of 300s allowed"
+err="$("$C" --home "$H" --stdout --time-ref=127.0.0.1 --quiet </dev/null 2>&1 >/dev/null)"
+hasnt "--time-ref is not bundle only" "$err" "not run:"
 echo "== 12. an output directory that cannot be written =="
 if [ "$(id -u)" != 0 ]; then
   RO="$ROOT/ro"; mkdir -p "$RO"; chmod 555 "$RO"

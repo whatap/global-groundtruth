@@ -22,6 +22,17 @@
 export LC_ALL=C
 
 # ---- collector metadata -----------------------------------------------------
+# 0.11.0 Fewer options. The log caps come from the environment: LOG_FILE_MB
+#        (default 5) and LOG_TOTAL_MB (default 100), whole numbers 1..999999
+#        (another value is ignored with a warning). --log-days rides on
+#        --with-rotated as --with-rotated=DAYS (default 14). Removed options
+#        exit 2 naming the replacement: --max-log-mb, --max-total-mb,
+#        --log-days. A bundle-only option (--threads, --histo, --heap, --du,
+#        --with-rotated) given without --bundle is named on the terminal
+#        instead of ignored silently, and no longer raises the run deadline.
+#        A value option with an empty value, or with the next option taken
+#        for it (`--out --file`), exits 2. Report unchanged; the bundle's
+#        SELECTION.txt and log warning name the new spellings.
 # 0.10.0 Section A reads hostname, kernel and arch from /proc/sys/kernel
 #        (hostname/uname only where a file is unreadable) and no longer
 #        prints the date and the timezone: section B has both, and its
@@ -46,7 +57,7 @@ export LC_ALL=C
 #        private directory; bad numeric options exit 2, a failed write exits 1;
 #        output is handed back under sudo. Needs bash.
 COLLECTOR_NAME="whatap-collserver"
-VERSION="0.10.0"
+VERSION="0.11.0"
 DOMAIN="collection-server"
 TARGET="collection-server/$(hostname 2>/dev/null || echo unknown)"   # refined after WHATAP_HOME is resolved
 
@@ -57,11 +68,12 @@ OPT_STDOUT=0
 OPT_QUIET=0          # suppress progress narration on stderr
 OPT_HOME=""
 OPT_OUT="."
-OPT_HOURS=24
-OPT_MAXLOG_MB=5      # bundle: per-file log copy cap (tail keeps the newest end)
-OPT_MAXTOTAL_MB=100  # bundle: cap on ALL copied logs together
+OPT_HOURS=24         # journal window: the report's journal errors and the bundle's journal
+# bundle: the log caps, from the environment (checked in main with _cap_or)
+OPT_MAXLOG_MB="${LOG_FILE_MB:-5}"      # per-file log copy cap (tail keeps the newest end)
+OPT_MAXTOTAL_MB="${LOG_TOTAL_MB:-100}" # cap on ALL copied logs together
 OPT_ROTATED=0        # bundle: copy rotated logs too (opt-in)
-OPT_LOG_DAYS=14      # bundle: with --with-rotated, only from the last N days
+OPT_LOG_DAYS=14      # bundle: with --with-rotated[=DAYS], only from the last DAYS days
 OPT_THREADS=0        # Tier 2: jstack iterations (0 = off)
 OPT_HISTO=0          # Tier 2: jmap -histo (no :live)
 OPT_HEAP=0           # Tier 2: full heap dump
@@ -86,11 +98,11 @@ explicit action flag (--file / --stdout / --bundle) so nothing starts by acciden
   collect-collserver.sh --quiet ...              silence progress on stderr (for automation)
   collect-collserver.sh --home DIR               force WHATAP_HOME (else auto-resolved)
   collect-collserver.sh --out DIR                output directory (default: .)
-  collect-collserver.sh --bundle --hours N       journal window for the bundle (default: 24)
-  collect-collserver.sh --bundle --max-log-mb M    per-file log copy cap (default: 5)
-  collect-collserver.sh --bundle --max-total-mb M  cap on all copied logs together (default: 100)
-  collect-collserver.sh --bundle --with-rotated    also copy rotated logs (default: current logs only)
-  collect-collserver.sh --bundle --log-days N      with --with-rotated, only the last N days (default: 14)
+  collect-collserver.sh --hours N ...            journal window in hours (default: 24): the
+                                                 report's journal errors and the bundle's journal
+  collect-collserver.sh --bundle --with-rotated[=DAYS]
+                                                 also copy rotated logs from the last DAYS days
+                                                 (default 14; without it: current logs only)
 
   Logs are the whole size of a bundle on a busy collection server. Current logs
   are always copied; rotated ones are opt-in. Whatever is left out is listed,
@@ -103,36 +115,57 @@ explicit action flag (--file / --stdout / --bundle) so nothing starts by acciden
   collect-collserver.sh --bundle --du            recursive du of yardbase (data-disk I/O)
   collect-collserver.sh --file --time-ref[=SRV]  also compare the clock to an external NTP/
                                       HTTP source (network call; clock not set)
+  --threads, --histo, --heap, --du and --with-rotated work on the bundle only;
+  given without --bundle they are named on the terminal and not run.
+
+  Environment (whole numbers 1..999999; another value is ignored with a warning):
+    CMD_TIMEOUT=N      cap on each external command, seconds (default 20)
+    RUN_DEADLINE=N     cap on the whole run, seconds (default 300, raised for
+                       the Tier 2 probes unless set)
+    LOG_FILE_MB=N      bundle: per-file log copy cap, MB (default 5; tail kept)
+    LOG_TOTAL_MB=N     bundle: cap on all copied logs together, MB (default 100)
+    WHATAP_HOME=DIR    a WHATAP_HOME candidate (--home DIR wins)
 EOF
 }
 
 ARGC=$#              # 0 args -> usage (handled in main, below)
+# _removed MESSAGE -> an option that no longer exists: exit 2, naming what
+# replaced it (fd 3 is not open yet, so stderr)
+_removed() { printf '!! %s\n' "$1" >&2; exit 2; }
+# _optval NAME VALUE -> exit 2 when VALUE is empty or starts with '-' (then
+# the next option was taken for the value: `--out --file`)
+_optval() {
+    case "$2" in ''|-*) printf -- 'missing value for %s\n' "$1" >&2; exit 2 ;; esac
+}
+_BUNDLE_ONLY=""      # the bundle-only options given, named when --bundle is not
 while [ $# -gt 0 ]; do
     case "$1" in
         --bundle) OPT_BUNDLE=1 ;;
         --file) OPT_FILE=1 ;;
         --stdout) OPT_STDOUT=1 ;;
         --quiet) OPT_QUIET=1 ;;
-        --home) OPT_HOME="$2"; shift ;;
-        --home=*) OPT_HOME="${1#*=}" ;;
-        --out) OPT_OUT="$2"; shift ;;
-        --out=*) OPT_OUT="${1#*=}" ;;
-        --hours) OPT_HOURS="$2"; shift ;;
-        --hours=*) OPT_HOURS="${1#*=}" ;;
-        --max-log-mb) OPT_MAXLOG_MB="$2"; shift ;;
-        --max-log-mb=*) OPT_MAXLOG_MB="${1#*=}" ;;
-        --max-total-mb) OPT_MAXTOTAL_MB="$2"; shift ;;
-        --max-total-mb=*) OPT_MAXTOTAL_MB="${1#*=}" ;;
-        --with-rotated) OPT_ROTATED=1 ;;
-        --log-days) OPT_LOG_DAYS="$2"; shift ;;
-        --log-days=*) OPT_LOG_DAYS="${1#*=}" ;;
-        --threads) OPT_THREADS=1 ;;
-        --threads=*) OPT_THREADS="${1#*=}" ;;
-        --histo) OPT_HISTO=1 ;;
-        --heap) OPT_HEAP=1 ;;
-        --du) OPT_DU=1 ;;
+        --home) _optval --home "${2:-}"; OPT_HOME="$2"; shift ;;
+        --home=*) _optval --home "${1#*=}"; OPT_HOME="${1#*=}" ;;
+        --out) _optval --out "${2:-}"; OPT_OUT="$2"; shift ;;
+        --out=*) _optval --out "${1#*=}"; OPT_OUT="${1#*=}" ;;
+        --hours) _optval --hours "${2:-}"; OPT_HOURS="$2"; shift ;;
+        --hours=*) _optval --hours "${1#*=}"; OPT_HOURS="${1#*=}" ;;
+        --max-log-mb|--max-log-mb=*)
+            _removed "--max-log-mb is no longer an option: set LOG_FILE_MB=N in the environment (default 5)" ;;
+        --max-total-mb|--max-total-mb=*)
+            _removed "--max-total-mb is no longer an option: set LOG_TOTAL_MB=N in the environment (default 100)" ;;
+        --log-days|--log-days=*)
+            _removed "--log-days was merged into --with-rotated: use --with-rotated=DAYS (default 14)" ;;
+        --with-rotated) OPT_ROTATED=1; _BUNDLE_ONLY="$_BUNDLE_ONLY --with-rotated" ;;
+        --with-rotated=*) _optval --with-rotated= "${1#*=}"; OPT_ROTATED=1; OPT_LOG_DAYS="${1#*=}"
+            _BUNDLE_ONLY="$_BUNDLE_ONLY --with-rotated" ;;
+        --threads) OPT_THREADS=1; _BUNDLE_ONLY="$_BUNDLE_ONLY --threads" ;;
+        --threads=*) _optval --threads= "${1#*=}"; OPT_THREADS="${1#*=}"; _BUNDLE_ONLY="$_BUNDLE_ONLY --threads" ;;
+        --histo) OPT_HISTO=1; _BUNDLE_ONLY="$_BUNDLE_ONLY --histo" ;;
+        --heap) OPT_HEAP=1; _BUNDLE_ONLY="$_BUNDLE_ONLY --heap" ;;
+        --du) OPT_DU=1; _BUNDLE_ONLY="$_BUNDLE_ONLY --du" ;;
         --time-ref) OPT_TIMEREF=1 ;;
-        --time-ref=*) OPT_TIMEREF=1; TIMEREF_SERVER="${1#*=}" ;;
+        --time-ref=*) _optval --time-ref= "${1#*=}"; OPT_TIMEREF=1; TIMEREF_SERVER="${1#*=}" ;;
         -h|--help) usage; exit 0 ;;
         *) printf 'unknown argument: %s\n' "$1" >&2; usage >&2; exit 2 ;;
     esac
@@ -1684,9 +1717,9 @@ collect_logs() {
     # goes to the operator rather than into the report's facts.
     if [ "$LOGSEL_DROP_N" -gt 0 ]; then
         if [ "$OPT_ROTATED" = 1 ]; then
-            warn "logs: $LOGSEL_DROP_N files not copied; --max-total-mb / --max-log-mb / --log-days copy more"
+            warn "logs: $LOGSEL_DROP_N files not copied; a larger LOG_TOTAL_MB / LOG_FILE_MB (environment) or --with-rotated=DAYS copies more"
         else
-            warn "logs: $LOGSEL_DROP_N files not copied; --with-rotated (and a larger --max-total-mb) copies more"
+            warn "logs: $LOGSEL_DROP_N files not copied; --with-rotated (and a larger LOG_TOTAL_MB in the environment) copies more"
         fi
     fi
 }
@@ -1896,10 +1929,22 @@ fi
 
 # Numeric options are checked before anything runs, not half way into a bundle.
 _need_int --hours "$OPT_HOURS"
-_need_int --max-log-mb "$OPT_MAXLOG_MB"
-_need_int --max-total-mb "$OPT_MAXTOTAL_MB"
-_need_int --log-days "$OPT_LOG_DAYS"
+_need_int --with-rotated=DAYS "$OPT_LOG_DAYS"
+case "$OPT_LOG_DAYS" in 0*|???????*)
+    warn "--with-rotated=DAYS takes a whole number of days, 1..999999 without leading zeros; got '$OPT_LOG_DAYS'"; exit 2 ;;
+esac
 _need_int --threads "$OPT_THREADS"
+# The log caps come from the environment, checked like RUN_DEADLINE and
+# CMD_TIMEOUT: a value that is not a whole number 1..999999 is named and the
+# default used.
+OPT_MAXLOG_MB="$(_cap_or LOG_FILE_MB "$OPT_MAXLOG_MB" 5)"
+OPT_MAXTOTAL_MB="$(_cap_or LOG_TOTAL_MB "$OPT_MAXTOTAL_MB" 100)"
+# The bundle-only options do nothing in a --file / --stdout run: say so rather
+# than ignore them, and do not raise the deadline for work that will not run.
+if [ "$OPT_BUNDLE" != 1 ] && [ -n "$_BUNDLE_ONLY" ]; then
+    warn "not run:$_BUNDLE_ONLY (bundle only; add --bundle to collect them)"
+    OPT_THREADS=0 OPT_HISTO=0 OPT_HEAP=0 OPT_DU=0 OPT_ROTATED=0
+fi
 
 # Tier 2 JVM work is capped per call (jstack 60s, jmap -histo 120s, heap dump
 # 900s); the run deadline is raised to fit them unless the caller set one.
