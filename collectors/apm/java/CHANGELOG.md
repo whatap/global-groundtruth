@@ -5,6 +5,65 @@ first. Every change to the script bumps its `VERSION` and adds one entry at
 the top of this list (docs/authoring-guide.md, step 2); `tools/validate.sh`
 checks that the newest entry is the script's `VERSION`.
 
+- **0.14.0** — Report reduced to what confirms a cause; no flag added or
+  removed. Section K (Kubernetes / operator injection context) is gone, so L,
+  M and N are now `[12]`–`[14]` (letters kept): the collector shell's
+  `JAVA_TOOL_OPTIONS` (0.13.2), `JAVA_HOME`, `WHATAP_JAVA_AGENT_PATH` and the
+  pod variables are in `[1]` under "collector shell environment";
+  `/var/run/secrets/kubernetes.io` and `/etc/hostname` are in A; the
+  `/whatap-agent` listing is E's home listing (a home no attached JVM
+  resolves is now listed there too), and E states `/whatap-agent: n/a (...)`
+  when attached JVMs exist and it is absent. Section L no longer counts
+  frames, thread states, thread-name shapes, dotted names or other APM
+  agents' frames, and section N no longer joins its index to them: the dumps
+  are the record, so a `--threads` dump is now printed in full (was the first
+  5000 lines). A `--dump-file` is identified by path, size, line count and
+  sha256 and included in full (it was counted before; the file may exist
+  only on the field host).
+  Section N drops the package histogram and the name-pattern index (count and
+  class list stay); section M drops the package map of each detailed jar and
+  of `BOOT-INF/classes` (class count stays; with `--appclasses` the classes
+  are in N's list). Section G prints the count of bundled `weaving/*` and
+  `whatap/agent/asm/*ASM` entries instead of listing up to 200 and 150 of
+  them (weaving-list check against the jar and on-disk weaving directory
+  stay) and no longer greps weaving / hook / instrumentation keys out of the
+  config file, which section E dumps verbatim. For attached JVMs past E's cap
+  of 8, E now prints `whatap.server.host`/`port` (with source) and the
+  non-comment lines of the config file, and for a config file longer than
+  the 400 printed lines, its non-comment lines past line 400 (J and G printed
+  those facts for every JVM before). Section I drops the `[WA*]` code tally
+  (the log tail is printed). Section J no longer re-derives
+  `whatap.server.host`/`port` (E prints config file, whatap env and every
+  `-Dwhatap.*`) and merges its two session lists into one from one `ss` call,
+  each session once: first the sessions to the server port(s) and 6600 from
+  any owner (where the 2026-09-11 BAF `vshell` sessions showed), then the
+  other sessions of the attached JVMs, each group capped at 60 with "first N
+  of M" when cut; an attached JVM of another uid is stated as `owner not
+  visible to uid N`. Sessions of an unattached JVM to other ports are no
+  longer listed. Section D, for a JVM without the WhaTap attach marker whose
+  environ was read, prints pid, the detecting test, uid, start time, cwd,
+  exe, program, cmdline and the VM options line, and drops comm, root and
+  mount namespace, state and thread count, VmRSS, server markers, the
+  `-javaagent` count, the JVM option variables and where fd 1 / fd 2 point; a
+  JVM whose environ was not read keeps the full detail (its marker is not
+  decided); the walk counts and tests are unchanged. Section B prints the
+  `release` file of each running JVM's binary verbatim (was four keys) and
+  runs `-version` only when that file is absent; java binaries on PATH,
+  `JAVA_HOME` and the install-root globs that no running JVM uses are no
+  longer searched for; a JVM whose `/proc/<pid>/exe` is not readable is
+  listed with that fact and its absolute `argv[0]`, resolved as that JVM
+  resolves it; when none resolves that way (`docker exec -u 0` without
+  CAP_SYS_PTRACE, argv[0] `java`), the java the collector shell finds through
+  `JAVA_HOME`, else `PATH`, is printed once and labelled as not verified to
+  be that JVM's binary (0.13.7 reached it through its PATH/`JAVA_HOME`
+  search). The usage text of `--library`, `--appclasses` and
+  `--dump-file` says the same. On a development host with one attached and
+  one unattached JVM the default run went from 646 to 464 lines.
+- **0.14.0** (defects present in 0.13.7) — Section C: the in-jar
+  `whatap/v.properties` of agent builds that ship it with CRLF put CR into
+  the report (`validate.sh --report` fails on it); CR is removed. Section J:
+  the port filter's `$(for ... case ... in ''|*[!0-9]*) ...)` was a syntax
+  error under bash 3.2; the case patterns now carry a leading `(`.
 - **0.13.7** — Comments only; report content unchanged. Shortened long
   comment runs in `_proc_env`, `_all_jvm_args`, `_jvm_opt_val`,
   `_jcmd_recover`, the path-resolution and `_nsresolve` header comments,
