@@ -10,5 +10,7 @@ whatap-*-*T*Z.tar.gz
 *.swp
 *~
 
-# 세션 워크트리. 레포 안에 박힌 별도 git 이라 추적하지 않는다
-.claude/
+# 세션 워크트리와 로컬 설정. 레포 안에 박힌 별도 git 이라 추적하지 않는다.
+# .claude/agents/ (난이도별 검증 에이전트) 만 커밋한다.
+.claude/*
+!.claude/agents/
