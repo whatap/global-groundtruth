@@ -31,7 +31,7 @@ export LC_ALL=C
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-apmphp"
 # History: CHANGELOG.md (next to this file).
-VERSION="0.7.4"
+VERSION="0.7.5"
 DOMAIN="apm"
 TARGET="host/$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || uname -n 2>/dev/null || echo unknown)"
 
@@ -1152,7 +1152,14 @@ EOF
         [ -x "$p" ] && [ -f "$p" ] && _add_php "$p"
     done
 
-    # agent home candidates
+    _disc_homes
+    _disc_inis
+}
+
+# _disc_homes -> the agent home candidates, then the service files and the
+# extension dirs they declare
+_disc_homes() {
+    local pid cwd envh exe d p
     [ -n "${WHATAP_HOME:-}" ] && _home_from_self "$WHATAP_HOME" WHATAP_HOME
     [ -d "$D_DEFAULT_HOME" ] && _add_home "$D_DEFAULT_HOME" "package install path (present on disk)"
     for pid in $D_AGENT_PIDS; do
@@ -1190,7 +1197,11 @@ $(printf '%s\n' "$D_SERVICE_FILES" | tr '|' '\n' | grep -v '^$' | while IFS= rea
     grep -h 'WHATAP_PHP_EXT_HOME=' "$p" 2>/dev/null | sed 's/.*WHATAP_PHP_EXT_HOME=//; s/"$//'
 done)
 EOF
+}
 
+# _disc_inis -> the whatap ini file candidates
+_disc_inis() {
+    local p d
     # whatap ini files: the installer copies template.ini to
     # <ini scan dir>/whatap.ini, and falls back to the agent home when PHP
     # reports no scan dir. Shallow globs over the known ini tree shapes
@@ -1602,108 +1613,7 @@ EOF
             break
         fi
         _php_probed=$_n
-        fact "-- php binary: $php"
-        fact "   resolves to: $(readlink -f "$php" 2>/dev/null || echo "$php")"
-        php_run "   version" "$php" -v
-        # the php-fpm on PATH run here with -v, under this name or another
-        # that resolves to the same file (a running /usr/sbin/php-fpm8.2 is
-        # listed first, the PATH php-fpm linking to it is folded into it):
-        # section 4 shows the same output instead of running it again, when it
-        # finished in time and wrote nothing to stderr (section 4 shows stdout
-        # and stderr together)
-        case "$php" in
-            */php-fpm*)
-                if [ -n "$_php_rc" ] && [ "$_php_rc" != 124 ] && [ -z "$_php_err" ] \
-                    && [ -n "$_fpm_path_key" ] \
-                    && [ "$(readlink -f "$php" 2>/dev/null || echo "$php")" = "$_fpm_path_key" ]; then
-                    _fpm_v_seen=1 _fpm_v_out="$_php_out"
-                fi ;;
-        esac
-        if php_info "$php"; then
-            php_info_grep "   php version / system" '^(PHP Version|System) =>' 4
-            php_info_grep "   SAPI" '^Server API =>' 2
-            php_info_grep "   ini paths" '^(Configuration File \(php\.ini\) Path|Loaded Configuration File|Scan this dir for additional \.ini files) =>' 4
-            php_info_block "   additional ini files parsed" '^Additional \.ini files parsed =>' 40
-            php_info_grep "   php api / build" '^(PHP API|PHP Extension|Zend Extension|Zend Extension Build|PHP Extension Build|Debug Build|Thread Safety|Zend Signal Handling) =>' 10
-            php_info_grep "   extension_dir" '^extension_dir =>' 2
-            php_info_grep "   opcache" '^opcache\.(enable|enable_cli|jit|jit_buffer_size|preload) =>' 8
-            php_info_grep "   whatap directives visible to this binary (local => master)" '^whatap\.' 80
-            # everything the binding section needs, taken from this one capture
-            # (a host with several PHP versions gets one record per version)
-            _f_ver="$(grep '^PHP Version =>' "$_infofile" 2>/dev/null | head -n1 | sed 's/.*=> *//')"
-            _f_sapi="$(grep '^Server API =>' "$_infofile" 2>/dev/null | head -n1 | sed 's/.*=> *//')"
-            _f_api="$(grep '^PHP API =>' "$_infofile" 2>/dev/null | head -n1 | sed 's/.*=> *//')"
-            _f_ts="$(grep '^Thread Safety =>' "$_infofile" 2>/dev/null | head -n1 | sed 's/.*=> *//')"
-            _f_ed="$(grep '^extension_dir =>' "$_infofile" 2>/dev/null | head -n1 | sed 's/.*=> *//; s/ *=>.*//')"
-            _f_sd="$(grep '^Scan this dir for additional' "$_infofile" 2>/dev/null | head -n1 | sed 's/.*=> *//')"
-            # PHP built without a scan dir prints "(none)": no scan dir is configured
-            case "$_f_sd" in "(none)"|"no value") _f_sd="" ;; esac
-            case "$_f_ed" in "(none)"|"no value") _f_ed="" ;; esac
-            case "$_f_ed" in *"|"*) D_ODD="$D_ODD \"$_f_ed\""; _f_ed="" ;; esac
-            if grep -q '^whatap\.' "$_infofile" 2>/dev/null; then _f_ld="yes"; else _f_ld="no"; fi
-            _f_wn="$( { grep -h 'Unable to load dynamic library' "$_infofile" "$_errfile" | head -n1 | cut -c1-200 ; } 2>/dev/null )"
-            [ -n "$_f_wn" ] || _f_wn="none in the php -i output"
-            # a relative scan dir entry is relative to the cwd of the PHP
-            # process; resolved through a live process of this binary, else
-            # recorded as not resolved
-            _f_sdr="" _ppid=""
-            case "$_nl$D_PHP_LIVE" in *"$_nl$php|"*) _ppid="${D_PHP_LIVE#*"$php|"}"; _ppid="${_ppid%%"$_nl"*}" ;; esac
-            # split on ':' only, never globbed: each entry is read as a line.
-            # An entry holding '|' (the record delimiter) is refused.
-            while IFS= read -r _d; do
-                [ -n "$_d" ] || continue
-                case "$_d" in *"|"*) D_ODD="$D_ODD \"$_d\""; continue ;; esac
-                case "$_d" in
-                    /*) ;;
-                    *) if [ -n "$_ppid" ] && _a="$(_abs_for_pid "$_ppid" "$_d")"; then _d="$_a"
-                       else D_SCAN_UNRES="$D_SCAN_UNRES $php: $_d;"; fi ;;
-                esac
-                _f_sdr="${_f_sdr:+$_f_sdr:}$_d"
-            done <<EOF
-$(printf '%s' "$_f_sd" | tr ':' '\n')
-EOF
-            # the record is '|'-separated; the shown scan dir keeps its '|' as \001
-            D_PHP_FACTS="$D_PHP_FACTS
-$php|$_f_ver|$_f_sapi|$_f_api|$_f_ts|$_f_ed|$(printf '%s' "$_f_sd" | tr '|' '\001')|$_f_sdr|$_f_ld|$_f_wn"
-            _add_ext_dir "$_f_ed" "php -i of $php"
-            # ini files this binary parses, and the whatap ini its own scan dir
-            # would hold — discovered per runtime, not guessed from a path list
-            grep -E '^(Loaded Configuration File|Additional \.ini files parsed) =>' "$_infofile" 2>/dev/null \
-                | sed 's/^[^=]*=> *//' | tr ',' '\n' | sed 's/^ *//; s/ *$//' \
-                | grep -i whatap > "$(_tmp ini.list)" 2>/dev/null
-            # _tmp gives /dev/null when there is no private dir: nothing to read back
-            # a relative entry follows the scan-dir rule: resolved through a
-            # live process of this binary, never against the collector's cwd
-            if [ "$(_tmp ini.list)" != /dev/null ] && [ -s "$(_tmp ini.list)" ]; then
-                while IFS= read -r _p; do
-                    case "$_p" in
-                        /*) _add_ini "$_p" ;;
-                        *) if [ -n "$_ppid" ] && _a="$(_abs_for_pid "$_ppid" "$_p")"; then _add_ini "$_a"
-                           else D_SCAN_UNRES="$D_SCAN_UNRES $php: parsed ini $_p;"; fi ;;
-                    esac
-                done < "$(_tmp ini.list)"
-            fi
-            # the scan dir may list several directories, colon-separated
-            # (PHP_INI_SCAN_DIR), and may be seen through a process root
-            while IFS= read -r _d; do
-                case "$_d" in /*) ;; *) continue ;; esac   # recorded in D_SCAN_UNRES
-                # a scan dir this uid cannot list hides its ini files: a gap,
-                # not an empty dir
-                _fd="$(resolve_fs "$_d")" || continue
-                if [ ! -r "$_fd" ] || [ ! -x "$_fd" ]; then
-                    case " $D_DIR_UNREAD " in *" $_fd "*) ;; *) D_DIR_UNREAD="$D_DIR_UNREAD $_fd" ;; esac
-                    continue
-                fi
-                for _p in "$_d"/whatap.ini "$_d"/*whatap*.ini; do _add_ini "$_p"; done
-            done <<EOF
-$(printf '%s' "$_f_sdr" | tr ':' '\n')
-EOF
-        else
-            fact "   php -i: n/a ($(_classify_err))"
-            D_PHPI_FAIL="$D_PHPI_FAIL $php"
-            D_PHP_FACTS="$D_PHP_FACTS
-$php||||||||no|php -i did not run"
-        fi
+        _rep_php_bin "$php"
         php_run "   extensions loaded (php -m)" "$php" -m
         # co-resident tracers and profilers, from the module list just taken
         _o="$(printf '%s\n' "$_php_out" | grep -iE 'newrelic|datadog|ddtrace|elastic|opentelemetry|otel|tideways|blackfire|xdebug|xhprof|pinpoint|scoutapm|instana' | tr '\n' ' ')"
@@ -1728,6 +1638,121 @@ EOF
     else
         fact "alternatives php entries: n/a (command not found: update-alternatives, alternatives)"
     fi
+}
+
+# _rep_php_bin PHP -> the facts of one php binary, from one `php -v` and one
+# `php -i` capture
+_rep_php_bin() {
+    local php="$1"
+    fact "-- php binary: $php"
+    fact "   resolves to: $(readlink -f "$php" 2>/dev/null || echo "$php")"
+    php_run "   version" "$php" -v
+    # the php-fpm on PATH run here with -v, under this name or another
+    # that resolves to the same file (a running /usr/sbin/php-fpm8.2 is
+    # listed first, the PATH php-fpm linking to it is folded into it):
+    # section 4 shows the same output instead of running it again, when it
+    # finished in time and wrote nothing to stderr (section 4 shows stdout
+    # and stderr together)
+    case "$php" in
+        */php-fpm*)
+            if [ -n "$_php_rc" ] && [ "$_php_rc" != 124 ] && [ -z "$_php_err" ] \
+                && [ -n "$_fpm_path_key" ] \
+                && [ "$(readlink -f "$php" 2>/dev/null || echo "$php")" = "$_fpm_path_key" ]; then
+                _fpm_v_seen=1 _fpm_v_out="$_php_out"
+            fi ;;
+    esac
+    if php_info "$php"; then
+        php_info_grep "   php version / system" '^(PHP Version|System) =>' 4
+        php_info_grep "   SAPI" '^Server API =>' 2
+        php_info_grep "   ini paths" '^(Configuration File \(php\.ini\) Path|Loaded Configuration File|Scan this dir for additional \.ini files) =>' 4
+        php_info_block "   additional ini files parsed" '^Additional \.ini files parsed =>' 40
+        php_info_grep "   php api / build" '^(PHP API|PHP Extension|Zend Extension|Zend Extension Build|PHP Extension Build|Debug Build|Thread Safety|Zend Signal Handling) =>' 10
+        php_info_grep "   extension_dir" '^extension_dir =>' 2
+        php_info_grep "   opcache" '^opcache\.(enable|enable_cli|jit|jit_buffer_size|preload) =>' 8
+        php_info_grep "   whatap directives visible to this binary (local => master)" '^whatap\.' 80
+        _php_record "$php"
+    else
+        fact "   php -i: n/a ($(_classify_err))"
+        D_PHPI_FAIL="$D_PHPI_FAIL $php"
+        D_PHP_FACTS="$D_PHP_FACTS
+$php||||||||no|php -i did not run"
+    fi
+}
+
+# _php_record PHP -> from the php -i capture of PHP: its record in D_PHP_FACTS,
+# its extension dir, and the whatap ini files it parses or its scan dir holds
+_php_record() {
+    local php="$1"
+    # everything the binding section needs, taken from this one capture
+    # (a host with several PHP versions gets one record per version)
+    _f_ver="$(grep '^PHP Version =>' "$_infofile" 2>/dev/null | head -n1 | sed 's/.*=> *//')"
+    _f_sapi="$(grep '^Server API =>' "$_infofile" 2>/dev/null | head -n1 | sed 's/.*=> *//')"
+    _f_api="$(grep '^PHP API =>' "$_infofile" 2>/dev/null | head -n1 | sed 's/.*=> *//')"
+    _f_ts="$(grep '^Thread Safety =>' "$_infofile" 2>/dev/null | head -n1 | sed 's/.*=> *//')"
+    _f_ed="$(grep '^extension_dir =>' "$_infofile" 2>/dev/null | head -n1 | sed 's/.*=> *//; s/ *=>.*//')"
+    _f_sd="$(grep '^Scan this dir for additional' "$_infofile" 2>/dev/null | head -n1 | sed 's/.*=> *//')"
+    # PHP built without a scan dir prints "(none)": no scan dir is configured
+    case "$_f_sd" in "(none)"|"no value") _f_sd="" ;; esac
+    case "$_f_ed" in "(none)"|"no value") _f_ed="" ;; esac
+    case "$_f_ed" in *"|"*) D_ODD="$D_ODD \"$_f_ed\""; _f_ed="" ;; esac
+    if grep -q '^whatap\.' "$_infofile" 2>/dev/null; then _f_ld="yes"; else _f_ld="no"; fi
+    _f_wn="$( { grep -h 'Unable to load dynamic library' "$_infofile" "$_errfile" | head -n1 | cut -c1-200 ; } 2>/dev/null )"
+    [ -n "$_f_wn" ] || _f_wn="none in the php -i output"
+    # a relative scan dir entry is relative to the cwd of the PHP
+    # process; resolved through a live process of this binary, else
+    # recorded as not resolved
+    _f_sdr="" _ppid=""
+    case "$_nl$D_PHP_LIVE" in *"$_nl$php|"*) _ppid="${D_PHP_LIVE#*"$php|"}"; _ppid="${_ppid%%"$_nl"*}" ;; esac
+    # split on ':' only, never globbed: each entry is read as a line.
+    # An entry holding '|' (the record delimiter) is refused.
+    while IFS= read -r _d; do
+        [ -n "$_d" ] || continue
+        case "$_d" in *"|"*) D_ODD="$D_ODD \"$_d\""; continue ;; esac
+        case "$_d" in
+            /*) ;;
+            *) if [ -n "$_ppid" ] && _a="$(_abs_for_pid "$_ppid" "$_d")"; then _d="$_a"
+               else D_SCAN_UNRES="$D_SCAN_UNRES $php: $_d;"; fi ;;
+        esac
+        _f_sdr="${_f_sdr:+$_f_sdr:}$_d"
+    done <<EOF
+$(printf '%s' "$_f_sd" | tr ':' '\n')
+EOF
+    # the record is '|'-separated; the shown scan dir keeps its '|' as \001
+    D_PHP_FACTS="$D_PHP_FACTS
+$php|$_f_ver|$_f_sapi|$_f_api|$_f_ts|$_f_ed|$(printf '%s' "$_f_sd" | tr '|' '\001')|$_f_sdr|$_f_ld|$_f_wn"
+    _add_ext_dir "$_f_ed" "php -i of $php"
+    # ini files this binary parses, and the whatap ini its own scan dir
+    # would hold — discovered per runtime, not guessed from a path list
+    grep -E '^(Loaded Configuration File|Additional \.ini files parsed) =>' "$_infofile" 2>/dev/null \
+        | sed 's/^[^=]*=> *//' | tr ',' '\n' | sed 's/^ *//; s/ *$//' \
+        | grep -i whatap > "$(_tmp ini.list)" 2>/dev/null
+    # _tmp gives /dev/null when there is no private dir: nothing to read back
+    # a relative entry follows the scan-dir rule: resolved through a
+    # live process of this binary, never against the collector's cwd
+    if [ "$(_tmp ini.list)" != /dev/null ] && [ -s "$(_tmp ini.list)" ]; then
+        while IFS= read -r _p; do
+            case "$_p" in
+                /*) _add_ini "$_p" ;;
+                *) if [ -n "$_ppid" ] && _a="$(_abs_for_pid "$_ppid" "$_p")"; then _add_ini "$_a"
+                   else D_SCAN_UNRES="$D_SCAN_UNRES $php: parsed ini $_p;"; fi ;;
+            esac
+        done < "$(_tmp ini.list)"
+    fi
+    # the scan dir may list several directories, colon-separated
+    # (PHP_INI_SCAN_DIR), and may be seen through a process root
+    while IFS= read -r _d; do
+        case "$_d" in /*) ;; *) continue ;; esac   # recorded in D_SCAN_UNRES
+        # a scan dir this uid cannot list hides its ini files: a gap,
+        # not an empty dir
+        _fd="$(resolve_fs "$_d")" || continue
+        if [ ! -r "$_fd" ] || [ ! -x "$_fd" ]; then
+            case " $D_DIR_UNREAD " in *" $_fd "*) ;; *) D_DIR_UNREAD="$D_DIR_UNREAD $_fd" ;; esac
+            continue
+        fi
+        for _p in "$_d"/whatap.ini "$_d"/*whatap*.ini; do _add_ini "$_p"; done
+    done <<EOF
+$(printf '%s' "$_f_sdr" | tr ':' '\n')
+EOF
 }
 
 # [4] what actually serves the traffic
@@ -1859,6 +1884,15 @@ _rep_install() {
 # version has its own extension_dir and its own ini scan dir.
 _rep_binding() {
     section "Tracer binding per PHP runtime (module, ini, load state)"
+    _rep_binding_runtimes
+    _rep_binding_extdirs
+    _rep_binding_inis
+    _rep_binding_maps
+}
+
+# _rep_binding_runtimes -> per runtime detailed in section 3: whatap.so in its
+# extension_dir, the whatap ini in its scan dirs, its whatap.* directives
+_rep_binding_runtimes() {
     if [ -z "$D_PHP_FACTS" ]; then
         fact "no PHP runtime was detailed in section 3; only the extension_dir view below applies"
     else
@@ -1910,6 +1944,11 @@ EOF
             fact "   dynamic-library load message: $_wn"
         done
     fi
+}
+
+# _rep_binding_extdirs -> every extension_dir seen, and whatap.so in the ones no
+# runtime reported
+_rep_binding_extdirs() {
     if [ -z "$D_EXT_DIRS" ]; then
         fact "extension_dir values: none discovered (php -i and service files both empty)"
     else
@@ -1935,6 +1974,11 @@ EOF
             fi
         done
     fi
+}
+
+# _rep_binding_inis -> whatap ini files, php.ini files with whatap lines, and
+# the ini directory trees present
+_rep_binding_inis() {
     fact "whatap ini files found on disk:"
     if [ -z "$D_INI_FILES" ]; then
         fact "   none found (searched the RHEL, Debian/Ubuntu per-SAPI, Alpine, source-build and agent-home ini locations)"
@@ -1974,6 +2018,10 @@ EOF
         fi
     done
     [ "$_hit" = 0 ] && fact "   none of the known ini tree paths exist on this host"
+}
+
+# _rep_binding_maps -> the whatap module mapped into running web/php processes
+_rep_binding_maps() {
     fact "live load status — whatap module mapped into running processes (from /proc/<pid>/maps):"
     _any=0
     _nread=0
@@ -2050,7 +2098,7 @@ _rep_conf() {
         [ -n "$home" ] || continue
         fshome="$(resolve_fs "$home")" || { fact "   -- home $home: n/a ($(_absent_why "$home" "$_src"))"; continue; }
         for f in security.conf paramkey.txt; do
-            if [ -e "$fshome/$f" ]; then printf '        %s: present, %s bytes\n' "$fshome/$f" "$(wc -c < "$fshome/$f" 2>/dev/null | tr -d ' ')"
+            if [ -e "$fshome/$f" ]; then printf '        %s: present, %s bytes\n' "$fshome/$f" "$({ wc -c < "$fshome/$f"; } 2>/dev/null | tr -d ' ')"
             else printf '        %s: absent\n' "$fshome/$f"; fi
         done
     done
@@ -2131,7 +2179,7 @@ _rep_logs() {
                 _boot="$(ls -t "$fshome"/logs/whatap-boot-*.log 2>/dev/null | head -n 1)"
                 if [ -n "$_boot" ]; then
                     _file_lines head "   $(basename "$_boot") (first lines: startup banner and configuration)" "$_boot" 80
-                    _tot="$(wc -l < "$_boot" 2>/dev/null | tr -d ' ')"
+                    _tot="$({ wc -l < "$_boot"; } 2>/dev/null | tr -d ' ')"
                     if [ "${_tot:-0}" -gt 80 ]; then
                         _file_lines tail "   $(basename "$_boot") (recent lines)" "$_boot" 150
                     else

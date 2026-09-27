@@ -29,7 +29,7 @@ export LC_ALL=C
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-apmnodejs"
 # History: CHANGELOG.md (next to this file).
-VERSION="0.8.4"
+VERSION="0.8.5"
 DOMAIN="apm"
 TARGET="host/$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || uname -n 2>/dev/null || echo unknown)"
 
@@ -1120,7 +1120,13 @@ EOF
         [ -x "$exe" ] && _add_node "$exe"
     done
 
-    # agent home candidates
+    _disc_homes
+    _disc_globals
+}
+
+# _disc_homes -> the agent home candidates
+_disc_homes() {
+    local pid cwd v _l _r
     [ -n "${WHATAP_HOME:-}" ] && _home_from_self "$WHATAP_HOME" WHATAP_HOME
     [ -n "${WHATAP_CONF_DIR:-}" ] && _home_from_self "$WHATAP_CONF_DIR" WHATAP_CONF_DIR
     [ -n "${WHATAP_CONF:-}" ] && _add_conf_name "$WHATAP_CONF"
@@ -1144,7 +1150,11 @@ EOF
     # operator auto-injection default mount (apm-init-nodejs seeds it)
     [ -d /whatap-agent ] && _add_home "/whatap-agent" "operator injection volume /whatap-agent"
     [ -e /whatap-agent/node_modules/whatap/package.json ] && _add_pkg_dir "/whatap-agent/node_modules/whatap" "operator injection volume"
+}
 
+# _disc_globals -> the global installs of the whatap package
+_disc_globals() {
+    local exe v
     # global installs: `npm root -g` once, and <prefix>/lib/node_modules of
     # every node binary found, which is where npm puts them without npm
     # having to run
@@ -1541,7 +1551,7 @@ EOF
             if [ -d "$fsd/agent" ]; then
                 printf '           bundled master agent binaries (agent/):\n'
                 for b in "$fsd"/agent/*/*/whatap_nodejs "$fsd"/agent/*/whatap_nodejs.exe; do
-                    [ -f "$b" ] && printf '             %s  %s bytes\n' "$b" "$(wc -c < "$b" 2>/dev/null | tr -d ' ')"
+                    [ -f "$b" ] && printf '             %s  %s bytes\n' "$b" "$({ wc -c < "$b"; } 2>/dev/null | tr -d ' ')"
                 done
             else
                 printf '           bundled master agent binaries: none (agent/ absent)\n'
@@ -1554,7 +1564,7 @@ EOF
             fi
             [ -f "$fsd/whatap.conf" ] && printf '           whatap.conf template in package dir: present\n'
             if [ -f "$fsd/paramkey.txt" ]; then
-                printf '           paramkey.txt in package dir: present, %s bytes (content not collected: key material)\n' "$(wc -c < "$fsd/paramkey.txt" 2>/dev/null | tr -d ' ')"
+                printf '           paramkey.txt in package dir: present, %s bytes (content not collected: key material)\n' "$({ wc -c < "$fsd/paramkey.txt"; } 2>/dev/null | tr -d ' ')"
             fi
         done
     fi
@@ -1571,11 +1581,11 @@ _rep_procs() {
         for pid in $D_GO_PIDS; do
             [ -d "/proc/$pid" ] || { printf '        -- pid %s: n/a (process exited)\n' "$pid"; continue; }
             printf '        -- pid %s (ppid %s)\n' "$pid" "$(awk '/^PPid:/{print $2}' "/proc/$pid/status" 2>/dev/null)"
-            printf '           cmdline: %s\n' "$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | cut -c1-300)"
+            printf '           cmdline: %s\n' "$({ tr '\0' ' ' < "/proc/$pid/cmdline"; } 2>/dev/null | cut -c1-300)"
             printf '           cwd: %s\n' "$(readlink -f "/proc/$pid/cwd" 2>/dev/null || echo "n/a (permission denied or gone)")"
             printf '           uid/state: %s\n' "$(awk '/^Uid:/{u=$2} /^State:/{s=$2" "$3} END{print u" / "s}' "/proc/$pid/status" 2>/dev/null)"
             if [ -r "/proc/$pid/environ" ]; then
-                tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | grep -E '^(WHATAP_|whatap\.|node\.version|APP_IDENTIFIER|APP_NAME|NODEJS_PARENT_APP_PID|PM2_)' | cut -c1-300 | _indent '           env '
+                { tr '\0' '\n' < "/proc/$pid/environ"; } 2>/dev/null | grep -E '^(WHATAP_|whatap\.|node\.version|APP_IDENTIFIER|APP_NAME|NODEJS_PARENT_APP_PID|PM2_)' | cut -c1-300 | _indent '           env '
             else
                 printf '           env: n/a (permission denied: /proc/%s/environ)\n' "$pid"
             fi
@@ -1594,19 +1604,19 @@ _rep_procs() {
             printf '        -- pid %s (ppid %s)\n' "$pid" "$(awk '/^PPid:/{print $2}' "/proc/$pid/status" 2>/dev/null)"
             printf '           comm: %s\n' "$(cat "/proc/$pid/comm" 2>/dev/null)"
             printf '           exe: %s\n' "$(readlink -f "/proc/$pid/exe" 2>/dev/null || echo n/a)"
-            printf '           cmdline: %s\n' "$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | cut -c1-300)"
+            printf '           cmdline: %s\n' "$({ tr '\0' ' ' < "/proc/$pid/cmdline"; } 2>/dev/null | cut -c1-300)"
             _cwd_of "$pid"; cwd="$_cw"
             printf '           cwd: %s\n' "${cwd:-n/a (permission denied or gone)}"
             # whatap attach markers: "-r whatap" on the cmdline, or a require
             # via NODE_OPTIONS (both reach the same preload path)
-            if tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null | grep -qE '^(-r|--require)$|^--require=.*whatap'; then
+            if { tr '\0' '\n' < "/proc/$pid/cmdline"; } 2>/dev/null | grep -qE '^(-r|--require)$|^--require=.*whatap'; then
                 printf '           cmdline carries -r/--require: yes\n'
             else
                 printf '           cmdline carries -r/--require: no\n'
             fi
             if [ -r "/proc/$pid/environ" ]; then
                 # one read of the environ; three groups, each in environ order
-                tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | awk '
+                { tr '\0' '\n' < "/proc/$pid/environ"; } 2>/dev/null | awk '
                     /^(NODE_OPTIONS|NODE_PATH|NODE_ENV|NEXT_RUNTIME)=/ { a = a "           env " substr($0, 1, 300) "\n" }
                     /^WHATAP_/ { w = w "           env " substr($0, 1, 300) "\n" }
                     /^(POD_NAME|NODE_NAME|NODE_IP|PM2_HOME|pm_id|name|instances|APP_NAME)=/ { k = k "           env " substr($0, 1, 200) "\n" }
@@ -1688,7 +1698,7 @@ _rep_homes() {
             [ "$_pp" = 0 ] && fact "   whatap_port_<pid> files: none present"
             [ -d "$fshome/run" ] && fact "   run dir: present" || fact "   run dir: absent"
             for sf in security.conf paramkey.txt; do
-                if [ -e "$fshome/$sf" ]; then fact "   $sf: present, $(wc -c < "$fshome/$sf" 2>/dev/null | tr -d ' ') bytes (content not collected: key material)"
+                if [ -e "$fshome/$sf" ]; then fact "   $sf: present, $({ wc -c < "$fshome/$sf"; } 2>/dev/null | tr -d ' ') bytes (content not collected: key material)"
                 else fact "   $sf: absent"; fi
             done
             if [ -d "$fshome/logs" ]; then
@@ -1767,7 +1777,7 @@ _rep_logs() {
                 fact "   whatap-boot-*.log: n/a (no such file under $fshome)"
             fi
             _req="$(ls -t "$fshome"/logs/reqlog-*.log "$fshome"/logs/reqlog.log 2>/dev/null | head -n1)"
-            [ -n "$_req" ] && fact "   request log present: $_req ($(wc -l < "$_req" 2>/dev/null | tr -d ' ') lines)" || fact "   request log (reqlog*): none present"
+            [ -n "$_req" ] && fact "   request log present: $_req ($({ wc -l < "$_req"; } 2>/dev/null | tr -d ' ') lines)" || fact "   request log (reqlog*): none present"
         done
     fi
 }
@@ -1783,7 +1793,7 @@ _rep_apps() {
     if [ -n "$_pm2d" ]; then
         fact "pm2 daemon process(es): $_pm2d"
         for p in $_pm2d; do
-            printf '        pid %s cmdline: %s\n' "$p" "$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | cut -c1-200)"
+            printf '        pid %s cmdline: %s\n' "$p" "$({ tr '\0' ' ' < "/proc/$p/cmdline"; } 2>/dev/null | cut -c1-200)"
             printf '        pid %s PM2_HOME: %s\n' "$p" "$(_proc_env "$p" PM2_HOME)"
         done
     else

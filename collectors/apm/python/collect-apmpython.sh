@@ -25,7 +25,7 @@ export LC_ALL=C
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-apmpython"
 # History: CHANGELOG.md (next to this file).
-VERSION="0.10.4"
+VERSION="0.10.5"
 DOMAIN="apm"
 TARGET="host/$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || uname -n 2>/dev/null || echo unknown)"
 
@@ -848,6 +848,135 @@ for i in order:
     out.write("%s %d rc %d\n" % (m, i + 1, rc))
     out.flush()
 '
+# The lookups _rep_interp runs in each interpreter (one _pyrun start for all
+# twelve). Each only reads importlib metadata or files; none imports whatap.
+_pc1='import sys; print(sys.version.replace(chr(10)," "))'
+_pc2='import sys; print(sys.prefix); print(getattr(sys,"base_prefix",sys.prefix))'
+_pc3='import importlib.metadata as m; print(m.version("whatap-python"))'
+_pc4='import importlib.util as u; s=u.find_spec("whatap"); print(s.origin if s and s.origin else "not found")'
+_pc5='
+import importlib.util as u, os, glob
+s=u.find_spec("whatap")
+if not (s and s.origin): print("not found")
+else:
+    sp=os.path.dirname(os.path.dirname(s.origin))
+    hits=glob.glob(os.path.join(sp,"whatap_python-*"))
+    print("\n".join(os.path.basename(h) for h in hits) if hits else "no whatap_python-* metadata dir in "+sp)'
+_pc6='import importlib.metadata as m; print(m.version("setuptools"))'
+_pc7='import pkg_resources; print("ok")'
+# Go module binaries shipped inside the package, vs this machine arch
+_pc8='
+import importlib.util as u, os
+s=u.find_spec("whatap")
+if not (s and s.origin): print("not found")
+else:
+    d=os.path.join(os.path.dirname(s.origin),"agent")
+    if not os.path.isdir(d): print("no agent dir: "+d)
+    else:
+        for root,_,files in os.walk(d):
+            for f in files:
+                p=os.path.join(root,f)
+                print("%s  %d bytes  exec=%s" % (p, os.path.getsize(p), os.access(p,os.X_OK)))'
+_pc9='
+import importlib.util as u, os
+s=u.find_spec("whatap")
+print(os.path.exists(os.path.join(os.path.dirname(s.origin),"bootstrap","sitecustomize.py")) if s and s.origin else "not found")'
+# hook surface of the INSTALLED agent version (trace/mod tree) — this
+# differs between agent versions, so it is reported per install
+_pc10='
+import importlib.util as u, os
+s=u.find_spec("whatap")
+if not (s and s.origin): print("not found")
+else:
+    base=os.path.join(os.path.dirname(s.origin),"trace","mod")
+    if not os.path.isdir(base): print("no trace/mod dir: "+base)
+    else:
+        groups={}
+        for root,dirs,files in os.walk(base):
+            rel=os.path.relpath(root,base)
+            cat="core" if rel=="." else rel.replace(os.sep,"/")
+            for f in sorted(files):
+                if f.endswith(".py") and f not in ("__init__.py","util.py"):
+                    groups.setdefault(cat,[]).append(f[:-3])
+        for k in sorted(groups): print(k+": "+", ".join(sorted(groups[k])))'
+# where an odoo package would be imported from: its release.py is
+# read as text in section [8]; the odoo module is never imported
+_pc11='
+import importlib.util as u, os
+s = u.find_spec("odoo")
+loc = ""
+if s:
+    if s.origin: loc = os.path.dirname(s.origin)
+    elif s.submodule_search_locations:
+        for _p in s.submodule_search_locations: loc = _p; break
+print(os.path.join(loc, "release.py") if loc else "")'
+# library inventory: the metadata entry names in every sys.path
+# directory (the entries pip list reads); nothing is imported
+_pc12='
+import sys, os, errno, stat
+enc = getattr(sys.__stdout__, "encoding", None) or "ascii"
+def esc(t):
+    # one line per name, and nothing the output stream cannot encode: a
+    # control character, an undecodable byte (surrogateescape) or a character
+    # outside the stdout encoding is written as a backslash escape
+    if str is bytes and not isinstance(t, str): t = t.encode("ascii", "backslashreplace")
+    # Python 2: bytes; a name that is not UTF-8 has its high bytes escaped
+    raw = 0
+    if str is bytes:
+        try:
+            t.decode("utf-8")
+        except Exception:
+            raw = 1
+    r = []
+    for c in t:
+        o = ord(c)
+        if c == "\n": r.append("\\n")
+        elif c == "\r": r.append("\\r")
+        elif c == "\t": r.append("\\t")
+        elif o < 32 or o == 127: r.append("\\x%02x" % o)
+        elif str is bytes: r.append(raw and o > 127 and "\\x%02x" % o or c)
+        elif 0xdc80 <= o <= 0xdcff: r.append("\\x%02x" % (o - 0xdc00))
+        elif o > 127:
+            try:
+                c.encode(enc)
+                r.append(c)
+            except Exception:
+                r.append(c.encode("ascii", "backslashreplace").decode("ascii"))
+        else: r.append(c)
+    return "".join(r)
+def why(e):
+    return esc(getattr(e, "strerror", None) or str(e))
+seen = {}
+left = 200
+found = 0
+for d in sys.path:
+    if not d or d in seen: continue
+    seen[d] = 1
+    try:
+        st = os.stat(d)
+    except OSError:
+        e = sys.exc_info()[1]
+        if e.errno not in (errno.ENOENT, errno.ENOTDIR): print("%s: n/a (%s)" % (esc(d), why(e)))
+        continue
+    if not stat.S_ISDIR(st.st_mode): continue
+    try:
+        ns = os.listdir(d)
+    except OSError:
+        print("%s: n/a (%s)" % (esc(d), why(sys.exc_info()[1])))
+        continue
+    ns = [n for n in ns if n.endswith(".dist-info") or n.endswith(".egg-info") or n.endswith(".egg") or n.endswith(".egg-link")]
+    if not ns: continue
+    ns.sort()
+    found = 1
+    print("%s (%d total):" % (esc(d), len(ns)))
+    for n in ns[:left]:
+        for x in (".dist-info", ".egg-info"):
+            if n.endswith(x): n = n[:-len(x)]
+        print("  " + esc(n))
+    if len(ns) > left: print("  (%d more not listed: cap 200 per interpreter)" % (len(ns) - left))
+    left = max(0, left - len(ns))
+if not found: print("no dist-info/egg-info/egg/egg-link entries in any sys.path directory")'
+
 _pyrun_py="" _pyrun_rc=0 _pyrun_pre="" _pyrun_post="" _pyrun_err="" _pyrun_started=0 _pyrun_rerun_to=0
 _pyrun() {
     local l n c ord="" cur="" step="" acc="" seen=0 i=1
@@ -1290,7 +1419,13 @@ EOF
         [ -x "$p" ] && _add_py "$p"
     done
 
-    # agent home candidates
+    _disc_homes "$_unmk"
+}
+
+# _disc_homes UNMK -> the agent home candidates; UNMK: the unreadable python
+# processes whose command line does not name whatap
+_disc_homes() {
+    local _unmk="$1" pid p cwd _l _r _o
     [ -n "${WHATAP_HOME:-}" ] && _home_from_self "$WHATAP_HOME" WHATAP_HOME
     [ -n "${WHATAP_HOME_BATCH:-}" ] && _home_from_self "$WHATAP_HOME_BATCH" WHATAP_HOME_BATCH
     if [ -r "$D_LOCK_FILE" ]; then
@@ -1660,175 +1795,7 @@ EOF
             break
         fi
         _py_probed=$_pycount
-        fact "-- interpreter: $py"
-        fact "   resolves to: $(readlink -f "$py" 2>/dev/null || echo "$py")"
-        _pc1='import sys; print(sys.version.replace(chr(10)," "))'
-        _pc2='import sys; print(sys.prefix); print(getattr(sys,"base_prefix",sys.prefix))'
-        _pc3='import importlib.metadata as m; print(m.version("whatap-python"))'
-        _pc4='import importlib.util as u; s=u.find_spec("whatap"); print(s.origin if s and s.origin else "not found")'
-        _pc5='
-import importlib.util as u, os, glob
-s=u.find_spec("whatap")
-if not (s and s.origin): print("not found")
-else:
-    sp=os.path.dirname(os.path.dirname(s.origin))
-    hits=glob.glob(os.path.join(sp,"whatap_python-*"))
-    print("\n".join(os.path.basename(h) for h in hits) if hits else "no whatap_python-* metadata dir in "+sp)'
-        _pc6='import importlib.metadata as m; print(m.version("setuptools"))'
-        _pc7='import pkg_resources; print("ok")'
-        # Go module binaries shipped inside the package, vs this machine arch
-        _pc8='
-import importlib.util as u, os
-s=u.find_spec("whatap")
-if not (s and s.origin): print("not found")
-else:
-    d=os.path.join(os.path.dirname(s.origin),"agent")
-    if not os.path.isdir(d): print("no agent dir: "+d)
-    else:
-        for root,_,files in os.walk(d):
-            for f in files:
-                p=os.path.join(root,f)
-                print("%s  %d bytes  exec=%s" % (p, os.path.getsize(p), os.access(p,os.X_OK)))'
-        _pc9='
-import importlib.util as u, os
-s=u.find_spec("whatap")
-print(os.path.exists(os.path.join(os.path.dirname(s.origin),"bootstrap","sitecustomize.py")) if s and s.origin else "not found")'
-        # hook surface of the INSTALLED agent version (trace/mod tree) — this
-        # differs between agent versions, so it is reported per install
-        _pc10='
-import importlib.util as u, os
-s=u.find_spec("whatap")
-if not (s and s.origin): print("not found")
-else:
-    base=os.path.join(os.path.dirname(s.origin),"trace","mod")
-    if not os.path.isdir(base): print("no trace/mod dir: "+base)
-    else:
-        groups={}
-        for root,dirs,files in os.walk(base):
-            rel=os.path.relpath(root,base)
-            cat="core" if rel=="." else rel.replace(os.sep,"/")
-            for f in sorted(files):
-                if f.endswith(".py") and f not in ("__init__.py","util.py"):
-                    groups.setdefault(cat,[]).append(f[:-3])
-        for k in sorted(groups): print(k+": "+", ".join(sorted(groups[k])))'
-        # where an odoo package would be imported from: its release.py is
-        # read as text in section [8]; the odoo module is never imported
-        _pc11='
-import importlib.util as u, os
-s = u.find_spec("odoo")
-loc = ""
-if s:
-    if s.origin: loc = os.path.dirname(s.origin)
-    elif s.submodule_search_locations:
-        for _p in s.submodule_search_locations: loc = _p; break
-print(os.path.join(loc, "release.py") if loc else "")'
-        # library inventory: the metadata entry names in every sys.path
-        # directory (the entries pip list reads); nothing is imported
-        _pc12='
-import sys, os, errno, stat
-enc = getattr(sys.__stdout__, "encoding", None) or "ascii"
-def esc(t):
-    # one line per name, and nothing the output stream cannot encode: a
-    # control character, an undecodable byte (surrogateescape) or a character
-    # outside the stdout encoding is written as a backslash escape
-    if str is bytes and not isinstance(t, str): t = t.encode("ascii", "backslashreplace")
-    # Python 2: bytes; a name that is not UTF-8 has its high bytes escaped
-    raw = 0
-    if str is bytes:
-        try:
-            t.decode("utf-8")
-        except Exception:
-            raw = 1
-    r = []
-    for c in t:
-        o = ord(c)
-        if c == "\n": r.append("\\n")
-        elif c == "\r": r.append("\\r")
-        elif c == "\t": r.append("\\t")
-        elif o < 32 or o == 127: r.append("\\x%02x" % o)
-        elif str is bytes: r.append(raw and o > 127 and "\\x%02x" % o or c)
-        elif 0xdc80 <= o <= 0xdcff: r.append("\\x%02x" % (o - 0xdc00))
-        elif o > 127:
-            try:
-                c.encode(enc)
-                r.append(c)
-            except Exception:
-                r.append(c.encode("ascii", "backslashreplace").decode("ascii"))
-        else: r.append(c)
-    return "".join(r)
-def why(e):
-    return esc(getattr(e, "strerror", None) or str(e))
-seen = {}
-left = 200
-found = 0
-for d in sys.path:
-    if not d or d in seen: continue
-    seen[d] = 1
-    try:
-        st = os.stat(d)
-    except OSError:
-        e = sys.exc_info()[1]
-        if e.errno not in (errno.ENOENT, errno.ENOTDIR): print("%s: n/a (%s)" % (esc(d), why(e)))
-        continue
-    if not stat.S_ISDIR(st.st_mode): continue
-    try:
-        ns = os.listdir(d)
-    except OSError:
-        print("%s: n/a (%s)" % (esc(d), why(sys.exc_info()[1])))
-        continue
-    ns = [n for n in ns if n.endswith(".dist-info") or n.endswith(".egg-info") or n.endswith(".egg") or n.endswith(".egg-link")]
-    if not ns: continue
-    ns.sort()
-    found = 1
-    print("%s (%d total):" % (esc(d), len(ns)))
-    for n in ns[:left]:
-        for x in (".dist-info", ".egg-info"):
-            if n.endswith(x): n = n[:-len(x)]
-        print("  " + esc(n))
-    if len(ns) > left: print("  (%d more not listed: cap 200 per interpreter)" % (len(ns) - left))
-    left = max(0, left - len(ns))
-if not found: print("no dist-info/egg-info/egg/egg-link entries in any sys.path directory")'
-        # one interpreter start for all twelve lookups (see _pyrun)
-        _pyrun "$py" "$_pc1" "$_pc2" "$_pc3" "$_pc4" "$_pc5" "$_pc6" "$_pc7" "$_pc8" "$_pc9" "$_pc10" "$_pc11" "$_pc12"
-        _pyreport 1 "version" "$_pc1"
-        _pyreport 2 "sys.prefix / base_prefix" "$_pc2"
-        _pyreport 3 "whatap-python version" "$_pc3"
-        _pyreport 4 "whatap package location" "$_pc4"
-        case "$_pyrc" in
-            0) case "$_pyout" in /*) _py_whatap=1 ;; esac ;;
-            # an interpreter that cannot run the lookup at all (python2: no
-            # importlib.util) has answered it: there is nothing to look up with.
-            # A timeout or any other failure left the input unread.
-            *) if [ "$_pyrc" != 124 ] && grep -qE '^(ImportError|ModuleNotFoundError|SyntaxError|AttributeError)' "$_errfile" 2>/dev/null; then :
-               else _py_fail="$_py_fail $py"; fi ;;
-        esac
-        _pyreport 5 "whatap_python-* metadata dirs next to the package" "$_pc5"
-        _pyreport 6 "setuptools version" "$_pc6"
-        _pyreport 7 "import pkg_resources" "$_pc7"
-        _pyreport 8 "bundled Go module binaries" "$_pc8"
-        _pyreport 9 "bootstrap/sitecustomize.py present" "$_pc9"
-        _pyreport 10 "instrumentation modules bundled in installed agent (trace/mod)" "$_pc10"
-        _pyreport 12 "installed distributions (metadata names per sys.path directory, first 200)" "$_pc12"
-        # the odoo lookup reports in section [8]: its facts are kept aside
-        _pyreport 11 "odoo package lookup via $py" "$_pc11" > "$(_tmp odoo.fact)"
-        if [ "$_pyrun_rc" = noexec ]; then :
-        elif [ "$_pyrc" = 0 ]; then [ -n "$_pyout" ] && _odoo_rel="$_odoo_rel$_pyout$_nl"
-        # as for the whatap lookup: an interpreter without importlib.util has
-        # nothing to look up with
-        elif [ "$_pyrc" = 124 ] || ! grep -qE '^(ImportError|ModuleNotFoundError|SyntaxError|AttributeError)' "$_errfile" 2>/dev/null; then
-            _odoo_miss="$_odoo_miss$(cat "$(_tmp odoo.fact)" 2>/dev/null)$_nl"
-        fi
-        # pip list reads what lookup 12 read, and adds pip's own view (the
-        # distribution it resolves first, whether pip runs). Not started in an
-        # interpreter whose lookups did not answer within the cap: it would
-        # wait a full cap for the same cause.
-        _l="installed packages ($py -m pip list, first 200)"
-        if [ "$_pyrun_rc" = noexec ]; then fact "$_l: n/a (not executable: $py)"
-        elif [ "$_pyrun_rc" = 124 ] && ! _past_deadline && { [ "$_pyrun_started" = 0 ] || [ "$_pyrun_rerun_to" = 1 ]; }; then
-            fact "$_l: n/a (not run: the lookups of this interpreter did not finish within ${CMD_TIMEOUT}s)"
-        else
-            probe "$_l" _head_of 200 env PIP_DISABLE_PIP_VERSION_CHECK=1 "$py" -m pip list --format=freeze
-        fi
+        _rep_interp "$py"
     done 9<<EOF
 $D_PY_EXES
 EOF
@@ -1838,50 +1805,104 @@ EOF
         if [ -n "$p" ]; then printf '        %-28s %s\n' "$c" "$p"
         else printf '        %-28s not on PATH\n' "$c"; fi
     done
-    # fallback that needs no interpreter execution (e.g. distroless images
-    # inspected from a kubectl-debug ephemeral container): package dirs derived
-    # from the PYTHONPATH of running processes, version read from metadata files
-    if [ -n "$D_PKG_DIRS" ]; then
-        fact "whatap package dirs seen in process environ (no interpreter execution):"
-        printf '%s\n' "$D_PKG_DIRS" | while IFS= read -r d; do
-            [ -n "$d" ] || continue
-            fsd="$(resolve_fs "$d")"
-            if [ -z "$fsd" ]; then printf '        -- %s: n/a (%s)\n' "$d" "$(_absent_why "$d")"; continue; fi
-            if [ "$fsd" != "$d" ]; then printf '        -- %s (read via %s)\n' "$d" "$fsd"
-            else printf '        -- %s\n' "$d"; fi
-            sp="$(dirname "$fsd")"
-            meta="$(ls "$sp"/whatap_python-*.dist-info/METADATA "$sp"/whatap_python-*.egg-info/PKG-INFO "$sp"/EGG-INFO/PKG-INFO 2>/dev/null | head -n1)"
-            if [ -n "$meta" ]; then
-                printf '           metadata: %s\n' "$meta"
-                printf '           %s\n' "$(grep -m1 '^Version:' "$meta" 2>/dev/null || echo 'Version: n/a (no Version line in metadata)')"
-            else
-                printf '           metadata: n/a (no whatap_python-* dist-info/egg-info next to %s)\n' "$fsd"
-            fi
-            # the agent's own version file, read as text (the operator's
-            # /whatap-agent copy has no dist-info)
-            if [ -r "$fsd/build.py" ]; then
-                _bv="$(grep -E '^(version|release_date) *=' "$fsd/build.py" 2>/dev/null | tr '\n' ' ' | sed 's/ *$//')"
-                printf '           build.py: %s\n' "${_bv:-n/a (no version line in $fsd/build.py)}"
-            else
-                printf '           build.py: n/a (%s)\n' "$(_absent_why "$fsd/build.py")"
-            fi
-            if [ -d "$fsd/agent" ]; then printf '           agent binaries dir: present\n'
-            else printf '           agent binaries dir: absent\n'; fi
-            # library inventory of this environment, from metadata dir names —
-            # needs neither pip nor a runnable interpreter
-            _dists="$(_names "$sp" | grep -E '\.dist-info$|\.egg-info$|\.egg$' | sed 's/\.dist-info$//; s/\.egg-info$//')"
-            if [ -n "$_dists" ]; then
-                printf '           installed distributions in %s (%s total, first 200):\n' "$sp" "$(printf '%s\n' "$_dists" | wc -l | tr -d ' ')"
-                printf '%s\n' "$_dists" | head -n 200 | _indent '             '
-            else
-                printf '           installed distributions: n/a (no dist-info/egg-info entries in %s)\n' "$sp"
-            fi
-            # hook surface of this install (shell glob; two levels, no walk)
-            _mods="$(for f in "$fsd"/trace/mod/*.py "$fsd"/trace/mod/*/*.py; do [ -f "$f" ] && basename "$f" .py; done 2>/dev/null | grep -vE '^(__init__|util)$' | sort -u | tr '\n' ' ')"
-            if [ -n "$_mods" ]; then printf '           instrumentation modules bundled in installed agent: %s\n' "$_mods"
-            else printf '           instrumentation modules: n/a (no trace/mod entries under %s)\n' "$fsd"; fi
-        done
+    _rep_pkgdirs
+}
+
+# _py_nolookup -> success when the last lookup failed because the interpreter
+# cannot run it at all (python2: no importlib.util): it has answered, as there
+# is nothing to look up with. A timeout or any other failure left it unread.
+_py_nolookup() {
+    [ "$_pyrc" != 124 ] && grep -qE '^(ImportError|ModuleNotFoundError|SyntaxError|AttributeError)' "$_errfile" 2>/dev/null
+}
+
+# _rep_interp PY -> the facts of one interpreter: the twelve lookups (one
+# start), then pip list
+_rep_interp() {
+    local py="$1"
+    fact "-- interpreter: $py"
+    fact "   resolves to: $(readlink -f "$py" 2>/dev/null || echo "$py")"
+    # one interpreter start for all twelve lookups (see _pyrun)
+    _pyrun "$py" "$_pc1" "$_pc2" "$_pc3" "$_pc4" "$_pc5" "$_pc6" "$_pc7" "$_pc8" "$_pc9" "$_pc10" "$_pc11" "$_pc12"
+    _pyreport 1 "version" "$_pc1"
+    _pyreport 2 "sys.prefix / base_prefix" "$_pc2"
+    _pyreport 3 "whatap-python version" "$_pc3"
+    _pyreport 4 "whatap package location" "$_pc4"
+    case "$_pyrc" in
+        0) case "$_pyout" in /*) _py_whatap=1 ;; esac ;;
+        *) _py_nolookup || _py_fail="$_py_fail $py" ;;
+    esac
+    _pyreport 5 "whatap_python-* metadata dirs next to the package" "$_pc5"
+    _pyreport 6 "setuptools version" "$_pc6"
+    _pyreport 7 "import pkg_resources" "$_pc7"
+    _pyreport 8 "bundled Go module binaries" "$_pc8"
+    _pyreport 9 "bootstrap/sitecustomize.py present" "$_pc9"
+    _pyreport 10 "instrumentation modules bundled in installed agent (trace/mod)" "$_pc10"
+    _pyreport 12 "installed distributions (metadata names per sys.path directory, first 200)" "$_pc12"
+    # the odoo lookup reports in section [8]: its facts are kept aside
+    _pyreport 11 "odoo package lookup via $py" "$_pc11" > "$(_tmp odoo.fact)"
+    if [ "$_pyrun_rc" = noexec ]; then :
+    elif [ "$_pyrc" = 0 ]; then [ -n "$_pyout" ] && _odoo_rel="$_odoo_rel$_pyout$_nl"
+    elif ! _py_nolookup; then
+        _odoo_miss="$_odoo_miss$(cat "$(_tmp odoo.fact)" 2>/dev/null)$_nl"
     fi
+    # pip list reads what lookup 12 read, and adds pip's own view (the
+    # distribution it resolves first, whether pip runs). Not started in an
+    # interpreter whose lookups did not answer within the cap: it would
+    # wait a full cap for the same cause.
+    _l="installed packages ($py -m pip list, first 200)"
+    if [ "$_pyrun_rc" = noexec ]; then fact "$_l: n/a (not executable: $py)"
+    elif [ "$_pyrun_rc" = 124 ] && ! _past_deadline && { [ "$_pyrun_started" = 0 ] || [ "$_pyrun_rerun_to" = 1 ]; }; then
+        fact "$_l: n/a (not run: the lookups of this interpreter did not finish within ${CMD_TIMEOUT}s)"
+    else
+        probe "$_l" _head_of 200 env PIP_DISABLE_PIP_VERSION_CHECK=1 "$py" -m pip list --format=freeze
+    fi
+}
+
+# _rep_pkgdirs -> the whatap package dirs derived from the PYTHONPATH of
+# running processes, read without executing an interpreter (e.g. a distroless
+# image inspected from a kubectl-debug ephemeral container): version from the
+# metadata files
+_rep_pkgdirs() {
+    [ -n "$D_PKG_DIRS" ] || return 0
+    fact "whatap package dirs seen in process environ (no interpreter execution):"
+    printf '%s\n' "$D_PKG_DIRS" | while IFS= read -r d; do
+        [ -n "$d" ] || continue
+        fsd="$(resolve_fs "$d")"
+        if [ -z "$fsd" ]; then printf '        -- %s: n/a (%s)\n' "$d" "$(_absent_why "$d")"; continue; fi
+        if [ "$fsd" != "$d" ]; then printf '        -- %s (read via %s)\n' "$d" "$fsd"
+        else printf '        -- %s\n' "$d"; fi
+        sp="$(dirname "$fsd")"
+        meta="$(ls "$sp"/whatap_python-*.dist-info/METADATA "$sp"/whatap_python-*.egg-info/PKG-INFO "$sp"/EGG-INFO/PKG-INFO 2>/dev/null | head -n1)"
+        if [ -n "$meta" ]; then
+            printf '           metadata: %s\n' "$meta"
+            printf '           %s\n' "$(grep -m1 '^Version:' "$meta" 2>/dev/null || echo 'Version: n/a (no Version line in metadata)')"
+        else
+            printf '           metadata: n/a (no whatap_python-* dist-info/egg-info next to %s)\n' "$fsd"
+        fi
+        # the agent's own version file, read as text (the operator's
+        # /whatap-agent copy has no dist-info)
+        if [ -r "$fsd/build.py" ]; then
+            _bv="$(grep -E '^(version|release_date) *=' "$fsd/build.py" 2>/dev/null | tr '\n' ' ' | sed 's/ *$//')"
+            printf '           build.py: %s\n' "${_bv:-n/a (no version line in $fsd/build.py)}"
+        else
+            printf '           build.py: n/a (%s)\n' "$(_absent_why "$fsd/build.py")"
+        fi
+        if [ -d "$fsd/agent" ]; then printf '           agent binaries dir: present\n'
+        else printf '           agent binaries dir: absent\n'; fi
+        # library inventory of this environment, from metadata dir names —
+        # needs neither pip nor a runnable interpreter
+        _dists="$(_names "$sp" | grep -E '\.dist-info$|\.egg-info$|\.egg$' | sed 's/\.dist-info$//; s/\.egg-info$//')"
+        if [ -n "$_dists" ]; then
+            printf '           installed distributions in %s (%s total, first 200):\n' "$sp" "$(printf '%s\n' "$_dists" | wc -l | tr -d ' ')"
+            printf '%s\n' "$_dists" | head -n 200 | _indent '             '
+        else
+            printf '           installed distributions: n/a (no dist-info/egg-info entries in %s)\n' "$sp"
+        fi
+        # hook surface of this install (shell glob; two levels, no walk)
+        _mods="$(for f in "$fsd"/trace/mod/*.py "$fsd"/trace/mod/*/*.py; do [ -f "$f" ] && basename "$f" .py; done 2>/dev/null | grep -vE '^(__init__|util)$' | sort -u | tr '\n' ' ')"
+        if [ -n "$_mods" ]; then printf '           instrumentation modules bundled in installed agent: %s\n' "$_mods"
+        else printf '           instrumentation modules: n/a (no trace/mod entries under %s)\n' "$fsd"; fi
+    done
 }
 
 # [4] runtime processes
@@ -1895,11 +1916,11 @@ _rep_procs() {
         for pid in $D_GO_PIDS; do
             [ -d "/proc/$pid" ] || { printf '        -- pid %s: n/a (process exited)\n' "$pid"; continue; }
             printf '        -- pid %s\n' "$pid"
-            printf '           cmdline: %s\n' "$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | cut -c1-300)"
+            printf '           cmdline: %s\n' "$({ tr '\0' ' ' < "/proc/$pid/cmdline"; } 2>/dev/null | cut -c1-300)"
             printf '           cwd: %s\n' "$(readlink -f "/proc/$pid/cwd" 2>/dev/null || echo "n/a (permission denied or gone)")"
             printf '           uid/state: %s\n' "$(awk '/^Uid:/{u=$2} /^State:/{s=$2" "$3} END{print u" / "s}' "/proc/$pid/status" 2>/dev/null)"
             if [ -r "/proc/$pid/environ" ]; then
-                tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | grep -E '^(WHATAP_HOME|WHATAP_VERSION|whatap\.port|python\.version)=' | _indent '           env '
+                { tr '\0' '\n' < "/proc/$pid/environ"; } 2>/dev/null | grep -E '^(WHATAP_HOME|WHATAP_VERSION|whatap\.port|python\.version)=' | _indent '           env '
             else
                 printf '           env: n/a (permission denied: /proc/%s/environ)\n' "$pid"
             fi
@@ -1917,12 +1938,12 @@ _rep_procs() {
             [ -d "/proc/$pid" ] || { printf '        -- pid %s: n/a (process exited)\n' "$pid"; continue; }
             printf '        -- pid %s (ppid %s)\n' "$pid" "$(awk '/^PPid:/{print $2}' "/proc/$pid/status" 2>/dev/null)"
             printf '           exe: %s\n' "$(readlink -f "/proc/$pid/exe" 2>/dev/null || echo n/a)"
-            printf '           cmdline: %s\n' "$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | cut -c1-300)"
+            printf '           cmdline: %s\n' "$({ tr '\0' ' ' < "/proc/$pid/cmdline"; } 2>/dev/null | cut -c1-300)"
             if [ -r "/proc/$pid/environ" ]; then
                 # one read of the environ: the bootstrap line, then which
                 # python environment this process actually runs in, WHATAP_*
                 # and OTEL_*, each group in environ order
-                tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | awk '
+                { tr '\0' '\n' < "/proc/$pid/environ"; } 2>/dev/null | awk '
                     /^PYTHONPATH=.*whatap\/bootstrap/ { b = 1 }
                     /^(VIRTUAL_ENV|PYTHONPATH|PYTHONHOME)=/ { v = v "           env " substr($0, 1, 300) "\n" }
                     /^WHATAP_/ { w = w "           env " $0 "\n" }
@@ -1992,7 +2013,7 @@ _rep_homes() {
                 fi
             done
             for sf in security.conf paramkey.txt; do
-                if [ -e "$fshome/$sf" ]; then fact "   $sf: present, $(wc -c < "$fshome/$sf" 2>/dev/null | tr -d ' ') bytes (content not collected: key material)"
+                if [ -e "$fshome/$sf" ]; then fact "   $sf: present, $({ wc -c < "$fshome/$sf"; } 2>/dev/null | tr -d ' ') bytes (content not collected: key material)"
                 else fact "   $sf: absent"; fi
             done
             if [ -d "$fshome/logs" ]; then
@@ -2073,7 +2094,7 @@ _rep_odoo() {
             [ -d "/proc/$opid" ] || { printf '        -- pid %s: n/a (process exited)\n' "$opid"; continue; }
             printf '        -- pid %s (ppid %s)\n' "$opid" "$(awk '/^PPid:/{print $2}' "/proc/$opid/status" 2>/dev/null)"
             printf '           comm: %s\n' "$(cat "/proc/$opid/comm" 2>/dev/null)"
-            printf '           cmdline: %s\n' "$(tr '\0' ' ' < "/proc/$opid/cmdline" 2>/dev/null | cut -c1-300)"
+            printf '           cmdline: %s\n' "$({ tr '\0' ' ' < "/proc/$opid/cmdline"; } 2>/dev/null | cut -c1-300)"
             printf '           cwd: %s\n' "$(readlink -f "/proc/$opid/cwd" 2>/dev/null || echo "n/a (permission denied or gone)")"
             printf '           uid: %s\n' "$(awk '/^Uid:/{print $2}' "/proc/$opid/status" 2>/dev/null)"
         done
@@ -2116,8 +2137,8 @@ EOF
     # odoo configuration — path from cmdline -c/--config, env ODOO_RC, then
     # the packaged default locations
     for opid in $D_ODOO_PIDS; do
-        _oc="$(tr '\0' '\n' < "/proc/$opid/cmdline" 2>/dev/null | awk 'p==1{print;exit} $0=="-c"||$0=="--config"{p=1;next} sub(/^--config=/,""){print;exit} sub(/^-c/,"") && length($0)>0 {print;exit}')"
-        [ -z "$_oc" ] && _oc="$(tr '\0' '\n' < "/proc/$opid/environ" 2>/dev/null | grep '^ODOO_RC=' | head -n1 | cut -d= -f2-)"
+        _oc="$({ tr '\0' '\n' < "/proc/$opid/cmdline"; } 2>/dev/null | awk 'p==1{print;exit} $0=="-c"||$0=="--config"{p=1;next} sub(/^--config=/,""){print;exit} sub(/^-c/,"") && length($0)>0 {print;exit}')"
+        [ -z "$_oc" ] && _oc="$({ tr '\0' '\n' < "/proc/$opid/environ"; } 2>/dev/null | grep '^ODOO_RC=' | head -n1 | cut -d= -f2-)"
         if [ -n "$_oc" ]; then
             fact "odoo config path (pid $opid): $_oc"
             case "$_ocands" in *"|$_oc|"*) ;; *) _ocands="$_ocands|$_oc|" ;; esac
