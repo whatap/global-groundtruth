@@ -32,7 +32,7 @@ export LC_ALL=C
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-apmjava"
 # History: CHANGELOG.md (next to this file).
-VERSION="0.13.5"
+VERSION="0.13.6"
 DOMAIN="apm"
 TARGET="host/$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || uname -n 2>/dev/null || echo unknown)"
 
@@ -1365,11 +1365,35 @@ _all_jvm_args() {
 }
 
 # _jvm_opt_val PID OPT... -> the argument that follows the first of the
-# options OPT (-jar, -cp ...) across all argument sources, or empty
+# options OPT (-jar, -cp ...) across all argument sources, or empty. Also
+# matches a long option's --key=value form for any OPT starting with "--"
+# (so callers list only "--class-path", never "--class-path=" as well).
+# Stops at -jar's value: everything after it is the application's own
+# argument, never the JVM's, so it is never matched (e.g. `-jar app.jar -cp
+# bogus` must not read "bogus" as this JVM's -cp). A bare, non-option
+# application argument (no -jar, e.g. a main class followed by its own -cp)
+# is not similarly detected: the argument sources here are concatenated
+# (JAVA_TOOL_OPTIONS, JDK_JAVA_OPTIONS, the raw cmdline including its own
+# argv[0], _JAVA_OPTIONS, jcmd-recovered args) with no marker for where the
+# cmdline segment starts, so a bare token cannot be told apart from argv[0]
+# or from another source's own value without risking cutting a legitimate
+# option short.
 _jvm_opt_val() {
     local pid="$1"; shift
-    _all_jvm_args "$pid" 2>/dev/null | awk -v o="$*" 'BEGIN { n = split(o, a, " "); for (i = 1; i <= n; i++) w[a[i]] = 1 }
-        (p in w) { print; exit } { p = $0 }'
+    _all_jvm_args "$pid" 2>/dev/null | awk -v o="$*" 'BEGIN {
+            n = split(o, a, " ")
+            for (i = 1; i <= n; i++) {
+                w[a[i]] = 1
+                if (a[i] ~ /^--/) pfx[a[i] "="] = 1
+            }
+        }
+        {
+            if (stop) next
+            for (q in pfx) if (substr($0, 1, length(q)) == q) { print substr($0, length(q) + 1); exit }
+            if (p in w) { print; exit }
+            if (p == "-jar") { stop = 1; next }
+            p = $0
+        }'
 }
 
 # _link_or_na PATH -> the target of the symlink PATH (a /proc link), or n/a
@@ -2807,7 +2831,7 @@ _rep_libs() {
 
 # 1) explicit classpath given to this JVM
 _libs_cp() {
-    _cp="$(_jvm_opt_val "$pid" -cp -classpath)"
+    _cp="$(_jvm_opt_val "$pid" -cp -classpath --class-path)"
     [ -z "$_cp" ] && _cp="$(_jvm_sysprop "$pid" java.class.path)"
     if [ -n "$_cp" ]; then
         _cpn="$(printf '%s' "$_cp" | tr ':' '\n' | grep -c .)"
@@ -3757,6 +3781,26 @@ _rep_appclasses() {
     _appcls_tjoin
 }
 
+# _appcls_strip_root -> strip a leading BOOT-INF/classes/ or WEB-INF/classes/
+# segment from $_fq, whichever is actually at its start (checked with `case`,
+# anchored, never a blind attempt against whichever literal happens to be
+# written first — two sequential blind `#` strips gave a different, wrong
+# answer depending on which of the two was written first: a path doubly
+# nested the other way around them, such as
+# WEB-INF/classes/BOOT-INF/classes/p/X.class, came out as
+# BOOT-INF.classes.p.X instead of p.X). Applied twice (there are only two
+# known segments, so at most two strips ever apply) so the archive-relative
+# name is fully bare either way round.
+_appcls_strip_root() {
+    local _i
+    for _i in 1 2; do
+        case "$_fq" in
+            BOOT-INF/classes/*) _fq="${_fq#BOOT-INF/classes/}" ;;
+            WEB-INF/classes/*)  _fq="${_fq#WEB-INF/classes/}" ;;
+        esac
+    done
+}
+
 # _appcls_names_from PREFIX -> read class paths on stdin, drop PREFIX/, the
 # .class suffix and a leading BOOT-INF/classes/ or WEB-INF/classes/, and
 # append the dotted names to FILE ($2, default $_NAMES)
@@ -3764,7 +3808,7 @@ _appcls_names_from() {
     while IFS= read -r _cf; do
         [ -n "$_cf" ] || continue
         _fq="${_cf#"$1"}"; _fq="${_fq%.class}"
-        _fq="${_fq#BOOT-INF/classes/}"; _fq="${_fq#WEB-INF/classes/}"
+        _appcls_strip_root
         printf '%s\n' "$_fq" | tr '/' '.' >> "${2:-$_NAMES}" 2>/dev/null
     done
 }
@@ -3774,7 +3818,7 @@ _appcls_names_from() {
 _appcls_root() {
     case "$1" in
         dir\|*)
-            _rt="${1#dir|}"
+            _rt="${1#dir|}"; [ "$_rt" = / ] || _rt="${_rt%/}"
             case "$_rt" in /proc/[0-9]*/root*) _rt="$(_vfix "$_rt")" ;; esac
             if [ ! -d "$_rt" ]; then fact "-- directory root $_rt: n/a (path not found)"; return 0; fi
             if [ ! -r "$_rt" ]; then fact "-- directory root $_rt: n/a (permission denied)"; return 0; fi
@@ -3814,10 +3858,12 @@ _appcls_root() {
             if [ "$_zrc" != 0 ] && [ "$_zrc" != 11 ]; then fact "-- archive root $_rt: n/a ($(_zwhy))"; return 0; fi
             _cnt="$(printf '%s\n' "$_lst" | grep -c .)"
             fact "-- archive root $_rt: ${_cnt:-0} class entries under WEB-INF/classes or BOOT-INF/classes (read bound: 20000)"
-            # WEB-INF/classes/ is removed before BOOT-INF/classes/ here
+            # the leading BOOT-INF/classes/ or WEB-INF/classes/ segment is
+            # stripped by _appcls_strip_root, same as every other root kind
             printf '%s\n' "$_lst" | head -n 20000 | while IFS= read -r _ce; do
                 [ -n "$_ce" ] || continue
-                _fq="${_ce#WEB-INF/classes/}"; _fq="${_fq#BOOT-INF/classes/}"; _fq="${_fq%.class}"
+                _fq="${_ce%.class}"
+                _appcls_strip_root
                 printf '%s\n' "$_fq" | tr '/' '.' >> "$_NAMES" 2>/dev/null
             done
             ;;
@@ -3873,7 +3919,7 @@ _appcls_refs() {
 _appcls_ref_root() {
     case "$1" in
         dir\|*)
-            _rt="${1#dir|}"
+            _rt="${1#dir|}"; [ "$_rt" = / ] || _rt="${_rt%/}"
             case "$_rt" in /proc/[0-9]*/root*) _rt="$(_vfix "$_rt")" ;; esac
             [ -d "$_rt" ] || return 0
             _bounded grep -rlF -a --include='*.class' -- "$_tki" "$_rt" 2>/dev/null | head -n 400 \
@@ -3884,7 +3930,7 @@ _appcls_ref_root() {
             _fsr="$(_rpath "" "$_rt")"
             [ -n "$_fsr" ] || return 0
             have unzip || return 0
-            _sz="$(wc -c < "$_fsr" 2>/dev/null)"
+            _sz="$({ wc -c < "$_fsr"; } 2>/dev/null)"
             if [ -n "$_sz" ] && [ "$_sz" -gt 83886080 ] 2>/dev/null; then
                 fact "   $_rt: skipped for this scan (above the 80 MB unpack bound)"
                 return 0

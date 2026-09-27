@@ -5,6 +5,24 @@ first. Every change to the script bumps its `VERSION` and adds one entry at
 the top of this list (docs/authoring-guide.md, step 2); `tools/validate.sh`
 checks that the newest entry is the script's `VERSION`.
 
+- **0.13.6** — Section F: a `-cp`/`-classpath` directory entry ending in `/`
+  (e.g. `/srv/cp app/classes/`) is used without the slash: its "directory
+  root" line drops the trailing `/`, and section N no longer shows its class
+  names as `.srv.cp app.classes.com.acme…`. `--class-path X` and
+  `--class-path=X` are recognized alongside `-cp` and `-classpath` (was "-cp
+  not set"). With `-jar app.jar -cp bogus` the `-cp` after the jar is the
+  application's argument and is no longer read as the JVM's (`_jvm_opt_val`
+  stops at `-jar`'s value; an application argument after a main class, with no
+  `-jar`, is still not told apart: the merged argument sources carry no
+  boundary). Section N (index and `--class-refs`): a class path nesting
+  `WEB-INF/classes/` and `BOOT-INF/classes/`, in either order or the same one
+  twice, loses both leading segments (`_appcls_strip_root`, shared by every
+  root kind). It was `BOOT-INF.classes.p.X` for
+  `WEB-INF/classes/BOOT-INF/classes/p/X` in dir, lib-jar and ref roots,
+  `WEB-INF.classes.p.X` for `BOOT-INF/classes/WEB-INF/classes/p/X` in archive
+  roots, and `BOOT-INF.classes.r.X` for a doubled segment. The size check of a
+  jar before a --class-refs scan no longer prints an open error on stderr.
+  Report content otherwise unchanged.
 - **0.13.5** — Split _rep_libs, _rep_tier2, _rep_appclasses and _rep_conf into
   per-subsection functions; -jar/-cp extraction is _jvm_opt_val, /proc link
   reads are _link_or_na, the WEB-INF/classes search is _libs_classes_under.

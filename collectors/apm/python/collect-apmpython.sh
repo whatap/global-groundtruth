@@ -25,7 +25,7 @@ export LC_ALL=C
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-apmpython"
 # History: CHANGELOG.md (next to this file).
-VERSION="0.10.5"
+VERSION="0.10.6"
 DOMAIN="apm"
 TARGET="host/$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || uname -n 2>/dev/null || echo unknown)"
 
@@ -711,7 +711,7 @@ _file_lines() {
     [ -e "$path" ] || { fact "$label: n/a (path not found: $path)"; return; }
     [ -r "$path" ] || { fact "$label: n/a (permission denied: $path)"; return; }
     [ -s "$path" ] || { fact "$label: (empty file)"; return; }
-    total="$(wc -l < "$path" 2>/dev/null | tr -d ' ')"
+    total="$( { wc -l < "$path"; } 2>/dev/null | tr -d ' ')"
     fact "$label ($w $cap of ${total:-?} lines):"
     "$how" -n "$cap" "$path" 2>/dev/null | _indent '        '
 }

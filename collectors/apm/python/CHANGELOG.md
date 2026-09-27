@@ -5,6 +5,10 @@ first. Every change to the script bumps its `VERSION` and adds one entry at
 the top of this list (docs/authoring-guide.md, step 2); `tools/validate.sh`
 checks that the newest entry is the script's `VERSION`.
 
+- **0.10.6** — `apm: file helpers` (templates/groups/apm.sh): `wc -l` reading
+  an unreadable file no longer leaks "Permission denied" to the operator's
+  stderr (the `<` redirect ran before `2>/dev/null`, so its own failure was
+  not yet silenced). Report content unchanged.
 - **0.10.5** — Split the large functions (_rep_runtimes, _rep_binding,
   discover) into per-section helpers; /proc/\<pid>/environ reads no longer
   print Permission denied on stderr as root without CAP_SYS_PTRACE. Report
