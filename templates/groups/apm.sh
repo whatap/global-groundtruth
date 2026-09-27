@@ -7,11 +7,9 @@
 #   tools/sync-shared-block.sh --apply     (--check reports drift)
 # the same way the skeleton's blocks reach every collector.
 #
-# A group block runs from `# ---- <group>: <name> — DO NOT EDIT` to
-# `# ---- end <group>: <name>`. Its second line, `# members: ...`, names the
-# collectors that carry it by the stem of their file name (collect-<stem>.sh);
-# it is the only membership list. A collector not named there must not carry
-# the block (the sync tool reports it as STRAY and leaves it alone).
+# The block format (banner, `# members:`, STRAY, `place: end`) is defined once
+# in [tools/sync-shared-block.sh](../../tools/sync-shared-block.sh); this file
+# only adds what apm's blocks need, below.
 #
 # To change a helper here: edit this file, run --apply, bump each member's
 # VERSION and add its CHANGELOG entry, and compare the members' reports before

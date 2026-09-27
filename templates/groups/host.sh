@@ -11,11 +11,9 @@
 # describe and scan its /proc for it (db, nms). k8s is not a member: it has
 # its own _classify_err (kubectl's errors) and no /proc scan.
 #
-# A group block runs from `# ---- <group>: <name> — DO NOT EDIT` to
-# `# ---- end <group>: <name>`. Its second line, `# members: ...`, names the
-# collectors that carry it by the stem of their file name (collect-<stem>.sh);
-# it is the only membership list. A collector not named there must not carry
-# the block (the sync tool reports it as STRAY and leaves it alone).
+# The block format (banner, `# members:`, STRAY, `place: end`) is defined once
+# in [tools/sync-shared-block.sh](../../tools/sync-shared-block.sh); this file
+# only adds what the host group's blocks need, below.
 #
 # To change a helper here: edit this file, run --apply, bump each member's
 # VERSION and add its CHANGELOG entry, and compare the members' reports before

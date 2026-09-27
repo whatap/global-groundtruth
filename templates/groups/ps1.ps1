@@ -8,12 +8,12 @@
 #
 # They are the PowerShell port of the skeleton's shell blocks (emit helpers,
 # run helpers, privilege, boot time, collection completeness) plus the fact
-# helpers both .ps1 collectors share. A block runs from
-# `# ---- ps1: <name> - DO NOT EDIT` (an em dash in the file) to
-# `# ---- end ps1: <name>`. Its second line, `# members: ...`, names the
-# collectors that carry it by the stem of their file name (collect-<stem>.ps1);
-# it is the only membership list. A .ps1 collector not named there must not
-# carry the block (the sync tool reports it as STRAY and leaves it alone).
+# helpers both .ps1 collectors share. The block format (banner, `# members:`,
+# STRAY) is defined once in
+# [tools/sync-shared-block.sh](../../tools/sync-shared-block.sh); here the
+# banner reads `# ---- ps1: <name> - DO NOT EDIT` with an em dash in the file,
+# matched by the end line `# ---- end ps1: <name>`, and members are named by
+# the stem of their file name (collect-<stem>.ps1).
 #
 # To change a helper here: edit this file, run --apply, bump each member's
 # VERSION and add its CHANGELOG entry, and compare the members' reports before

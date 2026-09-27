@@ -64,21 +64,17 @@ collector says so there.
 The wording stays inside rule 1's vocabulary: name what was not obtained and
 why, never what it means or what to do about the system.
 
-It also does not turn a normal environment into a failure. An absence is marked
-`na` when it is itself the answer — no ZFS on a host that does not use ZFS, no
-DBX component on a database host, no agent where the product is not installed
-and every place it would show was read — and the run is still COMPLETE. Only a **blocked** value, one a different run
-would obtain, makes it INCOMPLETE. A collector that reports an ordinary host as
-INCOMPLETE teaches the field to ignore the line, and then it protects nothing.
-
-The opposite mistake is worse, because nobody notices it: a run that could not
-see reports "not there". So an absence is `na` only when **every input the
-judgment rests on was read**. If any of them was unreadable, or the call that
-would have shown it failed, was refused or timed out, the absence is `missed`.
-"No agent process" from a non-root run that could not read other users'
-`/proc/<pid>/environ` is `missed`; "no CR" from an API call that was forbidden
-is `missed`; "no ZFS" from a host whose `/proc/spl` does not exist is `na`. See
-[docs/output-format.md](docs/output-format.md), "Three outcomes, not two".
+It also does not turn a normal environment into a failure. An absence is
+marked `na` when it is itself the answer — no ZFS on a host that does not use
+ZFS, no agent where the product is not installed — and the run is still
+COMPLETE. Only a **blocked** value, one a different run would obtain, makes it
+INCOMPLETE. A collector that reports an ordinary host as INCOMPLETE teaches
+the field to ignore the line; one that reports a blind run as COMPLETE sends a
+report that answers the question wrongly and nobody notices until the case has
+crossed a time zone. The precise rule for telling the two apart — the one
+authors write collectors against, with its worked examples — lives in one
+place: [docs/output-format.md](docs/output-format.md), "Three outcomes, not
+two". This page only needs what the distinction means for the field.
 
 `validate.sh` fails any collector whose **source** contains the words
 `likely`, `diagnos`, `recommend`, `should`, `root cause`, or `fix`

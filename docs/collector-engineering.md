@@ -266,30 +266,7 @@ and every collector must keep them.
 
 ---
 
-## Checklist (in addition to the authoring-guide checklist)
+## Checklist
 
-- [ ] Sections are MECE — each fact appears once, in one domain; domains are named.
-- [ ] Default run is Tier 0: no JVM attach, no recursive `du`, no whole-log grep.
-- [ ] Every external command runs through `probe` / `_bounded`; the run
-      reaches its footer on a host where every command hangs.
-- [ ] Expensive work is opt-in and announces its impact on stderr first.
-- [ ] `/proc`/`/sys` used where possible; external commands have fallbacks.
-- [ ] bash 3.2+ only; no `set -e`/`set -u`; counter loops increment.
-- [ ] Every absent value carries a classified reason; the `[1]` capability
-      preamble is present.
-- [ ] A goal is `na` only when every input behind it was read; a failed,
-      refused, unreadable or timed-out input makes it `missed`.
-- [ ] Reason/label strings contain no judgment words (`validate.sh` passes).
-- [ ] No-args prints usage and exits 0; a run needs an explicit action flag
-      (`--file` / `--stdout` / `--bundle`).
-- [ ] Progress is narrated on stderr (fd 3), never into the report; `--quiet`
-      suppresses it; progress strings carry no judgment words.
-- [ ] Must-see messages use `warn` (fd 3, not silenced), never plain stderr.
-- [ ] Options follow guideline 5: action flags + `--quiet`/`--out`/`--help`,
-      target options, one opt-in per loading/long/sensitive/touching feature;
-      caps via environment; no `--no-X`; a removed option exits 2 naming its
-      replacement.
-- [ ] Temporary files live under `_tmp`; nothing is left after Ctrl-C.
-- [ ] The change bumps `VERSION` and adds a CHANGELOG entry (newest first, in
-      the `CHANGELOG.md` next to the README); the script keeps only its
-      `# History:` pointer line (authoring-guide.md, step 2).
+These guidelines are checked, together with the rest of the contract, in the
+one checklist in [authoring-guide.md](authoring-guide.md#checklist).

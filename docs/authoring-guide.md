@@ -163,22 +163,54 @@ host yet.
 
 ## Checklist
 
-- [ ] Copied from the skeleton; four metadata variables set.
+This is the one checklist for a collector change — steps from this guide and
+the design guidelines of [collector-engineering.md](collector-engineering.md)
+together. Where a line names a `tools/validate.sh` check, it is one of the
+numbered checks in that script's own header comment.
+
+- [ ] Copied from the skeleton; four metadata variables set. `validate.sh`
+      checks the entrypoint name, `COLLECTOR_NAME` and `DOMAIN` (check 0).
 - [ ] A helper that behaves the same in sibling collectors is a group block in
       `templates/groups/<group>.sh` (its `# members:` line names this
       collector), not a hand copy; `tools/sync-shared-block.sh --check` passes.
-- [ ] Every section is facts only — no cause, no severity, no action.
-- [ ] Values are discovered (symlinks/mounts/args/config resolved), not hardcoded.
-- [ ] Absent values print `n/a` / `not found`, never a guessed default.
-- [ ] One command produces the whole paste.
+- [ ] Sections are MECE — each fact appears once, in one domain; domains are
+      named (collector-engineering.md guideline 1).
+- [ ] Every section is facts only — no cause, no severity, no action; reason
+      and progress strings carry no judgment words. `validate.sh` greps every
+      emitted line for judgment words (check 4).
+- [ ] Default run is Tier 0: no JVM attach, no recursive `du`, no whole-log
+      grep. Expensive work is opt-in and announces its impact on stderr first
+      (guideline 2).
+- [ ] Values are discovered (symlinks/mounts/args/config resolved), not
+      hardcoded. Absent values print `n/a` / `not found`, never a guessed
+      default, and carry a classified reason; the `[1]` capability preamble is
+      present (guideline 4).
+- [ ] A goal is `na` only when every input behind it was read; a failed,
+      refused, unreadable or timed-out input makes it `missed`
+      (output-format.md, "Three outcomes, not two").
+- [ ] `/proc`/`/sys` used where possible; external commands have fallbacks and
+      run through `probe` / `_bounded`, so the run reaches its footer even on a
+      host where every command hangs (guideline 3).
+- [ ] bash 3.2+ only; no `set -e`/`set -u`; counter loops increment.
+- [ ] One command produces the whole paste: no-args prints usage and exits 0,
+      a run needs an explicit action flag (`--file` / `--stdout` / `--bundle`);
+      progress is narrated on stderr (fd 3, `--quiet` suppresses it), never
+      into the report; must-see messages use `warn`, never plain stderr
+      (guideline 5). `validate.sh` checks that a goal is declared and
+      `emit_status` is called (check 3).
+- [ ] Options follow guideline 5: action flags plus `--quiet`/`--out`/`--help`,
+      target options, one opt-in per loading/long/sensitive/touching feature;
+      caps via environment; no `--no-X`; a removed option exits 2 naming its
+      replacement.
+- [ ] Temporary files live under `_tmp`; nothing is left after Ctrl-C.
 - [ ] Everything in the script is English — code, comments, usage/help text,
       progress narration, report output. Tools parse the exact strings; see
       the language policy in the root [README.md](../README.md).
-- [ ] No-args prints usage; a run needs an explicit action flag; progress is
-      narrated on stderr (`--quiet` to suppress). (engineering guideline 5)
+- [ ] The change bumps `VERSION` and adds a CHANGELOG entry (newest first, in
+      the `CHANGELOG.md` next to the README); the script keeps only its
+      `# History:` pointer line (step 2). `validate.sh` checks the pointer and
+      that the newest entry matches `VERSION` (check 5).
 - [ ] `tools/validate.sh` passes, and `tools/validate.sh --report` passes on a
       report the collector produced.
 - [ ] `collectors/<domain>/README.md` describes facts, delivery, what the
-      report can contain, and status ("validated at").
-- [ ] [collector-engineering.md](collector-engineering.md) checklist met (MECE,
-      load tiers, portability, reasoned `n/a`).
+      report can contain (step 3), and status ("validated at").
