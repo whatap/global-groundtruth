@@ -31,7 +31,7 @@ export LC_ALL=C
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-nms"
 # History: CHANGELOG.md (next to this file).
-VERSION="0.7.2"
+VERSION="0.7.3"
 DOMAIN="nms"
 TARGET="host/$(hostname 2>/dev/null || echo unknown)"
 
@@ -896,15 +896,9 @@ discover_root() {
 NMS_UNITS="uvicorn nmscore icmptcphealthd icmphealthd"
 
 # ---- report body ---------------------------------------------------------------
-run_report() {
-    emit_header
 
-    goal install "NMS installation on disk"
-    goal conf    "NMS configuration files"
-    goal logs    "NMS logs"
-    [ "$OPT_SNMP" = 1 ] && goal snmp "SNMP GET probe (--snmp)"
-
-    # the tool list pre-explains every "command not found" below
+# the tool list pre-explains every "command not found" below
+_rep_env() {
     section "Collection environment"
     fact "bash: ${BASH_VERSION:-unknown}"
     fact "uid: $(id -u 2>/dev/null || echo unknown) ($(id -un 2>/dev/null || echo unknown))"
@@ -933,7 +927,9 @@ run_report() {
     if [ -n "$NMS_ROOT" ]; then fact "nms install root (resolved): $NMS_ROOT (via $NMS_ROOT_SRC)"
     else fact "nms install root: n/a (no path from ${PKG_SCAN:-no package manifest (rpm, dpkg absent)}, no nms process argv[0] under a whatap-nms tree, /usr/share/whatap-nms not present)"; fi
     [ -n "$PKG_FAIL" ] && fact "package manifest query: n/a ($PKG_FAIL)"
+}
 
+_rep_a() {
     section "A. Host & platform"
     probe "hostname" hostname
     read_proc "os-release" /etc/os-release
@@ -946,15 +942,19 @@ run_report() {
     fi
     probe "virtualization" systemd-detect-virt
     probe "selinux" getenforce
+}
 
-    # the backend rejects packs as "future data" when the manager clock drifts
+# the backend rejects packs as "future data" when the manager clock drifts
+_rep_b() {
     section "B. Time & clock synchronization"
     fact "host clock (UTC): $(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown)"
     probe "timedatectl" timedatectl
     probe "chrony tracking" chronyc tracking
     probe "ntpstat" ntpstat
+}
 
-    # the rpm %post builds a venv with the system python and needs >= 3.9
+# the rpm %post builds a venv with the system python and needs >= 3.9
+_rep_c() {
     section "C. Python runtime"
     probe_merged "python3 --version" python3 --version
     if have python3; then
@@ -966,9 +966,11 @@ run_report() {
     if [ -n "$_py" ]; then printf '%s\n' "$_py" | while IFS= read -r _p; do printf '        %s\n' "$_p"; done
     else fact "    (none found)"; fi
     probe_merged "pip3 --version" pip3 --version
+}
 
-    # exclude= lines and a repo without the package both end in "whatap-nms not
-    # found"; both official install paths: rpm/dnf and dpkg/apt
+# exclude= lines and a repo without the package both end in "whatap-nms not
+# found"; both official install paths: rpm/dnf and dpkg/apt
+_rep_d() {
     section "D. Package & repository"
     if have rpm; then
         probe "rpm -qi $NMS_PKG" rpm -qi "$NMS_PKG"
@@ -979,15 +981,7 @@ run_report() {
     fi
     subsection "whatap repo definitions"
     local _found_repo=0 _rf
-    for _rf in /etc/yum.repos.d/*.repo; do
-        [ -e "$_rf" ] || continue
-        if grep -qi whatap "$_rf" 2>/dev/null; then
-            _found_repo=1
-            fact "$_rf ($(file_meta "$_rf")):"
-            _file_lines tail "$_rf" 40
-        fi
-    done
-    for _rf in /etc/apt/sources.list.d/*.list /etc/apt/sources.list; do
+    for _rf in /etc/yum.repos.d/*.repo /etc/apt/sources.list.d/*.list /etc/apt/sources.list; do
         [ -e "$_rf" ] || continue
         if grep -qi whatap "$_rf" 2>/dev/null; then
             _found_repo=1
@@ -1030,8 +1024,10 @@ run_report() {
     fi
     probe "dpkg.log entries (last 20)" sh -c 'grep -h "whatap-nms" /var/log/dpkg.log /var/log/dpkg.log.1 2>/dev/null | tail -n 20; :'
     probe "apt history entries (last 30 lines)" sh -c 'grep -h -B2 -A4 "whatap-nms" /var/log/apt/history.log 2>/dev/null | tail -n 30; :'
+}
 
-    # the venv and wheelhouse are where the rpm %post pip install breaks
+# the venv and wheelhouse are where the rpm %post pip install breaks
+_rep_e() {
     section "E. Deployment layout (on-disk)"
     if [ -n "$NMS_ROOT" ]; then
         fact "root: $NMS_ROOT"
@@ -1062,9 +1058,11 @@ run_report() {
     else
         fact "n/a (install root not resolved)"
     fi
+}
 
-    # units in start order (uvicorn -> nmscore -> icmptcphealthd); icmphealthd
-    # is the unit's pre-rename name (<= v0.42.x)
+# units in start order (uvicorn -> nmscore -> icmptcphealthd); icmphealthd
+# is the unit's pre-rename name (<= v0.42.x)
+_rep_f() {
     section "F. Runtime services & processes"
     if have systemctl; then
         local _u _ls
@@ -1097,9 +1095,11 @@ run_report() {
     else
         fact "no matching process in the /proc scan"
     fi
+}
 
-    # 514/udp (syslog) is also bound by a co-located WhaTap collection server;
-    # 162/udp is trap intake, 5000/tcp the manager UI
+# 514/udp (syslog) is also bound by a co-located WhaTap collection server;
+# 162/udp is trap intake, 5000/tcp the manager UI
+_rep_g() {
     section "G. Network endpoints"
     subsection "listening TCP sockets"
     if have ss; then probe "ss -ltnp" sh -c "ss -ltnp 2>/dev/null | head -n 40"
@@ -1137,8 +1137,10 @@ run_report() {
     probe "default route" sh -c "ip route show default 2>/dev/null | head -n 3"
     probe "proxy variables in current environment" sh -c "env | grep -i proxy; :"
     probe "proxy variables in /etc/environment" sh -c 'grep -i proxy /etc/environment 2>/dev/null; :'
+}
 
-    # a closed network breaks the rpm %post pip step ("ResolutionImpossible")
+# a closed network breaks the rpm %post pip step ("ResolutionImpossible")
+_rep_h() {
     section "H. Outbound reachability (2 bounded HEAD requests, 5s cap each)"
     local _url
     for _url in https://repo.whatap.io https://pypi.org; do
@@ -1150,8 +1152,10 @@ run_report() {
             fact "$_url: n/a (command not found: curl, wget)"
         fi
     done
+}
 
-    # wtinitset is the official configuration tool; -v prints the current one
+# wtinitset is the official configuration tool; -v prints the current one
+_rep_i() {
     section "I. Configuration (verbatim)"
     subsection "wtinitset -v"
     probe_merged "wtinitset -v" wtinitset -v
@@ -1204,9 +1208,11 @@ EOF
         if [ -n "$_cf_bad" ]; then fact "no *.conf read (see the not-readable entries above)"
         else fact "no *.conf discovered via package manifest, install root, or /etc/whatap-nms"; fi
     fi
+}
 
-    # pkg-install-error.log: install failures; /var/log/nmscore/nmscore.log:
-    # MIB module-load and engine issues (FAQ)
+# pkg-install-error.log: install failures; /var/log/nmscore/nmscore.log:
+# MIB module-load and engine issues (FAQ)
+_rep_j() {
     section "J. Logs & recent events"
     local _logdir=/var/log/whatap-nms _lg_bad="" _lg_n=0 _lgd _lgf
     for _lgd in /var/log/whatap-nms /var/log/nmscore; do
@@ -1264,56 +1270,78 @@ EOF
     else
         fact "journalctl: n/a (command not found: journalctl)"
     fi
+}
 
-    # Tier 2, opt-in: the answer and its arrival time both matter, since the
-    # manager polls with a first-response timeout of about 3s
-    if [ "$OPT_SNMP" = 1 ]; then
-        section "K. SNMP probe (opt-in) — target $SNMP_HOST:$SNMP_PORT, SNMPv2c"
-        if have snmpget; then
-            local _oid _name _t0 _t1 _out _rc _snmpdir _okn=0 _fails=""
-            # the community string reaches snmpget through a mode-600 snmp.conf
-            # in the run's private directory, never through its command line
-            _snmpdir="$(_tmp snmpconf)"
-            # net-snmp reads SNMPCONFPATH instead of its default search path,
-            # so the default path (system snmp.conf) is kept in front and the
-            # private file comes last, where its values win. "mibs :" loads no
-            # MIB module: numeric OIDs are asked, and a host without MIB files
-            # does not bury the reply under "Cannot find module" lines
-            local _snmpdef
-            _snmpdef="$(_bounded net-snmp-config --snmpconfpath 2>/dev/null)"
-            [ -n "$_snmpdef" ] || _snmpdef="/etc/snmp:/usr/share/snmp:/usr/local/etc/snmp:/usr/local/share/snmp:${HOME:-/nonexistent}/.snmp"
-            case "$SNMP_COMM" in
-                *[[:space:]\#\"\']*|"")
-                    fact "n/a (community string is empty or holds whitespace, '#' or a quote; snmp.conf cannot carry it)"
-                    warn "--snmp: community string is empty or holds whitespace, '#' or a quote; SNMP probe not sent"
-                    missed snmp "community string not usable in snmp.conf (empty, whitespace, '#' or a quote)"
-                    _snmpdir="" ;;
-            esac
-            if [ -z "$_snmpdir" ]; then :
-            elif mkdir -m 700 "$_snmpdir" 2>/dev/null \
-                && ( umask 077; printf 'defVersion 2c\ndefCommunity %s\nmibs :\n' "$SNMP_COMM" > "$_snmpdir/snmp.conf" ) 2>/dev/null; then
-                for _oid in "sysDescr.0=1.3.6.1.2.1.1.1.0" "sysUpTime.0=1.3.6.1.2.1.1.3.0" "ifNumber.0=1.3.6.1.2.1.2.1.0"; do
-                    _name="${_oid%%=*}"
-                    warn "sending 1 SNMP GET ($_name) to $SNMP_HOST:$SNMP_PORT"
-                    _t0="$(now_s)"
-                    _out="$(SNMPCONFPATH="$_snmpdef:$_snmpdir" CMD_TIMEOUT=15 _bounded snmpget -t 10 -r 0 "$SNMP_HOST:$SNMP_PORT" "${_oid#*=}" 2>&1)"; _rc=$?
-                    _t1="$(now_s)"
-                    fact "$_name: rc=$_rc elapsed=$(elapsed_s "$_t0" "$_t1")s"
-                    if [ -n "$_out" ]; then _emit_labeled "    reply" "$(printf '%s\n' "$_out" | grep -v '^$' | head -n 5 | cut -c1-160)"
-                    else fact "    reply: (no output)"; fi
-                    if [ "$_rc" -eq 0 ]; then _okn=$((_okn + 1)); else _fails="$_fails $_name(rc=$_rc)"; fi
-                done
-                if [ "$_okn" -eq 3 ]; then got snmp
-                else missed snmp "SNMP GET without a reply:$_fails"; fi
-            else
-                fact "n/a (snmp.conf could not be written in the run's private directory)"
-                missed snmp "snmp.conf could not be written in the run's private directory"
-            fi
+# Tier 2, opt-in: the answer and its arrival time both matter, since the
+# manager polls with a first-response timeout of about 3s
+_rep_k() {
+    section "K. SNMP probe (opt-in) — target $SNMP_HOST:$SNMP_PORT, SNMPv2c"
+    if have snmpget; then
+        local _oid _name _t0 _t1 _out _rc _snmpdir _okn=0 _fails=""
+        # the community string reaches snmpget through a mode-600 snmp.conf
+        # in the run's private directory, never through its command line
+        _snmpdir="$(_tmp snmpconf)"
+        # net-snmp reads SNMPCONFPATH instead of its default search path,
+        # so the default path (system snmp.conf) is kept in front and the
+        # private file comes last, where its values win. "mibs :" loads no
+        # MIB module: numeric OIDs are asked, and a host without MIB files
+        # does not bury the reply under "Cannot find module" lines
+        local _snmpdef
+        _snmpdef="$(_bounded net-snmp-config --snmpconfpath 2>/dev/null)"
+        [ -n "$_snmpdef" ] || _snmpdef="/etc/snmp:/usr/share/snmp:/usr/local/etc/snmp:/usr/local/share/snmp:${HOME:-/nonexistent}/.snmp"
+        case "$SNMP_COMM" in
+            *[[:space:]\#\"\']*|"")
+                fact "n/a (community string is empty or holds whitespace, '#' or a quote; snmp.conf cannot carry it)"
+                warn "--snmp: community string is empty or holds whitespace, '#' or a quote; SNMP probe not sent"
+                missed snmp "community string not usable in snmp.conf (empty, whitespace, '#' or a quote)"
+                _snmpdir="" ;;
+        esac
+        if [ -z "$_snmpdir" ]; then :
+        elif mkdir -m 700 "$_snmpdir" 2>/dev/null \
+            && ( umask 077; printf 'defVersion 2c\ndefCommunity %s\nmibs :\n' "$SNMP_COMM" > "$_snmpdir/snmp.conf" ) 2>/dev/null; then
+            for _oid in "sysDescr.0=1.3.6.1.2.1.1.1.0" "sysUpTime.0=1.3.6.1.2.1.1.3.0" "ifNumber.0=1.3.6.1.2.1.2.1.0"; do
+                _name="${_oid%%=*}"
+                warn "sending 1 SNMP GET ($_name) to $SNMP_HOST:$SNMP_PORT"
+                _t0="$(now_s)"
+                _out="$(SNMPCONFPATH="$_snmpdef:$_snmpdir" CMD_TIMEOUT=15 _bounded snmpget -t 10 -r 0 "$SNMP_HOST:$SNMP_PORT" "${_oid#*=}" 2>&1)"; _rc=$?
+                _t1="$(now_s)"
+                fact "$_name: rc=$_rc elapsed=$(elapsed_s "$_t0" "$_t1")s"
+                if [ -n "$_out" ]; then _emit_labeled "    reply" "$(printf '%s\n' "$_out" | grep -v '^$' | head -n 5 | cut -c1-160)"
+                else fact "    reply: (no output)"; fi
+                if [ "$_rc" -eq 0 ]; then _okn=$((_okn + 1)); else _fails="$_fails $_name(rc=$_rc)"; fi
+            done
+            if [ "$_okn" -eq 3 ]; then got snmp
+            else missed snmp "SNMP GET without a reply:$_fails"; fi
         else
-            fact "n/a (command not found: snmpget)"
-            missed snmp "command not found: snmpget"
+            fact "n/a (snmp.conf could not be written in the run's private directory)"
+            missed snmp "snmp.conf could not be written in the run's private directory"
         fi
+    else
+        fact "n/a (command not found: snmpget)"
+        missed snmp "command not found: snmpget"
     fi
+}
+
+run_report() {
+    emit_header
+
+    goal install "NMS installation on disk"
+    goal conf    "NMS configuration files"
+    goal logs    "NMS logs"
+    [ "$OPT_SNMP" = 1 ] && goal snmp "SNMP GET probe (--snmp)"
+
+    _rep_env
+    _rep_a
+    _rep_b
+    _rep_c
+    _rep_d
+    _rep_e
+    _rep_f
+    _rep_g
+    _rep_h
+    _rep_i
+    _rep_j
+    [ "$OPT_SNMP" = 1 ] && _rep_k
 
     if [ -n "$NMS_ROOT" ]; then got install
     elif [ -n "$ROOT_BLOCK" ]; then missed install "$ROOT_BLOCK"

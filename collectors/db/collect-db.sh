@@ -36,7 +36,7 @@ export LC_ALL=C
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-db"
 # History: CHANGELOG.md, section collect-db.sh (next to this file).
-VERSION="0.8.2"
+VERSION="0.8.3"
 DOMAIN="db"
 TARGET="db-host/$(hostname 2>/dev/null || echo unknown)"
 
@@ -2033,6 +2033,112 @@ _rep_tls() {
     fi
 }
 
+# one instance of section L; adds to sql_ok / sql_fail / sql_na of _rep_sql
+_rep_sql_inst() {
+    local idir="$1" cf="$1/whatap.conf"
+    local dbms dbip dbport dbname copt pack jar url alturl out ping
+    # everything the agent itself uses to connect is reused from
+    # whatap.conf (rule 2) — only credentials cannot come from it
+    # (stored encrypted by uid.sh; this script does not decrypt)
+    conf_get dbms "$cf" dbms
+    conf_get dbip "$cf" db_ip
+    conf_get dbport "$cf" db_port
+    conf_get dbname "$cf" 'db'
+    [ -z "$dbname" ] && conf_get dbname "$cf" plan_db
+    conf_get copt "$cf" connect_option
+    case "$copt" in ""|\?*) ;; *) copt="?$copt" ;; esac
+    subsection "instance: $idir (dbms=${dbms:-unset})"
+    pack=""; jar=""; url=""; alturl=""; ping="SELECT 1"
+    case "$dbms" in
+        postgres*|pg)
+            pack="$SCRIPT_DIR/sql/postgresql.sql"
+            jar="$(_find_jdbc_jar 'postgresql*.jar')"
+            url="jdbc:postgresql://$dbip:$dbport/${dbname:-postgres}$copt" ;;
+        mysql|mariadb)
+            pack="$SCRIPT_DIR/sql/mysql.sql"
+            jar="$(_find_jdbc_jar 'mysql-connector*.jar' 'mariadb*.jar')"
+            url="jdbc:mysql://$dbip:$dbport/${dbname}$copt"
+            case "$jar" in *mariadb*) url="jdbc:mariadb://$dbip:$dbport/${dbname}$copt" ;; esac ;;
+        oracle)
+            pack="$SCRIPT_DIR/sql/oracle.sql"
+            jar="$(_find_jdbc_jar 'ojdbc*.jar')"
+            url="jdbc:oracle:thin:@//$dbip:$dbport/$dbname"
+            alturl="jdbc:oracle:thin:@$dbip:$dbport:$dbname"
+            ping="SELECT 1 FROM DUAL" ;;
+        *)
+            fact "n/a (not applicable: no JDBC pack for dbms=${dbms:-unset} in this version)"
+            sql_na="$sql_na $idir: no JDBC pack for dbms=${dbms:-unset};"
+            return 0 ;;
+    esac
+    if [ ! -f "$pack" ]; then
+        fact "n/a (path not found: $pack)"
+        sql_fail="$sql_fail $idir: path not found: $pack (keep the sql/ dir next to this script);"
+        return 0
+    fi
+    if [ -z "$jar" ]; then
+        fact "n/a (no matching driver jar under any discovered jdbc/ dir)"
+        sql_fail="$sql_fail $idir: no matching driver jar under any discovered jdbc/ dir;"
+        return 0
+    fi
+    fact "driver jar: $jar"
+    fact "jdbc url: $url"
+    local down
+    if down="$(tcp_down "$dbip" "$dbport")"; then
+        fact "pack: n/a (skipped: $down)"
+        sql_fail="$sql_fail $idir: not sent: $down;"
+        return 0
+    fi
+    if ! _get_creds "$idir"; then
+        sql_fail="$sql_fail $idir: $CRED_WHY;"
+        return 0
+    fi
+    warn "sending read-only SQL pack $(basename "$pack") to $dbip:$dbport as $CRED_USER over JDBC"
+    [ -n "$RTT_MARK" ] || { _now_ms; RTT_MARK="GGT-RTT-$_ms-$RANDOM$RANDOM$RANDOM:"; }
+    out="$(_run_jdbc_pack "$pack" "$url" "$jar" "$ping")"
+    local jrc rtl=""; jrc="$(cat "$(_tmp runner.rc)" 2>/dev/null)"
+    # the runner's timing line is a fact of its own, not pack output
+    _rtt_split "$out" && { rtl="$RTT_LINE"; out="$RTT_REST"; }
+    if [ -n "$alturl" ] && printf '%s' "$out" | grep -q '^CONNECT-ERROR'; then
+        fact "first URL form did not connect; retrying SID form"
+        fact "jdbc url (retry): $alturl"
+        warn "retrying with SID-form URL $alturl"
+        local out2
+        out2="$(_run_jdbc_pack "$pack" "$alturl" "$jar" "$ping")"
+        _rtt_split "$out2" && { rtl="$RTT_LINE"; out2="$RTT_REST"; }
+        out="$out
+--- retry with $alturl ---
+$out2"
+    fi
+    if [ -n "$rtl" ]; then
+        fact "db round trip (runner VM clock): $rtl"
+    elif printf '%s\n' "$out" | grep -q '^CONNECT-ERROR'; then
+        fact "db round trip (runner VM clock): n/a (did not connect)"
+    elif [ -n "$out" ]; then
+        fact "db round trip (runner VM clock): n/a (the runner printed no timing line)"
+    fi
+    if [ -n "$out" ]; then
+        fact "pack output (verbatim):"
+        printf '%s\n' "$out" | _indent '        '
+    else
+        case "$jrc" in
+            124) fact "pack output: n/a (timed out: 120s or run deadline)" ;;
+            *)   fact "pack output: n/a (empty output, runner exit ${jrc:-unknown})" ;;
+        esac
+    fi
+    # connected at least once (the retry output follows the first)
+    if [ -z "$out" ]; then
+        sql_fail="$sql_fail $idir: runner produced no output (exit ${jrc:-unknown}$( [ "$jrc" = 124 ] && echo ', timed out'));"
+    elif printf '%s\n' "$out" | grep -q '^([0-9]* rows)$\|^SQL-ERROR: \|^(ok)$'; then
+        sql_ok=$((sql_ok + 1))
+    else
+        local cerr
+        cerr="$(printf '%s\n' "$out" | grep -m1 '^CONNECT-ERROR' | cut -c1-160)"
+        [ -n "$cerr" ] || cerr="runner output: $(printf '%s\n' "$out" | grep -m1 . | cut -c1-120)"
+        sql_fail="$sql_fail $idir: $cerr;"
+    fi
+    CRED_PW=""
+}
+
 # L. SQL pack over JDBC (--sql), the agent-native path
 _rep_sql() {
     local i
@@ -2048,108 +2154,7 @@ _rep_sql() {
         fact "runner: $_JDBC_MODE from $_JBIN"
         i=0
         while [ "$i" -lt "${#INST_DIRS[@]}" ]; do
-            local idir="${INST_DIRS[$i]}" cf="${INST_DIRS[$i]}/whatap.conf"
-            local dbms dbip dbport dbname copt pack jar url alturl out ping
-            # everything the agent itself uses to connect is reused from
-            # whatap.conf (rule 2) — only credentials cannot come from it
-            # (stored encrypted by uid.sh; this script does not decrypt)
-            conf_get dbms "$cf" dbms
-            conf_get dbip "$cf" db_ip
-            conf_get dbport "$cf" db_port
-            conf_get dbname "$cf" 'db'
-            [ -z "$dbname" ] && conf_get dbname "$cf" plan_db
-            conf_get copt "$cf" connect_option
-            case "$copt" in ""|\?*) ;; *) copt="?$copt" ;; esac
-            subsection "instance: $idir (dbms=${dbms:-unset})"
-            pack=""; jar=""; url=""; alturl=""; ping="SELECT 1"
-            case "$dbms" in
-                postgres*|pg)
-                    pack="$SCRIPT_DIR/sql/postgresql.sql"
-                    jar="$(_find_jdbc_jar 'postgresql*.jar')"
-                    url="jdbc:postgresql://$dbip:$dbport/${dbname:-postgres}$copt" ;;
-                mysql|mariadb)
-                    pack="$SCRIPT_DIR/sql/mysql.sql"
-                    jar="$(_find_jdbc_jar 'mysql-connector*.jar' 'mariadb*.jar')"
-                    url="jdbc:mysql://$dbip:$dbport/${dbname}$copt"
-                    case "$jar" in *mariadb*) url="jdbc:mariadb://$dbip:$dbport/${dbname}$copt" ;; esac ;;
-                oracle)
-                    pack="$SCRIPT_DIR/sql/oracle.sql"
-                    jar="$(_find_jdbc_jar 'ojdbc*.jar')"
-                    url="jdbc:oracle:thin:@//$dbip:$dbport/$dbname"
-                    alturl="jdbc:oracle:thin:@$dbip:$dbport:$dbname"
-                    ping="SELECT 1 FROM DUAL" ;;
-                *)
-                    fact "n/a (not applicable: no JDBC pack for dbms=${dbms:-unset} in this version)"
-                    sql_na="$sql_na $idir: no JDBC pack for dbms=${dbms:-unset};"
-                    i=$((i + 1)); continue ;;
-            esac
-            if [ ! -f "$pack" ]; then
-                fact "n/a (path not found: $pack)"
-                sql_fail="$sql_fail $idir: path not found: $pack (keep the sql/ dir next to this script);"
-                i=$((i + 1)); continue
-            fi
-            if [ -z "$jar" ]; then
-                fact "n/a (no matching driver jar under any discovered jdbc/ dir)"
-                sql_fail="$sql_fail $idir: no matching driver jar under any discovered jdbc/ dir;"
-                i=$((i + 1)); continue
-            fi
-            fact "driver jar: $jar"
-            fact "jdbc url: $url"
-            local down
-            if down="$(tcp_down "$dbip" "$dbport")"; then
-                fact "pack: n/a (skipped: $down)"
-                sql_fail="$sql_fail $idir: not sent: $down;"
-                i=$((i + 1)); continue
-            fi
-            if ! _get_creds "$idir"; then
-                sql_fail="$sql_fail $idir: $CRED_WHY;"
-                i=$((i + 1)); continue
-            fi
-            warn "sending read-only SQL pack $(basename "$pack") to $dbip:$dbport as $CRED_USER over JDBC"
-            [ -n "$RTT_MARK" ] || { _now_ms; RTT_MARK="GGT-RTT-$_ms-$RANDOM$RANDOM$RANDOM:"; }
-            out="$(_run_jdbc_pack "$pack" "$url" "$jar" "$ping")"
-            local jrc rtl=""; jrc="$(cat "$(_tmp runner.rc)" 2>/dev/null)"
-            # the runner's timing line is a fact of its own, not pack output
-            _rtt_split "$out" && { rtl="$RTT_LINE"; out="$RTT_REST"; }
-            if [ -n "$alturl" ] && printf '%s' "$out" | grep -q '^CONNECT-ERROR'; then
-                fact "first URL form did not connect; retrying SID form"
-                fact "jdbc url (retry): $alturl"
-                warn "retrying with SID-form URL $alturl"
-                local out2
-                out2="$(_run_jdbc_pack "$pack" "$alturl" "$jar" "$ping")"
-                _rtt_split "$out2" && { rtl="$RTT_LINE"; out2="$RTT_REST"; }
-                out="$out
---- retry with $alturl ---
-$out2"
-            fi
-            if [ -n "$rtl" ]; then
-                fact "db round trip (runner VM clock): $rtl"
-            elif printf '%s\n' "$out" | grep -q '^CONNECT-ERROR'; then
-                fact "db round trip (runner VM clock): n/a (did not connect)"
-            elif [ -n "$out" ]; then
-                fact "db round trip (runner VM clock): n/a (the runner printed no timing line)"
-            fi
-            if [ -n "$out" ]; then
-                fact "pack output (verbatim):"
-                printf '%s\n' "$out" | _indent '        '
-            else
-                case "$jrc" in
-                    124) fact "pack output: n/a (timed out: 120s or run deadline)" ;;
-                    *)   fact "pack output: n/a (empty output, runner exit ${jrc:-unknown})" ;;
-                esac
-            fi
-            # connected at least once (the retry output follows the first)
-            if [ -z "$out" ]; then
-                sql_fail="$sql_fail $idir: runner produced no output (exit ${jrc:-unknown}$( [ "$jrc" = 124 ] && echo ', timed out'));"
-            elif printf '%s\n' "$out" | grep -q '^([0-9]* rows)$\|^SQL-ERROR: \|^(ok)$'; then
-                sql_ok=$((sql_ok + 1))
-            else
-                local cerr
-                cerr="$(printf '%s\n' "$out" | grep -m1 '^CONNECT-ERROR' | cut -c1-160)"
-                [ -n "$cerr" ] || cerr="runner output: $(printf '%s\n' "$out" | grep -m1 . | cut -c1-120)"
-                sql_fail="$sql_fail $idir: $cerr;"
-            fi
-            CRED_PW=""
+            _rep_sql_inst "${INST_DIRS[$i]}"
             i=$((i + 1))
         done
     fi

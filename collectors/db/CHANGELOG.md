@@ -7,6 +7,9 @@ one entry at the top of its section (docs/authoring-guide.md, step 2);
 
 ## collect-db.sh
 
+- **0.8.3** — The per-instance body of _rep_sql moves to _rep_sql_inst. Report
+  content unchanged.
+
 - **0.8.2** — Shared code in synced blocks (R2 refactor): the skeleton's emit
   helpers now hold _optval, _emit_labeled, _tool_rows (the [1] tool table) and
   _indent (the indent loops), and its run helpers hold probe and read_proc.
