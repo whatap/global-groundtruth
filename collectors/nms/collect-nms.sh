@@ -416,7 +416,7 @@ _report_to_file() {
         return 1
     fi
     run_report > "$1" 2>/dev/null
-    if ! tail -n 1 "$1" 2>/dev/null | grep -q '^==== END OF COLLECTION'; then
+    if ! tail -n 1 -- "$1" 2>/dev/null | grep -q '^==== END OF COLLECTION'; then
         warn "the report was not written whole: $1 does not end with the footer"
         return 1
     fi
