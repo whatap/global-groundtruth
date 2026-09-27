@@ -1,0 +1,13 @@
+[Unit]
+Description=WhaTap NMS lab first-boot install (rpm install + dummy license + remaining services)
+After=network.target
+Before=multi-user.target
+ConditionPathExists=!/var/lib/whatap-nms-installed
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/nms-first-boot.sh
+
+[Install]
+WantedBy=multi-user.target
