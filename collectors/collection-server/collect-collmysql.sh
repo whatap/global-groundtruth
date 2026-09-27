@@ -27,7 +27,7 @@ export LC_ALL=C
 # ---- collector metadata -----------------------------------------------------
 # History: CHANGELOG.md, section collect-collmysql.sh (next to this file).
 COLLECTOR_NAME="whatap-collmysql"
-VERSION="0.11.0"
+VERSION="0.11.1"
 DOMAIN="collection-server"
 TARGET="collection-server-mysql/$(hostname 2>/dev/null || echo unknown)"
 
@@ -380,8 +380,12 @@ _run_init() {
     _tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/ggt.XXXXXX" 2>/dev/null)"
     # Script read from stdin (`sh -s`)? Then fd 0 is the script: a bounded
     # command must not read it, and bash 5.2 kills a $(...) that duplicates it.
+    # A shell started by its path (`/bin/bash -s`) has its own binary as $0:
+    # that is stdin too. Taken for a file, bash 3.2 frees its fd-0 input buffer
+    # twice after `4<&0`, and under musl it faults in a loop at full CPU.
     case "$0" in
-        */*|*.sh) [ -f "$0" ] || _stdin_script=1 ;;
+        */*|*.sh) [ -f "$0" ] || _stdin_script=1
+                  [ -e "/proc/$$/exe" ] && [ "$0" -ef "/proc/$$/exe" ] && _stdin_script=1 ;;
         *)        _stdin_script=1 ;;
     esac
     [ -n "$_tmp_dir" ] || warn "no private temp directory could be made under ${TMPDIR:-/tmp}; values that need one are reported as n/a"

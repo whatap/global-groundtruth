@@ -36,7 +36,7 @@ export LC_ALL=C
 # ---- collector metadata -----------------------------------------------------
 COLLECTOR_NAME="whatap-k8s"
 # History: CHANGELOG.md (next to this file).
-VERSION="0.12.1"
+VERSION="0.12.2"
 DOMAIN="k8s"
 TARGET="k8s-cluster/unresolved"      # refined after CLI/context/namespace discovery
 
@@ -397,8 +397,12 @@ _run_init() {
     _tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/ggt.XXXXXX" 2>/dev/null)"
     # Script read from stdin (`sh -s`)? Then fd 0 is the script: a bounded
     # command must not read it, and bash 5.2 kills a $(...) that duplicates it.
+    # A shell started by its path (`/bin/bash -s`) has its own binary as $0:
+    # that is stdin too. Taken for a file, bash 3.2 frees its fd-0 input buffer
+    # twice after `4<&0`, and under musl it faults in a loop at full CPU.
     case "$0" in
-        */*|*.sh) [ -f "$0" ] || _stdin_script=1 ;;
+        */*|*.sh) [ -f "$0" ] || _stdin_script=1
+                  [ -e "/proc/$$/exe" ] && [ "$0" -ef "/proc/$$/exe" ] && _stdin_script=1 ;;
         *)        _stdin_script=1 ;;
     esac
     [ -n "$_tmp_dir" ] || warn "no private temp directory could be made under ${TMPDIR:-/tmp}; values that need one are reported as n/a"

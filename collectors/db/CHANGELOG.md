@@ -7,6 +7,7 @@ one entry at the top of its section (docs/authoring-guide.md, step 2);
 
 ## collect-db.sh
 
+- **0.9.1** — `_run_init` (skeleton) also takes the script as read from stdin when `$0` is the shell's own binary (`/bin/bash -s`, `$0 -ef /proc/$$/exe`): bash 3.2 under musl otherwise faulted in a loop at full CPU after `4<&0`.
 - **0.9.0** — Derived views removed (CONTRACT rule 1, "Derived views"); every
   fact they gave is in raw output or in a count of what was read. Sections
   F and H: the WA/ORA/JDBC code histograms become, per code in order of

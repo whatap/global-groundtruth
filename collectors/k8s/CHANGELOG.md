@@ -5,6 +5,7 @@ change to the script bumps its `VERSION` and adds one entry at the top of this
 list (docs/authoring-guide.md, step 2); `tools/validate.sh` checks that the
 newest entry is the script's `VERSION`.
 
+- **0.12.2** — `_run_init` (skeleton) also takes the script as read from stdin when `$0` is the shell's own binary (`/bin/bash -s`, `$0 -ef /proc/$$/exe`): bash 3.2 under musl otherwise faulted in a loop at full CPU after `4<&0`.
 - **0.12.1** — Section D ("rbac & identity") prints the WhaTap credential
   Secrets decoded: `whatap-credentials` in the whatap namespace and the
   Secrets the WhatapAgent CR spec names (a field ending in `secretName`, or

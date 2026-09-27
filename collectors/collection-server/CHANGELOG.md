@@ -7,6 +7,7 @@ one entry at the top of its section (docs/authoring-guide.md, step 2);
 
 ## collect-collserver.sh
 
+- **0.13.1** — `_run_init` (skeleton) also takes the script as read from stdin when `$0` is the shell's own binary (`/bin/bash -s`, `$0 -ef /proc/$$/exe`): bash 3.2 under musl otherwise faulted in a loop at full CPU after `4<&0`.
 - **0.13.0** — A reads the cgroup of the WhaTap server JVMs, not only the
   root the run sees: per distinct `/proc/<pid>/cgroup` of the server JVMs, its
   content, the pids in it, and that cgroup's `memory.max` / `cpu.max` (v2) or
@@ -110,6 +111,7 @@ one entry at the top of its section (docs/authoring-guide.md, step 2);
 
 ## collect-collzfs.sh
 
+- **0.10.1** — `_run_init` (skeleton) also takes the script as read from stdin when `$0` is the shell's own binary (`/bin/bash -s`, `$0 -ef /proc/$$/exe`): bash 3.2 under musl otherwise faulted in a loop at full CPU after `4<&0`.
 - **0.10.0** — A prints `/etc/os-release` raw, and the kernel from
   `/proc/sys/kernel/{ostype,osrelease}` (`uname -sr` only where they are
   unreadable); the line reads as before. Lab jjsong-ggt-zfs, 2026-09-27.
@@ -219,6 +221,7 @@ one entry at the top of its section (docs/authoring-guide.md, step 2);
 
 ## collect-collmysql.sh
 
+- **0.11.1** — `_run_init` (skeleton) also takes the script as read from stdin when `$0` is the shell's own binary (`/bin/bash -s`, `$0 -ef /proc/$$/exe`): bash 3.2 under musl otherwise faulted in a loop at full CPU after `4<&0`.
 - **0.11.0** — F's tables whose name contains lock/meter/event/audit are
   matched on `LOWER(table_name)`: on MySQL 8.0 the match was case-sensitive,
   and `MeteringDaily`, `MeteringHourly`, `AuditLog` and `ReserveEvent` were

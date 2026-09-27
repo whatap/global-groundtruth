@@ -5,6 +5,7 @@ change to the script bumps its `VERSION` and adds one entry at the top of this
 list (docs/authoring-guide.md, step 2); `tools/validate.sh` checks that the
 newest entry is the script's `VERSION`.
 
+- **0.7.5** — `_run_init` (skeleton) also takes the script as read from stdin when `$0` is the shell's own binary (`/bin/bash -s`, `$0 -ef /proc/$$/exe`): bash 3.2 under musl otherwise faulted in a loop at full CPU after `4<&0`.
 - **0.7.4** — Shortened the top-of-file comment block: pointed the
   #nms-support traceability, docs cross-check and section detail at
   README.md instead of restating it. Comments only; report content unchanged.

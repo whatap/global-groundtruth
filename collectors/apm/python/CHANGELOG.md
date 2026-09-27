@@ -5,6 +5,7 @@ first. Every change to the script bumps its `VERSION` and adds one entry at
 the top of this list (docs/authoring-guide.md, step 2); `tools/validate.sh`
 checks that the newest entry is the script's `VERSION`.
 
+- **0.11.2** — `_run_init` (skeleton) also takes the script as read from stdin when `$0` is the shell's own binary (`/bin/bash -s`, `$0 -ef /proc/$$/exe`): bash 3.2 under musl otherwise faulted in a loop at full CPU after `4<&0`.
 - **0.11.1** — The host section adds `/sys/class/dmi/id/product_uuid`: its
   `ls -l` line and `dmi product_uuid readable by uid N:` (yes or no, from an
   open and a read of the file); the value follows only when it was read (group
