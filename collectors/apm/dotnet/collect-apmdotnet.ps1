@@ -72,7 +72,7 @@ param(
 
 $COLLECTOR_NAME = "whatap-apmdotnet"
 # History: CHANGELOG.md (next to this file).
-$VERSION        = "0.5.1"
+$VERSION        = "0.6.0"
 $DOMAIN         = "apm"
 $CompName = $env:COMPUTERNAME; if (-not $CompName) { $CompName = [Environment]::MachineName }
 $TARGET         = "host/$CompName"
@@ -1194,6 +1194,61 @@ TryFact "applicationHost.config lines matching COR/CORECLR/WHATAP/STARTUP_HOOKS 
 }
 
 Section "D. WhaTap service & runtime processes"
+# the CLR a process loaded: clr.dll (.NET Framework 4.x), coreclr.dll (.NET
+# Core / 5+), aspnetcorev2*.dll (the ASP.NET Core Module and its in-process
+# handler); their FileVersion is the runtime build actually running
+$RUNTIME_MODULES  = '\\(clr|coreclr|aspnetcorev2[^\\]*)\.dll$'
+$PROFILER_MODULES = 'whatap|clrprofiler|datadog|dynatrace|newrelic|appdynamics|instana|elastic.apm|contrast|scouter|jennifer'
+# Module lists of the w3wp and the first 10 dotnet.exe processes, read once.
+# A live process always has modules (ntdll at least): an empty list is one
+# this run could not read, which 0.4.0 printed as "none". Windows PowerShell
+# 5.1 (.NET Framework) lists only the WOW64 layer of a 32-bit process (ntdll,
+# wow64*.dll): the 32-bit Classic32 pool read "none" for both lists while
+# pwsh 7 listed its clr.dll (0.5.1, lab host, 2026-09-27). The lists of such
+# processes are read again by the 32-bit Windows PowerShell, in one bounded
+# call for all of them.
+$ModList = @{}; $ModErr = @{}; $ModNote = @{}; $wowPids = @()
+foreach ($p in @($procW3wp) + @($procDotnet | Select-Object -First 10)) {
+    $id = [int]$p.ProcessId
+    try {
+        $l = @((Get-Process -Id $id -ErrorAction Stop).Modules | Where-Object { $_ })
+        $ModList[$id] = $l
+        if ([Environment]::Is64BitProcess -and @($l | Where-Object { $_.FileName -imatch '\\wow64\.dll$' }).Count -gt 0 -and
+            @($l | Where-Object { $_.FileName -imatch '\\kernel32\.dll$' }).Count -eq 0) { $wowPids += $id }
+    } catch { $ModErr[$id] = $_.Exception.Message.Split("`n")[0] }
+}
+if ($wowPids.Count -gt 0) {
+    $ps32 = Join-Path $env:SystemRoot 'SysWOW64\WindowsPowerShell\v1.0\powershell.exe'
+    $why = ""
+    if (-not (Test-Path -LiteralPath $ps32)) { $why = "path not found: $ps32" }
+    else {
+        $src = @'
+foreach ($i in @(PIDS)) {
+    try { (Get-Process -Id $i -ErrorAction Stop).Modules | ForEach-Object { $v = ""; if ($_.FileName -imatch 'PATTERN') { $v = $_.FileVersionInfo.FileVersion }; "$i|$($_.FileName)|$v" } }
+    catch { "$i|!|$($_.Exception.Message.Split("`n")[0])" }
+}
+'@
+        $src = $src.Replace('PIDS', ($wowPids -join ',')).Replace('PATTERN', "$PROFILER_MODULES|$RUNTIME_MODULES")
+        $enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($src))
+        try {
+            $got = @{}
+            foreach ($line in @(Invoke-Bounded $ps32 @("-NoProfile", "-NonInteractive", "-EncodedCommand", $enc))) {
+                $f = "$line" -split '\|', 3
+                if ($f.Count -lt 3 -or $f[0] -notmatch '^\d+$') { continue }
+                $id = [int]$f[0]
+                if ($f[1] -eq '!') { $ModErr[$id] = "32-bit process; its module list through the 32-bit Windows PowerShell: $($f[2])"; $got[$id] = $true; continue }
+                if (-not $got.ContainsKey($id)) { $got[$id] = $true; $ModList[$id] = @() }
+                $ModList[$id] += [pscustomobject]@{ FileName = $f[1]; FileVersionInfo = [pscustomobject]@{ FileVersion = $f[2] } }
+                $ModNote[$id] = " (32-bit process: listed by the 32-bit Windows PowerShell)"
+            }
+            foreach ($id in $wowPids) { if (-not $got.ContainsKey($id)) { $why = "no module lines from $ps32"; break } }
+        } catch { $why = "$ps32 -- $($_.Exception.Message.Split("`n")[0])" }
+    }
+    if ($why) {
+        foreach ($id in $wowPids) { if (-not $ModNote.ContainsKey($id) -and -not $ModErr.ContainsKey($id)) {
+            $ModErr[$id] = "32-bit process; this PowerShell lists only its WOW64 modules, and the 32-bit read did not complete: $why" } }
+    }
+}
 TryFact "services matching 'whatap'" {
     $s = @(Get-CimBounded Win32_Service | Where-Object { $_.Name -imatch 'whatap' -or $_.DisplayName -imatch 'whatap' })
     if ($s.Count -eq 0) { "none" }
@@ -1217,15 +1272,16 @@ foreach ($p in $procW3wp) {
         $exeTxt = "$($p.ExecutablePath) [$bitMark]"
     } else { $exeTxt = "n/a (not readable)" }
     Fact "w3wp: pid=$($p.ProcessId) apppool=$pool start=$(Fmt-Time $p.CreationDate) ws_kb=$([int]($p.WorkingSetSize/1KB)) exe=$exeTxt"
-    try {
-        # a live process always has modules (ntdll at least): an empty list is
-        # a list this run could not read, which 0.4.0 printed as "none"
-        $all = @((Get-Process -Id $p.ProcessId -ErrorAction Stop).Modules | Where-Object { $_ })
-        $mods = @($all | Where-Object { $_.FileName -imatch 'whatap|clrprofiler|datadog|dynatrace|newrelic|appdynamics|instana|elastic.apm|contrast|scouter|jennifer' })
-        if ($all.Count -eq 0) { Fact "  loaded profiler-related modules: n/a (module list not readable)" }
-        elseif ($mods.Count -eq 0) { Fact "  loaded profiler-related modules: none" }
-        else { foreach ($m in $mods) { Fact "  loaded module: $($m.FileName)  FileVersion=$($m.FileVersionInfo.FileVersion)" } }
-    } catch { Fact "  loaded profiler-related modules: n/a ($($_.Exception.Message.Split("`n")[0]))" }
+    $id = [int]$p.ProcessId
+    if ($ModErr.ContainsKey($id)) { Fact "  loaded profiler-related modules: n/a ($($ModErr[$id]))"; Fact "  loaded runtime modules: n/a ($($ModErr[$id]))"; continue }
+    $all = @($ModList[$id]); $note = "$($ModNote[$id])"
+    if ($all.Count -eq 0) { Fact "  loaded profiler-related modules: n/a (module list not readable)"; Fact "  loaded runtime modules: n/a (module list not readable)"; continue }
+    $mods = @($all | Where-Object { $_.FileName -imatch $PROFILER_MODULES })
+    if ($mods.Count -eq 0) { Fact "  loaded profiler-related modules: none$note" }
+    else { foreach ($m in $mods) { Fact "  loaded module: $($m.FileName)  FileVersion=$($m.FileVersionInfo.FileVersion)" } }
+    $rt = @($all | Where-Object { $_.FileName -imatch $RUNTIME_MODULES })
+    if ($rt.Count -eq 0) { Fact "  loaded runtime modules (clr, coreclr, aspnetcorev2*): none$note" }
+    else { foreach ($m in $rt) { Fact "  loaded runtime module: $($m.FileName)  FileVersion=$($m.FileVersionInfo.FileVersion)$note" } }
 }
 Emit ""
 Fact "dotnet.exe processes: $($procDotnet.Count)"
@@ -1235,11 +1291,16 @@ foreach ($p in $procDotnet) {
     $cl = "$($p.CommandLine)"; if ($cl.Length -gt 240) { $cl = $cl.Substring(0, 240) + " ..." }
     if (-not $cl) { $cl = "n/a (not readable)" }
     Fact "dotnet: pid=$($p.ProcessId) start=$(Fmt-Time $p.CreationDate) cmd=$cl"
-    try {
-        $mods = @((Get-Process -Id $p.ProcessId -ErrorAction Stop).Modules | Where-Object { $_.FileName -imatch 'whatap|clrprofiler' })
-        if ($mods.Count -gt 0) { foreach ($m in $mods) { Fact "  loaded module: $($m.FileName)  FileVersion=$($m.FileVersionInfo.FileVersion)" } }
-    } catch { }
     $dnShown++
+    $id = [int]$p.ProcessId
+    if ($ModErr.ContainsKey($id)) { Fact "  loaded runtime modules: n/a ($($ModErr[$id]))"; continue }
+    $all = @($ModList[$id]); $note = "$($ModNote[$id])"
+    if ($all.Count -eq 0) { Fact "  loaded runtime modules: n/a (module list not readable)"; continue }
+    $mods = @($all | Where-Object { $_.FileName -imatch 'whatap|clrprofiler' })
+    foreach ($m in $mods) { Fact "  loaded module: $($m.FileName)  FileVersion=$($m.FileVersionInfo.FileVersion)" }
+    $rt = @($all | Where-Object { $_.FileName -imatch $RUNTIME_MODULES })
+    if ($rt.Count -eq 0) { Fact "  loaded runtime modules (clr, coreclr, aspnetcorev2*): none$note" }
+    else { foreach ($m in $rt) { Fact "  loaded runtime module: $($m.FileName)  FileVersion=$($m.FileVersionInfo.FileVersion)$note" } }
 }
 if ($null -eq $allProc) { Fact "process inventory: n/a (Win32_Process query failed: $procErr)" }
 
@@ -1464,6 +1525,10 @@ foreach ($ap in $appPaths) {
         TryFact "targetFramework lines" {
             $m = @(Select-String -LiteralPath $wc -Pattern 'targetFramework' -Encoding UTF8 -ErrorAction Stop | Select-Object -First 5)
             if ($m.Count -eq 0) { "no targetFramework attribute" } else { $m | ForEach-Object { $_.Line.Trim() } }
+        }
+        TryFact "hostingModel lines" {
+            $m = @(Select-String -LiteralPath $wc -Pattern 'hostingModel' -Encoding UTF8 -ErrorAction Stop | Select-Object -First 5)
+            if ($m.Count -eq 0) { "no hostingModel attribute" } else { $m | ForEach-Object { $_.Line.Trim() } }
         }
         TryFact "web.config <runtime> block (assemblyBinding, verbatim)" {
             $txt = Get-Content -LiteralPath $wc -Encoding UTF8 -ErrorAction Stop -Raw

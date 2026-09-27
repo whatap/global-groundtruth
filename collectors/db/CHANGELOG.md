@@ -65,6 +65,13 @@ one entry at the top of its section (docs/authoring-guide.md, step 2);
 
 ## windows/collect-db-mssql.ps1
 
+- **0.6.0** — Section B gives, per SQL Server instance installed on this host,
+  Version, PatchLevel and Edition from
+  `HKLM\SOFTWARE\Microsoft\Microsoft SQL Server\<instance id>\Setup` (ids
+  from `...\Instance Names\SQL`, both registry views on a 64-bit OS) and
+  the FileVersion of `<SQLBinRoot>\sqlservr.exe`, so the engine build is in
+  the default run without mssql.sql. Read through the .NET registry API;
+  the same lines not elevated and over OpenSSH (lab host, 2026-09-27).
 - **0.5.1** — The shared blocks (templates/groups/ps1.ps1) are synced by
   tools/sync-shared-block.sh; report unchanged.
 - **0.5.0** — First runs on a real Windows host (Windows Server 2022 Standard Eval

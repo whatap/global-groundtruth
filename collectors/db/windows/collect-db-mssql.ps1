@@ -49,7 +49,7 @@ param(
 
 $COLLECTOR_NAME = "whatap-db-mssql"
 # History: ../CHANGELOG.md, section windows/collect-db-mssql.ps1 (next to the db README).
-$VERSION        = "0.5.1"
+$VERSION        = "0.6.0"
 $DOMAIN         = "db"
 $CompName = $env:COMPUTERNAME; if (-not $CompName) { $CompName = [Environment]::MachineName }
 $TARGET         = "db-host/$CompName"
@@ -873,6 +873,49 @@ else {
     $sp = @($allProc | Where-Object { $_.Name -ieq 'sqlservr.exe' })
     if ($sp.Count -eq 0) { Fact "sqlservr processes on this host: none" }
     else { FactBlock "sqlservr processes on this host" @($sp | ForEach-Object { "pid=$($_.ProcessId) start=$(Fmt-Time $_.CreationDate) cmd=$(if ($_.CommandLine) { $_.CommandLine } else { 'n/a (not readable)' })" }) }
+}
+# SQL Server instances installed on this host, from the registry every account
+# may read (no SQL login, no process access): Instance Names\SQL maps each
+# instance name to its id, and <id>\Setup holds Version, PatchLevel, Edition
+# and SQLBinRoot, whose sqlservr.exe carries the FileVersion. Both registry
+# views on a 64-bit OS: a 32-bit instance registers under WOW6432Node.
+$sqlRoot = 'SOFTWARE\Microsoft\Microsoft SQL Server'
+$sqlViews = @(,@('64-bit', [Microsoft.Win32.RegistryView]::Registry64))
+if ([Environment]::Is64BitOperatingSystem) { $sqlViews += ,@('32-bit', [Microsoft.Win32.RegistryView]::Registry32) }
+else { $sqlViews = @(,@('32-bit', [Microsoft.Win32.RegistryView]::Registry32)) }
+foreach ($sv in $sqlViews) {
+    $vlabel = "SQL Server instances ($($sv[0]) registry view, HKLM\$sqlRoot\Instance Names\SQL)"
+    $base = $null; $names = $null
+    try {
+        $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, $sv[1])
+        $names = $base.OpenSubKey("$sqlRoot\Instance Names\SQL", $false)
+    } catch { Fact "${vlabel}: n/a (error: $($_.Exception.Message.Split("`n")[0]))"; if ($base) { $base.Close() }; continue }
+    if (-not $names) { Fact "${vlabel}: none (registry key not found)"; $base.Close(); continue }
+    $inst = @($names.GetValueNames() | Where-Object { $_ })
+    Fact "${vlabel}: $($inst.Count)"
+    foreach ($iname in $inst) {
+        $iid = "$($names.GetValue($iname))"
+        $setup = $null
+        try { $setup = $base.OpenSubKey("$sqlRoot\$iid\Setup", $false) }
+        catch { Fact "instance ${iname} (id $iid): n/a (error: $($_.Exception.Message.Split("`n")[0]))"; continue }
+        if (-not $setup) { Fact "instance ${iname} (id $iid): n/a (registry key not found: HKLM\$sqlRoot\$iid\Setup)"; continue }
+        $sv2 = @{}
+        foreach ($vn in @('Version', 'PatchLevel', 'Edition', 'SQLBinRoot')) {
+            $v = $setup.GetValue($vn); $sv2[$vn] = if ($null -eq $v) { "n/a (value not set)" } else { "$v" }
+        }
+        $setup.Close()
+        Fact "instance ${iname} (id $iid): Version=$($sv2.Version)  PatchLevel=$($sv2.PatchLevel)  Edition=$($sv2.Edition)"
+        if ($sv2.SQLBinRoot -like 'n/a*') { Fact "instance ${iname} sqlservr.exe: n/a (Setup\SQLBinRoot not set)"; continue }
+        $exe = Join-Path $sv2.SQLBinRoot "sqlservr.exe"
+        try {
+            $fv = (Get-Item -LiteralPath $exe -ErrorAction Stop).VersionInfo.FileVersion
+            Fact "instance ${iname} sqlservr.exe: $exe  FileVersion=$(if ($fv) { $fv } else { 'n/a (no version resource)' })"
+        } catch {
+            $st = if ($_.Exception -is [System.Management.Automation.ItemNotFoundException]) { "path not found" } else { "unreadable: $($_.Exception.Message.Split("`n")[0])" }
+            Fact "instance ${iname} sqlservr.exe: n/a (${st}: $exe)"
+        }
+    }
+    $names.Close(); $base.Close()
 }
 foreach ($u in $unresWhy) { Fact "install dir of $($u -replace ':.*$', ''): n/a ($($u -replace '^[^:]*: ', ''))" }
 foreach ($h in $AgentHome) { Fact "-AgentHome given: $h (exists: $(Test-Path -LiteralPath $h))" }

@@ -3,7 +3,7 @@
 > **Status: v0 implemented** (2026-07-16; validated at `collect-db.sh` 0.1.x
 > on mock install trees and live PostgreSQL 16 / MySQL 8.4 — see "Verification
 > status"; the script's own `VERSION` is the current one; `collect-db-mssql.ps1`
-> validated at 0.5.0 on Windows Server 2022). Owned by the DB domain team once
+> validated at 0.6.0 on Windows Server 2022). Owned by the DB domain team once
 > handed over (CONTRACT rule 4); until then managed by the Global team.
 > Scope grounded in a full read of #ext-db-모니터링-기술문의 (2025-04 → 2026-07,
 > ~282 field questions) plus deep-reads of the four longest support threads.
@@ -84,6 +84,15 @@ and run `tools/sync-shared-block.sh --apply`.
    OpenSSH a non-administrator gets a network logon that WMI refuses
    ("Access denied" on every CIM read, after which the run stops asking);
    the same account in a local logon reads the process list.
+
+   Section B also gives each SQL Server instance installed on the host where
+   it runs: `Version`, `PatchLevel` and `Edition` from
+   `HKLM\SOFTWARE\Microsoft\Microsoft SQL Server\<instance id>\Setup`
+   (instance ids from `...\Instance Names\SQL`, in the 64-bit and the 32-bit
+   registry view) and the FileVersion of `<SQLBinRoot>\sqlservr.exe`. Any
+   account reads them, elevated or not, and no SQL login is used; a host
+   without SQL Server says `none (registry key not found)`. `mssql.sql`
+   still gives `@@VERSION` of the engine it connects to.
 
 No agent process running, or one whose install dir the report says it could
 not resolve? Point the collector at the install dir:
@@ -212,7 +221,7 @@ Collection-server-side facts (server version, metrics categories) belong to
   `oracle.sql` and `windows/mssql.sql` are syntax-reviewed only — first field
   runs double as their validation. The Nashorn (JDK 8 jrunscript) runner path
   is untested on a live JDK 8.
-- `collect-db-mssql.ps1`: validated at 0.5.0 on Windows Server 2022 Standard
+- `collect-db-mssql.ps1`: validated at 0.6.0 (0.5.0 first) on Windows Server 2022 Standard
   Evaluation 10.0.20348 (lab VM jjsong-ggt-win) under Windows PowerShell
   5.1.20348.558 and pwsh 7.6.6, 2026-09-26: SQL Server 2022 Express
   16.0.1000.6 with two instances (`SQLEXPRESS` on 1433, `DBX2` on 14330) and
@@ -227,6 +236,12 @@ Collection-server-side facts (server version, metrics categories) belong to
   directory (the `!!` line and exit 1), `RUN_DEADLINE` / `CMD_TIMEOUT` and
   invalid values of them. Every `-File` report passes `validate.sh --report`.
   Before 0.3.0 it was not runnable (`-Home` clashed with `$HOME`).
+  0.6.0 (2026-09-27, same host) was run beside 0.5.1 under both PowerShells,
+  elevated, not elevated in a local logon and over OpenSSH: the only
+  differences are the new section B lines, identical in every run
+  (`Version=16.0.1000.6 PatchLevel=16.0.1000.6 Edition=Express Edition`,
+  sqlservr.exe `FileVersion=2022.0160.1000.06 ((SQL22_RTM).221008-0913)`,
+  32-bit view `none`); every report passes `validate.sh --report`.
 - `windows/mssql.sql` ran against both instances through `sqlcmd -S
   localhost,<port> -E -i mssql.sql` as a sysadmin and as a Windows login
   holding only VIEW SERVER STATE and VIEW ANY DEFINITION: every batch ran

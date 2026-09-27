@@ -5,6 +5,18 @@ newest first. Every change to the script bumps its `VERSION` and adds one
 entry at the top of this list (docs/authoring-guide.md, step 2);
 `tools/validate.sh` checks that the newest entry is the script's `VERSION`.
 
+- **0.6.0** — The runtime each process actually loaded is in the default run:
+  section D lists, per w3wp and per dotnet.exe (the first 10), the loaded
+  clr.dll, coreclr.dll and aspnetcorev2*.dll with their FileVersion, from
+  the module list already read for the profiler modules (a dotnet.exe
+  whose list cannot be read now says so instead of printing nothing).
+  Section J prints each web.config's `hostingModel` lines verbatim, as it
+  does the targetFramework lines. Windows PowerShell 5.1 lists only the
+  WOW64 layer of a 32-bit process, so the 32-bit Classic32 pool read "none"
+  for its profiler modules while pwsh 7 listed its clr.dll (lab host,
+  2026-09-27); such a process's list is now read by the 32-bit Windows
+  PowerShell, one bounded call for all of them (about 1–3 s: 2.8 s and 0.8 s in two lab runs), and its lines
+  say so.
 - **0.5.1** — The shared blocks (templates/groups/ps1.ps1) are synced by
   tools/sync-shared-block.sh; report unchanged.
 - **0.5.0** — First runs on a real Windows host (Windows Server 2022 Standard Eval

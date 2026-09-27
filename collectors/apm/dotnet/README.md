@@ -1,6 +1,6 @@
 # collectors/apm/dotnet — WhaTap .NET APM agent collector (Windows)
 
-> **Status: SEEDED (v0; validated at: 0.5.0 on Windows Server 2022 Standard
+> **Status: SEEDED (v0; validated at: 0.6.0 on Windows Server 2022 Standard
 > Evaluation 10.0.20348 under Windows PowerShell 5.1.20348.558 and pwsh 7.6.6,
 > elevated and not elevated, with a simulated agent, 2026-09-26; see
 > "Validation" below).**
@@ -83,13 +83,13 @@ redirection as UTF-16LE; `tools/validate.sh --report` rejects such a copy.
 | 2 | A. Host & platform | OS build, memory, clock+timezone, IIS version, .NET Framework `NDP\v4\Full` Release/Version, `dotnet --list-runtimes` / `--list-sdks` |
 | 3 | B. Agent installation on disk | uninstall registry entries (**DisplayVersion** = the product version), agent-home candidates from every discovery source with existence+marker flags, per-home inventory (`core\`, `net461\`, `net6.0\` with sizes/mtimes/FileVersions), **native profiler DLL mtime+SHA256**, net461 facade assembly versions, `VERSION` file, GAC_MSIL inventory of the 9 installer-set assemblies, machine `Path` (registry) leftovers, ISAPI filter dll presence |
 | 4 | C. Profiler registration & environment scopes | machine env registry vs **W3SVC/WAS service `Environment` (multi-sz, verbatim)** vs collector-process env; for every configured `*_PROFILER_PATH` / `DOTNET_STARTUP_HOOKS` value: does that exact file exist (+ its facts); CLSID `{21CAE18A-…}` and legacy `{D76F1D76-…}` InProcServer32 in both registry views; Fusion log settings (read-only); `applicationHost.config` lines naming COR/WHATAP variables |
-| 5 | D. WhaTap service & runtime processes | `WhaTap .NET` service state/account/binpath/pid, whatap-named processes, per w3wp: pid ↔ app pool (from `-ap`), exe path bitness marker, **loaded profiler-related modules** (WhaTap and other APM vendors — surfaces profiler-slot conflicts as facts), dotnet.exe processes |
+| 5 | D. WhaTap service & runtime processes | `WhaTap .NET` service state/account/binpath/pid, whatap-named processes, per w3wp: pid ↔ app pool (from `-ap`), exe path bitness marker, **loaded profiler-related modules** (WhaTap and other APM vendors — surfaces profiler-slot conflicts as facts), **loaded runtime modules** (`clr.dll`, `coreclr.dll`, `aspnetcorev2*.dll` with FileVersion: the runtime build actually running), dotnet.exe processes with their loaded runtime modules |
 | 6 | E. IIS topology | app pools (state, CLR version, pipeline, `enable32BitAppOnWin64`, identity), sites/apps/vdirs with physical paths, ISAPI filters — via appcmd, WebAdministration, or applicationHost.config fallback |
 | 7 | F. Agent configuration | `whatap.conf` verbatim per home **plus byte facts (first bytes/BOM, CR count)** |
 | 8 | G. Agent logs | both log dirs (`C:\ProgramData\WhaTap\dotnet\logs` fixed + `<home>\logs` legacy): inventory with **file owners**, native `core-YYYYMMDD.log` banner+head+tail, newest tracer log version/identity lines+head+tail, exception-line count, **PID-named log files cross-referenced against currently running PIDs** (PID-reuse leftovers owned by another pool's identity have caused w3wp CPU spins), audit dir presence/size only, `WT_TRACE_LOG_PATH` override |
 | 9 | H. Network endpoints | `netstat -ano` lines on port 6600 with owning pids (local tracer→daemon UDP and daemon→server TCP), one live TCP probe per `whatap.server.host:whatap.server.port` endpoint named in any conf |
 | 10 | I. Windows event logs | Application log (.NET Runtime / ASP.NET / Application Error / WER / WhaTap) and System log (WAS/W3SVC/HTTP), bounded to last 7 days, capped counts |
-| 11 | J. Application facts | per IIS app (≤10, capped with a note): `web.config` targetFramework lines + `<runtime>` assemblyBinding block verbatim, `bin\` facade assembly versions (`System.Net.Http` and friends — the assembly-binding case), `bin\Whatap.*` files, .NET Core markers (`*.runtimeconfig.json` dumped) |
+| 11 | J. Application facts | per IIS app (≤10, capped with a note): `web.config` targetFramework lines and ASP.NET Core `hostingModel` lines + `<runtime>` assemblyBinding block verbatim, `bin\` facade assembly versions (`System.Net.Http` and friends — the assembly-binding case), `bin\Whatap.*` files, .NET Core markers (`*.runtimeconfig.json` dumped) |
 
 ## Reading the report (explanations kept out of the report)
 
@@ -106,9 +106,18 @@ redirection as UTF-16LE; `tools/validate.sh --report` rejects such a copy.
   `C:\ProgramData\WhaTap\dotnet\logs`.
 - Reading IIS configuration through appcmd needs elevation; section J says
   whether the run was elevated when appcmd returned no vdir lines.
+- Windows PowerShell 5.1 (.NET Framework) lists only the WOW64 layer of a
+  32-bit process (ntdll, wow64*.dll). For a 32-bit w3wp (an app pool with
+  `enable32BitAppOnWin64`) the collector then reads the module list again
+  through the 32-bit Windows PowerShell (`SysWOW64\WindowsPowerShell`), one
+  bounded call for all such processes, and those lines end with `(32-bit
+  process: listed by the 32-bit Windows PowerShell)`. pwsh 7 lists them
+  itself. `clr.dll` is .NET Framework 4.x, `coreclr.dll` .NET (Core),
+  `aspnetcorev2.dll` the ASP.NET Core Module and
+  `aspnetcorev2_inprocess.dll` its in-process handler.
 - Not elevated, Windows hides another account's process details: a w3wp line
   then reads `apppool=n/a (command line not readable)` and `exe=n/a (not
-  readable)`, and its module list `n/a (module list not readable)`.
+  readable)`, and its module lists `n/a (module list not readable)`.
 - Over OpenSSH a non-administrator gets a network logon, and WMI refuses every
   CIM read of such a logon ("Access denied"): the boot time, OS, memory,
   process and service facts are then `n/a`. The same account logged on
@@ -167,7 +176,9 @@ Tier 0 only: read-only registry/file/process queries, bounded reads
 with explicit "omitted" notes). Nothing is written to the target: no registry
 value is set (Fusion settings are only read), no app pool is recycled, no
 iisreset, no service restart. The only external processes executed are
-`appcmd list …`, `dotnet --list-runtimes` / `--list-sdks`, and `netstat -ano`.
+`appcmd list …`, `dotnet --list-runtimes` / `--list-sdks`, `netstat -ano`,
+and, under Windows PowerShell 5.1 with a 32-bit w3wp running, one 32-bit
+Windows PowerShell that lists that process's modules (about 1–3 s on the lab host).
 Registry values are read through the .NET registry API, which answers an
 absent key at once where the PowerShell registry provider took 1.2-1.5 s per
 absent key under `HKLM:\SOFTWARE\Classes`. Managed assemblies are identified via metadata-only reflection
@@ -196,5 +207,6 @@ tools/validate.sh --report whatap-apmdotnet-<host>-<UTC>.txt   # the -File repor
 
 | version | where | how | result |
 |---|---|---|---|
+| 0.6.0 | same host, 2026-09-27 | 0.5.1 and 0.6.0 run side by side under both PowerShells, elevated with all four worker processes up, not elevated in a local logon (scheduled task as `ggtuser`) and over OpenSSH | every `-File` report passes `validate.sh --report`; the only differences are the new lines. Elevated, 5.1 and 7 give the same runtime modules for every w3wp (Framework64 or Framework `clr.dll` 4.8.4420.0, `aspnetcorev2.dll` 18.0.26234.31, `coreclr.dll` 8.0.31 in CoreApp and the Kestrel dotnet.exe); 5.1 reaches Classic32's through the 32-bit read (0.8–2.8 s across runs; the whole run 13–17 s against 14–15 s). Not elevated: `n/a (module list not readable)`, goals as in 0.5.1. |
 | 0.5.0 | Windows Server 2022 Standard Evaluation 10.0.20348 (lab VM jjsong-ggt-win), Windows PowerShell 5.1.20348.558 and pwsh 7.6.6 | IIS 10 with ASP.NET 4.8 pools (64- and 32-bit, one app with a failing `bindingRedirect`), a .NET 8.0.31 in-process pool (ANCM) and a standalone `dotnet.exe`; the WhaTap .NET agent **simulated** as this README describes (install dir, uninstall entry `WhaTap .NET_is1`, machine and W3SVC/WAS service environment, CLSID registration, ProgramData logs, a stopped `WhaTap .NET` service, a `whatap_dotnet.exe` holding UDP 6600), since no installer is publicly downloadable. Elevated (Administrator over OpenSSH), not elevated in a local logon (scheduled task as a Users-only account) and not elevated over OpenSSH; `-File`, `-Stdout`, `--help`, an unknown argument, `RUN_DEADLINE`/`CMD_TIMEOUT`, a clean host without IIS or agent | every `-File` report passes `validate.sh --report`. Elevated: COMPLETE, 15 s (5.1) / 12 s (7), 7 s of it the two collection-server probes of the fixture conf (one refused, one unanswered at its 5 s cap); the same host under 0.4.0 took 24 s / 19 s and its status explained none of it. Not elevated, local logon: INCOMPLETE on `agent configuration` with the privilege hint (the fixture `whatap.conf` is readable by Administrators, SYSTEM and IIS_IUSRS only), 7 s / 3 s. Not elevated over OpenSSH: the same, 14 s / 12 s (was 36 s before the CIM fail-fast). |
 
