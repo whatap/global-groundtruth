@@ -29,7 +29,7 @@ export LC_ALL=C
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-apmnodejs"
 # History: CHANGELOG.md (next to this file).
-VERSION="0.9.0"
+VERSION="0.9.2"
 DOMAIN="apm"
 TARGET="host/$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || uname -n 2>/dev/null || echo unknown)"
 
@@ -781,42 +781,64 @@ cli_version() {
 PKG_VERSION_NAMES="express next @nestjs/core koa fastify whatap"
 PKG_WALK_MAX=32
 PKG_NODE_PATH_MAX=50
+PKG_JSON_BYTES=262144   # bytes of each package.json the version awk reads
 
 # _pkg_ver_line NAME PATH [NOTE] -> "NAME: <version> (PATH[, NOTE])". The value
 # is the top-level "version" of the package.json at PATH, read as text by one
 # awk that tracks brace depth and skips string contents (a nested "version",
 # as in scripts or publishConfig, is not taken; the last top-level one is, as
-# JSON.parse does). A non-string value is printed raw with that said.
+# JSON.parse does). A non-string value is printed raw with that said. Only the
+# first PKG_JSON_BYTES bytes are read (busybox awk took minutes on a 1 MB
+# single-line file); a file cut there says so when no version was found in it.
+# fold keeps each awk record at 512 bytes and a string keeps its first 256
+# bytes (both were quadratic in busybox awk on long lines); the parse state
+# carries across records, and a token ends only at a delimiter or at EOF.
 _pkg_ver_line() {
-    local v
+    local v _t
     if [ ! -r "$2" ]; then printf '           %s: n/a (permission denied: %s%s)\n' "$1" "$2" "${3:+; $3}"; return; fi
-    v="$(awk '
+    v="$(head -c "$PKG_JSON_BYTES" "$2" 2>/dev/null | fold -b -w 512 | awk '
+        # a key written with \u00XX escapes (ver\u0073ion) is compared decoded
+        function un(x,  o, i) {
+            o = ""
+            while ((i = index(x, "\\u00")) > 0) {
+                o = o substr(x, 1, i - 1) sprintf("%c", 16 * (index(H, tolower(substr(x, i + 4, 1))) - 1) + index(H, tolower(substr(x, i + 5, 1))) - 1)
+                x = substr(x, i + 6)
+            }
+            return o x
+        }
+        BEGIN { H = "0123456789abcdef" }
         { n = length($0)
           for (i = 1; i <= n; i++) {
             c = substr($0, i, 1)
             if (ins) {
-                if (esc) { esc = 0; s = s c; continue }
-                if (c == "\\") { esc = 1; s = s c; continue }
+                if (esc) { esc = 0; if (sl++ < 256) s = s c; continue }
+                if (c == "\\") { esc = 1; if (sl++ < 256) s = s c; continue }
                 if (c == "\"") { ins = 0
                     if (d == 1) { if (ac) { if (w) { r = "S" s; w = 0 } } else k = s }
                     continue }
-                s = s c; continue
+                if (sl++ < 256) s = s c; continue
             }
-            if (c == "\"") { ins = 1; s = ""; continue }
+            if (c == "\"") { ins = 1; s = ""; sl = 0; continue }
             if (tok != "" && (c == "," || c == "}" || c == "]" || c == " " || c == "\t" || c == "\r")) { r = "R" tok; tok = ""; w = 0 }
             if (c == "{" || c == "[") { if (d == 1 && w) { r = "R" c; w = 0 } d++; continue }
             if (c == "}" || c == "]") { d--; continue }
             if (d != 1) continue
-            if (c == ":") { ac = 1; w = (k == "version"); continue }
+            if (c == ":") { ac = 1; w = (k == "version" || (index(k, "\\u") && un(k) == "version")); continue }
             if (c == ",") { ac = 0; w = 0; k = ""; continue }
             if (w && c != " " && c != "\t" && c != "\r") tok = tok c
           }
-          if (tok != "") { r = "R" tok; tok = ""; w = 0 } }
-        END { print substr(r, 1, 81) }' "$2" 2>/dev/null)"
+        }
+        END { if (tok != "") r = "R" tok
+              print substr(r, 1, 81) }' 2>/dev/null)"
     case "$v" in
         S?*) printf '           %s: %s (%s%s)\n' "$1" "${v#S}" "$2" "${3:+, $3}" ;;
         R?*) printf '           %s: n/a (top-level "version" is not a string: %s; %s%s)\n' "$1" "${v#R}" "$2" "${3:+, $3}" ;;
-        *)   printf '           %s: n/a (no top-level "version" in %s%s)\n' "$1" "$2" "${3:+; $3}" ;;
+        *)   _t="$({ wc -c < "$2"; } 2>/dev/null | tr -d ' ')"
+             if [ "${_t:-0}" -gt "$PKG_JSON_BYTES" ] 2>/dev/null; then
+                 printf '           %s: n/a (no top-level "version" in the first %s bytes of %s%s)\n' "$1" "$PKG_JSON_BYTES" "$2" "${3:+; $3}"
+             else
+                 printf '           %s: n/a (no top-level "version" in %s%s)\n' "$1" "$2" "${3:+; $3}"
+             fi ;;
     esac
 }
 
@@ -837,10 +859,18 @@ _pkg_versions() {
         return
     fi
     eval "np=\${_np_$pid:-}"
+    # entries past the cap: counted once per process, never visited
+    more=0
+    if [ -n "$np" ]; then
+        _o="$IFS"; IFS=":$_nl"; set -f; j=0
+        for e in $np; do [ -n "$e" ] && j=$((j + 1)); done
+        set +f; IFS="$_o"
+        [ "$j" -gt "$PKG_NODE_PATH_MAX" ] && more=$((j - PKG_NODE_PATH_MAX))
+    fi
     printf '           installed packages (package.json "version"; <dir>/node_modules from cwd up to %s dirs, then NODE_PATH%s):\n' \
         "$PKG_WALK_MAX" "${pre:+; read through $pre}"
     for name in $PKG_VERSION_NAMES; do
-        found="" den="" d="$cwd" i=0 more=0
+        found="" den="" d="$cwd" i=0
         while [ "$i" -lt "$PKG_WALK_MAX" ]; do
             i=$((i + 1))
             case "$d" in
@@ -861,7 +891,7 @@ _pkg_versions() {
             for e in $np; do
                 [ -n "$e" ] || continue
                 j=$((j + 1))
-                [ "$j" -gt "$PKG_NODE_PATH_MAX" ] && { more=$((more + 1)); continue; }
+                [ "$j" -gt "$PKG_NODE_PATH_MAX" ] && break
                 case "$e" in /*) ;; *) e="${cwd%/}/${e#./}" ;; esac
                 c="${e%/}/$name/package.json"
                 if [ -e "$pre$c" ]; then _pkg_ver_line "$name" "$pre$c" "via NODE_PATH${den:+; $den}"; found=1; break; fi

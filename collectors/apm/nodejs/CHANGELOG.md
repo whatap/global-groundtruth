@@ -5,6 +5,20 @@ first. Every change to the script bumps its `VERSION` and adds one entry at
 the top of this list (docs/authoring-guide.md, step 2); `tools/validate.sh`
 checks that the newest entry is the script's `VERSION`.
 
+- **0.9.2** — The version reader folds its input to 512-byte lines and keeps
+  the first 256 bytes of each string; busybox awk spent 47-50 s per
+  package.json holding one long single-line string inside the 256 KiB read,
+  now under 2 s. A key written with `\u00XX` escapes (`ver\u0073ion`) is
+  compared decoded, as JSON.parse does. Values read are otherwise unchanged
+  (checked against node on the verifier's fixtures under bash, dash, bash
+  3.2 and busybox).
+- **0.9.1** — The version reader reads at most the first 262144 bytes of each
+  package.json (busybox awk took minutes on a 1 MB single-line file); a file
+  cut there without a version found says `in the first 262144 bytes`. The
+  NODE_PATH walk stops at its cap of 50 instead of stepping through the rest
+  for every package, and the entries past it are counted once per process
+  (3000 entries x 20 processes cost +6.8 s in bash). Report otherwise
+  unchanged.
 - **0.9.0** — Section 4 prints, for each whatap-marked node process, the
   installed `version` of express, next, @nestjs/core, koa, fastify and whatap:
   the package.json that node's lookup from the process cwd reaches
