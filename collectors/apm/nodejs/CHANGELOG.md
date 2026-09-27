@@ -5,6 +5,25 @@ first. Every change to the script bumps its `VERSION` and adds one entry at
 the top of this list (docs/authoring-guide.md, step 2); `tools/validate.sh`
 checks that the newest entry is the script's `VERSION`.
 
+- **0.9.0** — Section 4 prints, for each whatap-marked node process, the
+  installed `version` of express, next, @nestjs/core, koa, fastify and whatap:
+  the package.json that node's lookup from the process cwd reaches
+  (`<dir>/node_modules/<pkg>` for the cwd and its parents, at most 32 dirs,
+  then at most 50 NODE_PATH entries, labelled `via NODE_PATH`), as `pkg:
+  version (path)` or `n/a (<why>)`. Only the top-level `"version"` string is
+  read (one awk tracking brace depth, strings skipped), so a nested
+  `scripts.version` / `publishConfig.version` is not taken; a non-string value
+  says so. A node_modules dir this uid cannot search is named (`permission
+  denied`), a marked process whose cwd is unreadable says `permission denied:
+  /proc/<pid>/cwd`, and a process in another mount namespace is read through
+  `/proc/<pid>/root`. Checked against node's own `require.resolve` and
+  JSON reading on 17 fixture apps (bash, dash, bash 3.2). Until now the report carried only the declared
+  dependency ranges of the app package.json. In the operator image the
+  `whatap` line reads 2.0.3 from `/whatap-agent/node_modules/whatap` via
+  NODE_PATH, the path `require.resolve('whatap')` gives from /app; with
+  `require('whatap')` in the app it reads 2.0.6 from
+  `/app/node_modules/whatap` (jjsong-ggt-apm-nodejs:1 and -op:1, 2026-09-27).
+  Report otherwise unchanged.
 - **0.8.6** — `apm: file helpers`/`apm: conf bytes` (templates/groups/apm.sh):
   `wc -l`/`wc -c`/`tr -dc '\r'` reading an unreadable file no longer leak
   "Permission denied" to the operator's stderr (the `<` redirect ran before

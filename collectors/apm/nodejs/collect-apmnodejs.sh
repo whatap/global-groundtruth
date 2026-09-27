@@ -29,7 +29,7 @@ export LC_ALL=C
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-apmnodejs"
 # History: CHANGELOG.md (next to this file).
-VERSION="0.8.6"
+VERSION="0.9.0"
 DOMAIN="apm"
 TARGET="host/$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || uname -n 2>/dev/null || echo unknown)"
 
@@ -775,6 +775,113 @@ cli_version() {
     else probe "$1 ($2 --version)" "$2" --version; fi
 }
 
+# Packages whose installed version section 4 reads for each whatap-marked node
+# process, the number of directories the node_modules walk visits (the cwd and
+# its parents, up to /), and the number of NODE_PATH entries it visits.
+PKG_VERSION_NAMES="express next @nestjs/core koa fastify whatap"
+PKG_WALK_MAX=32
+PKG_NODE_PATH_MAX=50
+
+# _pkg_ver_line NAME PATH [NOTE] -> "NAME: <version> (PATH[, NOTE])". The value
+# is the top-level "version" of the package.json at PATH, read as text by one
+# awk that tracks brace depth and skips string contents (a nested "version",
+# as in scripts or publishConfig, is not taken; the last top-level one is, as
+# JSON.parse does). A non-string value is printed raw with that said.
+_pkg_ver_line() {
+    local v
+    if [ ! -r "$2" ]; then printf '           %s: n/a (permission denied: %s%s)\n' "$1" "$2" "${3:+; $3}"; return; fi
+    v="$(awk '
+        { n = length($0)
+          for (i = 1; i <= n; i++) {
+            c = substr($0, i, 1)
+            if (ins) {
+                if (esc) { esc = 0; s = s c; continue }
+                if (c == "\\") { esc = 1; s = s c; continue }
+                if (c == "\"") { ins = 0
+                    if (d == 1) { if (ac) { if (w) { r = "S" s; w = 0 } } else k = s }
+                    continue }
+                s = s c; continue
+            }
+            if (c == "\"") { ins = 1; s = ""; continue }
+            if (tok != "" && (c == "," || c == "}" || c == "]" || c == " " || c == "\t" || c == "\r")) { r = "R" tok; tok = ""; w = 0 }
+            if (c == "{" || c == "[") { if (d == 1 && w) { r = "R" c; w = 0 } d++; continue }
+            if (c == "}" || c == "]") { d--; continue }
+            if (d != 1) continue
+            if (c == ":") { ac = 1; w = (k == "version"); continue }
+            if (c == ",") { ac = 0; w = 0; k = ""; continue }
+            if (w && c != " " && c != "\t" && c != "\r") tok = tok c
+          }
+          if (tok != "") { r = "R" tok; tok = ""; w = 0 } }
+        END { print substr(r, 1, 81) }' "$2" 2>/dev/null)"
+    case "$v" in
+        S?*) printf '           %s: %s (%s%s)\n' "$1" "${v#S}" "$2" "${3:+, $3}" ;;
+        R?*) printf '           %s: n/a (top-level "version" is not a string: %s; %s%s)\n' "$1" "${v#R}" "$2" "${3:+, $3}" ;;
+        *)   printf '           %s: n/a (no top-level "version" in %s%s)\n' "$1" "$2" "${3:+; $3}" ;;
+    esac
+}
+
+# _pkg_versions PID CWD -> one line per PKG_VERSION_NAMES entry: the package.json
+# of NAME that node's lookup from CWD reaches: <dir>/node_modules/NAME for CWD
+# and each parent (a dir itself named node_modules is skipped, as node does),
+# then each NODE_PATH entry of PID (a relative one taken against CWD). Files
+# are read through /proc/PID/root when PID is in another mount namespace
+# (its root is not this one). A node_modules (or @scope) dir this uid cannot
+# search is named, and the walk goes on past it as node's does. Other lookup
+# locations (the requiring file's own directory, $HOME/.node_modules,
+# <prefix>/lib/node) are not visited.
+_pkg_versions() {
+    local pid="$1" cwd="$2" pre="" name d i c e np _o found den nm sc j more
+    [ "/proc/$pid/root" -ef / ] || pre="/proc/$pid/root"
+    if [ -n "$pre" ] && [ ! -d "$pre$cwd" ]; then
+        printf '           installed packages: n/a (%s)\n' "$(_absent_why "$cwd" "cwd of node pid $pid")"
+        return
+    fi
+    eval "np=\${_np_$pid:-}"
+    printf '           installed packages (package.json "version"; <dir>/node_modules from cwd up to %s dirs, then NODE_PATH%s):\n' \
+        "$PKG_WALK_MAX" "${pre:+; read through $pre}"
+    for name in $PKG_VERSION_NAMES; do
+        found="" den="" d="$cwd" i=0 more=0
+        while [ "$i" -lt "$PKG_WALK_MAX" ]; do
+            i=$((i + 1))
+            case "$d" in
+                */node_modules) ;;
+                *) nm="${d%/}/node_modules"
+                   c="$nm/$name/package.json"
+                   if [ -e "$pre$c" ]; then _pkg_ver_line "$name" "$pre$c" "$den"; found=1; break; fi
+                   sc=""; case "$name" in */*) sc="$nm/${name%%/*}" ;; esac
+                   if [ -d "$pre$nm" ] && [ ! -x "$pre$nm" ]; then den="${den:+$den; }permission denied: $pre$nm"
+                   elif [ -n "$sc" ] && [ -d "$pre$sc" ] && [ ! -x "$pre$sc" ]; then den="${den:+$den; }permission denied: $pre$sc"; fi ;;
+            esac
+            [ "$d" = / ] && break
+            d="${d%/*}"; [ -n "$d" ] || d=/
+        done
+        [ -n "$found" ] && continue
+        if [ -n "$np" ]; then
+            _o="$IFS"; IFS=":$_nl"; set -f; j=0
+            for e in $np; do
+                [ -n "$e" ] || continue
+                j=$((j + 1))
+                [ "$j" -gt "$PKG_NODE_PATH_MAX" ] && { more=$((more + 1)); continue; }
+                case "$e" in /*) ;; *) e="${cwd%/}/${e#./}" ;; esac
+                c="${e%/}/$name/package.json"
+                if [ -e "$pre$c" ]; then _pkg_ver_line "$name" "$pre$c" "via NODE_PATH${den:+; $den}"; found=1; break; fi
+                if [ -d "$pre$e" ] && [ ! -x "$pre$e" ]; then den="${den:+$den; }permission denied: $pre$e"; fi
+            done
+            set +f; IFS="$_o"
+        fi
+        [ -n "$found" ] && continue
+        [ "$more" -gt 0 ] && den="${den:+$den; }$more more NODE_PATH entries not visited (cap: $PKG_NODE_PATH_MAX)"
+        if [ "$d" != / ]; then
+            printf '           %s: n/a (not found in node_modules of %s and its parents up to %s dirs; not visited: %s and above%s%s)\n' \
+                "$name" "$cwd" "$PKG_WALK_MAX" "$d" "${np:+; nor in NODE_PATH}" "${den:+; $den}"
+        elif [ -r "/proc/$pid/environ" ]; then
+            printf '           %s: n/a (not found in node_modules of %s and its parents%s%s)\n' "$name" "$cwd" "${np:+, nor in NODE_PATH}" "${den:+; $den}"
+        else
+            printf '           %s: n/a (not found in node_modules of %s and its parents; NODE_PATH not read: permission denied: /proc/%s/environ%s)\n' "$name" "$cwd" "$pid" "${den:+; $den}"
+        fi
+    done
+}
+
 # ---- apm: process table — DO NOT EDIT ---------------------------------------
 # members: apmnodejs apmphp apmpython
 # _proc_table -> one line per process that has a command line, fields joined by
@@ -1023,6 +1130,8 @@ _scan_gaps() {
 }
 # ---- end apm: environ readers
 
+# _np_PID: the NODE_PATH of a node PID ("" when unset or its environ was not
+# read); _mk_PID=1: the PID carries a whatap marker (cmdline, env, cwd install)
 # _cwd_of PID -> _cw = the cwd discovery resolved for a node PID ("" when it
 # could not be read), so the report does not fork a readlink per process again
 _cw=""
@@ -1080,6 +1189,7 @@ discover() {
             [ -n "$_ev_WHATAP_CONF" ] && _add_conf_name "$_ev_WHATAP_CONF"
             case "$_nl$_env" in *"${_nl}WHATAP_"*) _mk=1 ;; esac
             case "$_ev_NODE_OPTIONS" in *whatap*) _mk=1 ;; esac
+            eval "_np_$pid=\$_ev_NODE_PATH"
             # package dirs referenced by NODE_PATH
             # split on ':' (and newline) in this shell, globbing off
             v="$_ev_NODE_PATH"
@@ -1100,7 +1210,7 @@ discover() {
             _mk=1
         fi
         [ -n "$cwd" ] && [ -e "$cwd/node_modules/whatap/package.json" ] && _add_pkg_dir "$cwd/node_modules/whatap" "cwd of node pid $pid"
-        if [ "$_mk" = 1 ]; then _am="$_am $pid"; [ -n "$exe" ] && _ndm="$_ndm$exe$_nl"
+        if [ "$_mk" = 1 ]; then _am="$_am $pid"; eval "_mk_$pid=1"; [ -n "$exe" ] && _ndm="$_ndm$exe$_nl"
         else _ar="$_ar $pid"; [ -n "$exe" ] && _ndr="$_ndr$exe$_nl"; fi
     done <<EOF
 $(_proc_table)
@@ -1573,7 +1683,7 @@ EOF
 # [4] runtime processes
 _rep_procs() {
     section "Runtime processes"
-    local pid n
+    local pid n _m
     if [ -z "$D_GO_PIDS" ]; then
         fact "master agent (whatap_nodejs) processes: none found in /proc"
     else
@@ -1629,6 +1739,11 @@ _rep_procs() {
                 printf '           cwd/node_modules/whatap: present -> %s\n' "$(readlink -f "$cwd/node_modules/whatap" 2>/dev/null)"
             else
                 printf '           cwd/node_modules/whatap: absent\n'
+            fi
+            eval "_m=\${_mk_$pid:-}"
+            if [ -n "$_m" ]; then
+                if [ -n "$cwd" ]; then _pkg_versions "$pid" "$cwd"
+                else printf '           installed packages: n/a (permission denied: /proc/%s/cwd)\n' "$pid"; fi
             fi
         done
     fi

@@ -83,12 +83,46 @@ Container notes:
 | 1 | Collection environment | which tools were available to this collection |
 | 2 | Host / platform | OS, arch, container markers (they decide daemon-vs-foreground master agent), cgroup CPU/memory limits (the agent reports host-view CPU from the Node `os` module, so container-vs-host metric questions need these) |
 | 3 | Node.js runtimes and whatap package installs | every node binary with `--version`; every `whatap` install found via process cwds (pnpm symlinks resolved), NODE_PATH, `npm root -g` (run once), `<prefix>/lib/node_modules` of each node binary (found without npm), `/whatap-agent` — per install: package.json `version`/`releaseDate`/`engines` (the 0.5.x-vs-2.x fork), `build.txt` (master-agent build id), bundled `agent/<os>/<arch>/whatap_nodejs` binaries (none on the 0.5.x line, which has no master agent), **instrumentation surface** (`lib/observers` list, differs per version), conf template, `paramkey.txt` presence |
-| 4 | Runtime processes | `whatap_nodejs` master agents (none on the 0.5.x line; 1.x/2.x spawn one per agent home) with cmdline (`-t 2 -d 1`, `--llm`), cwd, and env (`NODEJS_PARENT_APP_PID` links master → app; `APP_IDENTIFIER` is the `<id8>` in file names); node processes (matched by comm, argv0 or `/proc/<pid>/exe`, since pm2 and next-server rename the process title; whatap-marked ones detailed first) with `-r/--require` detection, `NODE_OPTIONS`/`WHATAP_*`/`POD_NAME`/PM2 env, and `cwd/node_modules/whatap` resolution |
+| 4 | Runtime processes | `whatap_nodejs` master agents (none on the 0.5.x line; 1.x/2.x spawn one per agent home) with cmdline (`-t 2 -d 1`, `--llm`), cwd, and env (`NODEJS_PARENT_APP_PID` links master → app; `APP_IDENTIFIER` is the `<id8>` in file names); node processes (matched by comm, argv0 or `/proc/<pid>/exe`, since pm2 and next-server rename the process title; whatap-marked ones detailed first) with `-r/--require` detection, `NODE_OPTIONS`/`WHATAP_*`/`POD_NAME`/PM2 env, and `cwd/node_modules/whatap` resolution; for each whatap-marked process, the **installed versions** of express, next, @nestjs/core, koa, fastify and whatap (see "Installed package versions" below) |
 | 5 | Agent homes and configuration | every WHATAP_HOME candidate (env, port registry, process cwd/environ, `/whatap-agent`), and per home: `whatap.conf` verbatim **plus byte facts (size, CR 0x0D count — Windows-edited conf files are a recurring support case)**, alternate `WHATAP_CONF` names, `container.conf` (written by the k8s node agent), `whatap_nodejs` symlink resolution, pid-file liveness (`agent-<id8>.pid` vs legacy `whatap_nodejs.pid` — they differ by design after daemonization), lock files, `whatap_port_<pid>`, `run/`, `security.conf` / `paramkey.txt` presence and size, `logs/` inventory. A home that cannot be read says `path not found` or `permission denied` |
 | 6 | Network endpoints and port registry | UDP sockets **including connected peers** (the 2.x app holds a connected UDP socket to `127.0.0.1:<net_udp_port>`, visible in `ss -uanp`) on 66xx/67xx plus the `net_udp_port` named in the readable conf files, that port + 100 (the LLM channel) and the ports in the registry, TCP sessions on 6600 plus the `whatap.server.port` / `whatap_server_port` named there (each port labelled by its source), plus every socket of a whatap- or node-named process; without `ss`/`netstat`, the raw `/proc/net/udp|tcp` tables (ports in hex, 6600 = `19C8`); `/tmp/whatap-nodejs.lock` contents (format: `udp-port<TAB>home:app-identifier`) |
 | 7 | Agent logs | newest hook log (`*-hook-*.log`, 2.x) head+tail, **observer lines** (`XxxObserver starting!` / `unable to load <module>` — which hooks engaged, or could not engage, in this process), a `[WHATAP-*]` code frequency count, legacy `whatap-YYYYMMDD.log` (0.5.x), rotation-off `whatap.log`, master-agent `whatap-boot-*.log` head+tail with a `[WA*]` code count, reqlog presence — all bounded reads. The startup banner goes to the **app's stdout**, not to these files |
 | 8 | Application and launcher facts | how the app is started decides how the agent attaches: pm2 daemon + its launcher config `ecosystem.config.*`, app `package.json` (name, whatap lines, scripts block, **dependencies block**), **`node_modules` top-level package names** (what the app actually has installed), Next.js `next.config.*` (`serverExternalPackages`) and `instrumentation.*` whatap lines, `.next`/standalone markers, pnpm store entries |
 | 9 | Kubernetes / operator injection context | `/whatap-agent` volume as seeded by `apm-init-nodejs` (incl. the arch-resolved stable path `node_modules/whatap/agent/whatap_nodejs`), `WHATAP_NODEJS_AGENT_PATH` (symlink vs regular file), `POD_NAME`/`NODE_NAME`/`NODE_IP`/`WHATAP_OKIND`/`WHATAP_MICRO_ENABLED`, k8s markers |
+
+## Installed package versions
+
+The app `package.json` gives declared ranges (`"express": "^4.18.0"`);
+whether an environment is in the supported range is decided by what is
+installed. For each whatap-marked node process section 4 reads the
+`"version"` line of `<dir>/node_modules/<pkg>/package.json` for express,
+next, @nestjs/core, koa, fastify and whatap, where `<dir>` is the process
+cwd and then each parent (at most 32 directories, a directory itself named
+`node_modules` skipped), then the `NODE_PATH` entries of that process (at most
+50; a relative one taken against the cwd). The first file found is printed as
+`pkg: version (path)`; one found through `NODE_PATH` says `via NODE_PATH`.
+Only the top-level `"version"` string is taken (brace depth tracked, string
+contents skipped), so `scripts.version` or `publishConfig.version` never
+stands in for it; a non-string value is printed with `not a string`. A
+`node_modules` or `@scope` directory this uid cannot search is named as
+`permission denied`, and a marked process whose cwd cannot be read says
+`permission denied: /proc/<pid>/cwd`. When the process is in another mount
+namespace (a host run against a container), the files are read through
+`/proc/<pid>/root` and the path printed carries that prefix.
+
+This is the order node uses for a module preloaded with `-r whatap` /
+`NODE_OPTIONS=-r whatap`, which is resolved from the cwd, so the `whatap`
+line names the package that preload loads. It can differ from the agent
+installs listed in section 3: in the operator image `/app` has no
+`node_modules/whatap`, and the line reads 2.0.3 from
+`/whatap-agent/node_modules/whatap` via NODE_PATH, the same path
+`require.resolve('whatap')` gives from `/app`. A `require()` in application
+code resolves from the requiring file's directory instead, and node's other
+fallbacks (`$HOME/.node_modules`, `$HOME/.node_libraries`, `<prefix>/lib/node`)
+are not visited; for a process whose main script lives outside its cwd the
+lines show the cwd's view. A loaded JavaScript file does not appear in
+`/proc/<pid>/maps`, so the report does not show which file a running process
+actually loaded.
 
 ## Collection status
 
@@ -123,7 +157,8 @@ this list. Every place a secret can arrive from:
 - Lines of `next.config.*` naming whatap / `serverExternalPackages` /
   `transpilePackages` / `externals`, and lines of `instrumentation.*` naming
   whatap / `register` / `NEXT_RUNTIME`.
-- `node_modules` top-level and scoped package names.
+- `node_modules` top-level and scoped package names, and the `version` of
+  express, next, @nestjs/core, koa, fastify and whatap with their paths.
 - Heads and tails of the hook, agent, boot and rotation-off logs.
 - The collector's own environment: `WHATAP_NODEJS_AGENT_PATH`, `WHATAP_LICENSE`,
   `WHATAP_HOST`, `WHATAP_PORT`, `POD_NAME`, `NODE_NAME`, `NODE_IP`,
