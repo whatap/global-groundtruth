@@ -152,7 +152,11 @@ mechanical cause, not what to do about it.
 A reason on a fact line and the outcome of a goal must agree. A fact reason of
 `permission denied`, `timed out`, `command not found` or a failed call means
 the goal it feeds is `missed`, never `na`: the run did not see, so it cannot
-say the thing is absent (output-format.md, "Three outcomes"). Test for the
+say the thing is absent (output-format.md, "Three outcomes"). The exception
+is a tool that only adds detail (sysstat's `iostat` beside `zpool iostat`):
+it is not an input of another goal, so its absence is a fact line only, and a
+goal whose only inputs are such tools is declared only when one is installed
+(output-format.md, "A tool that only adds detail"). Test for the
 failure explicitly: a glob over an unreadable directory returns the pattern
 itself, `find` exits 1 on a denied subdirectory, and `awk`'s exit code is not
 the exit code of the command piped into it.
@@ -230,7 +234,8 @@ and every collector must keep them.
     connects to, sends no credentials, and left the same server log trace as
     that connect when measured, so it is part of the default run. A
     parameter of an opt-in rides on it as `--feature[=VALUE]`
-    (`--threads[=N]`, `--sample[=SEC]`), not as a second option.
+    (`--threads[=N]`, `--binlog[=N]`, `--with-rotated[=DAYS]`), not as a
+    second option.
   - **Caps and time limits come from the environment**, never from options:
     `CMD_TIMEOUT`, `RUN_DEADLINE`, and per-collector `<THING>_<KIND>` names
     (`APM_INTERP_CAP`, `BINLOG_TIMEOUT`, `LOG_TAIL_LINES`). Validate them
@@ -243,9 +248,13 @@ and every collector must keep them.
     such as `--tail is no longer an option: set LOG_TAIL_LINES=N in the
     environment`, so an old runbook stops instead of running with something
     silently ignored.
-  - The options that still break these rules are being removed:
-    collserver `--max-log-mb` / `--max-total-mb` (caps as options) and
-    collmysql `--no-sudo` (an option that does nothing).
+  - The options that broke these rules were removed, each exiting 2 with
+    its replacement: collserver `--max-log-mb` / `--max-total-mb` (caps as
+    options, now `LOG_FILE_MB` / `LOG_TOTAL_MB`) and `--log-days` (now
+    `--with-rotated=DAYS`) in 0.11.0; collmysql `--no-sudo` (an option that
+    did nothing) and `--sample` (now the window of every run, `--window=DUR`)
+    in 0.10.0; collzfs `--sample`, `--window-start`, `--no-filesizes`,
+    `--filesizes-secs`, `--event-days` and `--hours` in 0.8.0.
 
 - **Leave nothing behind.** Put every temporary file under the run's own
   directory (`_tmp NAME` in the shared block returns a path in it). The shared

@@ -246,6 +246,20 @@ thing it would inspect is there: no `zpool` binary on a host with no
 `/proc/spl` is still `na`, because `/proc/spl` was read and it answers the
 question.
 
+**A tool that only adds detail is not an input of another goal** (decided
+2026-09-26). A tool from an optional package that the host may lack (sysstat's
+`iostat`, procps's `vmstat`) only adds detail. Where a goal rests on other inputs,
+such a tool's absence, failure or cap is a fact line and never blocks that goal:
+collzfs's window rests on the txgs, the kstat deltas and `zpool iostat`, and
+an `iostat -x` that is absent or failed is `not delivered: iostat -x: command
+not found (sysstat)` in section O. Where a goal's only inputs are such tools,
+as collmysql's window (`iostat -x` and `vmstat`), the goal is declared only
+when at least one of them is installed. It is blocked only when every installed
+one failed or the run deadline cut the window; one absent or failed tool of
+two is a fact line (`iostat -x 3 6: n/a (command not found: iostat,
+sysstat)`). So a default run is not INCOMPLETE merely because the host lacks an
+optional package. Name each goal's inputs in the collector's README.
+
 **Which inputs count.** The inputs are those of the candidates the run
 identified, not of everything on the host. A candidate is found from what any
 uid can read (a process's name, argv0 or command line, a fixed path the
