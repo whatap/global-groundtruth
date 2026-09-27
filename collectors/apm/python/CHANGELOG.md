@@ -5,6 +5,9 @@ first. Every change to the script bumps its `VERSION` and adds one entry at
 the top of this list (docs/authoring-guide.md, step 2); `tools/validate.sh`
 checks that the newest entry is the script's `VERSION`.
 
+- **0.10.7** — Comments only; report content unchanged. Shortened long
+  comment runs in `_pyrun`, `_pyreport` and the process-scan comment; the
+  batching rationale now points to README "How each interpreter is asked".
 - **0.10.6** — `apm: file helpers` (templates/groups/apm.sh): `wc -l` reading
   an unreadable file no longer leaks "Permission denied" to the operator's
   stderr (the `<` redirect ran before `2>/dev/null`, so its own failure was

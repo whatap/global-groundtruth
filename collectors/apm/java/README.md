@@ -343,6 +343,43 @@ INT, TERM and HUP.
 No `--bundle` tier yet; copy the bundle plumbing from `collect-collserver.sh`
 if the domain team needs raw log artifacts.
 
+## Design notes
+
+- **`_jvm_opt_val` known gap**: it does not detect a bare, non-option
+  application argument (no `-jar`, e.g. a main class followed by its own
+  `-cp`). The argument sources it searches (`JAVA_TOOL_OPTIONS`,
+  `JDK_JAVA_OPTIONS`, the raw cmdline including its own `argv[0]`,
+  `_JAVA_OPTIONS`, jcmd-recovered args) are concatenated with no marker for
+  where the cmdline segment starts, so a bare token cannot be told apart from
+  `argv[0]` or another source's own value without risking cutting a
+  legitimate option short.
+
+- **`_find_jvms` — four tests, in order**: comm; the resolved exe; a
+  JVM-only whole argument on the command line (a shell wrapper that carries a
+  java invocation as text keeps it in one argument, and interpreters are
+  excluded outright); and last a `libjvm.so` / `libj9vm*.so` mapping in
+  `/proc/<pid>/maps`. The fourth exists for a native launcher that creates the
+  VM in its own process through `JNI_CreateJavaVM` (Axway API Gateway's
+  `vshell` is one): its comm and exe are its own and the JVM options never
+  reach `/proc/<pid>/cmdline`, but the VM library is mapped into it like into
+  every JVM. The mapping is matched, not a name list of launchers (CONTRACT
+  rule 2). It scales with the host, not per process: the exe links come from
+  one `ls`, the argument test from one `grep -z` over every cmdline, comm and
+  the verdicts from one `awk`, and the maps test from one `grep` over the
+  processes the first three did not settle; a fork per pid does not scale to
+  a large host.
+
+- **JVM thread-name detection** (used when `/proc/<pid>/maps` is closed to
+  us, e.g. another user's process as non-root): `/proc/<pid>/task/*/comm` is
+  world-readable and a JVM's own threads have fixed names. Verified on
+  HotSpot (OpenJDK 17): `VM Thread`, `Signal Dispatch(er)`,
+  `Reference Handl(er)`, `VM Periodic Tas(k)`, `C1/C2 CompilerThre(ad)`,
+  `GC Thread#<n>` — comm is cut at 15 characters. OpenJ9 names
+  (`JIT Compilation`, `Signal Reporter`, `Finalizer maste(r)`) are taken from
+  its thread list and **not verified** on a running OpenJ9. A process is a
+  candidate only when TWO distinct names match, so one thread a program
+  happens to call "VM Thread" is not enough.
+
 ## Cases
 
 The support cases behind parts of the collector (the script's comments name

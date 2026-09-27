@@ -32,7 +32,7 @@ export LC_ALL=C
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-apmjava"
 # History: CHANGELOG.md (next to this file).
-VERSION="0.13.6"
+VERSION="0.13.7"
 DOMAIN="apm"
 TARGET="host/$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || uname -n 2>/dev/null || echo unknown)"
 
@@ -1308,12 +1308,9 @@ weaving_lines() {
 
 # ---- process / JVM helpers ---------------------------------------------------
 # _proc_env PID NAME -> value of NAME= in the process environ (empty if none).
-# Java agent env names may contain dots (license, whatap.server.host), which is
-# why the environ file is read directly instead of using the shell environment.
-# NAME is compared literally (whatap.env is not whatapXenv); the first entry
-# wins. One awk pass per pid writes every "NAME<tab>value" under the run's
-# directory, read back with the shell's own read; without that directory the
-# same awk answers the one name.
+# Reads /proc directly, not the shell environment: agent env names may contain
+# dots (whatap.server.host), which the shell cannot hold. NAME is matched
+# literally (whatap.env is not whatapXenv); first entry wins.
 _proc_env() {
     local t l
     if [ -z "$_tmp_dir" ]; then
@@ -1339,13 +1336,10 @@ _proc_env() {
 _env_readable() { head -c 1 "/proc/$1/environ" >/dev/null 2>&1; }
 
 # _all_jvm_args PID -> one JVM argument per line, in the order the JVM applies
-# them: JAVA_TOOL_OPTIONS, JDK_JAVA_OPTIONS, the command line, then
-# _JAVA_OPTIONS. A fifth source is appended when it exists: arguments
-# recovered from the running VM with `jcmd` (_jcmd_recover), written only for a
-# process whose options are absent from /proc and only when --jcmd was passed.
-# It is last because it reports the EFFECTIVE set the VM holds, which is what
-# "last wins" means for _jvm_sysprop. Built once per pid and cached under the
-# run's directory; every section reads the same set.
+# them: JAVA_TOOL_OPTIONS, JDK_JAVA_OPTIONS, the command line, _JAVA_OPTIONS,
+# then (--jcmd only, when /proc had no options) jcmd-recovered args last,
+# since those report the VM's own EFFECTIVE set ("last wins" for
+# _jvm_sysprop). Cached per pid under the run's directory.
 _jvm_args_read() {
     local pid="$1"
     _proc_env "$pid" JAVA_TOOL_OPTIONS | tr ' ' '\n'
@@ -1366,18 +1360,11 @@ _all_jvm_args() {
 
 # _jvm_opt_val PID OPT... -> the argument that follows the first of the
 # options OPT (-jar, -cp ...) across all argument sources, or empty. Also
-# matches a long option's --key=value form for any OPT starting with "--"
-# (so callers list only "--class-path", never "--class-path=" as well).
+# matches a long option's --key=value form for any OPT starting with "--".
 # Stops at -jar's value: everything after it is the application's own
-# argument, never the JVM's, so it is never matched (e.g. `-jar app.jar -cp
-# bogus` must not read "bogus" as this JVM's -cp). A bare, non-option
-# application argument (no -jar, e.g. a main class followed by its own -cp)
-# is not similarly detected: the argument sources here are concatenated
-# (JAVA_TOOL_OPTIONS, JDK_JAVA_OPTIONS, the raw cmdline including its own
-# argv[0], _JAVA_OPTIONS, jcmd-recovered args) with no marker for where the
-# cmdline segment starts, so a bare token cannot be told apart from argv[0]
-# or from another source's own value without risking cutting a legitimate
-# option short.
+# argument (e.g. `-jar app.jar -cp bogus` must not read "bogus" as this JVM's
+# -cp). Known gap for a bare non-option app argument with no -jar: see
+# README "Design notes".
 _jvm_opt_val() {
     local pid="$1"; shift
     _all_jvm_args "$pid" 2>/dev/null | awk -v o="$*" 'BEGIN {
@@ -1402,18 +1389,12 @@ _link_or_na() {
 }
 
 # ---- Tier 2 argument recovery (opt-in: --jcmd) --------------------------------
-# A JVM the collector found only by its libjvm.so mapping carries its options
-# nowhere in /proc: the native launcher passed them to JNI_CreateJavaVM as an
-# array it built, so /proc/<pid>/cmdline holds the launcher's own arguments.
-# `jcmd <pid> VM.command_line` and `VM.system_properties` report them. That is
-# the JVM attach mechanism on a live process, Tier 2, so this runs ONLY with
-# --jcmd and only for the processes whose options are not in /proc. The output
-# goes to a per-pid file _all_jvm_args appends.
-#
-# jvm_args is split on spaces, as _all_jvm_args splits JAVA_TOOL_OPTIONS.
-# VM.system_properties is Properties.store format, in which "=", ":", "#" and
-# "!" arrive backslash-escaped (java.class.path reaches here as /a\:/b), so
-# those escapes are undone before each property is written as -Dkey=value.
+# A JVM found only by its libjvm.so mapping has no options in /proc (a native
+# launcher built its own array for JNI_CreateJavaVM), so this attaches
+# (Tier 2, --jcmd only) and reads them back via `jcmd VM.command_line` /
+# `VM.system_properties`. VM.system_properties is Properties.store format:
+# "=", ":", "#", "!" arrive backslash-escaped and are undone before writing
+# -Dkey=value.
 _JCMD_RECOVERED=""
 _jcmd_recover() {
     local pid="$1" out cl dst rc
@@ -1507,14 +1488,11 @@ _whatap_attached() {
 }
 
 # ---- path resolution, per owning process ----------------------------------------
-# A path a JVM names is a path in THAT process's view: a relative one is
-# relative to its working directory, an absolute one to its mount namespace.
-# Resolving either against the collector's own cwd or namespace reads another
-# file, or none, and reports its absence as a fact.
-#
-# D_NSMAP holds " <pid>=same|other|unknown" for every JVM: whether it shares
-# this collector's mount namespace. "unknown" is a namespace link this run
-# cannot read (another user's process, as non-root).
+# A path a JVM names is a path in THAT process's view (relative to its cwd,
+# absolute to its mount namespace); resolving it against the collector's own
+# view instead reads another file, or none. D_NSMAP holds " <pid>=same|other|
+# unknown" (namespace shared with the collector); "unknown" = an unreadable
+# namespace link (another user's process, non-root).
 _SELF_MNT=""
 D_NSMAP=""
 _note_ns() {
@@ -1558,14 +1536,13 @@ _path_why() {
     echo "path not found: $p"
 }
 
-# _nsresolve PID PATH -> PATH, absolute as the process PID sees it, resolved
-# one component at a time under /proc/PID/root. The kernel resolves
-# /proc/PID/root/<path> through the JVM's root only for the first step: a
-# symlink met further down with an absolute target is resolved against the
-# COLLECTOR's root, so a container's whatap.conf -> /etc/shadow would read the
-# host's file. Here an absolute target is re-rooted under /proc/PID/root and
-# ".." stops at that root, so nothing outside the JVM's own view is read.
-# Status 1 on a symlink chain longer than 40 or an unreadable link.
+# _nsresolve PID PATH -> PATH, absolute as PID sees it, resolved one
+# component at a time under /proc/PID/root. Needed because the kernel only
+# applies /proc/PID/root for the first step: a symlink further down with an
+# absolute target would otherwise resolve against the COLLECTOR's root (a
+# container's whatap.conf -> /etc/shadow reading the host file). Here it is
+# re-rooted under /proc/PID/root instead, and ".." stops there. Status 1 on a
+# chain longer than 40 or an unreadable link.
 _nsresolve() {
     local root="/proc/$1/root" rest="$2" cur="" comp t n=0
     while [ -n "$rest" ]; do
@@ -1852,20 +1829,10 @@ _add_java() {
 
 # _find_jvms -> D_JVM_PIDS, D_JVM_WHY, D_JVM_NOARGS and the walk counts.
 #
-# Four tests, in order: comm; the resolved exe; a JVM-only WHOLE argument on
-# the command line (a shell wrapper that carries a java invocation as text
-# keeps it in one argument, and interpreters are excluded outright); and last
-# a libjvm.so / libj9vm*.so mapping in /proc/<pid>/maps. The fourth exists for
-# a native launcher that creates the VM in its own process through
-# JNI_CreateJavaVM (Axway API Gateway's vshell is one): its comm and exe are
-# its own and the JVM options never reach /proc/<pid>/cmdline, but the VM
-# library is mapped into it like into every JVM. The mapping is matched, not a
-# name list of launchers (CONTRACT rule 2).
-#
-# Scale with the host, not per process: the exe links come from one ls, the
-# argument test from one grep -z over every cmdline, comm and the verdicts
-# from one awk, and the maps test from one grep over the processes the first
-# three did not settle; a fork per pid does not scale to a large host.
+# Four tests in order (comm, resolved exe, a JVM-only whole cmdline argument,
+# then a libjvm.so/libj9vm*.so maps mapping for a native launcher like
+# vshell) and host-scale batching (one ls/grep/awk pass, not a fork per pid):
+# see README "Design notes".
 _find_jvms() {
     local f_out f_map
     f_out="$(_tmp d.out)"; f_map="$(_tmp d.map)"
@@ -1965,18 +1932,11 @@ _jvm_maps() {
 # _jvm_tasks -> the candidates by VM thread name among the processes whose
 # maps were not readable, into $(_tmp d.tjvm); sets D_TASK_*.
 _jvm_tasks() {
-    # A process whose maps this run cannot read (another user's, as non-root)
-    # still names its threads in /proc/<pid>/task/*/comm, which is readable by
-    # everyone, and a JVM's own threads have fixed names. Verified on HotSpot
-    # (OpenJDK 17): VM Thread, Signal Dispatch(er), Reference Handl(er),
-    # VM Periodic Tas(k), C1/C2 CompilerThre(ad), GC Thread#<n>; comm is cut at
-    # 15 characters. OpenJ9 names (JIT Compilation, Signal Reporter,
-    # Finalizer maste(r)) are taken from its thread list and not verified on a
-    # running OpenJ9. A process is a candidate when TWO distinct names match,
-    # so one thread a program happens to call "VM Thread" is not enough. One
-    # glob of every thread's comm file, one grep, one awk; the line cap is a
-    # safety net, and hitting it (or the time cap) is reported and blocks the
-    # goals that rest on the scan.
+    # /proc/<pid>/task/*/comm (world-readable) names threads even when maps
+    # is closed to us; a JVM's threads have fixed names, matched by list below
+    # (HotSpot verified, OpenJ9 not) requiring TWO distinct matches. One glob
+    # + grep + awk pass; hitting the line/time cap is reported. Name list and
+    # verification status: README "Design notes".
     true > "$(_tmp d.tjvm)"
     D_TASK_TOTAL=0; D_TASK_READ=0; D_TASK_CAPPED=""
     sed -n 's|^grep: /proc/\([0-9][0-9]*\)/maps: .*ermission denied.*$|\1|p' "$(_tmp d.maperr)" 2>/dev/null | sort -u > "$(_tmp d.denied)"
@@ -3782,15 +3742,10 @@ _rep_appclasses() {
 }
 
 # _appcls_strip_root -> strip a leading BOOT-INF/classes/ or WEB-INF/classes/
-# segment from $_fq, whichever is actually at its start (checked with `case`,
-# anchored, never a blind attempt against whichever literal happens to be
-# written first — two sequential blind `#` strips gave a different, wrong
-# answer depending on which of the two was written first: a path doubly
-# nested the other way around them, such as
-# WEB-INF/classes/BOOT-INF/classes/p/X.class, came out as
-# BOOT-INF.classes.p.X instead of p.X). Applied twice (there are only two
-# known segments, so at most two strips ever apply) so the archive-relative
-# name is fully bare either way round.
+# segment from $_fq, whichever is at its start (checked with `case`, not two
+# sequential blind `#` strips — order then matters, e.g. a doubly-nested
+# WEB-INF/classes/BOOT-INF/classes/p/X.class kept a stray root segment).
+# Applied twice: at most two of the two known segments can ever nest.
 _appcls_strip_root() {
     local _i
     for _i in 1 2; do

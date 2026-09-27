@@ -5,6 +5,12 @@ first. Every change to the script bumps its `VERSION` and adds one entry at
 the top of this list (docs/authoring-guide.md, step 2); `tools/validate.sh`
 checks that the newest entry is the script's `VERSION`.
 
+- **0.13.7** — Comments only; report content unchanged. Shortened long
+  comment runs in `_proc_env`, `_all_jvm_args`, `_jvm_opt_val`,
+  `_jcmd_recover`, the path-resolution and `_nsresolve` header comments,
+  `_find_jvms`, the JVM thread-name detection comment and
+  `_appcls_strip_root`; the longer rationales moved to README "Design
+  notes".
 - **0.13.6** — Section F: a `-cp`/`-classpath` directory entry ending in `/`
   (e.g. `/srv/cp app/classes/`) is used without the slash: its "directory
   root" line drops the trailing `/`, and section N no longer shows its class

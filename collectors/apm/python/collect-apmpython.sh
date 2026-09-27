@@ -25,7 +25,7 @@ export LC_ALL=C
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-apmpython"
 # History: CHANGELOG.md (next to this file).
-VERSION="0.10.6"
+VERSION="0.10.7"
 DOMAIN="apm"
 TARGET="host/$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || uname -n 2>/dev/null || echo unknown)"
 
@@ -761,19 +761,12 @@ pyprobe() {
     _emit_labeled "$label" "$out"
 }
 
-# _pyrun PY CODE... -> every CODE in ONE interpreter start, not one `PY -c` each
-# (ten starts per interpreter were most of the run time). _PYDRV runs each CODE
-# with fresh globals, its stdout and stderr captured apart, an uncaught
-# exception printed as `python -c` prints it, and its exit status; per CODE it
-# prints "<marker> N start|out|err|rc R", flushing after each, so a CODE that
-# finished before a timeout keeps its result. The marker is random per run and
-# counts only when it is the one expected next, so output imitating it stays
-# output. Python 2.4+ and 3 syntax. The pkg_resources CODE runs last (importing
-# it rewires namespace packages); the report order stays as listed.
-# _pyreport N LABEL CODE then reports CODE N as pyprobe would have.
+# _pyrun PY CODE... -> every CODE in ONE interpreter start, not one `PY -c`
+# each (README "How each interpreter is asked": why, and the marker/ordering
+# scheme). Python 2.4+ and 3 syntax. _pyreport N LABEL CODE then reports
+# CODE N as pyprobe would have.
 # Differences from a `python -c` of its own, for whoever adds a CODE:
-#   * start-up (sitecustomize) and atexit output is printed once and added to
-#     EVERY CODE's stdout;
+#   * start-up (sitecustomize) and atexit output is added to EVERY CODE's stdout;
 #   * os.write(1|2, ...) and child processes bypass the capture (dropped);
 #   * sys.stdout/sys.stderr are StringIO: no .buffer, .fileno() or binary writes;
 #   * sys.argv is the driver's, not ['-c'];
@@ -1022,17 +1015,13 @@ EOF
     if [ "$seen" = 1 ]; then [ "$step" = end ] && _pyrun_post="$acc"; else _pyrun_pre="$acc"; fi
 }
 
-# _pyreport N LABEL CODE -> the facts pyprobe gives for CODE, from the result of
-# CODE N in the last _pyrun. A CODE with no status of its own:
-#   * it started and the cap stopped it: timed out (it was running);
-#   * the cap stopped the interpreter before any CODE started: timed out,
-#     as each `python -c` would have been;
-#   * it never started because a CODE before it hung or ended the process,
-#     or the interpreter cannot run the driver: run alone with pyprobe, under
-#     its own cap, as before _pyrun. Past the run deadline it is not run, and
-#     the reason says why. Once one such re-run also times out, the hang has
-#     a common cause and the rest are not run either: each would wait a full
-#     cap for the same answer.
+# _pyreport N LABEL CODE -> the facts pyprobe gives for CODE, from the result
+# of CODE N in the last _pyrun. A CODE with no status of its own is: timed out
+# (it, or the interpreter before any CODE started, ran into the cap); or, if a
+# CODE before it hung or ended the process, run alone with pyprobe under its
+# own cap (skipped past the run deadline). Once one such re-run also times
+# out, the rest are skipped too: a common cause would make each wait a full
+# cap for the same answer.
 _pyreport() {
     local n="$1" label="$2" out rc err started
     case "$_pyrun_rc" in
@@ -1341,14 +1330,12 @@ discover() {
                && D_HIDEPID="hidepid is set on /proc: other users' processes are not listed to uid $(id -u 2>/dev/null)" ;;
     esac
 
-    # Process scan. A python process is matched by its comm, by argv0, or by
-    # /proc/<pid>/exe. comm alone misses every app started from a shebang
-    # script (gunicorn, uvicorn, celery, odoo-bin, whatap-start-agent): the
-    # kernel names the process after the script, and puts the interpreter from
-    # the #! line into argv0. exe covers argv0 rewritten by setproctitle, for
-    # the processes this uid may resolve. Runs FIRST so the interpreters of
-    # live application processes take the detail slots before PATH/system
-    # interpreters when the cap applies.
+    # Process scan: matched by comm, argv0, or /proc/<pid>/exe. comm alone
+    # misses a shebang-started app (gunicorn, celery, odoo-bin: the kernel
+    # names it after the script, not the #! interpreter in argv0); exe covers
+    # argv0 rewritten by setproctitle. Runs FIRST so live application
+    # interpreters take the detail slots before PATH/system ones when the cap
+    # applies.
     while IFS="$_us" read -r pid comm exe a0 cmd; do
         [ -n "$pid" ] || continue
         [ "$pid" = "$$" ] && continue
