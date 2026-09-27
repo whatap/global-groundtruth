@@ -24,7 +24,7 @@ export LC_ALL=C
 # ---- collector metadata -----------------------------------------------------
 # History: CHANGELOG.md, section collect-collserver.sh (next to this file).
 COLLECTOR_NAME="whatap-collserver"
-VERSION="0.11.7"
+VERSION="0.12.0"
 DOMAIN="collection-server"
 TARGET="collection-server/$(hostname 2>/dev/null || echo unknown)"   # refined after WHATAP_HOME is resolved
 
@@ -1328,10 +1328,72 @@ _rep_c() {
         fact "YARDB_LOCK / pcode dirs: n/a (yardbase not present)"
     fi
     if [ -n "$WHOME" ]; then
-        for sub in keeperbase logsink db; do
+        for sub in keeperbase logsink; do
             fact "$sub dir: $( [ -d "$WHOME/$sub" ] && echo present || echo absent )"
         done
+        _rep_c_h2db
     fi
+}
+
+# _mnt_of P -> the mount point P is on; empty when neither tool answers. df -P
+# puts the mount point last, after five fields, so a point with spaces is kept.
+_mnt_of() {
+    local p="$1"
+    if have findmnt; then _bounded findmnt -no TARGET -T "$p" 2>/dev/null && return; fi
+    have df && _bounded df -P "$p" 2>/dev/null | awk 'NR > 1 { sub(/^[^ ]+ +[^ ]+ +[^ ]+ +[^ ]+ +[^ ]+ +/, ""); m = $0 } END { if (m != "") print m }'
+}
+
+# _count_files DIR [FIND-ARGS...] -> "N" files at depth 1, or the reason
+# the count is n/a; the trailing slash follows a symlinked DIR
+_count_files() {
+    local d="$1" out rc; shift
+    out="$(_bounded find "$d/" -maxdepth 1 -type f "$@" 2>"$_errfile")"; rc=$?
+    if [ "$rc" -eq 124 ]; then printf 'n/a (%s)' "$(_why_124)"; return; fi
+    if [ "$rc" -ne 0 ]; then printf 'n/a (find exit %s)' "$rc"; return; fi
+    if [ -z "$out" ]; then printf 0; else printf '%s\n' "$out" | wc -l | tr -d ' '; fi
+}
+
+# The account service's H2 database: conf/account.conf h2.file.path (the
+# package ships ./db), taken relative to WHATAP_HOME like yardbase, and the
+# daily SQL dumps under its backup/. A full disk corrupts this file, and it
+# fills with yardbase when both sit on one filesystem (2026-09-16, MEA), so
+# the mount point of each is printed. Listings are depth 1.
+_rep_c_h2db() {
+    local ac="$WHOME/conf/account.conf" v dbp st bk m ym
+    subsection "account H2 database"
+    v=""
+    if [ -f "$ac" ] && [ ! -r "$ac" ]; then
+        fact "h2.file.path (conf/account.conf): n/a (permission denied: $ac); checking ./db, the packaged value"
+    elif [ ! -f "$ac" ]; then
+        fact "h2.file.path (conf/account.conf): n/a (path not found: $ac); checking ./db, the packaged value"
+    else
+        v="$(grep -E '^[[:space:]]*h2\.file\.path[[:space:]]*[=:]' "$ac" 2>/dev/null | tail -n1 \
+            | sed 's/^[^=:]*[=:]//; s/^[[:space:]]*//; s/[[:space:][:cntrl:]]*$//')"
+        if [ -n "$v" ]; then fact "h2.file.path (conf/account.conf): $v"
+        else fact "h2.file.path (conf/account.conf): n/a (not set); checking ./db, the packaged value"; fi
+    fi
+    [ -z "$v" ] && v=./db
+    case "$v" in /*) dbp="$v" ;; *) dbp="$WHOME/${v#./}" ;; esac
+    st="$(_path_state "$dbp")"; [ "$st" = ok ] && st=present
+    fact "db path: $dbp ($st)"
+    [ "$st" = present ] || return 0
+    m="$(_mnt_of "$dbp/")"
+    if [ -z "$m" ]; then fact "db mount point: n/a (findmnt/df returned nothing)"
+    elif [ -n "$YARDBASE" ] && [ -d "$YARDBASE" ]; then
+        ym="$(_mnt_of "$YARDBASE/")"
+        if [ "$m" = "$ym" ]; then fact "db mount point: $m (the same as yardbase's)"
+        else fact "db mount point: $m (yardbase's: ${ym:-n/a})"; probe "db capacity (df -h)" df -h "$dbp/"; fi
+    else fact "db mount point: $m (yardbase not present)"; probe "db capacity (df -h)" df -h "$dbp/"; fi
+    probe "db files (depth 1)" ls -l "$dbp/"
+    bk="$dbp/backup"
+    st="$(_path_state "$bk")"
+    if [ "$st" = ok ]; then
+        local n z
+        n="$(_count_files "$bk")"
+        case "$n" in n/a*) z="n/a (not counted: the file count is n/a)" ;; *) z="$(_count_files "$bk" -size 0)" ;; esac
+        fact "backup files in $bk: $n (of them 0 bytes: $z)"
+        probe "backup files, newest 10 (ls -lt)" sh -c 'ls -lt "$1/" | head -n 11' sh "$bk"
+    else fact "backup dir: $bk ($st)"; fi
 }
 
 # _home_missed GOAL [SUB] -> resolves GOAL when WHATAP_HOME (or its SUB

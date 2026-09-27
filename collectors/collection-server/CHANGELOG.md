@@ -7,6 +7,14 @@ one entry at the top of its section (docs/authoring-guide.md, step 2);
 
 ## collect-collserver.sh
 
+- **0.12.0** — C reports the account H2 database: `h2.file.path` from
+  `conf/account.conf` (`./db` when unset), the db path's mount point and
+  whether it is yardbase's, a depth-1 listing of the db, and the SQL dumps
+  under `db/backup` (count, 0-byte count, newest 10 by mtime). The
+  `db dir: present` line is replaced by it. Field case 2026-09-16 (MEA): a
+  full `/whatap` corrupted `account.mv.db`, yardbase (428G) and the db shared
+  the filesystem, and the dumps of the day the disk filled were 0 bytes;
+  none of the three was in the report.
 - **0.11.7** — collect_logs' cap comment no longer tells the field incident
   (a per-file cap alone once gave a 393 MB bundle, 99.95% logs) behind the
   two log caps. Comments only; report content unchanged.

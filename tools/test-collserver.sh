@@ -482,5 +482,46 @@ EOF
 out="$(PATH="$S24" "$C" --stdout --time-ref </dev/null 2>/dev/null)"
 has "a failed curl names its exit status" "$out" "external time: n/a (curl exit 7: "
 
+echo "== 25. the account H2 database and its dumps =="
+H25="$ROOT/h25"; mkhome "$H25"; mkdir -p "$H25/yardbase" "$H25/data/h2/backup"
+printf 'h2.file.path=./data/h2\n' > "$H25/conf/account.conf"
+: > "$H25/data/h2/account.mv.db"; echo x > "$H25/data/h2/backup/account_20260901.sql"
+: > "$H25/data/h2/backup/account_20260902.sql"
+out="$("$C" --home "$H25" --stdout 2>/dev/null)"
+has "h2.file.path is read from account.conf" "$out" "h2.file.path (conf/account.conf): ./data/h2"
+has "and resolved against WHATAP_HOME" "$out" "db path: $H25/data/h2 (present)"
+has "a db on yardbase's filesystem says so" "$out" "(the same as yardbase's)"
+has "the db files are listed" "$out" "account.mv.db"
+has "dumps are counted, 0-byte ones apart" "$out" "backup files in $H25/data/h2/backup: 2 (of them 0 bytes: 1)"
+hasnt "the old db line is gone" "$out" "db dir: present"
+rm -f "$H25/conf/account.conf"; rm -rf "$H25/data"
+out="$("$C" --home "$H25" --stdout 2>/dev/null)"
+has "no account.conf: the packaged ./db is checked" "$out" "checking ./db, the packaged value"
+has "and an absent db stops there" "$out" "db path: $H25/db (absent)"
+hasnt "without a mount line" "$out" "db mount point:"
+
+# A db behind a symlink, with spaces in its path, is followed, not listed as a link.
+mkdir -p "$H25/moved db/backup"; ln -s "$H25/moved db" "$H25/dblink"
+printf 'h2.file.path = ./dblink \r\n' > "$H25/conf/account.conf"
+: > "$H25/moved db/account.mv.db"; : > "$H25/moved db/backup/a.sql"; echo x > "$H25/moved db/backup/b.sql"
+out="$("$C" --home "$H25" --stdout 2>/dev/null)"
+has "the value is trimmed at its ends only" "$out" "db path: $H25/dblink (present)"
+has "a symlinked backup dir is followed" "$out" "backup files in $H25/dblink/backup: 2 (of them 0 bytes: 1)"
+has "and a symlinked db is listed through" "$out" "account.mv.db"
+if [ "$(id -u)" != 0 ]; then
+  chmod 000 "$H25/conf/account.conf"
+  out="$("$C" --home "$H25" --stdout 2>/dev/null)"
+  has "an unreadable account.conf is not 'not set'" "$out" "h2.file.path (conf/account.conf): n/a (permission denied:"
+  chmod 644 "$H25/conf/account.conf"
+else skip "the unreadable account.conf case (root reads anything)"; fi
+# A find that never answers makes the count n/a, never 0.
+S25="$ROOT/stub25"; stub_clone "$S" "$S25"; rm -f "$S25/find"
+stub_write "$S25/find" <<'EOF2'
+#!/bin/sh
+exec sleep 30
+EOF2
+out="$(PATH="$S25" CMD_TIMEOUT=2 "$C" --home "$H25" --stdout 2>/dev/null)"
+has "a capped find is n/a, not 0" "$out" "backup files in $H25/dblink/backup: n/a (timed out: 2s)"
+
 echo; echo "PASS=$PASS FAIL=$FAIL SKIP=$SKIP"
 [ "$FAIL" -eq 0 ]

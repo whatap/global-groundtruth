@@ -56,6 +56,12 @@ One `.txt` report, organized into MECE domains (each fact in exactly one place):
 - **C. Storage & filesystem** — yardbase path, **its filesystem type (ZFS or
   not)** and, on ZFS, pool/dataset/ARC properties; capacity via `df` (never a
   recursive `du` in the report); `YARDB_LOCK`; partition range (shallow).
+  The account service's H2 database: `h2.file.path` from `conf/account.conf`
+  (the package ships `./db`, taken relative to `WHATAP_HOME`), its mount point
+  and whether yardbase shares it, its files, and the daily SQL dumps under
+  `db/backup` (count, how many are 0 bytes, newest 10). A full disk corrupts
+  this file, and it fills with yardbase when both are on one filesystem;
+  a dump the backup could not write is left at 0 bytes (2026-09-16, MEA).
 - **D. Deployment layout** — resolved `WHATAP_HOME` (and how it was resolved),
   directory tree, jar versions, conf file list.
 - **E. Runtime processes** — per service: pid, jar/version, heap & GC flags,
