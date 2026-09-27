@@ -62,7 +62,17 @@ COLLECTOR_NAME="whatap-k8s"
 #        written stops the run before it collects (2026-09-26).
 #        A value option given nothing, or a value starting with '-', exits 2
 #        ("missing value for --out"); it took the next option as its value.
-VERSION="0.11.0"
+# 0.11.1 [1]'s privilege line says when uid 0 has no CAP_SYS_PTRACE (bit 19
+#        of CapEff; the default in docker and k8s): "root without
+#        CAP_SYS_PTRACE (other uids' /proc/<pid>/environ, root, cwd are not
+#        readable: run as the target's uid, ...)". It read "root" while
+#        another uid's environ, root and cwd were denied. A bounded call
+#        leaves no process to PID 1: the watchdog is ended by USR1 and reaps
+#        its sleep (a KILL left it to PID 1), and busybox timeout(1), whose
+#        timer outlived each call, is not used; the watchdog caps instead.
+#        Under a PID 1 that does not reap (sleep infinity), one run of each
+#        collector left 1 zombie on debian and 41-55 on alpine; now 0 (2026-09-27).
+VERSION="0.11.1"
 DOMAIN="k8s"
 TARGET="k8s-cluster/unresolved"      # refined after CLI/context/namespace discovery
 
@@ -262,6 +272,16 @@ _note_privilege() {
     elif [ "$_priv_uid" = 0 ]; then
         PRIV_WHY="root${SUDO_UID:+ (elevated by sudo from uid $SUDO_UID)}"
         PRIV_GAP=""
+        # uid 0 in a container is often without CAP_SYS_PTRACE (bit 19 of
+        # CapEff; docker's and k8s's defaults), and then another uid's
+        # /proc/<pid>/{environ,root,cwd} are denied although the line says root.
+        # The low 8 hex digits: all shells agree on 32 bits.
+        _priv_cap="$(awk '/^CapEff:/{print substr($2, length($2) - 7); exit}' /proc/self/status 2>/dev/null)"
+        case "$_priv_cap" in
+            ''|*[!0-9a-fA-F]*) ;;
+            *) [ "$(( (0x$_priv_cap >> 19) & 1 ))" = 0 ] \
+                && PRIV_WHY="$PRIV_WHY without CAP_SYS_PTRACE (other uids' /proc/<pid>/environ, root, cwd are not readable: run as the target's uid, e.g. docker exec -u <uid> or kubectl exec)" ;;
+        esac
     else
         PRIV_WHY="not root (uid $_priv_uid)"
         PRIV_GAP="run again with sudo"
@@ -298,7 +318,9 @@ _note_boot() {
 #   no SECONDS, no `type -t`, no ${v//x/y} outside a BASH_VERSION guard.
 # - A cap returns 124 whatever timeout(1) returns for a kill (busybox: 143).
 #   timeout(1) gets -k where it takes it, so a command deaf to TERM still ends;
-#   without timeout(1), or for a shell function, a watchdog that ends in KILL.
+#   without timeout(1) (busybox's counts as without), or for a shell function,
+#   a watchdog that ends in KILL. A call that finishes leaves no process to
+#   PID 1 (a killed tree's grandchildren still can).
 # - Past RUN_DEADLINE nothing runs (124), so the report still reaches its footer.
 # - Each call is logged with its time; only the command name and a subcommand
 #   word, never arguments (they can hold a path or a credential).
@@ -386,6 +408,9 @@ _run_init() {
     trap '_run_cleanup; exit 130' INT
     trap '_run_cleanup; exit 143' TERM
     [ -n "${_timeout_bin:-}" ] || _timeout_bin="$(command -v timeout 2>/dev/null)"
+    # busybox timeout(1) runs CMD in its own pid and leaves its timer to PID 1,
+    # a zombie per call under a PID 1 that does not reap: the watchdog instead
+    case "$_timeout_bin" in /*) LC_ALL=C grep -q 'BusyBox v' "$_timeout_bin" 2>/dev/null && _timeout_bin="" ;; esac
     if [ -n "${_timeout_bin:-}" ] && "$_timeout_bin" -k 1 5 true </dev/null >/dev/null 2>&1; then
         _timeout_k=5
     fi
@@ -498,16 +523,23 @@ _bounded_in() {
         else                  { "$@" 0<&4 4<&- & } 4<&0; fi
         p=$!
         set +m 2>/dev/null
-        ( i=0
-          # background sleep + wait, so a TERM ends the watchdog at once
+        # The watchdog is ended by USR1, on which it KILLs and reaps its sleep:
+        # a sleep left behind goes to PID 1, and a container's PID 1 that does
+        # not reap keeps it as a zombie (one per call). No trap of this shell
+        # is on USR1, so one that lands before the watchdog's trap is set ends
+        # it at once, before it has a child. A TERM could land before dash
+        # reset the inherited traps and be lost, and a KILL orphans the sleep.
+        # The trap's own kill is KILL: a TERM to a sleep not yet exec'd is lost.
+        ( trap '[ "$!" = "$p" ] || kill -KILL "$!" 2>/dev/null; wait; exit 0' USR1
+          i=0
+          # background sleep + wait, so the USR1 ends the watchdog at once
           while [ "$i" -lt "$t" ]; do sleep 1 & wait $!; kill -0 "$p" 2>/dev/null || exit 0; i=$((i + 1)); done
           kill -TERM -- "-$p" 2>/dev/null; _kill_tree TERM "$p"
-          sleep 2
+          sleep 2 & wait $!
           kill -KILL -- "-$p" 2>/dev/null; _kill_tree KILL "$p" ) >/dev/null 2>&1 &
         w=$!
         wait "$p"; rc=$?
-        # KILL: a TERM can arrive before dash resets the inherited traps and be lost
-        kill -KILL "$w" 2>/dev/null; wait "$w" 2>/dev/null
+        kill -USR1 "$w" 2>/dev/null; wait "$w" 2>/dev/null
     fi
     _now_ms; d=$((_ms - m0))
     case "$rc" in 124|137|143) [ "$((d / 1000))" -ge "$t" ] && rc=124 ;; esac

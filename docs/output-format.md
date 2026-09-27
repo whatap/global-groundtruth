@@ -157,13 +157,14 @@ The environment section carries one `privilege:` line.
 
 What a collection can read is decided by the privilege it was given, so a report
 that leaves it out gives the reader no way to tell an absent value from an
-unreadable one. Three shapes on a shell collector, and the Windows pair ports
+unreadable one. Four shapes on a shell collector, and the Windows pair ports
 the same line with `elevated` / `not elevated (DOMAIN\user)`:
 
 | Line | What it says |
 |---|---|
 | `privilege: root` | The run was root already |
 | `privilege: root (elevated by sudo from uid 3103)` | It was reached through sudo |
+| `privilege: root without CAP_SYS_PTRACE (other uids' /proc/<pid>/environ, root, cwd are not readable: run as the target's uid, ...)` | uid 0 whose CapEff lacks bit 19 (docker and k8s by default); no gap, since sudo adds nothing |
 | `privilege: not root (uid 3103)` | It was not, and `run again with sudo` is the gap |
 
 The authoring side is the shared block in the skeleton. `_note_privilege` fills
