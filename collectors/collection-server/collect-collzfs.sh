@@ -46,6 +46,10 @@
 export LC_ALL=C
 
 # ---- collector metadata -----------------------------------------------------
+# 0.8.4  stderr stays quiet on an unreadable file: 2>/dev/null now covers the <
+#        redirect it followed, which failed before it took effect.
+#        _is_whatap_server steps past a token that holds the prefix
+#        again: one pass per token, not one per copy; report unchanged.
 # 0.8.3  _is_whatap_server moved into the collection-server process scan
 #        block, written with case patterns so the block parses under dash;
 #        report unchanged.
@@ -87,7 +91,7 @@ export LC_ALL=C
 #        df -i of every WhaTap path is in the report and df-i.txt in the
 #        bundle, so the file count is there without a walk.
 COLLECTOR_NAME="whatap-collzfs"
-VERSION="0.8.3"
+VERSION="0.8.4"
 DOMAIN="collection-server"
 TARGET="collection-server-zfs/$(hostname 2>/dev/null || echo unknown)"   # refined after pool discovery
 
@@ -874,7 +878,7 @@ read_kstat_tail() {
     local label="$1" path="$2" n="$3" total out
     if [ ! -e "$path" ]; then fact "$label: n/a (path not found: $path)"; return; fi
     if [ ! -r "$path" ]; then fact "$label: n/a (permission denied: $path)"; return; fi
-    total="$(wc -l < "$path" 2>/dev/null | tr -d ' ')"
+    total="$( { wc -l < "$path"; } 2>/dev/null | tr -d ' ')"
     if [ -z "$total" ] || [ "$total" -eq 0 ] 2>/dev/null; then fact "$label: n/a (empty output)"; return; fi
     if [ "$total" -le "$n" ] 2>/dev/null; then
         out="$(cat "$path" 2>/dev/null)"
@@ -907,7 +911,7 @@ _CL=""
 cmdline_of() {
     local a=""
     _CL=""
-    while IFS= read -r -d '' a; do _CL="$_CL$a "; done < "/proc/$1/cmdline" 2>/dev/null
+    while IFS= read -r -d '' a; do _CL="$_CL$a "; done 2>/dev/null < "/proc/$1/cmdline"
     _CL="$_CL$a"
 }
 
@@ -957,10 +961,13 @@ _is_whatap_server() {
             s="${s#*"$pfx"}"
             tok="${s%%[!A-Za-z0-9._-]*}"
             case "$tok" in ?*.jar*) hit=1 ;; esac
+            # past tok: a later hit inside it is a suffix of tok, no .jar either
+            # (only when tok holds one: the strip copies the rest of the string)
+            case "$tok" in *"$pfx"*) s="${s#"$tok"}" ;; esac
         done
     done
     [ -n "$hit" ] || return 1
-    IFS= read -r comm < "/proc/$1/comm" 2>/dev/null
+    { IFS= read -r comm < "/proc/$1/comm"; } 2>/dev/null
     [ "$comm" = java ] || [ "${a0##*/}" = java ]
 }
 # ---- end collection-server: process scan
@@ -1527,7 +1534,7 @@ _rep_a() {
     else
         fact "zfs units: n/a (command not found: systemctl)"
     fi
-    fact "/etc/zfs/zpool.cache: $( [ -e /etc/zfs/zpool.cache ] && echo "present ($(wc -c < /etc/zfs/zpool.cache 2>/dev/null | tr -d ' ') bytes, mtime $(date -u -r /etc/zfs/zpool.cache +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo n/a))" || echo 'absent (path not found)' )"
+    fact "/etc/zfs/zpool.cache: $( [ -e /etc/zfs/zpool.cache ] && echo "present ($( { wc -c < /etc/zfs/zpool.cache; } 2>/dev/null | tr -d ' ') bytes, mtime $(date -u -r /etc/zfs/zpool.cache +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo n/a))" || echo 'absent (path not found)' )"
 }
 
 # -- B. ZFS module parameters ---------------------------------------------
@@ -1620,7 +1627,7 @@ _rep_b() {
         dump_file "$mp" 200
     done
     [ "$any_mp" = 0 ] && fact "no /etc/modprobe.d/*zfs* or *spl* file (path not found)"
-    probe_pipe "kernel cmdline zfs options" cat "tr ' ' '\n' < /proc/cmdline 2>/dev/null | grep -iE 'zfs|spl' || true"
+    probe_pipe "kernel cmdline zfs options" cat "{ tr ' ' '\n' < /proc/cmdline; } 2>/dev/null | grep -iE 'zfs|spl' || true"
 }
 
 # -- C. Pool topology & allocation classes --------------------------------

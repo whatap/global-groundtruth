@@ -25,6 +25,9 @@
 export LC_ALL=C
 
 # ---- collector metadata -----------------------------------------------------
+# 0.10.2 stderr stays quiet on an unreadable file: 2>/dev/null now covers the <
+#        redirect it followed, which failed before it took effect; report
+#        unchanged.
 # 0.10.1 Helpers moved into the collection-server group blocks; report
 #        unchanged. The blocks are copies of
 #        templates/groups/collection-server.sh.
@@ -86,7 +89,7 @@ export LC_ALL=C
 #        SHOW BINARY LOGS, a failed or capped decode, a NULL log_bin_basename and
 #        no local mysqld without arguments are gaps with reasons. Needs bash.
 COLLECTOR_NAME="whatap-collmysql"
-VERSION="0.10.1"
+VERSION="0.10.2"
 DOMAIN="collection-server"
 TARGET="collection-server-mysql/$(hostname 2>/dev/null || echo unknown)"
 
@@ -811,8 +814,8 @@ _pw_opt() {
 # _tty_restore -> the terminal settings saved before the password prompt
 _STTY_SAVED=""
 _tty_restore() {
-    if [ -n "$_STTY_SAVED" ]; then stty "$_STTY_SAVED" </dev/tty 2>/dev/null
-    else stty echo </dev/tty 2>/dev/null; fi
+    if [ -n "$_STTY_SAVED" ]; then { stty "$_STTY_SAVED" </dev/tty; } 2>/dev/null
+    else { stty echo </dev/tty; } 2>/dev/null; fi
 }
 
 # _short_pw WORD -> true when a short-option cluster holds -p. Sets _SP_KEPT
@@ -889,11 +892,11 @@ _take_password() {
     # operator's terminal without echo.
     local left prc=0; left="$(_prompt_budget)"
     [ "$left" -lt 1 ] && left=1
-    _STTY_SAVED="$(stty -g </dev/tty 2>/dev/null)"
+    _STTY_SAVED="$( { stty -g </dev/tty; } 2>/dev/null)"
     trap '_tty_restore; _run_cleanup; exit 129' HUP
     trap '_tty_restore; _run_cleanup; exit 130' INT
     trap '_tty_restore; _run_cleanup; exit 143' TERM
-    stty -echo </dev/tty 2>/dev/null
+    { stty -echo </dev/tty; } 2>/dev/null
     printf 'MySQL password (asked once, for every query of this run): ' >/dev/tty
     IFS= read -r -t "$left" _PW </dev/tty || prc=$?
     _tty_restore
@@ -1034,7 +1037,7 @@ _local_ips() {
             *"/32 host LOCAL"*) [ -n "$prev" ] && printf '%s\n' "$prev" ;;
             *"-- "[0-9]*) prev="${l##*-- }" ;;
         esac
-    done < "$1" 2>/dev/null
+    done 2>/dev/null < "$1"
 }
 
 # _bl_target -> where the client connected, classified: _BL_TGT is "local"
@@ -1109,7 +1112,7 @@ _binlog_proc() {
         c=""; { IFS= read -r c < "$d/comm"; } 2>/dev/null
         case "$c" in mysqld|mariadbd) ;; *) continue ;; esac
         p="${d##*/}"
-        st=""; IFS= read -r st < "$d/stat" 2>/dev/null; st="${st##*) }"
+        st=""; { IFS= read -r st < "$d/stat"; } 2>/dev/null; st="${st##*) }"
         case "$st" in Z*|X*) continue ;; esac      # a zombie holds no files
         cand=$((cand + 1)); v=""
         if [ "$_BL_TGT" = ips ]; then
@@ -1127,14 +1130,14 @@ EOF
             rt="$d/root"; how="read through $rt"; ns="$p"
             while IFS= read -r l; do
                 case "$l" in NSpid:*) set -f; set -- $l; set +f; eval "ns=\${$#}" ;; esac
-            done < "$d/status" 2>/dev/null
+            done 2>/dev/null < "$d/status"
             # absent only when its directory could be searched (a datadir of
             # mode 700 hides it from a mysql-group user: unreadable, not absent)
             v="$rt$pf"; v="${v%/*}"
             if [ ! -e "$rt$pf" ] && [ -x "${v:-/}" ]; then other="$other $p(pid file absent)"; v=""; continue; fi
             v=""
             [ -r "$rt$pf" ] || { unread="$unread $p"; continue; }
-            IFS= read -r v < "$rt$pf" 2>/dev/null
+            { IFS= read -r v < "$rt$pf"; } 2>/dev/null
         else
             # a root this uid may not enter (another uid; no CAP_SYS_PTRACE in
             # a container): the pid file as seen here, holding P's own pid
@@ -1143,7 +1146,7 @@ EOF
             if [ ! -e "$pf" ] && [ -x "${v:-/}" ]; then other="$other $p(pid file absent here; /proc/$p/root not enterable by uid $(id -u 2>/dev/null || echo '?'))"; v=""; continue; fi
             v=""
             [ -r "$pf" ] || { unread="$unread $p"; continue; }
-            IFS= read -r v < "$pf" 2>/dev/null
+            { IFS= read -r v < "$pf"; } 2>/dev/null
         fi
         if [ "$v" != "$ns" ]; then other="$other $p(pid file holds ${v:-nothing})"; continue; fi
         # 2. the pid file written with the server's start

@@ -22,6 +22,10 @@
 export LC_ALL=C
 
 # ---- collector metadata -----------------------------------------------------
+# 0.11.3 stderr stays quiet on an unreadable file: 2>/dev/null now covers the <
+#        redirect it followed, which failed before it took effect.
+#        _is_whatap_server steps past a token that holds the prefix
+#        again: one pass per token, not one per copy; report unchanged.
 # 0.11.2 _is_whatap_server moved into the collection-server process scan
 #        block, written with case patterns so the block parses under dash;
 #        report unchanged.
@@ -63,7 +67,7 @@ export LC_ALL=C
 #        private directory; bad numeric options exit 2, a failed write exits 1;
 #        output is handed back under sudo. Needs bash.
 COLLECTOR_NAME="whatap-collserver"
-VERSION="0.11.2"
+VERSION="0.11.3"
 DOMAIN="collection-server"
 TARGET="collection-server/$(hostname 2>/dev/null || echo unknown)"   # refined after WHATAP_HOME is resolved
 
@@ -745,7 +749,7 @@ _path_state() {
 # uname prints for -n, -s, -r and -m.
 _ksys() {
     _KV=""
-    [ -r "/proc/sys/kernel/$1" ] && IFS= read -r _KV < "/proc/sys/kernel/$1" 2>/dev/null
+    [ -r "/proc/sys/kernel/$1" ] && { IFS= read -r _KV < "/proc/sys/kernel/$1"; } 2>/dev/null
     [ -n "$_KV" ]
 }
 
@@ -792,7 +796,7 @@ _CL=""
 cmdline_of() {
     local a=""
     _CL=""
-    while IFS= read -r -d '' a; do _CL="$_CL$a "; done < "/proc/$1/cmdline" 2>/dev/null
+    while IFS= read -r -d '' a; do _CL="$_CL$a "; done 2>/dev/null < "/proc/$1/cmdline"
     _CL="$_CL$a"
 }
 
@@ -842,10 +846,13 @@ _is_whatap_server() {
             s="${s#*"$pfx"}"
             tok="${s%%[!A-Za-z0-9._-]*}"
             case "$tok" in ?*.jar*) hit=1 ;; esac
+            # past tok: a later hit inside it is a suffix of tok, no .jar either
+            # (only when tok holds one: the strip copies the rest of the string)
+            case "$tok" in *"$pfx"*) s="${s#"$tok"}" ;; esac
         done
     done
     [ -n "$hit" ] || return 1
-    IFS= read -r comm < "/proc/$1/comm" 2>/dev/null
+    { IFS= read -r comm < "/proc/$1/comm"; } 2>/dev/null
     [ "$comm" = java ] || [ "${a0##*/}" = java ]
 }
 # ---- end collection-server: process scan
@@ -1218,7 +1225,7 @@ run_report() {
     probe "timedatectl" timedatectl
     # /etc/timezone, else the zone /etc/localtime links to, else date's abbreviation
     local _stz=""
-    [ -r /etc/timezone ] && IFS= read -r _stz < /etc/timezone 2>/dev/null
+    [ -r /etc/timezone ] && { IFS= read -r _stz < /etc/timezone; } 2>/dev/null
     if [ -z "$_stz" ]; then
         _stz="$(readlink -f /etc/localtime 2>/dev/null)"
         case "$_stz" in */zoneinfo/*) _stz="${_stz#*/zoneinfo/}" ;; *) _stz="" ;; esac
@@ -1414,7 +1421,7 @@ run_report() {
             [ -e "$cf" ] || { fact "no *.conf files under $WHOME/conf"; break; }
             _cfn=$((_cfn + 1))
             [ -r "$cf" ] || _cfu="$_cfu $(basename "$cf")"
-            fact "$(basename "$cf") ($(wc -c < "$cf" 2>/dev/null | tr -d ' ') bytes, mtime $(date -u -r "$cf" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo n/a)):"
+            fact "$(basename "$cf") ($( { wc -c < "$cf"; } 2>/dev/null | tr -d ' ') bytes, mtime $(date -u -r "$cf" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo n/a)):"
             dump_file "$cf"
         done
         if [ -n "$_cfu" ]; then missed conf "uid $(id -u 2>/dev/null || echo '?') cannot read$_cfu under $WHOME/conf$(_priv_hint)"
@@ -1439,7 +1446,7 @@ run_report() {
             [ -f "$_f" ] || continue
             case "$_f" in *.[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].*.log) continue ;; esac
             _cur=1
-            fact "$(printf '%s\t%s bytes\t%s' "${_f#"$WHOME"/}" "$(wc -c < "$_f" 2>/dev/null | tr -d ' ')" "$(date -u -r "$_f" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo n/a)")"
+            fact "$(printf '%s\t%s bytes\t%s' "${_f#"$WHOME"/}" "$( { wc -c < "$_f"; } 2>/dev/null | tr -d ' ')" "$(date -u -r "$_f" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo n/a)")"
         done
         if [ "$_cur" = 0 ]; then
             fact "no non-rotated *.log found under $WHOME/logs"
@@ -1712,7 +1719,7 @@ collect_logs() {
     while IFS="$(printf '\t')" read -r kind _ f; do
         [ -n "$f" ] && [ -f "$f" ] || continue
         rel="${f#"$WHOME"/logs/}"
-        sz="$(wc -c < "$f" 2>/dev/null | tr -d ' ')"; [ -z "$sz" ] && sz=0
+        sz="$( { wc -c < "$f"; } 2>/dev/null | tr -d ' ')"; [ -z "$sz" ] && sz=0
         LOGSEL_SRC_BYTES=$((LOGSEL_SRC_BYTES + sz))
 
         if [ "$kind" = rotated ] && [ "$OPT_ROTATED" != 1 ]; then

@@ -139,7 +139,7 @@ _CL=""
 cmdline_of() {
     local a=""
     _CL=""
-    while IFS= read -r -d '' a; do _CL="$_CL$a "; done < "/proc/$1/cmdline" 2>/dev/null
+    while IFS= read -r -d '' a; do _CL="$_CL$a "; done 2>/dev/null < "/proc/$1/cmdline"
     _CL="$_CL$a"
 }
 
@@ -189,10 +189,13 @@ _is_whatap_server() {
             s="${s#*"$pfx"}"
             tok="${s%%[!A-Za-z0-9._-]*}"
             case "$tok" in ?*.jar*) hit=1 ;; esac
+            # past tok: a later hit inside it is a suffix of tok, no .jar either
+            # (only when tok holds one: the strip copies the rest of the string)
+            case "$tok" in *"$pfx"*) s="${s#"$tok"}" ;; esac
         done
     done
     [ -n "$hit" ] || return 1
-    IFS= read -r comm < "/proc/$1/comm" 2>/dev/null
+    { IFS= read -r comm < "/proc/$1/comm"; } 2>/dev/null
     [ "$comm" = java ] || [ "${a0##*/}" = java ]
 }
 # ---- end collection-server: process scan
