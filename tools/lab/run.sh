@@ -5,9 +5,12 @@
 #       for each TARGET: bring it up if it is not running (reuse otherwise),
 #       run every collector that applies, once from REF (default HEAD, taken
 #       with git archive) and once from the working tree, with the target's
-#       argument sets; store masked stdout / stderr / rc under
-#       DIR/<target>/{base,new}/, check the target's expected facts on both,
-#       print a per-target summary. Exit 1 on any difference or failed check.
+#       argument sets; store masked stdout / stderr / rc, plus the unmasked
+#       stdout (.raw), under DIR/<target>/{base,new}/, check the target's
+#       expected facts on both, run tools/validate.sh --report on every .raw
+#       report (skipping help/badarg, which produce none), print a
+#       per-target summary. Exit 1 on any difference, failed check, or a
+#       validate.sh --report failure in the working tree.
 #   tools/lab/run.sh --list               targets, what they cover, collectors
 #   tools/lab/run.sh --status [TARGET...] state, uptime, memory, health
 #   tools/lab/run.sh --up TARGET...       first start (or restart) and wait healthy
@@ -26,7 +29,7 @@ LAB="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$LAB/../.." && pwd)"
 export LAB REPO
 
-usage() { sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+usage() { sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
 
 # mask() and compare() come from capture-compare.sh so the two tools cannot
 # drift apart; the file is read, not run (its case dispatch would exit).
@@ -118,6 +121,7 @@ run_target() {
     load_target "$1" || return 2
     local o="$OUT/$1" c p n line an user shell env args tree base_rc=0 f
     local -a av
+    local -A ARGSMAP=()   # "<collector>.<argset>" -> its args string, for the report step below
     t_up || { echo "$1: NOT UP (see above)"; return 3; }
     health || { echo "$1: NOT HEALTHY"; return 3; }
     mkdir -p "$o/base" "$o/new"
@@ -129,6 +133,7 @@ run_target() {
             [ -n "$line" ] || continue
             IFS='|' read -r an user shell env args <<<"$line"
             read -r -a av <<<"$args"
+            ARGSMAP["$n.$an"]="$args"
             for tree in base new; do
                 if [ "$tree" = base ]; then p="$BASE_TREE/collectors/$c"; else p="$REPO/collectors/$c"; fi
                 f="$o/$tree/$n.$an"
@@ -136,6 +141,7 @@ run_target() {
                 printf 'lab: %s %s %-10s %s\n' "$1" "$tree" "$an" "$n" >&2
                 t_exec "$user" "$shell" "$env" "$p" "${av[@]}" > "$LAB_WORK/o" 2> "$LAB_WORK/e"
                 echo $? > "$f.rc"
+                cp "$LAB_WORK/o" "$f.raw"
                 mask < "$LAB_WORK/o" > "$f.out"; mask < "$LAB_WORK/e" > "$f.err"
             done
         done < <(argsets_for "$c")
@@ -164,18 +170,65 @@ run_target() {
         done
     done
 
-    local d nf nd rcs
-    d="$(compare "$o/base" "$o/new")" || base_rc=1
+    # validate.sh --report on the unmasked stdout of every argument set whose
+    # mode actually produces a report on stdout: rc, header, numbering,
+    # footer, on both trees. Skipped, not counted either way: help/badarg
+    # (no report at all), and any argset whose args ask for --bundle or
+    # --file (the report goes to a tar.gz or a file on the target, not
+    # stdout — an empty .raw is the same case caught a second way, for an
+    # argset this list does not already recognise as one). --file's written
+    # report is not fetched back today (no target exposes one, see
+    # tools/lab/README.md); each argset skipped this way is counted so the
+    # summary says so instead of silently covering less than it looks like.
+    local rf an2 ncol vout vrc rpt_new_tot=0 rpt_new_ok=0 rpt_base_tot=0 rpt_base_ok=0 rpt_fails="" rpt_skip=0
+    for tree in new base; do
+        local -a rfiles=()
+        for rf in "$o/$tree"/*.raw; do
+            [ -e "$rf" ] || continue
+            ncol="$(basename "$rf" .raw)"; an2="${ncol##*.}"; ncol="${ncol%.*}"
+            case "$an2" in help|badarg) continue ;; esac
+            case " ${ARGSMAP["$ncol.$an2"]:-} " in
+                *' --bundle '*|*' --file '*) [ "$tree" = new ] && rpt_skip=$((rpt_skip + 1)); continue ;;
+            esac
+            [ -s "$rf" ] || { [ "$tree" = new ] && rpt_skip=$((rpt_skip + 1)); continue; }
+            rfiles+=("$rf")
+        done
+        [ ${#rfiles[@]} -gt 0 ] || continue
+        vout="$("$REPO/tools/validate.sh" --report "${rfiles[@]}" 2>&1)"; vrc=$?
+        if [ "$tree" = new ]; then
+            rpt_new_tot=${#rfiles[@]}
+            rpt_new_ok=$(printf '%s\n' "$vout" | grep -c '^PASS  ')
+            [ "$vrc" = 0 ] || rpt_fails="$rpt_fails
+$(printf '%s\n' "$vout" | grep -v '^PASS  ')"
+        else
+            rpt_base_tot=${#rfiles[@]}
+            rpt_base_ok=$(printf '%s\n' "$vout" | grep -c '^PASS  ')
+        fi
+    done
+
+    # compare() diffs whatever is in the two directories it is given: give it
+    # a view without the unmasked .raw files, so they do not double the .out
+    # diff with a coarser (blanket digit-masking) comparison of their own.
+    local d nf nd rcs cmpb cmpn
+    cmpb="$(mktemp -d "${TMPDIR:-/tmp}/ggtlab-cmp.XXXXXX")"; cmpn="$(mktemp -d "${TMPDIR:-/tmp}/ggtlab-cmp.XXXXXX")"
+    for f in "$o/base"/*; do case "$f" in *.raw) ;; *) ln -s "$f" "$cmpb/$(basename "$f")"; esac; done
+    for f in "$o/new"/*; do case "$f" in *.raw) ;; *) ln -s "$f" "$cmpn/$(basename "$f")"; esac; done
+    d="$(compare "$cmpb" "$cmpn")" || base_rc=1
+    rm -rf "$cmpb" "$cmpn"
     printf '%s\n' "$d" > "$o/diff.txt"
-    nf="$(find "$o/new" -type f | wc -l)"
+    nf="$(find "$o/new" -type f ! -name '*.raw' | wc -l)"
     nd="$(printf '%s\n' "$d" | grep -cE '^(== |MISSING |EXTRA )')"
     rcs="$(for f in "$o/new"/*.rc; do printf '%s=%s ' "$(basename "$f" .rc)" "$(cat "$f")"; done)"
     printf '== %s (%s)\n' "$1" "$(t_status 2>/dev/null)"
     printf '   files %s, differ %s, checks %s/%s (base %s/%s)\n' "$nf" "$nd" "$okn" "$tot" "$okb" "$tot"
+    local rpt_skip_msg=""
+    [ "$rpt_skip" -gt 0 ] && rpt_skip_msg=", skipped $rpt_skip (--bundle/--file, no stdout report)"
+    printf '   report PASS %s/%s (base %s/%s)%s\n' "$rpt_new_ok" "$rpt_new_tot" "$rpt_base_ok" "$rpt_base_tot" "$rpt_skip_msg"
     printf '   rc new: %s\n' "$rcs"
     [ -n "$fails" ] && printf '   checks failed on the working tree:%s\n' "$fails"
+    [ -n "$rpt_fails" ] && printf '   validate --report failed on the working tree:%s\n' "$rpt_fails"
     [ "$nd" -gt 0 ] && printf '%s\n' "$d" | sed 's/^/   /'
-    [ "$base_rc" = 0 ] && [ "$okn" = "$tot" ]
+    [ "$base_rc" = 0 ] && [ "$okn" = "$tot" ] && [ "$rpt_new_ok" = "$rpt_new_tot" ]
 }
 
 # ---- main ----------------------------------------------------------------

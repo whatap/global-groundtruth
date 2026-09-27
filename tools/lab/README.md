@@ -15,25 +15,34 @@ tools/lab/run.sh --status                       # state, uptime, memory, health 
 For each target, `run.sh` brings it up if it is not running (and reuses it
 when it is), runs every collector that applies — once from `--base` (default
 `HEAD`, taken with `git archive`) and once from the working tree — with the
-target's argument sets, and writes masked stdout / stderr / rc to
-`--out DIR` (default `$TMPDIR/ggtlab-out/<UTC>/`) as
-`<target>/{base,new}/<collector>.<argset>.{out,err,rc}` plus `<target>/diff.txt`.
-Masking and the diff are `mask()` and `compare()` of
+target's argument sets, and writes masked stdout / stderr / rc, plus the
+**unmasked** stdout, to `--out DIR` (default `$TMPDIR/ggtlab-out/<UTC>/`) as
+`<target>/{base,new}/<collector>.<argset>.{out,err,rc,raw}` plus
+`<target>/diff.txt`. Masking and the diff are `mask()` and `compare()` of
 [`../capture-compare.sh`](../capture-compare.sh), read from that file at run
-time, so the two tools mask the same way. Then the target's checks (facts
-that must appear) are run on both trees. The summary per target:
+time, so the two tools mask the same way (the diff itself only ever looks at
+the masked files, not `.raw`). Then the target's checks (facts that must
+appear) are run on both trees, and `tools/validate.sh --report` is run on
+every `.raw` file whose argument set actually produces a report — every set
+except `help` and `badarg` — on both trees; masking replaces versions and
+timestamps with tokens that `validate.sh` does not expect, which is why it
+reads `.raw`, not `.out`. The summary per target:
 
 ```
 == java-zoo (jjsong-ggt-java-zoo running since …, mem 310MiB / 23.47GiB)
    files 21, differ 0, checks 14/14 (base 14/14)
+   report PASS 14/14 (base 14/14)
    rc new: collect-apmjava.app-bash=0 … collect-apmjava.badarg=2 …
 ```
 
-Exit 0 when nothing differs and every check passes, 1 otherwise, 2 on usage,
-3 when a target cannot be brought up or is not healthy. A difference is not
-a verdict: live state (pids, sessions, the deadline mode `dl` under load)
-moves between two runs. Run the base twice (`--base HEAD` with a clean tree)
-to see the noise floor, as with capture-compare.
+Exit 0 when nothing differs, every check passes, and `validate.sh --report`
+passes on the working tree's own reports; 1 otherwise, 2 on usage, 3 when a
+target cannot be brought up or is not healthy. A `validate.sh --report`
+failure on the base is printed (`base n/m`) but does not affect the exit
+status — it is pre-existing, not caused by the change under test. A
+difference is not a verdict: live state (pids, sessions, the deadline mode
+`dl` under load) moves between two runs. Run the base twice (`--base HEAD`
+with a clean tree) to see the noise floor, as with capture-compare.
 
 ## Lab rules
 
@@ -67,6 +76,10 @@ to see the noise floor, as with capture-compare.
 | `apm-php-rocky` | `jjsong-ggt-apm-php-rocky:1` | Rocky 9 with systemd as PID 1, php-fpm 8.2 + nginx, whatap-php 2.14-2 rpm |
 | `apm-php-alpine` | `jjsong-ggt-apm-php-alpine:1` | Alpine (musl), php-fpm 8.3 + nginx, WhaTap PHP 2.14.2 Alpine tarball, PID 1 `sleep` |
 | `java-zoo` | `jjsong-ggt-java-zoo:1` | the apmjava edge cases below |
+| `zfs` | `jjsong-ggt-zfs` (ssh) | collzfs against the real zpool `yard`; root over sudo -n |
+| `collsrv` | `jjsong-ggt-collsrv` (ssh) | collserver + collmysql against a real on-prem install; collmysql's `--binlog` argset runs as root (unix-socket auth, binlog files are mode 640 owner mysql) |
+| `k8sproxy` | `jjsong-ggt-k8sproxy` (local + ssh) | collect-k8s.sh against the MEA 2026-08-18 webhook-fail-open repro, once from this machine (bastion shape, `KUBECONFIG=~/.kube/config-ggt-k8sproxy`) and once from inside the VM (the serving-chain probe needs a route to the pod/service CIDR) |
+| `k8s-lab` | jjsong-k8s cluster (local, default kubeconfig) | collect-k8s.sh, read-only, against the real cluster with real operator-injected APM pods in `coursematerials` |
 
 Every apm container target runs the same argument sets (`apm_argsets` in
 `lib.sh`): `help`, `badarg`, `app-sh` / `app-bash` (script on stdin as the
@@ -122,19 +135,35 @@ CHECKS=( "apmjava|app-sh|some ERE that must appear" "apmjava|app-sh|!an ERE that
 - An argument set is `name|user|shell|ENV|args`. `shell` `sh -s`, `bash -s`,
   `dash -s` feed the script on stdin; `sh`, `bash`, `dash` run it as a file.
   `user` is a uid or name inside a container, `-` for the login user of a
-  local or ssh target, `0` for root (sudo -n over ssh).
+  local or ssh target, `0` for root (sudo -n over ssh). An `ssh_target` only
+  runs collectors on stdin (`sh -s`/`bash -s`/`dash -s`; a bare shell name
+  errors out) — the collector itself needs bash (e.g. collzfs, collserver,
+  collmysql), so give it `bash -s`, not `sh -s`.
 - A target that needs different sets per collector defines `argsets()`
-  printing them (see `targets/local.sh`).
+  printing them (see `targets/local.sh`, `targets/collsrv.sh`).
 - A check is `collector-ERE|argset-ERE|ERE`, searched in the masked stdout
   of both trees; the summary shows new and base counts, so a check that
   only the working tree passes is a new fact, and one only the base passes
   is a regression.
+- A target that must run the same collector on two different hosts (e.g.
+  `k8sproxy`: this machine as a bastion, and inside the VM for the
+  serving-chain probe) is not one of the three kinds: call `local_target` (or
+  `ssh_target`) for its `t_up`/`t_down`/`t_status`, then override `t_exec`
+  yourself, dispatching on the argset's `user` field. `_ssh` (from
+  `ssh_target`) and the `$LAB_WORK` scratch dir (from `local_target`) are
+  plain global functions/variables after the helper has run, so the override
+  can still use them. See `targets/k8sproxy.sh`.
+- ssh targets are permanent VMs the lab does not start or stop: `t_up` only
+  checks they answer, and a `--bundle`/`--file` argset's output file is left
+  on the VM (send `--out /tmp` so it ages out with the VM's own tmpfiles
+  policy, rather than the login home).
 
 ## Not covered yet
 
-- ssh targets are supported by `lib.sh`, but no target file uses one yet
-  (candidate: `jjsong-ggt-zfs` for collzfs).
 - `mask()` stays in `capture-compare.sh` and is read from there; moving it
   to a shared file would touch that tool.
+- `compare()` never sees `.raw` files (`run_target` links everything else
+  into two scratch dirs first): comparing them too would just repeat the
+  `.out` diff through a coarser, blanket digit-masking pass of its own.
 - `DOCKER_HOST=ssh://…` opens one ssh connection per docker call; a
   `ControlMaster` entry for `ggt-docker` in `~/.ssh/config` makes runs faster.
