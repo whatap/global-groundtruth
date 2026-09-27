@@ -30,7 +30,7 @@ developer, but also the engineer on site).
 > If a line could start with "so you should…", "this is probably…", or
 > "the problem is…", it violates this rule. Delete the judgment; keep the fact.
 
-A fact section holds **observed values only**. Two kinds of line that are not
+A fact section holds **observed values only**. Three kinds of line that are not
 judgments still do not belong there:
 
 - **Explanation** — what a field means, how the product behaves, what a
@@ -42,6 +42,14 @@ judgments still do not belong there:
   obtain what it did not*, and it lives only in the `Collection status` section
   and on stderr, attached to the goal it would obtain (`run again with sudo`,
   `rerun with --sql`, `run it on the DB host`).
+- **Derived views** — tallies, frequency tables, histograms, percentiles,
+  joins between sections, or a table rebuilt from output the report or bundle
+  already carries. Print the raw output once; the reader, or a helper on the
+  analysis side, builds the view. A count of what was read (`backup files: 3`,
+  `172 jars`) is a fact about the run and stays. When a case shows a report is
+  hard to read, the fix is an analysis-side helper, not a new collector section:
+  derived code parses, breaks across product versions, and makes the collector
+  heavier without adding a fact.
 
 ### Saying whether the collection worked
 
