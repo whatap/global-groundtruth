@@ -5,6 +5,9 @@ change to the script bumps its `VERSION` and adds one entry at the top of this
 list (docs/authoring-guide.md, step 2); `tools/validate.sh` checks that the
 newest entry is the script's `VERSION`.
 
+- **0.7.4** — Shortened the top-of-file comment block: pointed the
+  #nms-support traceability, docs cross-check and section detail at
+  README.md instead of restating it. Comments only; report content unchanged.
 - **0.7.3** — Split run_report (426 lines) into one _rep_\<letter> per section;
   the yum and apt repo loops are one loop. Report content unchanged.
 - **0.7.2** — Shared code in synced blocks (R2 refactor): the skeleton's emit

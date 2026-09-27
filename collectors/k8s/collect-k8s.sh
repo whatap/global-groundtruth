@@ -3,20 +3,14 @@
 # WhaTap Global Groundtruth — Kubernetes collector (seeded v0)
 # -----------------------------------------------------------------------------
 # Gathers facts about a WhaTap Kubernetes monitoring install (operator,
-# WhatapAgent CR, node-agent DaemonSet, master-agent, webhooks, helm state)
-# so a remote developer does not have to ask the field engineer twenty
-# questions. Runs wherever kubectl (or oc) can reach the cluster — a bastion,
-# an engineer workstation — NOT on the node. Node-level facts (container log
-# real path, runtime sockets, cgroup version) are collected best-effort by
-# exec'ing into running whatap node-agent pods.
-#
-# Sections: declared state in C/D/E, observed events in F, all log streams in
-# G, image index in H, in-pod facts in I, APM auto-instrumentation of
-# application pods in J. Load-safe: the default report is read-only API GETs
-# with a bounded --tail and a per-call timeout; full logs and yaml archives are
-# --bundle; per-node exec fan-out is opt-in (--exec-per-node) and announced.
-# kubectl falls back to oc; helm facts degrade to release-secret names without
-# the binary; no jq, no mapfile, no associative arrays.
+# WhatapAgent CR, node-agent DaemonSet, master-agent, webhooks, helm state) so
+# a remote developer does not have to ask the field engineer twenty questions.
+# Runs wherever kubectl (or oc) can reach the cluster — a bastion, an engineer
+# workstation — NOT on the node; node-level facts are collected best-effort by
+# exec'ing into running whatap node-agent pods. Sections and load tiers:
+# README.md "(a) What it collects". kubectl falls back to oc; helm facts
+# degrade to release-secret names without the binary; no jq, no mapfile, no
+# associative arrays.
 #
 # Verbatim, no masking. `get secret -o yaml|json` is never used: secrets appear
 # as name/type tables, and the one Secret field read is the webhook certificate
@@ -39,7 +33,7 @@ export LC_ALL=C
 # ---- collector metadata -----------------------------------------------------
 COLLECTOR_NAME="whatap-k8s"
 # History: CHANGELOG.md (next to this file).
-VERSION="0.11.4"
+VERSION="0.11.5"
 DOMAIN="k8s"
 TARGET="k8s-cluster/unresolved"      # refined after CLI/context/namespace discovery
 
@@ -949,22 +943,15 @@ pod_exec_probe_ns() {
 pod_exec_probe() { pod_exec_probe_ns "$NS" "$1" "$2" "$3" "$4"; }
 
 # ---- merged calls ----------------------------------------------------------------
-# Every kubectl call is an API round trip (105 of them took 20 of a run's 25 s
-# on a lab cluster), so the jsonpath reads of one object or list are asked in
-# ONE call, each template preceded by a marker line, and split back afterwards.
-# km_get GROUP ARGS... -> `ARGS -o jsonpath=<KM_T joined>`, stored as one group
-#   record (KM_GN name, KM_GRC exit status, KM_GERR stderr, KM_GFB=1 on a template
-#   error: jsonpath named in stderr) and one segment per marker line met (KM_SK
-#   KEY, KM_SS the text after it). A group's segments are contiguous, from
-#   index KM_GS for KM_GC entries, so a lookup reads only its own. A new call
-#   of a group replaces it: its old range is unset (the segment arrays are
-#   sparse; KM_SN is the next free index) and the new one starts at KM_SN.
-# A template carries its marker: _km_mark KEY, or per item of a range
-#   {"\n<marker> "}{.metadata.name}{"/KEY\n"} with the KEYs, in order, in KM_IKEYS.
-# The marker is random per run and a marker line counts only when it is the one
-# expected next, so a value holding marker-like text stays part of the value.
+# Why: 105 kubectl calls took 20 of a run's 25s on a lab cluster, so per-object
+# jsonpath reads are merged into one call and split back by marker line. Full
+# mechanism (marker format, group/segment layout, replacement rule): README.md
+# Design notes.
+# km_get GROUP ARGS... -> `ARGS -o jsonpath=<KM_T joined>`, one group record
+#   (KM_GN/KM_GRC/KM_GERR/KM_GFB) plus one segment per marker line (KM_SK KEY,
+#   KM_SS text).
 # kg_run GROUP KEY ARGS... stands in for `run_k ARGS` (K_OUT, K_RC, $_errfile as
-# that call would leave them); a template error or a missing key makes the call.
+#   that call would leave them); a template error or a missing key makes the call.
 _km_rand=""
 { read -r _km_rand < /proc/sys/kernel/random/uuid; } 2>/dev/null
 [ -n "$_km_rand" ] || _km_rand="$(od -An -N8 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')"
@@ -1141,13 +1128,11 @@ kr_keep() {
 }
 
 # _pod_probes_run POD CONTAINER CMD... -> every CMD in one `kubectl exec`, each
-# through its own `sh -c` (a CMD that does not parse fails alone, as it did in
-# its own exec). Per CMD the pod prints "<marker> N/start", then N/out, the
-# stdout, N/err, the stderr, and N/rc with the exit status on the next line;
-# the marker is the per-run random one of km_get, passed as $1, and a marker
-# line counts only when it is the one expected next. Stored as the segments
-# of the reserved group "" (_PX_GI; keys N/out, N/err, N/rc; N/start with an empty text);
-# _pod_probe_emit N "label" CMD then reports CMD N as pod_exec_probe did.
+# through its own `sh -c` (a CMD that does not parse fails alone). Per CMD the
+# pod prints "<marker> N/start", N/out+stdout, N/err+stderr, N/rc+exit status;
+# marker is km_get's per-run random one ($1), counted only when it is the next
+# expected. Segments live in the reserved group "" (_PX_GI; keys N/out, N/err,
+# N/rc); _pod_probe_emit N "label" CMD reports CMD N as pod_exec_probe did.
 _PX_DRV='m=$1; shift; i=0; for c in "$@"; do i=$((i + 1)); echo "$m $i/start"; echo "$m $i/out"; { e=$( { sh -c "$c" 2>&1 1>&3 3>&-; } ); } 3>&1; r=$?; echo; echo "$m $i/err"; printf "%s\n" "$e"; echo "$m $i/rc"; echo "$r"; done'
 PX_POD="" PX_CONT="" PX_RERUN_TO=0 _PX_GI=-1
 _pod_probes_run() {
@@ -1178,14 +1163,12 @@ EOF
     if [ -n "$key" ]; then _seg_flush "$key" "$acc"; fi
 }
 _px() { KG_V=""; _km_seg "$_PX_GI" "$1"; }
-# A probe with no status of its own: one that started and was cut off takes
-# the exec's reason (a timeout says timed out); when no probe started at all
-# the exec's reason stands for each, as each exec would have failed alike;
-# one that never started while a probe before it did (it hung, or the stream
-# broke) runs alone in its own exec under its own cap. Past the run deadline
-# it is not run, and the reason says why. Once one such re-run also times
-# out, the rest are not run either: each would wait a full cap for the same
-# cause.
+# A probe with no status of its own: one cut off after starting takes the
+# exec's reason (e.g. timed out); if none started, the exec's reason stands
+# for each (all would have failed alike). One that never started while an
+# earlier one did (it hung, or the stream broke) is re-run alone under its
+# own cap, unless past the run deadline; once a re-run also times out, the
+# rest are not run either (same cause, same wait).
 _pod_probe_emit() {
     local n="$1" label="$2" cmd="$3" out err rc
     if _px "$n/rc"; then
@@ -1711,13 +1694,10 @@ _x509_fp() { openssl x509 -noout -sha256 -fingerprint -subject "$@" 2>/dev/null 
 
 _rep_operator_cert() {
     subsection "webhook serving certificate vs registered caBundle"
-    # The operator generates a fresh self-signed CA on every process start (cmd/main.go
-    # generateSelfSignedCert) and writes it to /etc/webhook/certs, which the Deployment
-    # mounts as an emptyDir — nothing persists across pod restarts. The caBundle in the
-    # webhook configuration is written from whichever operator process reconciled last.
-    # When the two disagree the API server rejects the call with
-    #   x509: certificate signed by unknown authority ... "whatap-webhook-ca"
-    # and, under failurePolicy: Ignore, the pod is admitted with no injection and no error.
+    # Root cause of a mismatch: the operator mints a fresh self-signed CA into an
+    # emptyDir on every process start (cmd/main.go generateSelfSignedCert), so it
+    # can disagree with the caBundle of whichever process reconciled last — see
+    # README.md section D for the resulting x509/failurePolicy failure mode.
     # So: the fingerprints below, and the times they were produced, are the fact.
     if [ -n "$WEBHOOKS" ] && have openssl; then
         local wh2 cab1 fpr
@@ -1925,17 +1905,12 @@ _rep_logs() {
     section "G. Logs (bounded tails)"
     fact "bounds: --tail=$LOG_TAIL_LINES per container; previous instance --tail=100; up to 3 sample node-agent pods (--bundle carries fuller logs)"
     if [ -n "$NS" ]; then
-        # The admission decision is written when a pod is CREATED, which is usually
-        # far behind a 200-line tail on a long-lived operator. Pull a deeper tail and
-        # keep only the lines the injector emits (agent injection, env assembly,
-        # webhook admission), so the trail survives without shipping the whole log.
-        # The same read carries the --tail lines: they are its last lines when
-        # --tail is at most 4000 and the byte cap did not cut it. The cap cuts the
-        # NEWEST lines (the kubelet seeks to the --tail start, then stops writing
-        # at --limit-bytes). $(...) strips only the trailing newlines, at most one
-        # per line, so an output under 4000000 - 4000 bytes was not cut. Otherwise, or when the
-        # deep read failed, the tail is its own call, as before. One read also
-        # means one pod: deploy/NAME is resolved to a pod per call.
+        # Merged read (why a deep tail is needed for the injection trail: README.md
+        # Design notes) reuses one --tail=4000 call for both the --tail lines and
+        # the trail. --limit-bytes cuts the NEWEST lines, so an output under
+        # 3996000 bytes (4000000 - 4000, one $(...) newline strip per line) was
+        # not cut; otherwise, or if the read failed, --tail is its own call. One
+        # read also means one pod: deploy/NAME resolves to a pod per call.
         if [ -n "$OP_DEPLOY" ]; then
             local dp_rc dp_out dp_why="" inj
             run_k logs -n "$NS" "deploy/$OP_DEPLOY" --tail=4000 --limit-bytes=4000000

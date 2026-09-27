@@ -5,6 +5,12 @@ change to the script bumps its `VERSION` and adds one entry at the top of this
 list (docs/authoring-guide.md, step 2); `tools/validate.sh` checks that the
 newest entry is the script's `VERSION`.
 
+- **0.11.5** — Shortened long comment runs: the top-of-file block now points at
+  README.md for section/tier detail instead of restating it; the merged-calls
+  and deep-operator-log-tail algorithm rationale moved to a new README.md
+  "Design notes" section, with a short pointer left in the code; the webhook
+  cert mismatch root cause and the pod-probe fallback rules were tightened in
+  place. Comments only; report content unchanged.
 - **0.11.4** — The batched-call store keeps each group's segments contiguous
   (start KM_GS, count KM_GC per group; KM_SK holds KEY only), so a lookup reads
   only that group's segments and a re-run unsets only its own range instead of

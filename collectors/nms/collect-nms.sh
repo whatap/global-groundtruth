@@ -2,18 +2,15 @@
 #
 # WhaTap Global Groundtruth — NMS Control Manager collector (seeded v0)
 # -----------------------------------------------------------------------------
-# The facts NMS support cases ask for over and over (from the #nms-support
-# history; question -> section traceability in the analysis workspace case
-# 2026-07-03-nms-support-channel-analysis), checked against
-# docs.whatap.io/nms/supported-spec (OS/python, ports) and /install-agent (repo,
-# wtinitset, units). Runs on the host where the NMS Control Manager (whatap-nms
-# rpm or deb) is, or was supposed to be, installed.
+# Facts NMS support cases ask for over and over. Runs on the host where the
+# NMS Control Manager (whatap-nms rpm or deb) is, or was supposed to be,
+# installed. See README.md for the #nms-support traceability source and the
+# docs cross-check, and "(a) Facts it collects" for section detail.
 #
-# Load-safe: the default run is read-only; log reads are tail-bounded, no
-# recursive du/find, two outbound HEAD requests capped at 5s each (closed-network
-# detection is itself a recurring question). SNMP is Tier 2, opt-in, single GETs.
-# Discovery: install root from rpm -ql / dpkg -L, services from systemd, ports
-# from ss/netstat/proc, never hardcoded. Owned by the NMS development team.
+# Load-safe: the default run is read-only, log reads tail-bounded, no
+# recursive du/find; SNMP is Tier 2, opt-in. Install root, services and ports
+# are always discovered (rpm -ql/dpkg -L, systemd, ss/netstat/proc), never
+# hardcoded. Owned by the NMS development team.
 #
 # CONTRACT ../../CONTRACT.md, guidelines ../../docs/collector-engineering.md;
 # no set -e on purpose (the run must reach its footer).
@@ -31,7 +28,7 @@ export LC_ALL=C
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-nms"
 # History: CHANGELOG.md (next to this file).
-VERSION="0.7.3"
+VERSION="0.7.4"
 DOMAIN="nms"
 TARGET="host/$(hostname 2>/dev/null || echo unknown)"
 

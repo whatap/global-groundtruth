@@ -159,6 +159,31 @@ Load tiers:
 The old idea of an in-cluster `Job` manifest delivery (host mounted read-only)
 remains future work; v0 is bastion-run by decision.
 
+## Design notes
+
+**Merged calls** (`# ---- merged calls` in `collect-k8s.sh`): 105 kubectl calls
+took 20 of a run's 25s on a lab cluster, so per-object jsonpath reads are asked
+in ONE call and split back afterwards. `km_get GROUP ARGS...` runs
+`ARGS -o jsonpath=<KM_T joined>` and stores one group record (`KM_GN` name,
+`KM_GRC` exit status, `KM_GERR` stderr, `KM_GFB=1` on a template error) plus
+one segment per marker line met (`KM_SK` KEY, `KM_SS` the text after it). A
+group's segments are contiguous, from index `KM_GS` for `KM_GC` entries, so a
+lookup reads only its own; a new call of a group replaces it (the old range is
+unset — the segment arrays are sparse; `KM_SN` is the next free index — and
+the new one starts at `KM_SN`). A template carries its marker: `_km_mark KEY`,
+or per item of a range `{"\n<marker> "}{.metadata.name}{"/KEY\n"}` with the
+KEYs, in order, in `KM_IKEYS`. The marker is random per run and a marker line
+counts only when it is the one expected next, so a value holding marker-like
+text stays part of the value.
+
+**Deep operator-log tail** (`_rep_logs` in `collect-k8s.sh`): the admission
+decision is written when a pod is CREATED, which is usually far behind a
+200-line tail on a long-lived operator. The section pulls a deeper tail
+(`--tail=4000 --limit-bytes=4000000`) and keeps only the lines the injector
+emits (agent injection, env assembly, webhook admission), so the trail
+survives without shipping the whole log — the same read also supplies the
+plain `--tail` lines when they fit inside it.
+
 ## (c) Maintenance
 
 - Validate: `../../tools/validate.sh collect-k8s.sh` (must PASS).

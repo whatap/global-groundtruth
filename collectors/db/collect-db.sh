@@ -5,18 +5,10 @@
 # Collects facts about a WhaTap DB-monitoring installation. The DBX agent
 # queries the monitored database over JDBC, so the agent host and the DB host
 # are often DIFFERENT machines (and the DB itself may be a managed cloud
-# service with no reachable host at all). This collector therefore discovers
-# what is present on the host it runs on and adapts:
-#
-#   * DBX-side components found (dbx / dmx / prx / dbxc)  -> agent-host sections
-#   * XOS / xcub / DB server processes found              -> DB-host sections
-#   * neither                                             -> that fact itself
-#
-# Field procedure (see README.md):
-#   1. run on the DBX agent host:      ./collect-db.sh --file
-#   2. on-prem split topology: run the same command on the DB host too
-#   3. run the matching sql/<engine>.sql through the DB client with the
-#      monitoring account, and paste its output together with the reports
+# service with no reachable host at all); this collector discovers what is
+# present on the host it runs on and adapts. See README.md "Why the layout
+# looks like this" for the agent-host / DB-host / DB-engine split, and
+# "Field procedure" for how to run it in each topology.
 #
 # CONTRACT ../../CONTRACT.md, guidelines ../../docs/collector-engineering.md;
 # no set -e on purpose (the run must reach its footer). Config files are dumped
@@ -36,7 +28,7 @@ export LC_ALL=C
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-db"
 # History: CHANGELOG.md, section collect-db.sh (next to this file).
-VERSION="0.8.3"
+VERSION="0.8.4"
 DOMAIN="db"
 TARGET="db-host/$(hostname 2>/dev/null || echo unknown)"
 
