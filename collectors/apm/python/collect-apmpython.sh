@@ -82,9 +82,43 @@ COLLECTOR_NAME="whatap-apmpython"
 #        /proc/sys/kernel/hostname, else `uname -n`, and so does Target (both
 #        were: unknown, and validate.sh --report refused Target: host/unknown);
 #        the file name reuses the name Target resolved.
-VERSION="0.10.1"
+# 0.10.2 The interpreters this run starts (the python -c lookups, pip list)
+#        run without the whatap/bootstrap entries of PYTHONPATH. Run by
+#        kubectl exec in an operator-injected pod, the shell inherits
+#        PYTHONPATH=/whatap-agent:/whatap-agent/whatap/bootstrap; its
+#        sitecustomize.py calls whatap.agent() in every interpreter, and one
+#        collector run killed the application's whatap_python Go module and
+#        left orphaned copies that outlived the run (lab container, 2026-09-27).
+#        Report: [1] names the entries removed; section 3 loses the agent's
+#        start-up lines ("WHATAP: AGENT UP!") that were added to each lookup.
+#        Each whatap package dir seen in process environ also gets the
+#        version and release_date lines of its build.py ("build.py: version
+#        = '2.1.2' release_date = '20260722'"): the operator's copy has no
+#        dist-info, so its version was n/a everywhere in section 3.
+VERSION="0.10.2"
 DOMAIN="apm"
 TARGET="host/$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || uname -n 2>/dev/null || echo unknown)"
+
+# An interpreter started with <dir>/whatap/bootstrap on PYTHONPATH runs its
+# sitecustomize.py, which starts the WhaTap agent (and its Go module). Every
+# interpreter this run starts gets PYTHONPATH without those entries; the
+# other entries stay, so a package found through them is still found.
+_SELF_PYDROP=""
+if [ -n "${PYTHONPATH:-}" ]; then
+    _pp_new="" _pp_ifs="$IFS"
+    set -f; IFS=:
+    for _e in $PYTHONPATH; do
+        case "${_e%/}" in
+            */whatap/bootstrap|whatap/bootstrap) _SELF_PYDROP="$_SELF_PYDROP $_e" ;;
+            *) _pp_new="${_pp_new:+$_pp_new:}$_e" ;;
+        esac
+    done
+    IFS="$_pp_ifs"; set +f
+    if [ -n "$_SELF_PYDROP" ]; then
+        if [ -n "$_pp_new" ]; then PYTHONPATH="$_pp_new"; export PYTHONPATH; else unset PYTHONPATH; fi
+    fi
+    unset _pp_new _pp_ifs _e
+fi
 
 # ---- CLI harness — DO NOT EDIT ----------------------------------------------
 OPT_FILE=0        # write the report to a .txt file
@@ -1537,6 +1571,7 @@ _rep_env() {
     fact "privilege: $PRIV_WHY"
     _note_boot
     fact "collector cwd: $(pwd 2>/dev/null || echo unknown)"
+    fact "PYTHONPATH entries removed from the interpreters this run starts:${_SELF_PYDROP:- none}"
     fact "tools:"
     for t in python3 python pip3 ss netstat readlink timeout file stat awk tr; do
         if command -v "$t" >/dev/null 2>&1; then printf '        %-12s present (%s)\n' "$t" "$(command -v "$t")"
@@ -1824,6 +1859,14 @@ EOF
                 printf '           %s\n' "$(grep -m1 '^Version:' "$meta" 2>/dev/null || echo 'Version: n/a (no Version line in metadata)')"
             else
                 printf '           metadata: n/a (no whatap_python-* dist-info/egg-info next to %s)\n' "$fsd"
+            fi
+            # the agent's own version file, read as text (the operator's
+            # /whatap-agent copy has no dist-info)
+            if [ -r "$fsd/build.py" ]; then
+                _bv="$(grep -E '^(version|release_date) *=' "$fsd/build.py" 2>/dev/null | tr '\n' ' ' | sed 's/ *$//')"
+                printf '           build.py: %s\n' "${_bv:-n/a (no version line in $fsd/build.py)}"
+            else
+                printf '           build.py: n/a (%s)\n' "$(_absent_why "$fsd/build.py")"
             fi
             if [ -d "$fsd/agent" ]; then printf '           agent binaries dir: present\n'
             else printf '           agent binaries dir: absent\n'; fi

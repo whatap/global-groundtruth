@@ -1,6 +1,12 @@
 # collectors/apm/python — WhaTap Python APM agent collector
 
-> **Status: SEEDED (v0).** `collect-apmpython.sh` is a working Tier-0
+> **Status: SEEDED (v0; validated at `collect-apmpython.sh` 0.10.2 on
+> 2026-09-27 against real `whatap-python` agents: 2.2.0 from PyPI in a
+> virtualenv under `whatap-start-agent gunicorn`, and the operator's
+> `apm-init-python` copy (2.1.2, `PYTHONPATH=/whatap-agent:/whatap-agent/whatap/bootstrap`)
+> under plain gunicorn; as root, as the app's user and as another user, bash
+> and `sh -s`; no collection server was reachable, so the Go module opened no
+> UDP listener and no TCP session).** `collect-apmpython.sh` is a working Tier-0
 > collector seeded by the Global team (CONTRACT rule 4 — interim ownership).
 > Ongoing ownership belongs to the Python agent developers once handed over.
 
@@ -66,6 +72,17 @@ Container notes (all verified against real images):
 | 9 | Kubernetes / operator injection context | `/whatap-agent` volume, `WHATAP_PYTHON_AGENT_PATH` (symlink vs regular file), k8s env facts |
 
 ## How each interpreter is asked
+
+Every interpreter this run starts gets `PYTHONPATH` without its
+`*/whatap/bootstrap` entries. That directory holds the agent's
+`sitecustomize.py`, which calls `whatap.agent()` in any interpreter that finds
+it; the operator puts it on the container's `PYTHONPATH`, and the
+`kubectl exec` shell inherits it. Before 0.10.2 one run started the agent in
+its own interpreter: the application's `whatap_python` Go module was killed
+and replaced by orphaned copies (parent pid 1, two or three per run in the
+lab) that outlived the run. The other entries
+stay, so a package found through them (`/whatap-agent`) is still found. `[1]`
+names the entries removed.
 
 The lookups of section 3 (version, prefixes, whatap-python version and
 location, metadata dirs, setuptools, `pkg_resources`, bundled binaries,
