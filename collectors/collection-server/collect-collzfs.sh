@@ -48,7 +48,7 @@ export LC_ALL=C
 # ---- collector metadata -----------------------------------------------------
 # History: CHANGELOG.md, section collect-collzfs.sh (next to this file).
 COLLECTOR_NAME="whatap-collzfs"
-VERSION="0.8.6"
+VERSION="0.8.7"
 DOMAIN="collection-server"
 TARGET="collection-server-zfs/$(hostname 2>/dev/null || echo unknown)"   # refined after pool discovery
 
@@ -1578,78 +1578,52 @@ _rep_b() {
     # The runtime value of a tunable and the value persisted in modprobe.d can
     # differ (a live `echo > /sys/module/...` is lost on reboot; a modprobe.d
     # entry added after boot is not yet active). Both are reported.
+    local p
     section "B. ZFS module parameters (runtime + persisted)"
     subsection "allocation class routing"
-    param zfs_special_class_metadata_reserve_pct
-    param zfs_ddt_data_is_special
-    param zfs_user_indirect_is_special
-    param zfs_dmu_offset_next_sync
+    for p in zfs_special_class_metadata_reserve_pct zfs_ddt_data_is_special \
+        zfs_user_indirect_is_special zfs_dmu_offset_next_sync; do
+        param "$p"
+    done
     subsection "block size limits"
-    param zfs_max_recordsize
-    param zfs_default_bs
-    param zfs_default_ibs
-    param zvol_volmode
+    for p in zfs_max_recordsize zfs_default_bs zfs_default_ibs zvol_volmode; do param "$p"; done
     subsection "transaction group & dirty-data write throttle"
-    param zfs_txg_timeout
-    param zfs_txg_history
-    param zfs_dirty_data_max
-    param zfs_dirty_data_max_max
-    param zfs_dirty_data_max_percent
-    param zfs_dirty_data_sync_percent
-    param zfs_delay_min_dirty_percent
-    param zfs_delay_scale
-    param zfs_vdev_async_write_active_min_dirty_percent
-    param zfs_vdev_async_write_active_max_dirty_percent
+    for p in zfs_txg_timeout zfs_txg_history zfs_dirty_data_max zfs_dirty_data_max_max \
+        zfs_dirty_data_max_percent zfs_dirty_data_sync_percent \
+        zfs_delay_min_dirty_percent zfs_delay_scale \
+        zfs_vdev_async_write_active_min_dirty_percent \
+        zfs_vdev_async_write_active_max_dirty_percent; do
+        param "$p"
+    done
     subsection "metaslab & allocator"
-    param metaslab_df_free_pct
-    param metaslab_df_alloc_threshold
-    param metaslab_force_ganging
-    param metaslab_force_ganging_pct
-    param metaslab_aliquot
-    param metaslab_debug_load
-    param metaslab_debug_unload
-    param metaslab_unload_delay
-    param metaslab_preload_enabled
-    param zfs_metaslab_switch_threshold
-    param zfs_metaslab_fragmentation_threshold
-    param zfs_mg_fragmentation_threshold
-    param zfs_mg_noalloc_threshold
-    param zfs_metaslab_sm_blksz_no_log
-    param zfs_metaslab_sm_blksz_with_log
+    for p in metaslab_df_free_pct metaslab_df_alloc_threshold metaslab_force_ganging \
+        metaslab_force_ganging_pct metaslab_aliquot metaslab_debug_load \
+        metaslab_debug_unload metaslab_unload_delay metaslab_preload_enabled \
+        zfs_metaslab_switch_threshold zfs_metaslab_fragmentation_threshold \
+        zfs_mg_fragmentation_threshold zfs_mg_noalloc_threshold \
+        zfs_metaslab_sm_blksz_no_log zfs_metaslab_sm_blksz_with_log; do
+        param "$p"
+    done
     subsection "ZIL / sync write path"
-    param zil_slog_bulk
-    param zil_nocacheflush
-    param zfs_immediate_write_sz
-    param zfs_commit_timeout_pct
+    for p in zil_slog_bulk zil_nocacheflush zfs_immediate_write_sz zfs_commit_timeout_pct; do param "$p"; done
     subsection "ARC / L2ARC"
-    param zfs_arc_max
-    param zfs_arc_min
-    param zfs_arc_meta_limit
-    param zfs_arc_meta_limit_percent
-    param zfs_arc_meta_balance
-    param zfs_arc_dnode_limit_percent
-    param zfs_compressed_arc_enabled
-    param zfs_abd_scatter_enabled
-    param l2arc_write_max
-    param l2arc_write_boost
-    param l2arc_noprefetch
-    param l2arc_rebuild_enabled
-    param l2arc_exclude_special
+    for p in zfs_arc_max zfs_arc_min zfs_arc_meta_limit zfs_arc_meta_limit_percent \
+        zfs_arc_meta_balance zfs_arc_dnode_limit_percent zfs_compressed_arc_enabled \
+        zfs_abd_scatter_enabled l2arc_write_max l2arc_write_boost l2arc_noprefetch \
+        l2arc_rebuild_enabled l2arc_exclude_special; do
+        param "$p"
+    done
     subsection "prefetch & vdev aggregation"
-    param zfs_prefetch_disable
-    param zfetch_max_distance
-    param zfetch_max_streams
-    param zfs_vdev_aggregation_limit
-    param zfs_vdev_aggregation_limit_non_rotating
-    param zfs_vdev_read_gap_limit
-    param zfs_vdev_write_gap_limit
+    for p in zfs_prefetch_disable zfetch_max_distance zfetch_max_streams \
+        zfs_vdev_aggregation_limit zfs_vdev_aggregation_limit_non_rotating \
+        zfs_vdev_read_gap_limit zfs_vdev_write_gap_limit; do
+        param "$p"
+    done
     subsection "scrub / resilver / trim"
-    param zfs_scan_vdev_limit
-    param zfs_resilver_min_time_ms
-    param zfs_scrub_min_time_ms
-    param zfs_trim_extent_bytes_min
-    param zfs_trim_txg_batch
-    param zfs_rebuild_scrub_enabled
+    for p in zfs_scan_vdev_limit zfs_resilver_min_time_ms zfs_scrub_min_time_ms \
+        zfs_trim_extent_bytes_min zfs_trim_txg_batch zfs_rebuild_scrub_enabled; do
+        param "$p"
+    done
     subsection "all /sys/module/zfs/parameters (name = value)"
     dump_param_dir /sys/module/zfs/parameters
     subsection "all /sys/module/spl/parameters (name = value)"
@@ -2858,6 +2832,9 @@ _win_saved() { awk -F'\t' -v k="$2" '$1 == k { print $2 }' "$WIN_DIR/$1/params" 
 
 # -- O. Write-path window (--window) ---------------------------------------
 WIN_GOAL="time window (every txg, counters, zpool iostat -vlq, -r/-w)"
+# _O_WHY / _O_NOPOOL: what section O's subsections found missing, for its goal line
+_O_WHY="" _O_NOPOOL=0
+_o_why() { _O_WHY="${_O_WHY:+$_O_WHY; }$1"; }
 _rep_o() {
     section "O. Time window (every run; --window sets its length and start)"
     goal window "$WIN_GOAL"
@@ -2880,20 +2857,38 @@ _rep_o() {
         fi
         return
     fi
-    local why="" p pn f st="" n np fn g0 g1 gn ge nopool=0
+    local p
+    _O_WHY="" _O_NOPOOL=0
     fact "window: $(_win_local "$WIN_T0") -> $(_win_local "$WIN_T1"), $(_win_hms $((WIN_T1 - WIN_T0)))"
     if [ -n "$WIN_SIG" ]; then
         fact "ended early: SIG$WIN_SIG after $(_win_hms $((WIN_T1 - WIN_T0))) of $(_win_hms "$WIN_SECS"); what follows covers the part collected"
-        why="ended early by SIG$WIN_SIG after $(_win_hms $((WIN_T1 - WIN_T0))) of $(_win_hms "$WIN_SECS")"
+        _O_WHY="ended early by SIG$WIN_SIG after $(_win_hms $((WIN_T1 - WIN_T0))) of $(_win_hms "$WIN_SECS")"
     elif [ -n "$WIN_CUT" ]; then
         fact "ended early: the run deadline (${RUN_DEADLINE}s, ${WIN_RESERVE}s kept for the report) cut it to $(_win_hms "$WIN_PLAN") of $(_win_hms "$WIN_SECS"); it ran $(_win_hms $((WIN_T1 - WIN_T0))) with the last reads"
-        why="cut by the run deadline (${RUN_DEADLINE}s) to $(_win_hms "$WIN_PLAN") of $(_win_hms "$WIN_SECS")"
+        _O_WHY="cut by the run deadline (${RUN_DEADLINE}s) to $(_win_hms "$WIN_PLAN") of $(_win_hms "$WIN_SECS")"
     fi
     subsection "module parameters at start and end (read, never written)"
     for p in zfs_txg_history zfs_txg_timeout; do
         fact "$p: start $(_win_saved start "$p"), end $(_win_saved end "$p")"
     done
+    _rep_o_txgs
+    _rep_o_counters
+    _rep_o_io
 
+    subsection "txgs rows kept (column header, then one row per txg, ascending)"
+    for p in "$WIN_DIR"/txg/*/; do
+        p="${p%/}"; [ -s "$p/rows" ] || continue
+        fact "pool ${p##*/}:"
+        dump_file "$p/rows" $((WIN_ROW_CAP + 1))
+    done
+    if [ -n "$_O_WHY" ]; then missed window "$_O_WHY"
+    elif [ "$_O_NOPOOL" = 1 ]; then na window "no <pool>/txgs under $KSTAT_DIR and no pool listed by zpool (no pool imported)"
+    else got window; fi
+}
+
+# _rep_o_txgs -> every txg of the window, per pool (adds to _O_WHY / _O_NOPOOL)
+_rep_o_txgs() {
+    local p pn n np g0 g1 gn ge
     subsection "txgs per pool (reads merged by txg number)"
     if [ -n "$WIN_IV_LO" ]; then
         fact "read interval used: ${WIN_IV_LO}..${WIN_IV_HI}s (half the shortest ring span of all pools, clamped to ${WIN_IV_MIN}..${WIN_IV_MAX}s, cut to the time left)"
@@ -2911,7 +2906,7 @@ _rep_o() {
             END { if (mn < 0) print "-"; else printf "%d..%ds", mn, mx }' "$p/reads.tsv" 2>/dev/null)"
         if [ "$w_first" = - ]; then
             fact "  txgs: none read (the ring was empty or not readable at every read)"
-            why="${why:+$why; }pool $pn: no txgs row read (zfs_txg_history=$(_win_saved end zfs_txg_history) at the end)"
+            _o_why "pool $pn: no txgs row read (zfs_txg_history=$(_win_saved end zfs_txg_history) at the end)"
             continue
         fi
         n=$((w_last - w_first + 1))
@@ -2923,40 +2918,44 @@ _rep_o() {
                 blk "txg $g0 .. $g1 ($gn), missing from the read at $(_win_local "$ge")"
             done
             [ "$(wc -l < "$p/gaps.tsv")" -gt 50 ] && blk "(first 50 ranges; all of them in the bundle's window/gaps-$pn.tsv)"
-            why="${why:+$why; }pool $pn: $w_gap txgs left the ring unseen (zfs_txg_history=$(_win_saved end zfs_txg_history) at the end; a larger ring covers a longer span)"
+            _o_why "pool $pn: $w_gap txgs left the ring unseen (zfs_txg_history=$(_win_saved end zfs_txg_history) at the end; a larger ring covers a longer span)"
         fi
         if [ "$w_over" -gt 0 ]; then
             fact "  row cap: $WIN_ROW_CAP rows kept, $w_over later ones not kept"
-            why="${why:+$why; }pool $pn: $w_over rows past the ${WIN_ROW_CAP}-row cap (a shorter --window keeps them all)"
+            _o_why "pool $pn: $w_over rows past the ${WIN_ROW_CAP}-row cap (a shorter --window keeps them all)"
         fi
         if [ -f "$p/gone" ]; then
             IFS="$_tab" read -r g0 g1 < "$p/gone"
             fact "  $KSTAT_DIR/$pn/txgs: not found at the read of $(_win_local "$g0"); the last read with rows was at $( [ -n "$g1" ] && _win_local "$g1" || echo n/a ), newest txg $w_last; txgs after it are not in this report"
-            why="${why:+$why; }pool $pn: $KSTAT_DIR/$pn/txgs not found from $(_win_local "$g0") on"
+            _o_why "pool $pn: $KSTAT_DIR/$pn/txgs not found from $(_win_local "$g0") on"
         fi
         fact "  distribution over the rows seen completed (nearest rank):"
         _win_dist "$p/rows"
     done
     if [ "$np" = 0 ]; then
         fact "no <pool>/txgs under $KSTAT_DIR at the start"
-        if [ "${ZPOOL_COUNT:-0}" -gt 0 ] 2>/dev/null; then why="${why:+$why; }zpool list listed $ZPOOLS but $KSTAT_DIR has no <pool>/txgs"
-        else nopool=1; fi
+        if [ "${ZPOOL_COUNT:-0}" -gt 0 ] 2>/dev/null; then _o_why "zpool list listed $ZPOOLS but $KSTAT_DIR has no <pool>/txgs"
+        else _O_NOPOOL=1; fi
     fi
+}
 
+# _rep_o_counters -> dmu_tx, arcstats and objset-* at start and end (adds to _O_WHY)
+_rep_o_counters() {
+    local p pn f fn st=""
     subsection "counters at start and end (dmu_tx, arcstats, objset-* per dataset)"
     if [ -f "$WIN_DIR/start/dmu_tx" ] && [ -f "$WIN_DIR/end/dmu_tx" ]; then
         fact "dmu_tx ($KSTAT_DIR/dmu_tx):"
         _win_delta "$WIN_DIR/start/dmu_tx" "$WIN_DIR/end/dmu_tx"
     else
         fact "dmu_tx: n/a (not read at $( [ -f "$WIN_DIR/start/dmu_tx" ] && echo end || echo start ): $KSTAT_DIR/dmu_tx)"
-        why="${why:+$why; }dmu_tx not read"
+        _o_why "dmu_tx not read"
     fi
     if [ -f "$WIN_DIR/start/arcstats" ] && [ -f "$WIN_DIR/end/arcstats" ]; then
         fact "arcstats ($KSTAT_DIR/arcstats; the ARC counters behind arcstat, sizes as gauges):"
         _win_delta "$WIN_DIR/start/arcstats" "$WIN_DIR/end/arcstats"
     else
         fact "arcstats: n/a (not read at $( [ -f "$WIN_DIR/start/arcstats" ] && echo end || echo start ): $KSTAT_DIR/arcstats)"
-        why="${why:+$why; }arcstats not read"
+        _o_why "arcstats not read"
     fi
     for p in "$WIN_DIR"/start/pools/*/ "$WIN_DIR"/end/pools/*/; do
         p="${p%/}"; [ -d "$p" ] || continue
@@ -2978,16 +2977,20 @@ _rep_o() {
             fi
         done
     done
+}
 
+# _rep_o_io -> zpool iostat / iostat -x / histograms / arcstat of the window (adds to _O_WHY)
+_rep_o_io() {
+    local n
     subsection "zpool iostat -vlq and iostat -x over the window (started together, same interval)"
     _pair_emit "$WIN_DIR/io" "$WIN_IO_IV" "$WIN_IO_N" "$WIN_IOSTAT_LINES"
-    [ -n "$PAIR_WHY" ] && why="${why:+$why; }$PAIR_WHY"
+    [ -n "$PAIR_WHY" ] && _o_why "$PAIR_WHY"
 
     subsection "zpool iostat -r / -w for the window (first block: since pool import; second: the window)"
     for n in hist-r hist-w; do
         if [ -f "$WIN_DIR/io/$n.t0" ]; then
             _bg_emit "$WIN_DIR/io" "$n" "zpool iostat -T d -${n#hist-} $WIN_PLAN 2 ($( [ "$n" = hist-r ] && echo 'request-size histogram' || echo 'latency histogram' )):" 1000
-            [ -n "$BG_WHY" ] && why="${why:+$why; }$BG_WHY"
+            [ -n "$BG_WHY" ] && _o_why "$BG_WHY"
         fi
     done
     [ -f "$WIN_DIR/io/hist-r.t0" ] || fact "n/a (not run with zpool iostat above)"
@@ -2995,20 +2998,11 @@ _rep_o() {
     subsection "arcstat over the window"
     if [ -f "$WIN_DIR/io/arcstat.t0" ]; then
         _bg_emit "$WIN_DIR/io" arcstat "arcstat $WIN_IO_IV $WIN_IO_N:" "$WIN_IOSTAT_LINES"
-        [ -n "$BG_WHY" ] && why="${why:+$why; }$BG_WHY"
+        [ -n "$BG_WHY" ] && _o_why "$BG_WHY"
     else
         fact "n/a (command not found: arcstat; the arcstats counters it reads are in the start/end table above)"
     fi
 
-    subsection "txgs rows kept (column header, then one row per txg, ascending)"
-    for p in "$WIN_DIR"/txg/*/; do
-        p="${p%/}"; [ -s "$p/rows" ] || continue
-        fact "pool ${p##*/}:"
-        dump_file "$p/rows" $((WIN_ROW_CAP + 1))
-    done
-    if [ -n "$why" ]; then missed window "$why"
-    elif [ "$nopool" = 1 ]; then na window "no <pool>/txgs under $KSTAT_DIR and no pool listed by zpool (no pool imported)"
-    else got window; fi
 }
 
 bundle_window() {

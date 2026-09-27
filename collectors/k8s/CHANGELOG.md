@@ -5,6 +5,10 @@ change to the script bumps its `VERSION` and adds one entry at the top of this
 list (docs/authoring-guide.md, step 2); `tools/validate.sh` checks that the
 newest entry is the script's `VERSION`.
 
+- **0.11.3** — Split _rep_operator and _rep_apm into per-subsection and
+  per-level functions; the batched-call store uses flat arrays keyed GROUP/KEY
+  instead of 14 evals over generated names; repeated code is _seg_flush,
+  _x509_fp and _ns_found. Report content unchanged.
 - **0.11.2** — Shared code in synced blocks (R2 refactor): the skeleton's emit
   helpers now hold _optval, _emit_labeled, _tool_rows (the [1] tool table) and
   _indent (the indent loops), and its run helpers hold probe and read_proc.

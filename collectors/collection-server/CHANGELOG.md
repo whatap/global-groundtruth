@@ -74,6 +74,8 @@ one entry at the top of its section (docs/authoring-guide.md, step 2);
 
 ## collect-collzfs.sh
 
+- **0.8.7** — Split _rep_o into txgs, counters and io parts; section B's named
+  parameters are one loop per subsection. Report content unchanged.
 - **0.8.6** — Shared code in synced blocks (R2 refactor): the skeleton's emit
   helpers now hold _optval, _emit_labeled, _tool_rows (the [1] tool table) and
   _indent (the indent loops), and its run helpers hold probe and read_proc.
