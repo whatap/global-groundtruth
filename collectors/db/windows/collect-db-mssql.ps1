@@ -48,32 +48,7 @@ param(
 )
 
 $COLLECTOR_NAME = "whatap-db-mssql"
-# 0.4.0  The status gives the run time, and when a bounded call was slow (3s),
-#        capped or not run past the deadline, the host load at start and end
-#        and where the time went, as the shell collectors do. CIM queries go
-#        through Get-CimBounded; CMD_TIMEOUT and RUN_DEADLINE are read from the
-#        environment.
-# 0.5.0  First runs on a real Windows host (Windows Server 2022 Standard Eval
-#        20348, Windows PowerShell 5.1 and pwsh 7.6, elevated and not). The
-#        report file is UTF-8 without a BOM with LF line ends (5.1 wrote a BOM,
-#        both wrote CRLF, and validate.sh --report failed them). The host load
-#        reads raw CPU counters (Win32_Processor took 4-5 s and left every
-#        field n/a). One CIM probe with room for a refusal decides whether
-#        WMI refuses this logon; later refusals are per class. TCP probes are
-#        timed, deadline-bound and made once per endpoint. Timestamps have one
-#        format. Conf files are read as UTF-8 (in the culture's ANSI code
-#        page only when the bytes are not UTF-8). -Out DIR (the shell --out) writes the report elsewhere
-#        and is checked for writing before the run; -Help and -h print the
-#        usage; -Home DIR adds an install dir; the shell spellings
-#        --file/--stdout/--quiet/--help/--home/--out (and --x=DIR) work; an
-#        unknown argument or a --home/--out without a value prints usage to
-#        stderr and exits 2.
-#        Scheduled tasks come from schtasks and IPv4 addresses from the .NET
-#        interface list (the cmdlets' module imports cost 1.4-5.5 s); sqlservr
-#        processes come from the process inventory with their instance
-#        argument; an empty service or task list says "none".
-# 0.5.1  The shared blocks (templates/groups/ps1.ps1) are synced by
-#        tools/sync-shared-block.sh; report unchanged.
+# History: ../CHANGELOG.md, section windows/collect-db-mssql.ps1 (next to the db README).
 $VERSION        = "0.5.1"
 $DOMAIN         = "db"
 $CompName = $env:COMPUTERNAME; if (-not $CompName) { $CompName = [Environment]::MachineName }

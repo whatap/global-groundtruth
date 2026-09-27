@@ -8,50 +8,8 @@
 # and the whatap-operator Java injector (internal/webhook/v2alpha1/
 # injector_java.go). The support cases behind each part: README, "Cases".
 #
-# What the report answers with facts:
-#   * Is a WhaTap -javaagent attached, and how many agents are on the JVM? The
-#     option may come from the command line OR from JAVA_TOOL_OPTIONS /
-#     _JAVA_OPTIONS / JDK_JAVA_OPTIONS (the operator injects it that way, so it
-#     never appears in /proc/<pid>/cmdline); all four sources are read.
-#   * Which agent jar and version: whatap/v.properties INSIDE the jar
-#     (VERSION/BUILD), with its size/mtime/sha256 and the agent log banner as
-#     independent cross-checks.
-#   * Where the agent looks for its config: env WHATAP_CONFIG_FILE, else
-#     -Dwhatap.config.file, else -Dwhatap.home (default ".", the process working
-#     directory) plus -Dwhatap.config (default "whatap.conf"). Resolved per
-#     process, and the file dumped verbatim.
-#   * Which settings are in force: the agent overlays env and system properties
-#     onto the config (whatap/lang/conf/ConfigValueUtil.replaceSysProp), so every
-#     whatap-related env variable (names may carry dots: license,
-#     whatap.server.host) and -D property is listed per process.
-#   * What kind of Java process: the server markers the agent's own
-#     ProcessTypeDetector reads (catalina.base, jboss.home.dir, jeus.home,
-#     weblogic, websphere, the Spring Boot loader).
-#   * "Installed and healthy, but the hitmap stays empty": four facts side by
-#     side — what the application carries (F), what THIS agent build can
-#     instrument (G: the weaving modules and ASM classes read from the installed
-#     jar), which modules the configuration selects, and which the running
-#     process loaded (the agent log's Weaving lines, class-version warnings
-#     included).
-#   * The application's own libraries: from its -cp/-classpath, -jar
-#     (BOOT-INF/lib), CLASSPATH and the server deploy directories its -D
-#     properties name. The -javaagent jar is EXCLUDED and the exclusion stated:
-#     it bundles weaving-module markers, so a scan that includes it reports the
-#     agent's catalog instead of the application's libraries.
-#   * Where the JVM's stdout goes (/proc/<pid>/fd/1): the agent boot banner and
-#     a SIGQUIT thread dump land there, not in the agent log.
-#   * The logging framework in play, its config files and its output files.
-#   * A JVM nothing names as java: a native launcher that creates the VM
-#     in-process through JNI_CreateJavaVM (Axway API Gateway's vshell) has its
-#     own comm and exe and passes the JVM options in memory. It is identified by
-#     the VM library mapped into it (libjvm.so / libj9vm*.so), and --jcmd reads
-#     its options back from the VM itself.
-#   * Opt-in, read-only: --library (detail pack for writing a weaving module),
-#     --appclasses (the application's own classes), --class-refs (which of them
-#     name a type, from the constant pool: "names it", not "implements it"),
-#     --dump-file (a thread dump taken elsewhere enters the same frame, thread
-#     name, state and other-APM-agent counts, without touching any JVM).
-#   * Tier 2, opt-in: thread dumps (--threads) and jcmd VM data (--jcmd).
+# What the report answers, question by question: README.md, "Four things
+# about the Java agent shape the report" and "Facts collected".
 #
 # Sections: [1] environment, A host, B Java runtimes, C agent artifacts, D JVM
 # processes and attachment, E home and config, F application libraries,
@@ -73,46 +31,7 @@ export LC_ALL=C
 
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-apmjava"
-# 0.12.6  Shared helpers moved into the apm group block; report unchanged.
-#         The apm: blocks are copies of templates/groups/apm.sh.
-# 0.13.0  Fewer options (user decision, 2026-09-26): --library '*' details
-#         every enumerated jar (cap 40) and --library-all is refused with exit
-#         2 naming it. --class-refs turns on --appclasses (it searches the class
-#         roots that index reads; alone it did nothing), and [1] says so.
-#         --class without --library is named on the operator stream, not
-#         silently ignored. Report: [1] loses the field --library-all=N
-#         ("library detail flags: --library=<patterns, * for all>
-#         --class=..."), and M says "not requested (--library absent)" and
-#         "patterns requested: * (every enumerated jar)". --out DIR puts the
-#         --file report in DIR. An option missing its value (last, empty after
-#         =, or followed by another option) ends the run with exit 2 under
-#         every shell; --threads=N takes a whole number 1..999999 only.
-#         --library patterns are matched with globbing off. A
-#         probe error line over 100 bytes keeps its start and its end.
-# 0.13.1  main is the apm group block `apm: main`; report unchanged. The
-#         warning for --class without --library comes from _init_probe, right
-#         after the private temp directory is made (was: right before).
-#         Without hostname(1) and /proc, Target and the --file name take
-#         `uname -n` (was: unknown); the file name reuses Target's name.
-# 0.13.2  Every JVM this run starts (java -version, javap, jcmd, jstack) runs
-#         without JAVA_TOOL_OPTIONS, JDK_JAVA_OPTIONS and _JAVA_OPTIONS. Run
-#         by kubectl exec in an operator-injected pod, the shell inherits
-#         JAVA_TOOL_OPTIONS=-javaagent:..., and each java -version loaded the
-#         WhaTap agent: two "WhaTap Java v... / Start ..." banners and weaving
-#         lines in the pod's whatap.log per run, read back by section I as
-#         the agent's own (lab k8s, 2026-09-27). Report: [1] names the
-#         variables removed; B's -version loses the "Picked up
-#         JAVA_TOOL_OPTIONS" lines; K prints the value the shell had.
-# 0.13.3  [1]'s privilege line says when uid 0 has no CAP_SYS_PTRACE (bit 19
-#         of CapEff; the default in docker and k8s): "root without
-#         CAP_SYS_PTRACE (other uids' /proc/<pid>/environ, root, cwd are not
-#         readable: run as the target's uid, ...)". It read "root" while
-#         another uid's environ, root and cwd were denied. A bounded call
-#         leaves no process to PID 1: the watchdog is ended by USR1 and reaps
-#         its sleep (a KILL left it to PID 1), and busybox timeout(1), whose
-#         timer outlived each call, is not used; the watchdog caps instead.
-#         Under a PID 1 that does not reap (sleep infinity), one run of each
-#         collector left 1 zombie on debian and 41-55 on alpine; now 0 (2026-09-27).
+# History: CHANGELOG.md (next to this file).
 VERSION="0.13.3"
 DOMAIN="apm"
 TARGET="host/$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || uname -n 2>/dev/null || echo unknown)"

@@ -22,60 +22,7 @@
 export LC_ALL=C
 
 # ---- collector metadata -----------------------------------------------------
-# 0.11.4 [1]'s privilege line says when uid 0 has no CAP_SYS_PTRACE (bit 19
-#        of CapEff; the default in docker and k8s): "root without
-#        CAP_SYS_PTRACE (other uids' /proc/<pid>/environ, root, cwd are not
-#        readable: run as the target's uid, ...)". It read "root" while
-#        another uid's environ, root and cwd were denied. A bounded call
-#        leaves no process to PID 1: the watchdog is ended by USR1 and reaps
-#        its sleep (a KILL left it to PID 1), and busybox timeout(1), whose
-#        timer outlived each call, is not used; the watchdog caps instead.
-#        Under a PID 1 that does not reap (sleep infinity), one run of each
-#        collector left 1 zombie on debian and 41-55 on alpine; now 0 (2026-09-27).
-# 0.11.3 stderr stays quiet on an unreadable file: 2>/dev/null now covers the <
-#        redirect it followed, which failed before it took effect.
-#        _is_whatap_server steps past a token that holds the prefix
-#        again: one pass per token, not one per copy; report unchanged.
-# 0.11.2 _is_whatap_server moved into the collection-server process scan
-#        block, written with case patterns so the block parses under dash;
-#        report unchanged.
-# 0.11.1 Helpers moved into the collection-server group blocks; report
-#        unchanged. The blocks are copies of
-#        templates/groups/collection-server.sh.
-# 0.11.0 Fewer options. The log caps come from the environment: LOG_FILE_MB
-#        (default 5) and LOG_TOTAL_MB (default 100), whole numbers 1..999999
-#        (another value is ignored with a warning). --log-days rides on
-#        --with-rotated as --with-rotated=DAYS (default 14). Removed options
-#        exit 2 naming the replacement: --max-log-mb, --max-total-mb,
-#        --log-days. A bundle-only option (--threads, --histo, --heap, --du,
-#        --with-rotated) given without --bundle is named on the terminal
-#        instead of ignored silently, and no longer raises the run deadline.
-#        A value option with an empty value, or with the next option taken
-#        for it (`--out --file`), exits 2. Report unchanged; the bundle's
-#        SELECTION.txt and log warning name the new spellings.
-# 0.10.0 Section A reads hostname, kernel and arch from /proc/sys/kernel
-#        (hostname/uname only where a file is unreadable) and no longer
-#        prints the date and the timezone: section B has both, and its
-#        timezone falls back to date +%Z as A's did. The --time-ref curl is
-#        bounded and its Date header loses the trailing CR; a failure names
-#        curl's exit status. A call cut by the
-#        run deadline (java -version, journalctl, curl) says "run deadline
-#        reached", not "timed out".
-# 0.9.2  Readability refactor; report unchanged.
-# 0.9.1  No *.hprof found is "none", not "n/a (empty output)", and only when
-#        every directory searched could be listed (a symlink this uid cannot
-#        follow is not absent; a missing home is "path not found", a dangling
-#        symlink says so); otherwise n/a with the uid, also next to dumps
-#        found elsewhere. A process counts as a whatap module only when it is
-#        java and names a server/opslake jar or the yard boot class.
-# 0.9.0  An absence is `na` only when every input behind it was read (conf/,
-#        logs/, hidepid, cmdlines, the process scan, a JVM whose home was not
-#        found, unit files, install paths). WHATAP_HOME is also found from a
-#        JVM's cwd, $WHATAP_HOME and common install paths. Every external
-#        command is bounded (a hung systemctl is asked once); discovery is one
-#        grep over /proc and one `systemctl show`. The bundle is built in the
-#        private directory; bad numeric options exit 2, a failed write exits 1;
-#        output is handed back under sudo. Needs bash.
+# History: CHANGELOG.md, section collect-collserver.sh (next to this file).
 COLLECTOR_NAME="whatap-collserver"
 VERSION="0.11.4"
 DOMAIN="collection-server"

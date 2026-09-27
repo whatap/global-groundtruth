@@ -29,7 +29,8 @@ export LC_ALL=C
 
 # ---- collector metadata — EDIT THESE ----------------------------------------
 COLLECTOR_NAME="whatap-skeleton"       # whatap-<token>, for collect-<token>.sh
-VERSION="0.0.0"                        # x.y.z, bumped in every change
+# History: CHANGELOG.md (next to this file).
+VERSION="0.0.0"                        # x.y.z, bumped with a CHANGELOG entry
 DOMAIN="server"                        # k8s | server | apm | db | nms | collection-server
 # <kind>/<name>[@<qualifier>]: an identity, no spaces, never an outcome of the run
 TARGET="host/$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || echo unknown)"

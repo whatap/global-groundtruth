@@ -36,6 +36,10 @@
 #       line before this scan: they are proper names a .NET collector must
 #       emit as facts, not judgment prose. The prose words "diagnose /
 #       diagnosis / diagnostic(s)" outside such identifiers still fail.
+#   (5) its version history is in the script (`# x.y.z ...` comment lines), or
+#       (collect-* only) it has no `# History: <CHANGELOG.md>[, section <s>]`
+#       pointer line, the CHANGELOG or section it names is not there, or the
+#       newest entry there (the first `- **x.y.z**` item) is not its VERSION.
 #   (2b) a PowerShell collector does not parse. `bash -n` has no counterpart for
 #        .ps1, so this runs the PowerShell parser when `pwsh` is present. When it
 #        is not, the line "~ not checked" is printed instead: a check that could
@@ -334,6 +338,35 @@ for f in "${targets[@]}"; do
                 grep -qE '^_run_init$' "$f" \
                     || problems+=("main never calls _run_init: no deadline, no private temp directory, no cleanup") ;;
             esac ;;
+    esac
+
+    # (5) the version history lives in the CHANGELOG.md next to the README
+    #     (authoring-guide.md, step 2): the script keeps VERSION and one
+    #     `# History:` line naming that file (and its section, where several
+    #     collectors share one), and the newest entry there is VERSION.
+    _hv="$(grep -nE '^#[[:space:]]+[0-9]+\.[0-9]+\.[0-9]+[[:space:]]' "$f" | head -n 3 | cut -d: -f1 | tr '\n' ' ')"
+    [ -n "$_hv" ] && problems+=("version history in the script (line ${_hv% }): it belongs in the CHANGELOG the # History: line names")
+    case "$bn" in
+        collect-*.sh|collect-*.ps1)
+            _hl="$(grep -m1 '^# History: ' "$f" | tr -d '\r')"
+            _ver="$(grep -m1 -E '^[$]?VERSION *= *"' "$f" | sed -E 's/^[^"]*"([^"]*)".*/\1/')"
+            if [ -z "$_hl" ]; then
+                problems+=("no '# History: CHANGELOG.md ...' line: the version history lives in the CHANGELOG next to the README")
+            else
+                _clp="${_hl#\# History: }"; _clp="${_clp%%[ ,]*}"
+                _sec=""; case "$_hl" in *", section "*) _sec="${_hl#*, section }"; _sec="${_sec%% *}" ;; esac
+                if [ ! -f "$fdir/$_clp" ]; then
+                    problems+=("the # History: line names $_clp, which is not there")
+                elif [ -n "$_sec" ] && ! grep -qxF "## $_sec" "$fdir/$_clp"; then
+                    problems+=("$_clp has no section '## $_sec' (named by the # History: line)")
+                else
+                    _new="$(awk -v sec="$_sec" '
+                        sec != "" && /^## / { ins = ($0 == "## " sec); next }
+                        (sec == "" || ins) && match($0, /^- \*\*[0-9]+\.[0-9]+\.[0-9]+\*\*/) { print substr($0, 5, RLENGTH - 6); exit }' "$fdir/$_clp")"
+                    [ "$_new" = "$_ver" ] \
+                        || problems+=("the newest entry of $_clp${_sec:+ ($_sec)} is ${_new:-none}, not VERSION ${_ver:-none}: add the entry for $_ver")
+                fi
+            fi ;;
     esac
 
     # (4) judgment words in emitted lines (exclude comments + footer sentinel,

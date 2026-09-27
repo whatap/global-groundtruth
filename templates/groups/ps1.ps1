@@ -16,10 +16,10 @@
 # carry the block (the sync tool reports it as STRAY and leaves it alone).
 #
 # To change a helper here: edit this file, run --apply, bump each member's
-# VERSION, and compare the members' reports before and after (pwsh -NoProfile
-# -File <member> -Stdout, then tools/validate.sh --report). To add a helper:
-# it goes in only when it is byte-identical in every member; one that differs
-# (DumpFile, TcpProbe) stays in its collector.
+# VERSION and add its CHANGELOG entry, and compare the members' reports before
+# and after (pwsh -NoProfile -File <member> -Stdout, then tools/validate.sh
+# --report). To add a helper: it goes in only when it is byte-identical in
+# every member; one that differs (DumpFile, TcpProbe) stays in its collector.
 #
 # What the blocks rely on the members to define: the -Quiet switch ($Quiet,
 # read by Progress) and $script:PRIV_GAP (set by the member's privilege line in

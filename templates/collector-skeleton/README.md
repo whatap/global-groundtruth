@@ -21,7 +21,12 @@ The starter for a new collector. It already emits the shared report shape
 
 2. Set the four metadata variables at the top: `COLLECTOR_NAME`
    (`whatap-<token>`), `VERSION` (`x.y.z`), `DOMAIN` (the top-level directory
-   name), `TARGET` (`<kind>/<name>[@<qualifier>]`, never an outcome).
+   name), `TARGET` (`<kind>/<name>[@<qualifier>]`, never an outcome). Start
+   `collectors/<domain>/CHANGELOG.md` next to the README with the first entry,
+   `- **<VERSION>** — First version.`; the script keeps only the pointer line
+   `# History: CHANGELOG.md (next to this file).` above `VERSION`. Every later
+   change bumps `VERSION` and adds an entry at the top of that list
+   ([../../docs/authoring-guide.md](../../docs/authoring-guide.md) step 2).
 
 3. Replace the placeholder sections with your domain's facts, using the helpers:
 

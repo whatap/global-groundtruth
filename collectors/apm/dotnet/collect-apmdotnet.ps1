@@ -7,30 +7,12 @@
 # dotnet-apm source repo (installer release.iss, ClrProfiler, Tracer, Loader,
 # Startup), and docs.whatap.io (install-check, supported-spec).
 #
-# Recurring field questions this report answers with facts:
-#   * Which agent build is actually installed? The native/managed DLL file
-#     versions are pinned at 1.0.0.0 across product releases, so the product
-#     version lives in the uninstall registry (DisplayVersion of
-#     "WhaTap .NET_is1") plus file mtimes/SHA256 of both profiler DLL copies.
-#   * Are the CLR injection variables present at the scopes that matter?
-#     COR_*/CORECLR_*/DOTNET_STARTUP_HOOKS are written to the W3SVC and WAS
-#     service registry Environment (multi-sz), NOT machine-wide; machine env
-#     carries only WHATAP_* keys. Both scopes are dumped verbatim.
-#   * Does the DOTNET_STARTUP_HOOKS / COR_PROFILER_PATH value point at a file
-#     that exists? (A mistyped dll name in that variable has been a full
-#     instrumentation outage in the field.)
-#   * Which profiler DLL did each w3wp actually load (loaded-module scan)?
-#   * Native profiler log (C:\ProgramData\WhaTap\dotnet\logs\core-*.log) and
-#     managed tracer logs (<date>-<id>.log) -- including the version/banner
-#     lines, and file owners (log files owned by another app pool's identity
-#     have caused w3wp CPU spins after PID reuse).
-#   * IIS topology: app pool CLR version / bitness / identity, app -> pool
-#     mapping, physical paths -- and per-app web.config assemblyBinding plus
-#     bin\ facade assembly versions (System.Net.Http and friends).
-#   * whatap.conf resolution chain and verbatim content, with byte-level facts
-#     (BOM, CR count) that plain type/cat hides.
-#   * Is the "WhaTap .NET" relay service running, and does anything hold the
-#     local UDP 6600 / remote TCP 6600 endpoints?
+# Sections: [1] collection environment, A host & platform, B agent
+# installation on disk, C profiler registration & environment scopes,
+# D WhaTap service & runtime processes, E IIS topology, F agent
+# configuration, G agent logs, H network endpoints, I Windows event logs,
+# J application facts; then status. The question each answers: README.md,
+# "Facts collected".
 #
 # THE CONTRACT (../../../CONTRACT.md):
 #   1. Facts only. No conclusion is stated on any emitted line.
@@ -89,35 +71,7 @@ param(
 )
 
 $COLLECTOR_NAME = "whatap-apmdotnet"
-# 0.4.0  The status gives the run time, and when a bounded call was slow (3s),
-#        capped or not run past the deadline, the host load at start and end
-#        and where the time went, as the shell collectors do. CIM queries go
-#        through Get-CimBounded; CMD_TIMEOUT and RUN_DEADLINE are read from the
-#        environment.
-# 0.5.0  First runs on a real Windows host (Windows Server 2022 Standard Eval
-#        20348, Windows PowerShell 5.1 and pwsh 7.6, elevated and not). The
-#        report file is UTF-8 without a BOM with LF line ends (5.1 wrote a BOM,
-#        both wrote CRLF, and validate.sh --report failed them). The host load
-#        reads raw CPU counters (Win32_Processor took 4-5 s and left every
-#        field n/a). One CIM probe with room for a refusal decides whether
-#        WMI refuses this logon; later refusals are per class. TCP probes are
-#        timed, deadline-bound and made once per endpoint. Timestamps have one
-#        format. Conf files are read as UTF-8 (in the culture's ANSI code
-#        page only when the bytes are not UTF-8). -Out DIR (the shell --out) writes the report elsewhere
-#        and is checked for writing before the run; -Help and -h print the
-#        usage; -Home DIR adds an install dir; the shell spellings
-#        --file/--stdout/--quiet/--help/--home/--out (and --x=DIR) work; an
-#        unknown argument or a --home/--out without a value prints usage to
-#        stderr and exits 2.
-#        Registry values are read through the .NET API (each absent key under
-#        HKLM:\SOFTWARE\Classes cost 1.3 s through the provider); port 6600 comes
-#        from one netstat -ano; a profiler path under core\x86 no longer makes
-#        core\ a second agent home; an unreadable w3wp says so instead of
-#        "64-bit path" and "none".
-#        An event message keeps the lines that name the failure (an ASP.NET
-#        1310 event's "Exception message") when it is cut at 400 characters.
-# 0.5.1  The shared blocks (templates/groups/ps1.ps1) are synced by
-#        tools/sync-shared-block.sh; report unchanged.
+# History: CHANGELOG.md (next to this file).
 $VERSION        = "0.5.1"
 $DOMAIN         = "apm"
 $CompName = $env:COMPUTERNAME; if (-not $CompName) { $CompName = [Environment]::MachineName }

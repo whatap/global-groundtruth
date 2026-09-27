@@ -289,3 +289,6 @@ and every collector must keep them.
       caps via environment; no `--no-X`; a removed option exits 2 naming its
       replacement.
 - [ ] Temporary files live under `_tmp`; nothing is left after Ctrl-C.
+- [ ] The change bumps `VERSION` and adds a CHANGELOG entry (newest first, in
+      the `CHANGELOG.md` next to the README); the script keeps only its
+      `# History:` pointer line (authoring-guide.md, step 2).

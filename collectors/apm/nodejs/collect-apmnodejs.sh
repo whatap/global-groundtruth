@@ -9,29 +9,12 @@
 # `whatap` npm package source (2.0.6 latest + 0.5.27 legacy), docs.whatap.io,
 # and the operator apm-init-nodejs image (1.0.1).
 #
-# Recurring field questions this report answers with facts:
-#   * Which whatap package version is installed where? (0.5.x and 1.x/2.x have
-#     different architectures: 0.5.x sends TCP directly from the app process;
-#     1.x/2.x spawn a native master agent process `whatap_nodejs` and talk to
-#     it over local UDP, and the master opens the TCP session to the server.)
-#   * Where is WHATAP_HOME / whatap.conf, and what does it actually contain —
-#     including byte-level facts (size, CR bytes) that plain `cat` hides?
-#   * Is the `whatap_nodejs` master agent process running, from which home,
-#     spawned by which app (env NODEJS_PARENT_APP_PID)?
-#   * How is the app launched (node -r whatap? pm2? next-server?) and which
-#     WHATAP_* / NODE_OPTIONS variables reached the process?
-#   * pid / lock / port-registry files: agent-<id>.pid, whatap_nodejs.pid[.llm],
-#     whatap_port_<pid>, /tmp/whatap-nodejs.lock.
-#   * Agent logs: logs/whatap-hook-YYYYMMDD.log (2.x), logs/whatap-YYYYMMDD.log
-#     (0.5.x), whatap-boot-* (master agent side) — and which WHATAP-NNN codes
-#     appear in the recent lines.
-#   * Kubernetes/operator artifacts: /whatap-agent volume seeded by
-#     apm-init-nodejs, WHATAP_NODEJS_AGENT_PATH, container.conf.
-#   * When the install is healthy but no transactions appear: which modules
-#     the installed agent can hook (lib/observers, section 3), which
-#     libraries the app declares and has installed (package.json deps +
-#     node_modules names, section 8), and which observers actually engaged
-#     in this process (hook-log observer lines, section 7).
+# Sections: [1] collection environment, [2] host / platform, [3] Node.js
+# runtimes and whatap package installs, [4] runtime processes, [5] agent
+# homes and configuration, [6] network endpoints and port registry, [7] agent
+# logs, [8] application and launcher facts, [9] Kubernetes / operator
+# injection context; then status. The question each answers: README.md,
+# "Facts collected".
 #
 # Runs only `node --version` per node binary and one `npm root -g`; the npm and
 # pm2 versions are read from their package.json (`npm/pm2 --version` only when
@@ -45,50 +28,7 @@ export LC_ALL=C
 
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-apmnodejs"
-# 0.8.3  [1]'s privilege line says when uid 0 has no CAP_SYS_PTRACE (bit 19
-#        of CapEff; the default in docker and k8s): "root without
-#        CAP_SYS_PTRACE (other uids' /proc/<pid>/environ, root, cwd are not
-#        readable: run as the target's uid, ...)". It read "root" while
-#        another uid's environ, root and cwd were denied. A bounded call
-#        leaves no process to PID 1: the watchdog is ended by USR1 and reaps
-#        its sleep (a KILL left it to PID 1), and busybox timeout(1), whose
-#        timer outlived each call, is not used; the watchdog caps instead.
-#        Under a PID 1 that does not reap (sleep infinity), one run of each
-#        collector left 1 zombie on debian and 41-55 on alpine; now 0 (2026-09-27).
-# 0.8.2  The node processes this run starts (node --version, npm root -g,
-#        npm/pm2 --version) run without NODE_OPTIONS. Run by kubectl exec in
-#        an operator-injected pod, the shell inherits NODE_OPTIONS=-r whatap,
-#        and npm root -g loaded the agent: it initialised, tried to rewrite
-#        whatap.conf, opened a UDP channel to the running whatap_nodejs and
-#        wrote its start-up to the pod's hook log, and its console lines
-#        became the "global node_modules" value (lab container, 2026-09-27).
-#        Report: [1] says whether NODE_OPTIONS was removed and whether it
-#        named whatap; section 3 gets the real npm root -g.
-# 0.8.1  main is the apm group block `apm: main`; report unchanged. A --file run
-#        on a host without hostname(1) names the report after
-#        /proc/sys/kernel/hostname, else `uname -n`, and so does Target (both
-#        were: unknown, and validate.sh --report refused Target: host/unknown);
-#        the file name reuses the name Target resolved.
-# 0.8.0  --out DIR puts the --file report in DIR (an unwritable one ends the
-#        run before collecting). A probe error line over 100 bytes keeps
-#        its start and its end; report otherwise unchanged.
-# 0.7.1  Shared helpers moved into the apm group block; report unchanged.
-#        The apm: blocks are copies of templates/groups/apm.sh.
-# 0.7.0  The npm and pm2 versions are read from the package.json next to the
-#        entry script each command resolves to (the line names the file);
-#        `npm/pm2 --version`, which starts node, runs only when that file gives
-#        none, and its line then names the command. A value read from the
-#        file does not show whether npm/pm2 can run. The machine arch is taken
-#        from the one `uname -srm` (no second `uname -m`).
-# 0.6.2  A directory this uid can read but not enter lists its names again
-#        (the refactor's _names dropped them; ls did not).
-# 0.6.1  Readability refactor; report unchanged.
-# 0.6.0  Less work per node process: _env_pick settles an absent name with one
-#        match and splits the environ with IFS instead of a read loop, NODE_PATH
-#        is split in the shell, the cwd each process resolved in discovery is
-#        reused by the report, and the detail list reads each environ once.
-#        The report is unchanged; 8.4 s -> 4.9 s on a host with 168 node
-#        processes, 18.3 s -> 9.5 s with 300 more (2026-09-25).
+# History: CHANGELOG.md (next to this file).
 VERSION="0.8.3"
 DOMAIN="apm"
 TARGET="host/$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || uname -n 2>/dev/null || echo unknown)"

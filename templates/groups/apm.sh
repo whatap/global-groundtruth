@@ -14,9 +14,9 @@
 # the block (the sync tool reports it as STRAY and leaves it alone).
 #
 # To change a helper here: edit this file, run --apply, bump each member's
-# VERSION, and compare the members' reports before and after. To add a helper:
-# it goes in only when it behaves the same in every member; one that differs
-# stays in its collector.
+# VERSION and add its CHANGELOG entry, and compare the members' reports before
+# and after. To add a helper: it goes in only when it behaves the same in
+# every member; one that differs stays in its collector.
 #
 # What the blocks rely on the members to define (before any call, at run time):
 #   from the skeleton blocks: fact, _tmp, _bounded, _cmd_kind, _past_deadline,

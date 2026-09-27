@@ -1,0 +1,47 @@
+# collect-apmjava.sh — changelog
+
+The version history of [`collect-apmjava.sh`](collect-apmjava.sh), newest
+first. Every change to the script bumps its `VERSION` and adds one entry at
+the top of this list (docs/authoring-guide.md, step 2); `tools/validate.sh`
+checks that the newest entry is the script's `VERSION`.
+
+- **0.13.3** — [1]'s privilege line says when uid 0 has no CAP_SYS_PTRACE (bit 19
+  of CapEff; the default in docker and k8s): "root without
+  CAP_SYS_PTRACE (other uids' /proc/\<pid>/environ, root, cwd are not
+  readable: run as the target's uid, ...)". It read "root" while
+  another uid's environ, root and cwd were denied. A bounded call
+  leaves no process to PID 1: the watchdog is ended by USR1 and reaps
+  its sleep (a KILL left it to PID 1), and busybox timeout(1), whose
+  timer outlived each call, is not used; the watchdog caps instead.
+  Under a PID 1 that does not reap (sleep infinity), one run of each
+  collector left 1 zombie on debian and 41-55 on alpine; now 0 (2026-09-27).
+- **0.13.2** — Every JVM this run starts (java -version, javap, jcmd, jstack) runs
+  without JAVA_TOOL_OPTIONS, JDK_JAVA_OPTIONS and _JAVA_OPTIONS. Run
+  by kubectl exec in an operator-injected pod, the shell inherits
+  JAVA_TOOL_OPTIONS=-javaagent:..., and each java -version loaded the
+  WhaTap agent: two "WhaTap Java v... / Start ..." banners and weaving
+  lines in the pod's whatap.log per run, read back by section I as
+  the agent's own (lab k8s, 2026-09-27). Report: [1] names the
+  variables removed; B's -version loses the "Picked up
+  JAVA_TOOL_OPTIONS" lines; K prints the value the shell had.
+- **0.13.1** — main is the apm group block `apm: main`; report unchanged. The
+  warning for --class without --library comes from _init_probe, right
+  after the private temp directory is made (was: right before).
+  Without hostname(1) and /proc, Target and the --file name take
+  `uname -n` (was: unknown); the file name reuses Target's name.
+- **0.13.0** — Fewer options (user decision, 2026-09-26): --library '*' details
+  every enumerated jar (cap 40) and --library-all is refused with exit
+  2 naming it. --class-refs turns on --appclasses (it searches the class
+  roots that index reads; alone it did nothing), and [1] says so.
+  --class without --library is named on the operator stream, not
+  silently ignored. Report: [1] loses the field --library-all=N
+  ("library detail flags: --library=\<patterns, * for all>
+  --class=..."), and M says "not requested (--library absent)" and
+  "patterns requested: * (every enumerated jar)". --out DIR puts the
+  --file report in DIR. An option missing its value (last, empty after
+  =, or followed by another option) ends the run with exit 2 under
+  every shell; --threads=N takes a whole number 1..999999 only.
+  --library patterns are matched with globbing off. A
+  probe error line over 100 bytes keeps its start and its end.
+- **0.12.6** — Shared helpers moved into the apm group block; report unchanged.
+  The apm: blocks are copies of templates/groups/apm.sh.

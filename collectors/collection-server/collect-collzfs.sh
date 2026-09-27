@@ -46,60 +46,7 @@
 export LC_ALL=C
 
 # ---- collector metadata -----------------------------------------------------
-# 0.8.5  [1]'s privilege line says when uid 0 has no CAP_SYS_PTRACE (bit 19
-#        of CapEff; the default in docker and k8s): "root without
-#        CAP_SYS_PTRACE (other uids' /proc/<pid>/environ, root, cwd are not
-#        readable: run as the target's uid, ...)". It read "root" while
-#        another uid's environ, root and cwd were denied. A bounded call
-#        leaves no process to PID 1: the watchdog is ended by USR1 and reaps
-#        its sleep (a KILL left it to PID 1), and busybox timeout(1), whose
-#        timer outlived each call, is not used; the watchdog caps instead.
-#        Under a PID 1 that does not reap (sleep infinity), one run of each
-#        collector left 1 zombie on debian and 41-55 on alpine; now 0 (2026-09-27).
-# 0.8.4  stderr stays quiet on an unreadable file: 2>/dev/null now covers the <
-#        redirect it followed, which failed before it took effect.
-#        _is_whatap_server steps past a token that holds the prefix
-#        again: one pass per token, not one per copy; report unchanged.
-# 0.8.3  _is_whatap_server moved into the collection-server process scan
-#        block, written with case patterns so the block parses under dash;
-#        report unchanged.
-# 0.8.2  Helpers moved into the collection-server group blocks; report
-#        unchanged. The blocks are copies of
-#        templates/groups/collection-server.sh.
-# 0.8.1  --out, --home, --window and --filesizes= with an empty value, or
-#        with the next option taken for it (`--out --file`), exit 2 naming
-#        the option. iostat -x in the window only adds detail: absent (no
-#        sysstat), failed or stopped, it is a "not delivered:" fact line in
-#        section O and no longer blocks the window goal, whose inputs are the
-#        txgs, the kstat deltas and zpool iostat.
-# 0.8.0  A time window runs in every run (15s; --window=DUR[@START] sets its
-#        length and start) and replaces --sample. Section O keeps every txg of
-#        the window (the txgs ring re-read before it
-#        wraps, merged by txg number, gaps counted); the start, end and delta
-#        of dmu_tx, arcstats and each objset-* kstat; zpool iostat -vlq and
-#        iostat -x started together at the same interval, with timestamps;
-#        zpool iostat -r / -w for the window; arcstat when present. J's
-#        "interval sample (--sample)" subsection is gone, and [1]'s tiers
-#        line reads "... filesizes=off window=off" (no sample=). Removed
-#        options exit 2 naming the replacement: --sample, --window-start,
-#        --no-filesizes, and --filesizes-secs, --event-days, --hours, which are
-#        now FILESIZES_SECS, EVENT_DAYS and JOURNAL_HOURS in the environment
-#        (defaults 300, 30, 24). H's per-pool kstat paths no
-#        longer carry a double slash (yard//zil).
-# 0.7.0  zpool list -v runs once: the raw probe's output feeds the derived
-#        views of sections C and H and the bundle's zpool-list-v.txt (it was
-#        run a second time, capped at 20s, for the views, and a third time
-#        for the bundle). Report unchanged when the call answers; the views
-#        now follow the probe's CMD_TIMEOUT cap, not a fixed 20s. The zpool
-#        feature checks (section A) and the zfs-unit journal (L) say "run
-#        deadline reached" when the deadline cut them, not "timed out".
-# 0.6.4  A zpool status -vt that succeeds with no output (no pool imported) is
-#        one "empty output" line again, not a fallback to -v and -t (0.6.3).
-# 0.6.3  Readability refactor; report unchanged.
-# 0.6.2  The file-size walk is opt-in (Tier 2) again: on a yard of ~10^8 files
-#        it loads the special vdev and the ARC and cannot finish in its bound.
-#        df -i of every WhaTap path is in the report and df-i.txt in the
-#        bundle, so the file count is there without a walk.
+# History: CHANGELOG.md, section collect-collzfs.sh (next to this file).
 COLLECTOR_NAME="whatap-collzfs"
 VERSION="0.8.5"
 DOMAIN="collection-server"

@@ -34,10 +34,31 @@ cp templates/collector-skeleton/collector-skeleton.sh \
 Set `COLLECTOR_NAME`, `VERSION`, `DOMAIN`, `TARGET` at the top:
 
 - `COLLECTOR_NAME="whatap-<token>"`, the same token as the file name;
-- `VERSION` as `x.y.z`, bumped in every change to the script;
+- `VERSION` as `x.y.z`: every change to the script bumps it and adds a
+  CHANGELOG entry for it (below);
 - `DOMAIN` as the top-level directory name only (`apm`, not `apm/java`);
 - `TARGET` as `<kind>/<name>[@<qualifier>]` with no spaces and no run
   outcome in it (output-format.md, "Header block").
+
+**The version history lives in `CHANGELOG.md` next to the collector's README,
+not in the script.** The script keeps `VERSION` and one pointer line in its
+metadata block, `# History: CHANGELOG.md (next to this file).` Each entry is a
+markdown list item, newest first, that says what changed in the report or the
+behaviour and on what evidence:
+
+```markdown
+- **0.2.0** — Section C reads X from /proc instead of Y (Y was absent on
+  Alpine, 2026-09-27).
+- **0.1.0** — First version.
+```
+
+Where several collectors share a directory and one README with a section per
+collector (`collectors/collection-server/`, `collectors/db/`), they share one
+`CHANGELOG.md` with a `## <script>` section each, and the pointer names it:
+`# History: CHANGELOG.md, section collect-<token>.sh (next to this file).`
+`tools/validate.sh` fails a collector whose pointer is missing, whose
+CHANGELOG (or section) is missing, whose newest entry is not its `VERSION`, or
+that carries `# x.y.z` history lines in the script again.
 
 **Name the entrypoint `collect-<token>.sh`** — never a bare `collect.sh`. The
 `<token>` is this collector's unique short id, the **same token that prefixes its

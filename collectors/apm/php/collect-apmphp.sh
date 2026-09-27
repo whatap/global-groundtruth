@@ -9,40 +9,14 @@
 # itself (rpm 2.14-2 and the Alpine tarball: install.sh, whatap-php service
 # wrapper, whatap-php.service, template.ini, modules/, whatap_php, whatap.so).
 #
-# The PHP agent has two halves that are installed and configured separately:
-#   * the tracer  — a Zend extension (whatap.so) loaded into every Apache /
-#     PHP-FPM / CLI worker, built per PHP API version (whatap[_zts]_<API>.so),
-#   * the agent   — a Go process (whatap_php, or whatap_php_static on musl)
-#     that receives from the tracer over UDP and talks to the collection server.
-# install.sh resolves the environment once (php binary, extension_dir, ini scan
-# dir) and writes the result into the service files. Almost every support case
-# is about a mismatch between what it resolved then and what runs now.
-#
-# Recurring field questions this report answers with facts:
-#   * Which PHP binaries/SAPIs exist, at which version, PHP API and thread
-#     safety (NTS/ZTS) — and which extension_dir and ini files does each use?
-#   * On a host carrying **several PHP versions** (Sury/ondrej, Remi, SCL,
-#     cPanel EasyApache, Plesk, CloudLinux alt-php, LiteSpeed lsphp, or a
-#     source build next to the distro one): which of them is the tracer bound
-#     to, which one serves the traffic, and where does `php` on PATH point?
-#   * Is whatap.so present in that extension_dir, and which
-#     whatap[_zts]_<API>.so does the symlink actually point to?
-#   * Is the extension actually mapped into the live Apache/PHP-FPM workers, or
-#     only configured on disk? Does starting PHP emit a load warning?
-#   * Where did install.sh put whatap.ini, and does that ini tree belong to the
-#     SAPI that serves traffic (cli vs fpm vs apache2 trees differ)?
-#   * What do whatap.ini / the [whatap] block in php.ini actually contain
-#     (accesskey, server host, app_name, app_process_name, hook options)?
-#   * Is whatap_php running, from which home, with which WHATAP_* environment
-#     (WHATAP_CONFIG_HOME is written by install.sh into the unit/init script)?
-#   * Is the UDP channel (net_udp_port, default 6600) bound, is there a TCP
-#     session to the collection server, and does the SysV shared memory /
-#     semaphore pair the agent uses exist?
-#   * Which application server model runs the app (Apache prefork/worker/event,
-#     PHP-FPM pools, or a persistent-worker runtime such as Swoole/Octane,
-#     RoadRunner, FrankenPHP)?
-#   * What do the agent logs (whatap-boot-*.log, whatap-install-*.log) and the
-#     web server error log (WA*-coded lines from whatap.so) say?
+# Sections: [1] collection environment, [2] host / platform, [3] PHP runtimes
+# and SAPIs, [4] web server / application server layer, [5] WhaTap PHP agent
+# installation on disk, [6] tracer binding per PHP runtime, [7] agent
+# configuration, [8] agent process, service state and channels, [9] agent
+# logs and web server error markers, [10] container / Kubernetes context;
+# then status. The two halves of the agent and the question each section
+# answers: README.md, "Why the two halves are the first fact" and "Facts
+# collected".
 #
 # The PHP binaries found are executed read-only, with -v / -m / -i only
 # — the same calls the vendor installer makes. No application code is run. The
@@ -56,47 +30,7 @@ export LC_ALL=C
 
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-apmphp"
-# 0.7.3  [1]'s privilege line says when uid 0 has no CAP_SYS_PTRACE (bit 19
-#        of CapEff; the default in docker and k8s): "root without
-#        CAP_SYS_PTRACE (other uids' /proc/<pid>/environ, root, cwd are not
-#        readable: run as the target's uid, ...)". It read "root" while
-#        another uid's environ, root and cwd were denied. A bounded call
-#        leaves no process to PID 1: the watchdog is ended by USR1 and reaps
-#        its sleep (a KILL left it to PID 1), and busybox timeout(1), whose
-#        timer outlived each call, is not used; the watchdog caps instead.
-#        Under a PID 1 that does not reap (sleep infinity), one run of each
-#        collector left 1 zombie on debian and 41-55 on alpine; now 0 (2026-09-27).
-# 0.7.2  A php-cgi binary's php -i (HTML: the CGI SAPI prints phpinfo() as a
-#        page) is read as the text form the CLI prints; it was matched as
-#        text, so php-cgi showed "PHP n/a, SAPI n/a", "ini scan dir: none
-#        configured" and "whatap.* directives registered: no" while it
-#        loads whatap.so from /etc/php.d (Rocky 9, whatap-php 2.14-2 rpm,
-#        2026-09-27). A service file reached by two paths (/lib ->
-#        usr/lib) is dumped once. Report: section 3 and 6 carry php-cgi's
-#        values; section 7 loses the second copy of the unit file.
-# 0.7.1  main is the apm group block `apm: main`; report unchanged. A --file run
-#        on a host without hostname(1) names the report after
-#        /proc/sys/kernel/hostname, else `uname -n`, and so does Target (both
-#        were: unknown, and validate.sh --report refused Target: host/unknown);
-#        the file name reuses the name Target resolved.
-# 0.7.0  --out DIR puts the --file report in DIR (an unwritable one ends the
-#        run before collecting); the help names APM_INTERP_CAP. A probe
-#        error line over 100 bytes keeps its start and its end; report
-#        otherwise unchanged.
-# 0.6.1  Shared helpers moved into the apm group block; report unchanged.
-#        The apm: blocks are copies of templates/groups/apm.sh.
-# 0.6.0  Section 4 reuses the `php-fpm -v` of section 3 also when section 3
-#        ran it under a name that resolves to the PATH php-fpm (a running
-#        php-fpm8.2 found before the php-fpm link to it); the machine arch is
-#        taken from the one `uname -srm` (no second `uname -m`).
-# 0.5.4  _proc_env compares the variable name literally; PATH lookups read
-#        their answer back from a file instead of a second lookup in a $(...).
-# 0.5.3  "ini directory trees present" prints "(no whatap entry)" for a tree
-#        without one (the column was blank) and names an unreadable tree;
-#        section 4 reuses the `php-fpm -v` section 3 ran on the same binary.
-# 0.5.2  A directory this uid can read but not enter lists its names again
-#        (the refactor's _names dropped them; ls did not).
-# 0.5.1  Readability refactor; report unchanged.
+# History: CHANGELOG.md (next to this file).
 VERSION="0.7.3"
 DOMAIN="apm"
 TARGET="host/$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || uname -n 2>/dev/null || echo unknown)"
