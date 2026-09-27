@@ -1,6 +1,8 @@
 # collectors/apm/php — WhaTap PHP APM agent collector
 
-> **Status: SEEDED (v0.2; validated at `collect-apmphp.sh` 0.7.2 on
+> **Status: SEEDED (v0.2; validated at `collect-apmphp.sh` 0.8.0 on
+> 2026-09-27 on the lab targets `apm-php-rocky` / `apm-php-alpine` (web user
+> and root without CAP_SYS_PTRACE, `sh -s`, `bash -s`, file); 0.7.2 on
 > 2026-09-27 against the real agent: whatap-php 2.14-2 rpm on Rocky 9 (PHP 8.2
 > php-fpm + nginx, systemd `whatap-php.service`) and the Alpine tarball on
 > `php:8.3-fpm-alpine` (`whatap_php_static` started by the wrapper); as root,
@@ -60,25 +62,30 @@ application code runs. The agent binary is only ever executed with its
 **Several PHP versions on one host is the normal case.** `install.sh` binds the
 tracer to exactly one of them — the one its `php` lookup resolved to — and each
 version has its own `extension_dir`, its own ini scan dir, and often its own
-FPM service. Section `[6]` therefore reports the binding **per runtime**, so
-the split is visible at a glance:
+FPM service. Section `[3]` prints each runtime's own `php -i` lines (`PHP API`,
+`Thread Safety`, `extension_dir`, the scan dir and the ini files it parsed, its
+`whatap.*` directives) and section `[6]` prints `whatap.so` once per
+`extension_dir` (ls, sha256, symlink target, the file it resolves to), so the
+split is read by matching the two (shape, abridged, for a host like the
+multi-version Debian one above):
 
 ```text
--- runtime: /usr/sbin/php-fpm8.1
-   PHP 8.1.34, SAPI FPM/FastCGI, PHP API 20210902, Thread Safety disabled
-   extension_dir: /usr/lib/php/20210902
-   whatap.so there: ... -> /usr/whatap/php/modules/x64/whatap_20210902.so
-   ini scan dir: /etc/php/8.1/fpm/conf.d
-   whatap ini in that scan dir: n/a (no *whatap*.ini in /etc/php/8.1/fpm/conf.d)
-   whatap.* directives registered in this runtime (module loaded at startup): no
--- runtime: /usr/bin/php8.1
-   ...
-   ini scan dir: /etc/php/8.1/cli/conf.d
-   whatap ini in that scan dir: /etc/php/8.1/cli/conf.d/whatap.ini
-   whatap.* directives registered in this runtime (module loaded at startup): yes
--- runtime: /usr/bin/php   (PHP 8.3.33, API 20230831)
-   whatap.so there: n/a (path not found: /usr/lib/php/20230831/whatap.so)
+[3] -- php binary: /usr/sbin/php-fpm8.1
+       php api / build:  PHP API => 20210902 ... Thread Safety => disabled
+       extension_dir: extension_dir => /usr/lib/php/20210902 => /usr/lib/php/20210902
+       additional ini files parsed: (no whatap.ini in the list)
+       whatap directives visible to this binary (local => master): n/a (no matching line in php -i output)
+[6] -- /usr/lib/php/20210902   <- php -i of /usr/sbin/php-fpm8.1
+       whatap.so:
+        lrwxrwxrwx ... /usr/lib/php/20210902/whatap.so -> /usr/whatap/php/modules/x64/whatap_20210902.so
+        sha256: ...
+    -- /usr/lib/php/20230831   <- php -i of /usr/bin/php
+       whatap.so: n/a (path not found: /usr/lib/php/20230831/whatap.so)
 ```
+
+The collector does not decode the module name or rebuild a per-runtime table:
+the name (`whatap[_zts]_<API>.so`) and the `php -i` lines are both in the
+report as read.
 
 Supporting facts for the same question: what `php` / `php-fpm` on PATH resolve
 to and the `update-alternatives` entries (on a multi-version host `php -v` in a
@@ -134,10 +141,10 @@ Notes:
 | --- | --- | --- |
 | 1 | Collection environment | which tools were available to this collection |
 | 2 | Host / platform | OS, kernel, arch, **libc** (glibc vs musl decides `whatap_php` vs `whatap_php_static`), cgroup limits, container markers, clock (agent time-sync questions) |
-| 3 | PHP runtimes and SAPIs | every php / php-fpm / php-cgi binary found (PATH, per-version install paths of every common layout, running processes — detail cap 10): version, **SAPI**, **PHP API**, **Thread Safety**, build strings, `extension_dir`, the ini paths it parses, opcache/JIT settings, the **`whatap.*` directives as that binary actually resolves them (local => master)**, the loaded module list; plus **other APM/profiler extensions** present (newrelic, ddtrace, elastic, opentelemetry, tideways, blackfire, xdebug, …), what `php`/`php-fpm` on PATH resolve to, and the `update-alternatives` entries |
+| 3 | PHP runtimes and SAPIs | every php / php-fpm / php-cgi binary found (PATH, per-version install paths of every common layout, running processes — detail cap 10): version, **SAPI**, **PHP API**, **Thread Safety**, build strings, `extension_dir`, the ini paths it parses, opcache/JIT settings, the **`whatap.*` directives as that binary actually resolves them (local => master)**, the loaded module list (`php -m`: co-resident APM/profiler extensions such as newrelic, ddtrace, opentelemetry, xdebug are read there), what `php`/`php-fpm` on PATH resolve to, and the `update-alternatives` entries |
 | 4 | Web server / application server layer | Apache binary + `-V` (**MPM prefork/worker/event** — decides whether a `_zts` module is required) and its php/mpm modules; php-fpm version, config and pool files; **per-version FPM systemd units**; nginx; every web/php process (matched by comm, argv0 or `/proc/<pid>/exe`, so a script started from `#!/usr/bin/php` and `lsphp` count) with cmdline, exe and uid; **persistent-worker runtimes** (Swoole/Laravel Octane, RoadRunner, FrankenPHP, Workerman, php-pm) whose request cycle is not the per-request PHP model the tracer hooks, so per-request extension hooks do not bound it the same way. They are matched on the executable (`frankenphp`, `rr`, `roadrunner`), or on the command line of a PHP executable (`octane`, `swoole`, `workerman`, `php-pm`, `artisan queue|horizon`) — an editor or `tail` naming swoole is not one |
-| 5 | WhaTap PHP agent installation on disk | agent home candidates and their source; home listing; `whatap_php` / `whatap_php_static` with size, mtime and **sha256**; `whatap_php version` (`ver <x.y.z.date>, buildno <commit>`); ChangeLog head (shipped version); `template.ini`; the **PHP-version → PHP API table read out of the installed `install.sh`**; the shipped tracer module inventory per arch; package manager records (rpm/dpkg/apk — the Alpine tarball leaves none by design) |
-| 6 | Tracer binding per PHP runtime | **one block per runtime found in `[3]`**: its `extension_dir` and whether `whatap.so` is there with its **symlink target decoded** (thread-safe build yes/no, PHP API), its ini scan dir (one line per directory of a colon-separated `PHP_INI_SCAN_DIR` value, read through a process root when not visible here; a relative entry is resolved against the cwd of a live process of that binary, and is a gap when none can be read) and whether a whatap ini sits in it, whether the `whatap.*` directives are registered in that runtime (i.e. the module loaded at startup), and any dynamic-library load message. Then: every `extension_dir` seen with its source and whether a runtime reported it (a dir only the service files name belongs to a PHP install no longer present); every `whatap.ini` found on disk; `php.ini` files carrying whatap lines (the installer's fallback when PHP reports no scan dir); which ini trees exist and whether each holds a whatap entry; **live load status from `/proc/<pid>/maps`**, with the pids whose maps could not be read |
+| 5 | WhaTap PHP agent installation on disk | agent home candidates and their source; home listing; `whatap_php` / `whatap_php_static` with size, mtime and **sha256**; `whatap_php version` (`ver <x.y.z.date>, buildno <commit>`); ChangeLog head (shipped version); `template.ini`; `install.sh` (ls, sha256 — its `get_php_api_version()` holds the PHP-version → PHP API table the installer used; read it in the package of that sha256); the shipped tracer module inventory per arch; package manager records (rpm/dpkg/apk — the Alpine tarball leaves none by design) |
+| 6 | Tracer binding | **`whatap.so` once per `extension_dir` seen** (a runtime's `php -i` or `WHATAP_PHP_EXT_HOME` in a service file; the first source is named): its `ls -l`, **sha256**, symlink target, the file it resolves to and that file's `ls -lL` (size, mtime); every whatap ini found on disk (ls -l); `php.ini` files carrying whatap lines (the installer's fallback when PHP reports no scan dir); the ini directories present — the known tree paths and every absolute scan dir a runtime's `php -i` named (one line per entry of a colon-separated `PHP_INI_SCAN_DIR`, read through a process root when not visible here; a relative entry is resolved against the cwd of a live process of that binary; when none can be read it is listed as `n/a (relative scan dir of <bin>, not resolved)`) — with the whatap entries each holds; **live load status from `/proc/<pid>/maps`**, with the pids whose maps could not be read. Which runtime uses which dir, its PHP API and thread safety, whether its `whatap.*` directives are registered and any "Unable to load dynamic library" line are the `php -i` / `php -v` lines of `[3]` |
 | 7 | Agent configuration (verbatim) | every `whatap.ini` dumped verbatim **plus byte facts (size, CR 0x0D count — Windows-edited ini files are a recurring support case)**; the service/unit/init files verbatim (they carry `WHATAP_CONFIG_HOME`, `WHATAP_PHP_EXT_HOME`, `WHATAP_PHP_EXT_SRC`, `WHATAP_PHP_BIN` as install.sh resolved them); the `WHATAP_*` environment of the live processes; `whatap.app_process_name` and how many processes match it right now (the process-memory metric is summed over that name); `security.conf` / `paramkey.txt` of every agent home by presence and size only |
 | 8 | Agent process, service state and channels | `whatap_php` processes (comm is capped at 15 chars, so the musl build shows as `whatap_php_stat`) with cmdline, cwd, uid, threads, RSS and start time; pid file vs live pid; systemd/sysv service state; UDP sockets on 66xx plus the `whatap.net_udp_port`, TCP sessions on 6600 plus the `whatap.server.port` named in the readable whatap ini files (each port labelled by its source), plus every socket of a whatap-named process; **SysV shared memory and semaphore arrays** (the tracer↔agent pair uses key `0x19c8`, which `install.sh remove` deletes with `ipcrm -S 6600 -M 6600`) |
 | 9 | Agent logs and web server error markers | `logs/` inventory; newest `whatap-boot-*.log` head (banner, `[WA214] Config: <path>` — the config file the agent actually read) and tail; newest `whatap-install-*.log` (exactly what install.sh resolved on this host); the last 300 lines of each known web server / php-fpm error log scanned for `whatap` / `WA###` lines written by the tracer |

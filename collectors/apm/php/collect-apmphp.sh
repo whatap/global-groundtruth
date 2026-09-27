@@ -31,7 +31,7 @@ export LC_ALL=C
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-apmphp"
 # History: CHANGELOG.md (next to this file).
-VERSION="0.7.6"
+VERSION="0.8.0"
 DOMAIN="apm"
 TARGET="host/$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || uname -n 2>/dev/null || echo unknown)"
 
@@ -840,7 +840,6 @@ _proc_table() {
 # Populates:
 #   D_PHP_BINS    distinct php / php-fpm / php-cgi binaries (PATH, globs, procs),
 #                 newline-joined
-#   D_PHP_FACTS   one record per detailed runtime, filled in by section 3
 #   D_AGENT_PIDS  pids of the Go agent (comm: whatap_php / whatap_php_stat*)
 #   D_WEB_PIDS    pids of httpd / apache2 / php-fpm / php-cgi / php / lsphp
 #                 processes (by comm, argv0 or exe)
@@ -858,7 +857,6 @@ _proc_table() {
 #                 in by section 6
 D_PHP_BINS=""
 D_PHP_KEYS=""
-D_PHP_FACTS=""      # newline-joined "bin|version|sapi|api|threadsafety|extdir|scandir|loaded|loadmsg"
 D_AGENT_PIDS=""
 D_WEB_PIDS=""
 D_ALT_PIDS=""
@@ -873,6 +871,8 @@ D_MAPS_UNREAD=""
 D_DIR_UNREAD=""     # ini scan dirs / extension_dirs that exist but cannot be listed
 D_PHP_LIVE=""       # "exe|pid" of running php processes, newline-joined
 D_SCAN_UNRES=""     # relative ini scan dir entries no process cwd resolved
+D_SCAN_DIRS=""      # absolute ini scan dirs the runtimes' php -i named, newline-joined
+D_SCAN_REL=""       # "bin|entry" relative scan dir entries not resolved, newline-joined
 # PHP binaries detailed per run. APM_INTERP_CAP in the environment raises it
 # (the CLI flags are a shared block).
 D_PHP_CAP=10   # set in discover
@@ -1590,7 +1590,7 @@ _rep_runtimes() {
     if [ -z "$D_PHP_BINS" ]; then
         fact "   none on PATH, in the known per-version install paths (distro, Sury, Remi, SCL, cPanel EA, Plesk, alt-php, LiteSpeed, source builds), or among running processes"
     fi
-    local _n=0 php _mods=""
+    local _n=0 php
     _php_probed=0 _php_unprobed_live=""
     # the file the PATH php-fpm resolves to, for section 4's reuse of its -v
     _fpm_path_key=""
@@ -1615,16 +1615,9 @@ EOF
         _php_probed=$_n
         _rep_php_bin "$php"
         php_run "   extensions loaded (php -m)" "$php" -m
-        # co-resident tracers and profilers, from the module list just taken
-        _o="$(printf '%s\n' "$_php_out" | grep -iE 'newrelic|datadog|ddtrace|elastic|opentelemetry|otel|tideways|blackfire|xdebug|xhprof|pinpoint|scoutapm|instana' | tr '\n' ' ')"
-        [ -n "$_o" ] && _mods="$_mods$(printf '        %-40s %s' "$php" "$_o")$_nl"
     done 9<<EOF
 $D_PHP_BINS
 EOF
-    # they occupy the same hook surface
-    fact "other APM / profiler extensions among the loaded module lists above:"
-    if [ -n "$_mods" ]; then printf '%s' "$_mods"
-    else fact "   none found (searched: newrelic, datadog/ddtrace, elastic, opentelemetry, tideways, blackfire, xdebug, xhprof, pinpoint, scoutapm, instana)"; fi
     fact "what the php commands on PATH resolve to:"
     for c in php php-fpm php-cgi; do
         _which "$c"; p="$_wp"
@@ -1674,30 +1667,21 @@ _rep_php_bin() {
     else
         fact "   php -i: n/a ($(_classify_err))"
         D_PHPI_FAIL="$D_PHPI_FAIL $php"
-        D_PHP_FACTS="$D_PHP_FACTS
-$php||||||||no|php -i did not run"
     fi
 }
 
-# _php_record PHP -> from the php -i capture of PHP: its record in D_PHP_FACTS,
-# its extension dir, and the whatap ini files it parses or its scan dir holds
+# _php_record PHP -> from the php -i capture of PHP, the paths the next reads
+# need: its extension dir, its ini scan dirs, and the whatap ini files it
+# parses or its scan dir holds. The values themselves are the php -i lines
+# printed above; nothing here is printed again.
 _php_record() {
     local php="$1"
-    # everything the binding section needs, taken from this one capture
-    # (a host with several PHP versions gets one record per version)
-    _f_ver="$(grep '^PHP Version =>' "$_infofile" 2>/dev/null | head -n1 | sed 's/.*=> *//')"
-    _f_sapi="$(grep '^Server API =>' "$_infofile" 2>/dev/null | head -n1 | sed 's/.*=> *//')"
-    _f_api="$(grep '^PHP API =>' "$_infofile" 2>/dev/null | head -n1 | sed 's/.*=> *//')"
-    _f_ts="$(grep '^Thread Safety =>' "$_infofile" 2>/dev/null | head -n1 | sed 's/.*=> *//')"
     _f_ed="$(grep '^extension_dir =>' "$_infofile" 2>/dev/null | head -n1 | sed 's/.*=> *//; s/ *=>.*//')"
     _f_sd="$(grep '^Scan this dir for additional' "$_infofile" 2>/dev/null | head -n1 | sed 's/.*=> *//')"
     # PHP built without a scan dir prints "(none)": no scan dir is configured
     case "$_f_sd" in "(none)"|"no value") _f_sd="" ;; esac
     case "$_f_ed" in "(none)"|"no value") _f_ed="" ;; esac
     case "$_f_ed" in *"|"*) D_ODD="$D_ODD \"$_f_ed\""; _f_ed="" ;; esac
-    if grep -q '^whatap\.' "$_infofile" 2>/dev/null; then _f_ld="yes"; else _f_ld="no"; fi
-    _f_wn="$( { grep -h 'Unable to load dynamic library' "$_infofile" "$_errfile" | head -n1 | cut -c1-200 ; } 2>/dev/null )"
-    [ -n "$_f_wn" ] || _f_wn="none in the php -i output"
     # a relative scan dir entry is relative to the cwd of the PHP
     # process; resolved through a live process of this binary, else
     # recorded as not resolved
@@ -1711,15 +1695,12 @@ _php_record() {
         case "$_d" in
             /*) ;;
             *) if [ -n "$_ppid" ] && _a="$(_abs_for_pid "$_ppid" "$_d")"; then _d="$_a"
-               else D_SCAN_UNRES="$D_SCAN_UNRES $php: $_d;"; fi ;;
+               else D_SCAN_UNRES="$D_SCAN_UNRES $php: $_d;"; D_SCAN_REL="$D_SCAN_REL$php|$_d$_nl"; fi ;;
         esac
         _f_sdr="${_f_sdr:+$_f_sdr:}$_d"
     done <<EOF
 $(printf '%s' "$_f_sd" | tr ':' '\n')
 EOF
-    # the record is '|'-separated; the shown scan dir keeps its '|' as \001
-    D_PHP_FACTS="$D_PHP_FACTS
-$php|$_f_ver|$_f_sapi|$_f_api|$_f_ts|$_f_ed|$(printf '%s' "$_f_sd" | tr '|' '\001')|$_f_sdr|$_f_ld|$_f_wn"
     _add_ext_dir "$_f_ed" "php -i of $php"
     # ini files this binary parses, and the whatap ini its own scan dir
     # would hold — discovered per runtime, not guessed from a path list
@@ -1742,6 +1723,8 @@ $php|$_f_ver|$_f_sapi|$_f_api|$_f_ts|$_f_ed|$(printf '%s' "$_f_sd" | tr '|' '\00
     # (PHP_INI_SCAN_DIR), and may be seen through a process root
     while IFS= read -r _d; do
         case "$_d" in /*) ;; *) continue ;; esac   # recorded in D_SCAN_UNRES
+        # section 6 lists it with the whatap ini names it holds
+        case "$_nl$D_SCAN_DIRS$_nl" in *"$_nl$_d$_nl"*) ;; *) D_SCAN_DIRS="$D_SCAN_DIRS$_d$_nl" ;; esac
         # a scan dir this uid cannot list hides its ini files: a gap,
         # not an empty dir
         _fd="$(resolve_fs "$_d")" || continue
@@ -1854,13 +1837,6 @@ _rep_install() {
         _file_lines head "   ChangeLog (top: shipped agent version and date)" "$fshome/ChangeLog" 6
         file_facts "   install.sh" "$fshome/install.sh"
         _file_lines head "   template.ini (installer's ini template)" "$fshome/template.ini" 60
-        # the PHP-version -> Zend API table the INSTALLED installer uses, read
-        # from that installer rather than assumed
-        if [ -r "$fshome/install.sh" ]; then
-            _map="$(sed -n '/get_php_api_version()/,/^}/p' "$fshome/install.sh" 2>/dev/null | grep -oE '"[0-9]+\.[0-9]+"\) PHP_API="[0-9]+"' | tr -d '"' | sed 's/) PHP_API=/ -> /' | tr '\n' ' ')"
-            if [ -n "$_map" ]; then fact "   php version -> PHP API map in this install.sh: $_map"
-            else fact "   php version -> PHP API map: n/a (no get_php_api_version block in $fshome/install.sh)"; fi
-        fi
         if [ -d "$fshome/modules" ]; then
             probe "   shipped tracer modules per arch (count)" _mods_count "$fshome"
             probe "   shipped tracer modules (names)" _mods_names "$fshome"
@@ -1879,101 +1855,41 @@ _rep_install() {
     else fact "   apk: n/a (command not found: apk)"; fi
 }
 
-# [6] the binding, reported per PHP runtime — on a host with several PHP
-# versions the tracer is bound to some of them and not to others, and each
-# version has its own extension_dir and its own ini scan dir.
+# [6] the binding: whatap.so in every extension_dir seen, the whatap ini
+# files and ini directories, and the module mapped into live processes. Which
+# runtime reads which extension_dir and scan dir, and its PHP API and thread
+# safety, are the php -i lines of section 3; the reader matches them here.
 _rep_binding() {
-    section "Tracer binding per PHP runtime (module, ini, load state)"
-    _rep_binding_runtimes
+    section "Tracer binding (module, ini, load state)"
     _rep_binding_extdirs
     _rep_binding_inis
     _rep_binding_maps
 }
 
-# _rep_binding_runtimes -> per runtime detailed in section 3: whatap.so in its
-# extension_dir, the whatap ini in its scan dirs, its whatap.* directives
-_rep_binding_runtimes() {
-    if [ -z "$D_PHP_FACTS" ]; then
-        fact "no PHP runtime was detailed in section 3; only the extension_dir view below applies"
-    else
-        printf '%s\n' "$D_PHP_FACTS" | grep -v '^$' | while IFS='|' read -r _p _v _sapi _api _ts _ed _sd _sdr _ld _wn; do
-            [ -n "$_p" ] || continue
-            fact "-- runtime: $_p"
-            fact "   PHP ${_v:-n/a}, SAPI ${_sapi:-n/a}, PHP API ${_api:-n/a}, Thread Safety ${_ts:-n/a}"
-            if [ -n "$_ed" ]; then
-                fact "   extension_dir: $_ed"
-                fsd="$(resolve_fs "$_ed")"
-                if [ -z "$fsd" ]; then
-                    fact "   whatap.so there: n/a ($(_absent_why "$_ed"))"
-                elif [ ! -x "$fsd" ]; then
-                    fact "   whatap.so there: n/a (permission denied: $fsd)"
-                elif [ -e "$fsd/whatap.so" ]; then
-                    fact "   whatap.so there: $(ls -l "$fsd/whatap.so" 2>/dev/null)"
-                    _t="$(readlink -f "$fsd/whatap.so" 2>/dev/null)"
-                    if [ -n "$_t" ]; then
-                        _b="$(basename "$_t")"
-                        fact "   it resolves to: $_b (name encodes: thread-safe build = $(case "$_b" in (*_zts_*) echo yes ;; (*) echo no ;; esac), PHP API = $(echo "$_b" | grep -oE '[0-9]{8}' | head -n1))"
-                    fi
-                else
-                    fact "   whatap.so there: n/a (path not found: $_ed/whatap.so)"
-                fi
-            else
-                fact "   extension_dir: n/a (php -i reported none)"
-            fi
-            if [ -n "$_sd" ]; then
-                fact "   ini scan dir: $(printf '%s' "$_sd" | tr '\001' '|')"
-                # one line per entry, absolute or not (refused entries are
-                # listed with the other refused paths)
-                while IFS= read -r _d; do
-                    [ -n "$_d" ] || continue
-                    case "$_d" in /*) ;; *) fact "   -- $_d: n/a (relative scan dir, not resolved)"; continue ;; esac
-                    _fd="$(resolve_fs "$_d")" || { fact "   -- $_d: n/a ($(_absent_why "$_d"))"; continue; }
-                    if [ ! -r "$_fd" ] || [ ! -x "$_fd" ]; then fact "   -- $_d: n/a (permission denied: $_fd)"; continue; fi
-                    _i=""
-                    for _q in "$_fd"/*whatap*.ini; do [ -f "$_q" ] && _i="$_i $_q"; done
-                    if [ -n "$_i" ]; then fact "   -- $_d: whatap ini:$_i"
-                    else fact "   -- $_d: no *whatap*.ini"; fi
-                done <<EOF
-$(printf '%s' "$_sdr" | tr ':' '\n')
-EOF
-
-            else
-                fact "   ini scan dir: none configured (php -i reports none)"
-            fi
-            fact "   whatap.* directives registered in this runtime: $_ld"
-            fact "   dynamic-library load message: $_wn"
-        done
-    fi
-}
-
-# _rep_binding_extdirs -> every extension_dir seen, and whatap.so in the ones no
-# runtime reported
+# _rep_binding_extdirs -> whatap.so in each extension_dir seen (php -i of a
+# runtime, or a service file), once per directory: ls, sha256, the symlink
+# target and the file it resolves to
 _rep_binding_extdirs() {
     if [ -z "$D_EXT_DIRS" ]; then
         fact "extension_dir values: none discovered (php -i and service files both empty)"
-    else
-        fact "every extension_dir seen, its source, and whether a discovered runtime reported it:"
-        printf '%s\n' "$D_EXT_DIRS" | grep -v '^$' | while IFS='|' read -r _d _s; do
-            [ -n "$_d" ] || continue
-            _u="no"
-            case "$D_PHP_FACTS" in *"|$_d|"*) _u="yes" ;; esac
-            printf '        %-50s <- %-42s runtime-reported: %s\n' "$_d" "$_s" "$_u"
-        done
-        # a dir that only the service files name belongs to a PHP install that
-        # no runtime found here reports — its module facts are collected too
-        printf '%s\n' "$D_EXT_DIRS" | grep -v '^$' | while IFS='|' read -r _d _s; do
-            [ -n "$_d" ] || continue
-            case "$D_PHP_FACTS" in *"|$_d|"*) continue ;; esac
-            fsd="$(resolve_fs "$_d")"
-            if [ -z "$fsd" ]; then fact "-- extension_dir $_d (no runtime reported it): n/a ($(_absent_why "$_d"))"; continue; fi
-            fact "-- extension_dir $_d (no runtime reported it):"
-            if [ -e "$fsd/whatap.so" ]; then
-                file_facts "   whatap.so" "$fsd/whatap.so"
-            else
-                fact "   whatap.so: n/a (path not found: $_d/whatap.so)"
-            fi
-        done
+        return
     fi
+    fact "whatap.so in each extension_dir seen (first source that named the dir):"
+    printf '%s\n' "$D_EXT_DIRS" | grep -v '^$' | while IFS='|' read -r _d _s; do
+        [ -n "$_d" ] || continue
+        fsd="$(resolve_fs "$_d")"
+        if [ -z "$fsd" ]; then fact "-- $_d   <- $_s: n/a ($(_absent_why "$_d"))"; continue; fi
+        fact "-- $_d   <- $_s"
+        [ "$fsd" != "$_d" ] && fact "   filesystem view: $fsd (read through a process root)"
+        if [ ! -x "$fsd" ]; then
+            fact "   whatap.so: n/a (permission denied: $fsd)"
+        elif [ -e "$fsd/whatap.so" ]; then
+            file_facts "   whatap.so" "$fsd/whatap.so"
+            [ -L "$fsd/whatap.so" ] && printf '        resolved file: %s\n' "$(ls -lL "$fsd/whatap.so" 2>/dev/null)"
+        else
+            fact "   whatap.so: n/a (path not found: $_d/whatap.so)"
+        fi
+    done
 }
 
 # _rep_binding_inis -> whatap ini files, php.ini files with whatap lines, and
@@ -1999,8 +1915,8 @@ _rep_binding_inis() {
         grep -n -i whatap "$p" 2>/dev/null | head -n 30 | _indent '           '
     done
     [ "$_hit" = 0 ] && fact "   none found"
-    fact "ini directory trees present:"
-    _hit=0
+    fact "ini directories present and their whatap entries (known tree paths, then scan dirs php -i named in section 3):"
+    _hit=0 _seen="|"
     for d in /etc/php.d /etc/php/*/cli/conf.d /etc/php/*/fpm/conf.d /etc/php/*/apache2/conf.d /etc/php/*/mods-available \
              /etc/php[0-9]*/conf.d /usr/local/etc/php/conf.d \
              /opt/remi/php*/root/etc/php.d /etc/opt/remi/php*/php.d \
@@ -2008,7 +1924,7 @@ _rep_binding_inis() {
              /opt/cpanel/ea-php*/root/etc/php.d /opt/plesk/php/*/etc/php.d \
              /opt/alt/php*/etc/php.d /usr/local/lsws/lsphp*/etc/php.d; do
         [ -d "$d" ] || continue
-        _hit=1
+        _hit=1 _seen="$_seen$d|"
         # a directory this uid cannot read lists no names: not "no entry"
         if [ -r "$d" ]; then
             _w="$(_names "$d" | grep -i whatap | tr '\n' ' ')"
@@ -2017,7 +1933,30 @@ _rep_binding_inis() {
             printf '        %-46s %s\n' "$d" "n/a (permission denied: $d)"
         fi
     done
-    [ "$_hit" = 0 ] && fact "   none of the known ini tree paths exist on this host"
+    # a scan dir may be seen through a process root; a relative one no
+    # process cwd resolved is in the status section
+    while IFS= read -r d; do
+        [ -n "$d" ] || continue
+        case "$_seen" in *"|$d|"*) continue ;; esac
+        _hit=1 _seen="$_seen$d|"
+        fd="$(resolve_fs "$d")" || { printf '        %-46s %s\n' "$d" "n/a ($(_absent_why "$d"))"; continue; }
+        if [ -r "$fd" ] && [ -x "$fd" ]; then
+            _w="$(_names "$fd" | grep 'whatap.*\.ini$' | tr '\n' ' ')"
+            printf '        %-46s %s%s\n' "$d" "${_w:-(no *whatap*.ini)}" "$([ "$fd" != "$d" ] && printf '   (read at %s)' "$fd")"
+        else
+            printf '        %-46s %s\n' "$d" "n/a (permission denied: $fd)"
+        fi
+    done <<EOF
+$D_SCAN_DIRS
+EOF
+    while IFS='|' read -r _b d; do
+        [ -n "$d" ] || continue
+        _hit=1
+        printf '        %-46s %s\n' "$d" "n/a (relative scan dir of $_b, not resolved)"
+    done <<EOF
+$D_SCAN_REL
+EOF
+    [ "$_hit" = 0 ] && fact "   none of the known ini tree paths or php -i scan dirs exist on this host"
 }
 
 # _rep_binding_maps -> the whatap module mapped into running web/php processes
@@ -2082,7 +2021,8 @@ _rep_conf() {
     done
     [ "$_any" = 0 ] && fact "   no WHATAP_* variable found in the environ of the processes inspected"
     # app_process_name drives the process-memory metric; the matching live
-    # process count is the fact that makes it verifiable
+    # process count is the fact that makes it verifiable (section 4 details
+    # at most 20 processes)
     _apn="$(printf '%s\n' "$D_INI_FILES" | tr '|' '\n' | grep -v '^$' | sort -u | while IFS= read -r p; do grep -h '^[[:space:]]*whatap\.app_process_name' "$p" 2>/dev/null; done | head -n1 | sed 's/.*= *//')"
     if [ -n "$_apn" ]; then
         fact "whatap.app_process_name configured value: $_apn"

@@ -5,6 +5,31 @@ Every change to the script bumps its `VERSION` and adds one entry at the top
 of this list (docs/authoring-guide.md, step 2); `tools/validate.sh` checks
 that the newest entry is the script's `VERSION`.
 
+- **0.8.0** — Derived views removed (CONTRACT rule 1, "Derived views"); every
+  fact they carried is still in the report as read. Section 6 is "Tracer
+  binding (module, ini, load state)" and no longer has one block per runtime:
+  the "PHP x, SAPI y, PHP API z, Thread Safety w" line, the runtime's
+  `extension_dir` and `ini scan dir`, "whatap.* directives registered: yes/no"
+  and "dynamic-library load message" repeated the `php -i` lines of section 3
+  (`PHP Version`, `Server API`, `PHP API`/`Thread Safety`, `extension_dir`,
+  `Scan this dir`/`Additional .ini files parsed`, the `whatap.*` directive
+  list) and the `php -v`/`php -m` output and stderr there. "it resolves to:
+  whatap_X.so (name encodes: thread-safe build, PHP API)" decoded the module
+  name; the name is now printed as read, with more than before: whatap.so is
+  shown once per extension_dir with `ls -l`, sha256, symlink target,
+  `readlink -f` and the resolved file's `ls -lL` (size, mtime). The
+  "runtime-reported: yes/no" column (a join with section 3) is gone; the
+  first source of each dir is printed. The per-runtime "scan dir: whatap ini"
+  lines moved into "ini directories present and their whatap entries", which
+  now also lists each absolute scan dir php -i named. Section 3 loses "other
+  APM / profiler extensions among the loaded module lists above" (a filter of
+  the `php -m` lists printed just above it). Run on apm-php-rocky and
+  apm-php-alpine (tools/lab/run.sh --base HEAD): only these lines differ.
+  Section 5 loses "php version -> PHP API map in this install.sh" (vendor
+  source parsed out of install.sh; install.sh's ls and sha256 stay, and the
+  README names its get_php_api_version()). In section 6, a relative scan dir no process
+  cwd resolved is listed in the ini directory list as "n/a (relative scan dir of <bin>, not
+  resolved)", as the per-runtime block printed it.
 - **0.7.6** — `apm: file helpers`/`apm: conf bytes` (templates/groups/apm.sh):
   `wc -l`/`wc -c`/`tr -dc '\r'` reading an unreadable file no longer leak
   "Permission denied" to the operator's stderr (the `<` redirect ran before
