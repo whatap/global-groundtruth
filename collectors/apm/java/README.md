@@ -1,8 +1,12 @@
 # collectors/apm/java — WhaTap Java APM agent collector
 
-> **Status: SEEDED (v0; validated at `collect-apmjava.sh` 0.6.0, the third
-> live run at FIF on 2026-09-17; the script's own `VERSION` is the current
-> one, and the changes after 0.6.0 have not met a real host yet).**
+> **Status: SEEDED (v0; validated at `collect-apmjava.sh` 0.13.2 on
+> 2026-09-27 against real WhaTap Java agents: an operator-injected Spring Boot
+> pod on the lab cluster (Temurin 17.0.18, agent 2.2.68 from
+> `apm-init-java:latest`, connected to the collection server) and Temurin
+> 21.0.12 containers with agent 2.2.77 attached by `-javaagent` and by
+> `JAVA_TOOL_OPTIONS`; as root, as the JVM's user and as another user, under
+> bash and `sh -s`; see "Cases". The FIF runs of 2026-09-17 were at 0.6.0).**
 > `collect-apmjava.sh` is a working Tier-0 collector, plus an opt-in library
 > detail pack (`--library` / `--class`) and two opt-in Tier-2 flags
 > (`--threads` / `--jcmd`), seeded by the Global team (CONTRACT rule 4 —
@@ -307,7 +311,12 @@ one `grep -z` over every cmdline, one `awk` for comm and the verdicts, one
 not one per process: 0.11.1 took 16.7s at 704 processes on a development
 host, 0.12.0 took 4–7s at about 720 on the same host. `-version` is executed
 only against discovered binaries named `java`, never against a running
-process.
+process. Every JVM the run starts (`-version`, `javap`, `jcmd`, `jstack`) runs
+without `JAVA_TOOL_OPTIONS`, `JDK_JAVA_OPTIONS` and `_JAVA_OPTIONS`: in an
+operator-injected pod the `kubectl exec` shell inherits
+`JAVA_TOOL_OPTIONS=-javaagent:...`, and a JVM started with it loads the WhaTap
+agent. `[1]` names the variables removed; section K prints the value the
+shell had.
 
 The library detail pack (`--library` / `--class`) is off by
 default because it is targeted, not because it is risky: it reads jar central
@@ -347,6 +356,7 @@ the mechanism, not the case):
 | 2026-09-11, BAF | section D reported no JVM while section J showed two `vshell` processes connected on :6600 | the `libjvm.so` mapping test and `--jcmd` argument recovery (D) |
 | 2026-09-17, FIF | one unit carried 282 jars, the customer's own sorting at "f"; the thread dump arrived over Slack and was counted by hand; which of 72 batchprocess classes are Quartz jobs; 40 detailed jars made 988 of the report's 2738 lines, and all 40 came from one of two units | every jar is recorded though 120 are printed (F); `--dump-file` (L); `--class-refs` (N); no package histogram for a jar section N indexes, and a byte-identical copy is named, not detailed again (M) |
 | 2026-09-25, verification | a relative `-Dwhatap.home` was reported "not visible from this mount namespace" | every path is resolved as the JVM that names it resolves it (the Config row above) |
+| 2026-09-27, lab cluster (operator-injected pod) | each run's `java -version` picked up the inherited `JAVA_TOOL_OPTIONS` and started the WhaTap agent: a `WhaTap Java v2.2.68` / `Start` banner and the weaving lines in the pod's `whatap.log`, which section I then printed as the agent's own | JVMs the run starts get no JVM option variables ([1], Load profile) |
 
 ## Validate
 

@@ -94,9 +94,28 @@ COLLECTOR_NAME="whatap-apmjava"
 #         after the private temp directory is made (was: right before).
 #         Without hostname(1) and /proc, Target and the --file name take
 #         `uname -n` (was: unknown); the file name reuses Target's name.
-VERSION="0.13.1"
+# 0.13.2  Every JVM this run starts (java -version, javap, jcmd, jstack) runs
+#         without JAVA_TOOL_OPTIONS, JDK_JAVA_OPTIONS and _JAVA_OPTIONS. Run
+#         by kubectl exec in an operator-injected pod, the shell inherits
+#         JAVA_TOOL_OPTIONS=-javaagent:..., and each java -version loaded the
+#         WhaTap agent: two "WhaTap Java v... / Start ..." banners and weaving
+#         lines in the pod's whatap.log per run, read back by section I as
+#         the agent's own (lab k8s, 2026-09-27). Report: [1] names the
+#         variables removed; B's -version loses the "Picked up
+#         JAVA_TOOL_OPTIONS" lines; K prints the value the shell had.
+VERSION="0.13.2"
 DOMAIN="apm"
 TARGET="host/$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || uname -n 2>/dev/null || echo unknown)"
+
+# A JVM started with these loads the agents they name (kubectl exec inherits
+# the operator's JAVA_TOOL_OPTIONS=-javaagent:...). The shell's values are kept
+# for section K; every JVM this run starts runs without them.
+_SELF_JTO="${JAVA_TOOL_OPTIONS:-}"
+_SELF_JVMOPTS=""
+for _v in JAVA_TOOL_OPTIONS JDK_JAVA_OPTIONS _JAVA_OPTIONS; do
+    eval "[ -n \"\${$_v+x}\" ]" && _SELF_JVMOPTS="$_SELF_JVMOPTS $_v"
+done
+unset JAVA_TOOL_OPTIONS JDK_JAVA_OPTIONS _JAVA_OPTIONS _v
 
 # ---- CLI harness — DO NOT EDIT ----------------------------------------------
 OPT_FILE=0        # write the report to a .txt file
@@ -2318,6 +2337,7 @@ _rep_env() {
     done
     fact "per-command cap: ${CMD_TIMEOUT}s; run deadline: ${RUN_DEADLINE}s"
     fact "Tier 2 flags: --threads=$OPT_THREADS  --jcmd=$OPT_JCMD (0 = not requested)"
+    fact "JVM option variables removed from the JVMs this run starts:${_SELF_JVMOPTS:- none were set}"
     _libshow="$OPT_LIBS"; [ "$OPT_LIBALL" = 1 ] && _libshow="$_libshow *"
     fact "library detail flags: --library=${_libshow:-none}  --class=${OPT_CLASSES:-none}"
     _appshow="$OPT_APPCLASSES"; [ "$OPT_APPIMPLIED" = 1 ] && _appshow="1 (turned on by --class-refs)"
@@ -3313,7 +3333,7 @@ _rep_k8s() {
         fact "/whatap-agent: n/a ($(_path_why /whatap-agent))"
     fi
     fact "env WHATAP_JAVA_AGENT_PATH (collector shell): ${WHATAP_JAVA_AGENT_PATH:-not set}"
-    fact "env JAVA_TOOL_OPTIONS (collector shell): ${JAVA_TOOL_OPTIONS:-not set}"
+    fact "env JAVA_TOOL_OPTIONS (collector shell): ${_SELF_JTO:-not set}"
     for v in POD_NAME PODNAME NODE_NAME NODE_IP OKIND WHATAP_MICRO_ENABLED; do
         eval "_val=\${$v:-}"
         if [ -n "$_val" ]; then fact "env $v: $_val"; else fact "env $v: not set"; fi
