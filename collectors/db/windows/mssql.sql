@@ -10,12 +10,15 @@
 -- missing VIEW SERVER STATE or xp_readerrorlog EXECUTE surfaces here).
 -- Paste the FULL output together with the collect-db-mssql.ps1 report.
 -- Facts only -- this script reports what is, never what it means.
+-- Section labels are '==== [n] title ===='. A label must not START with '[':
+-- classic sqlcmd (ODBC) strips leading [...] groups from a PRINT message
+-- (observed with sqlcmd 16.0), so a bare '[1] title' arrives as ' title'.
 -- ---------------------------------------------------------------------------
 
-PRINT '==== WhaTap Global Groundtruth -- db/windows/mssql.sql v0.2.0 ====';
+PRINT '==== WhaTap Global Groundtruth -- db/windows/mssql.sql v0.3.0 ====';
 GO
 
-PRINT '[1] server & session identity';
+PRINT '==== [1] server & session identity ====';
 SELECT @@VERSION AS version;
 SELECT @@SERVERNAME                        AS server_name,
        SERVERPROPERTY('Edition')           AS edition,
@@ -27,7 +30,7 @@ SELECT @@SERVERNAME                        AS server_name,
 SELECT SUSER_NAME() AS connected_as, DB_NAME() AS current_database;
 GO
 
-PRINT '[2] server-level permissions of the monitoring account';
+PRINT '==== [2] server-level permissions of the monitoring account ====';
 SELECT IS_SRVROLEMEMBER('sysadmin') AS is_sysadmin;
 SELECT permission_name, state_desc
 FROM sys.server_permissions p
@@ -36,28 +39,28 @@ WHERE s.name = SUSER_NAME();
 SELECT * FROM fn_my_permissions(NULL, 'SERVER');
 GO
 
-PRINT '[3] xp_readerrorlog EXECUTE permission (checked in master -- grantable only there)';
+PRINT '==== [3] xp_readerrorlog EXECUTE permission (checked in master -- grantable only there) ====';
 USE master;
 SELECT HAS_PERMS_BY_NAME('sys.xp_readerrorlog', 'OBJECT', 'EXECUTE') AS has_xp_readerrorlog_execute;
 GO
 
-PRINT '[4] databases visible to the monitoring account';
+PRINT '==== [4] databases visible to the monitoring account ====';
 SELECT name, state_desc, recovery_model_desc, is_read_only
 FROM sys.databases ORDER BY name;
 GO
 
-PRINT '[5] AlwaysOn availability state (no rows when HADR is off or no availability group exists)';
+PRINT '==== [5] AlwaysOn availability state (no rows when HADR is off or no availability group exists) ====';
 SELECT ag.name AS ag_name, rs.role_desc, rs.connected_state_desc, rs.synchronization_health_desc
 FROM sys.dm_hadr_availability_replica_states rs
 JOIN sys.availability_groups ag ON rs.group_id = ag.group_id;
 GO
 
-PRINT '[6] connection encryption of this session';
+PRINT '==== [6] connection encryption of this session ====';
 SELECT session_id, encrypt_option, auth_scheme, protocol_type
 FROM sys.dm_exec_connections WHERE session_id = @@SPID;
 GO
 
-PRINT '[7] sessions of this monitoring account (the agent connections)';
+PRINT '==== [7] sessions of this monitoring account (the agent connections) ====';
 SELECT session_id, login_name, host_name, program_name, status, login_time
 FROM sys.dm_exec_sessions WHERE login_name = SUSER_NAME();
 GO

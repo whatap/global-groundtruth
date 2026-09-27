@@ -223,11 +223,18 @@ Collection-server-side facts (server version, metrics categories) belong to
   directory (the `!!` line and exit 1), `RUN_DEADLINE` / `CMD_TIMEOUT` and
   invalid values of them. Every `-File` report passes `validate.sh --report`.
   Before 0.3.0 it was not runnable (`-Home` clashed with `$HOME`).
-- `windows/mssql.sql` ran against both instances through go-sqlcmd 1.10.0
-  (`sqlcmd -S localhost,<port> -E -i mssql.sql`) as a sysadmin and as a
-  Windows login holding only VIEW SERVER STATE and VIEW ANY DEFINITION: every
-  batch ran without an error. go-sqlcmd drops a leading `[n]` from a PRINT
-  message, so the pack's section labels arrive without their numbers there.
+- `windows/mssql.sql` ran against both instances through `sqlcmd -S
+  localhost,<port> -E -i mssql.sql` as a sysadmin and as a Windows login
+  holding only VIEW SERVER STATE and VIEW ANY DEFINITION: every batch ran
+  without an error. On that host `sqlcmd` on PATH is the classic ODBC sqlcmd
+  16.0 (`Client SDK\ODBC\170\Tools\Binn`), not go-sqlcmd 1.10.0
+  (`C:\ggt\sqlcmd`). Classic sqlcmd strips leading `[...]` groups from a
+  PRINT message, so up to v0.2.0 the section labels
+  (`[n] title`) arrived there as ` title`. Since v0.3.0 they read
+  `==== [n] title ====`; at v0.3.0 (2026-09-27) the labels arrived intact
+  through classic sqlcmd 16.0, go-sqlcmd 1.10.0 (stdout and `-o`) and
+  `Invoke-Sqlcmd` of the SQLPS 16.0 module (verbose stream), on both
+  instances. SSMS is not installed on that host (not run).
 
 ## What the report can contain
 
