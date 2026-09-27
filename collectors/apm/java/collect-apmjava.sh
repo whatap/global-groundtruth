@@ -32,7 +32,7 @@ export LC_ALL=C
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-apmjava"
 # History: CHANGELOG.md (next to this file).
-VERSION="0.13.4"
+VERSION="0.13.5"
 DOMAIN="apm"
 TARGET="host/$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || uname -n 2>/dev/null || echo unknown)"
 
@@ -1364,6 +1364,19 @@ _all_jvm_args() {
     return 0
 }
 
+# _jvm_opt_val PID OPT... -> the argument that follows the first of the
+# options OPT (-jar, -cp ...) across all argument sources, or empty
+_jvm_opt_val() {
+    local pid="$1"; shift
+    _all_jvm_args "$pid" 2>/dev/null | awk -v o="$*" 'BEGIN { n = split(o, a, " "); for (i = 1; i <= n; i++) w[a[i]] = 1 }
+        (p in w) { print; exit } { p = $0 }'
+}
+
+# _link_or_na PATH -> the target of the symlink PATH (a /proc link), or n/a
+_link_or_na() {
+    readlink "$1" 2>/dev/null || echo 'n/a (permission denied or gone)'
+}
+
 # ---- Tier 2 argument recovery (opt-in: --jcmd) --------------------------------
 # A JVM the collector found only by its libjvm.so mapping carries its options
 # nowhere in /proc: the native launcher passed them to JNI_CreateJavaVM as an
@@ -2528,16 +2541,16 @@ _rep_jvms() {
             printf '        -- pid %s (ppid %s)\n' "$pid" "${_pst%%|*}"
             printf '           detected as a JVM by: %s\n' "$(printf '%s\n' "$D_JVM_WHY" | awk -F'|' -v p="$pid" '$1==p{sub(/^[^|]*\|/,""); print; exit}')"
             printf '           comm: %s\n' "$(cat "/proc/$pid/comm" 2>/dev/null)"
-            printf '           exe: %s\n' "$(readlink "/proc/$pid/exe" 2>/dev/null || echo 'n/a (permission denied or gone)')"
+            printf '           exe: %s\n' "$(_link_or_na "/proc/$pid/exe")"
             printf '           root and mount namespace: %s\n' "$(case "$(_ns_of "$pid")" in (same) echo "the collector's own" ;; (other) echo "not the collector's (root $(readlink "/proc/$pid/root" 2>/dev/null); paths are read through /proc/$pid/root)" ;; (*) echo "n/a (/proc/$pid/root not readable)" ;; esac)"
             _pst="${_pst#*|}"
             printf '           uid/state/threads: %s\n' "${_pst%%|*}"
             printf '           VmRSS: %s\n' "${_pst#*|}"
             printf '           start time(UTC): %s\n' "$(_proc_start "$pid")"
-            printf '           cwd: %s\n' "$(readlink "/proc/$pid/cwd" 2>/dev/null || echo 'n/a (permission denied or gone)')"
+            printf '           cwd: %s\n' "$(_link_or_na "/proc/$pid/cwd")"
             # where the boot banner and any SIGQUIT dump land
-            printf '           stdout (fd 1) -> %s\n' "$(readlink "/proc/$pid/fd/1" 2>/dev/null || echo 'n/a (permission denied or gone)')"
-            printf '           stderr (fd 2) -> %s\n' "$(readlink "/proc/$pid/fd/2" 2>/dev/null || echo 'n/a (permission denied or gone)')"
+            printf '           stdout (fd 1) -> %s\n' "$(_link_or_na "/proc/$pid/fd/1")"
+            printf '           stderr (fd 2) -> %s\n' "$(_link_or_na "/proc/$pid/fd/2")"
             printf '           cmdline (verbatim):\n'
             tr '\0' '\n' 2>/dev/null < "/proc/$pid/cmdline" | _indent '             '
             if ! _env_readable "$pid"; then
@@ -2585,7 +2598,7 @@ _rep_jvms() {
             [ "$_smk" = 0 ] && printf '             none of the listed server properties is set on this JVM\n'
             # program identity: the option values (-cp, -jar, --module-path ...)
             # are skipped so a classpath is never reported as a main class
-            _jarv="$(_all_jvm_args "$pid" | awk 'p=="-jar"{print; exit} {p=$0}')"
+            _jarv="$(_jvm_opt_val "$pid" -jar)"
             case " $D_JVM_NOARGS " in
                 *" $pid "*)
                     _jc="$(cat "$(_tmp "jcmdmain.$pid")" 2>/dev/null)"
@@ -2681,77 +2694,86 @@ _rep_conf() {
         else
             fact "   whatap system properties on the arguments of this process: none set"
         fi
-        # other files the agent reads or writes in its home
-        _fsh="$(_rpath "$pid" "$_hm")"
-        if [ -n "$_fsh" ] && [ -d "$_fsh" ] && [ -r "$_fsh" ]; then
-            _n="$(_rnote "$pid" "$_hm" "$_fsh")"; [ -n "$_n" ] && fact "   home $_n"
-            _probe_ls "   home listing (first 60 lines)" "$_fsh" 60
-            _flag agent_home_read "home $_hm"
-            for _sf in security.conf paramkey.txt; do
-                if [ -f "$(_vfix "$_fsh/$_sf")" ]; then
-                    fact "   $_sf: present, $(_fsize "$_fsh/$_sf") bytes (content not collected)"
-                else
-                    fact "   $_sf: absent"
-                fi
-            done
-            _ccp="$(_proc_env "$pid" WHATAP_CONTAINER_CONF_PATH)"
-            if [ -n "$_ccp" ]; then
-                fact "   env WHATAP_CONTAINER_CONF_PATH: $_ccp"
-                _ccv="$(_rpath "$pid" "$_ccp/container.conf")"
-                if [ -n "$_ccv" ]; then _file_lines first "   container.conf" "$_ccv" 40
-                else fact "   container.conf: n/a ($(_rwhy "$pid" "$_ccp/container.conf"))"; fi
-            else
-                _file_lines first "   container.conf" "$_fsh/container.conf" 40
-            fi
-        elif [ -n "$_fsh" ]; then
-            fact "   home listing: n/a (permission denied: $_fsh)"
-            _flag agent_unread "home $_hm of pid $pid: permission denied: $_fsh"
-        else
-            _w="$(_rwhy "$pid" "$_hm")"
-            fact "   home listing: n/a ($_w)"
-            case "$_w" in "permission denied"*) _flag agent_unread "home $_hm of pid $pid: $_w" ;; esac
-        fi
+        _conf_home
     done
-    if [ -n "$D_HOMES" ]; then
-        fact "all agent home candidates discovered (union of every source):"
-        printf '%s\n' "$D_HOMES" | while IFS='|' read -r _p _pid _s; do
-            [ -n "$_p" ] || continue
-            _v="$(_rpath "$_pid" "$_p")"
-            if [ -n "$_v" ] && [ -d "$_v" ] && [ -r "$_v" ] && [ -x "$_v" ]; then
-                _st="readable directory"; _n="$(_rnote "$_pid" "$_p" "$_v")"; [ -n "$_n" ] && _st="$_st, $_n"
-                _flag agent_home_read "home $_p"
-            elif [ -n "$_v" ] && [ ! -d "$_v" ]; then
-                _st="n/a (not a directory: $_v)"
-            elif [ -n "$_v" ]; then
-                _st="n/a (permission denied: $_v)"
-                _flag agent_unread "home $_p ($_s): permission denied: $_v"
+    [ -n "$D_HOMES" ] && _conf_all_homes
+    return 0
+}
+
+# other files the agent reads or writes in the home $_hm of $pid
+_conf_home() {
+    _fsh="$(_rpath "$pid" "$_hm")"
+    if [ -n "$_fsh" ] && [ -d "$_fsh" ] && [ -r "$_fsh" ]; then
+        _n="$(_rnote "$pid" "$_hm" "$_fsh")"; [ -n "$_n" ] && fact "   home $_n"
+        _probe_ls "   home listing (first 60 lines)" "$_fsh" 60
+        _flag agent_home_read "home $_hm"
+        for _sf in security.conf paramkey.txt; do
+            if [ -f "$(_vfix "$_fsh/$_sf")" ]; then
+                fact "   $_sf: present, $(_fsize "$_fsh/$_sf") bytes (content not collected)"
             else
-                _w="$(_rwhy "$_pid" "$_p")"; _st="n/a ($_w)"
-                case "$_w" in
-                    "permission denied"*) _flag agent_unread "home $_p ($_s): $_w" ;;
-                    *) _flag agent_absent "home $_p ($_s): $_w" ;;
-                esac
-            fi
-            printf '        %s   <- %s: %s\n' "$_p" "$_s" "$_st"
-            # a home no attached JVM resolved: its whatap.conf, the assumed
-            # default file name, since no process names another
-            case " $D_MARKED " in *" $_pid "*) continue ;; esac
-            case "$_s" in *" of pid "*) continue ;; esac
-            [ -n "$_v" ] && [ -d "$_v" ] || continue
-            if [ -e "$_v/whatap.conf" ]; then
-                if [ -r "$_v/whatap.conf" ]; then
-                    _file_lines first "        $_p/whatap.conf (assumed default file name; verbatim)" "$_v/whatap.conf" 400
-                    _flag conf_read "$_p/whatap.conf"
-                else
-                    printf '        %s/whatap.conf: n/a (permission denied)\n' "$_p"
-                    _flag conf_unread "$_p/whatap.conf: permission denied"
-                fi
-            else
-                _w="$(_path_why "$_v/whatap.conf")"
-                case "$_w" in "path not found"*) _flag conf_absent_home "$_p/whatap.conf" ;; *) _flag conf_unread "$_p/whatap.conf: $_w" ;; esac
+                fact "   $_sf: absent"
             fi
         done
+        _ccp="$(_proc_env "$pid" WHATAP_CONTAINER_CONF_PATH)"
+        if [ -n "$_ccp" ]; then
+            fact "   env WHATAP_CONTAINER_CONF_PATH: $_ccp"
+            _ccv="$(_rpath "$pid" "$_ccp/container.conf")"
+            if [ -n "$_ccv" ]; then _file_lines first "   container.conf" "$_ccv" 40
+            else fact "   container.conf: n/a ($(_rwhy "$pid" "$_ccp/container.conf"))"; fi
+        else
+            _file_lines first "   container.conf" "$_fsh/container.conf" 40
+        fi
+    elif [ -n "$_fsh" ]; then
+        fact "   home listing: n/a (permission denied: $_fsh)"
+        _flag agent_unread "home $_hm of pid $pid: permission denied: $_fsh"
+    else
+        _w="$(_rwhy "$pid" "$_hm")"
+        fact "   home listing: n/a ($_w)"
+        case "$_w" in "permission denied"*) _flag agent_unread "home $_hm of pid $pid: $_w" ;; esac
     fi
+}
+
+# every agent home candidate of D_HOMES, and the whatap.conf of a home no
+# attached JVM resolved
+_conf_all_homes() {
+    fact "all agent home candidates discovered (union of every source):"
+    printf '%s\n' "$D_HOMES" | while IFS='|' read -r _p _pid _s; do
+        [ -n "$_p" ] || continue
+        _v="$(_rpath "$_pid" "$_p")"
+        if [ -n "$_v" ] && [ -d "$_v" ] && [ -r "$_v" ] && [ -x "$_v" ]; then
+            _st="readable directory"; _n="$(_rnote "$_pid" "$_p" "$_v")"; [ -n "$_n" ] && _st="$_st, $_n"
+            _flag agent_home_read "home $_p"
+        elif [ -n "$_v" ] && [ ! -d "$_v" ]; then
+            _st="n/a (not a directory: $_v)"
+        elif [ -n "$_v" ]; then
+            _st="n/a (permission denied: $_v)"
+            _flag agent_unread "home $_p ($_s): permission denied: $_v"
+        else
+            _w="$(_rwhy "$_pid" "$_p")"; _st="n/a ($_w)"
+            case "$_w" in
+                "permission denied"*) _flag agent_unread "home $_p ($_s): $_w" ;;
+                *) _flag agent_absent "home $_p ($_s): $_w" ;;
+            esac
+        fi
+        printf '        %s   <- %s: %s\n' "$_p" "$_s" "$_st"
+        # a home no attached JVM resolved: its whatap.conf, the assumed
+        # default file name, since no process names another
+        case " $D_MARKED " in *" $_pid "*) continue ;; esac
+        case "$_s" in *" of pid "*) continue ;; esac
+        [ -n "$_v" ] && [ -d "$_v" ] || continue
+        if [ -e "$_v/whatap.conf" ]; then
+            if [ -r "$_v/whatap.conf" ]; then
+                _file_lines first "        $_p/whatap.conf (assumed default file name; verbatim)" "$_v/whatap.conf" 400
+                _flag conf_read "$_p/whatap.conf"
+            else
+                printf '        %s/whatap.conf: n/a (permission denied)\n' "$_p"
+                _flag conf_unread "$_p/whatap.conf: permission denied"
+            fi
+        else
+            _w="$(_path_why "$_v/whatap.conf")"
+            case "$_w" in "path not found"*) _flag conf_absent_home "$_p/whatap.conf" ;; *) _flag conf_unread "$_p/whatap.conf: $_w" ;; esac
+        fi
+    done
 }
 
 # [7] F. Application libraries visible to the target JVMs
@@ -2761,6 +2783,7 @@ _rep_libs() {
     if [ "${_nm:-0}" -eq 0 ]; then
         fact "n/a (no JVM carrying a WhaTap attach marker)"
     fi
+    # each _libs_* below reads the JVM of this loop from $pid
     _pc=0
     for pid in $D_MARKED; do
         _pc=$((_pc + 1))
@@ -2768,258 +2791,294 @@ _rep_libs() {
         fact "-- pid $pid"
         _LIBSINK="$(_tmp libs.$pid)"
         true > "$_LIBSINK" 2>/dev/null
-        # 1) explicit classpath given to this JVM
-        _cp="$(_all_jvm_args "$pid" 2>/dev/null | awk 'p=="-cp"||p=="-classpath"{print; exit} {p=$0}')"
-        [ -z "$_cp" ] && _cp="$(_jvm_sysprop "$pid" java.class.path)"
-        if [ -n "$_cp" ]; then
-            _cpn="$(printf '%s' "$_cp" | tr ':' '\n' | grep -c .)"
-            fact "   -cp / -classpath entries: $_cpn (first 120, agent jar excluded)"
-            printf '%s' "$_cp" | tr ':' '\n' | grep -v -i 'whatap.agent' | head -n 120 | while IFS= read -r _l; do
-                [ -n "$_l" ] || continue
-                printf '             %s\n' "$_l"
-                _lib_record "${_l##*/}"
-                _fsl="$(_rpath "$pid" "$_l")"
-                if [ -n "$_fsl" ]; then
-                    _n="$(_rnote "$pid" "$_l" "$_fsl")"; [ -n "$_n" ] && printf '               %s\n' "$_n"
-                else
-                    printf '               n/a (%s)\n' "$(_rwhy "$pid" "$_l")"
-                fi
-                case "$_l" in
-                    *.jar) [ -n "$_fsl" ] && _path_record "file|$_fsl" ;;
-                    *)     [ -n "$_fsl" ] && [ -d "$_fsl" ] && _appclass_record "dir|$_fsl" ;;
-                esac
-            done
-        else
-            fact "   -cp / -classpath: not set on this JVM"
-        fi
-        _cpe="$(_proc_env "$pid" CLASSPATH)"
-        [ -n "$_cpe" ] && fact "   env CLASSPATH: $(printf '%s' "$_cpe" | cut -c1-400)"
-        # 2) executable jar (Spring Boot fat jar carries its libraries inside)
-        _jar="$(_all_jvm_args "$pid" 2>/dev/null | awk 'p=="-jar"{print; exit} {p=$0}')"
-        if [ -n "$_jar" ]; then
-            fact "   executable jar: $_jar"
-            _fsj="$(_rpath "$pid" "$_jar")"
-            if [ -n "$_fsj" ]; then
-                _n="$(_rnote "$pid" "$_jar" "$_fsj")"; [ -n "$_n" ] && fact "     $_n"
-                bootjar_facts "             " "$_fsj"
-                _appclass_record "archive|$_fsj"
-                fact "   libraries packed inside that jar:"
-                jar_entries "             " "$_fsj" 'BOOT-INF/lib/*' 200
-                jar_entries "             " "$_fsj" 'WEB-INF/lib/*' 200
+        _libs_cp        # 1) explicit classpath
+        _libs_jar       # 2) executable jar
+        _libs_cwd       # 3) working directory
+        # 4) server deploy and lib directories derived from this JVM's own -D
+        _libs_weblogic
+        _libs_catalina
+        _libs_jetty
+        _libs_jboss
+        _libs_other
+        _libs_openfds   # 5) open jar files
+        _LIBSINK=""
+    done
+}
+
+# 1) explicit classpath given to this JVM
+_libs_cp() {
+    _cp="$(_jvm_opt_val "$pid" -cp -classpath)"
+    [ -z "$_cp" ] && _cp="$(_jvm_sysprop "$pid" java.class.path)"
+    if [ -n "$_cp" ]; then
+        _cpn="$(printf '%s' "$_cp" | tr ':' '\n' | grep -c .)"
+        fact "   -cp / -classpath entries: $_cpn (first 120, agent jar excluded)"
+        printf '%s' "$_cp" | tr ':' '\n' | grep -v -i 'whatap.agent' | head -n 120 | while IFS= read -r _l; do
+            [ -n "$_l" ] || continue
+            printf '             %s\n' "$_l"
+            _lib_record "${_l##*/}"
+            _fsl="$(_rpath "$pid" "$_l")"
+            if [ -n "$_fsl" ]; then
+                _n="$(_rnote "$pid" "$_l" "$_fsl")"; [ -n "$_n" ] && printf '               %s\n' "$_n"
             else
-                fact "     n/a ($(_rwhy "$pid" "$_jar"))"
+                printf '               n/a (%s)\n' "$(_rwhy "$pid" "$_l")"
             fi
+            case "$_l" in
+                *.jar) [ -n "$_fsl" ] && _path_record "file|$_fsl" ;;
+                *)     [ -n "$_fsl" ] && [ -d "$_fsl" ] && _appclass_record "dir|$_fsl" ;;
+            esac
+        done
+    else
+        fact "   -cp / -classpath: not set on this JVM"
+    fi
+    _cpe="$(_proc_env "$pid" CLASSPATH)"
+    [ -n "$_cpe" ] && fact "   env CLASSPATH: $(printf '%s' "$_cpe" | cut -c1-400)"
+}
+
+# 2) executable jar (Spring Boot fat jar carries its libraries inside)
+_libs_jar() {
+    _jar="$(_jvm_opt_val "$pid" -jar)"
+    if [ -n "$_jar" ]; then
+        fact "   executable jar: $_jar"
+        _fsj="$(_rpath "$pid" "$_jar")"
+        if [ -n "$_fsj" ]; then
+            _n="$(_rnote "$pid" "$_jar" "$_fsj")"; [ -n "$_n" ] && fact "     $_n"
+            bootjar_facts "             " "$_fsj"
+            _appclass_record "archive|$_fsj"
+            fact "   libraries packed inside that jar:"
+            jar_entries "             " "$_fsj" 'BOOT-INF/lib/*' 200
+            jar_entries "             " "$_fsj" 'WEB-INF/lib/*' 200
         else
-            fact "   executable jar (-jar): not set on this JVM"
+            fact "     n/a ($(_rwhy "$pid" "$_jar"))"
         fi
-        # 3) the working directory of this JVM. A process started with neither
-        #    -cp nor -jar loads from its own working directory (the default
-        #    class path is "."), which is how an extracted application layout
-        #    runs, so the working directory is a class root candidate on its
-        #    own. Section D reports the same directory.
-        _cwd="$(cwd_view "$pid")"
-        if [ -n "$_cwd" ]; then
-            fact "   working directory of this JVM: $_cwd"
-            _cwdn=0
-            for _sub in BOOT-INF/classes WEB-INF/classes classes; do
-                if [ -d "$_cwd/$_sub" ]; then
-                    fact "     $_sub is present under it"
-                    _appclass_record "dir|$_cwd/$_sub"
-                    _cwdn=$((_cwdn + 1))
-                fi
-            done
-            if [ -n "$(_bounded find "$_cwd" -maxdepth 1 -name '*.class' -type f 2>/dev/null | head -n 1)" ]; then
-                fact "     class files are present directly under it"
-                _appclass_record "dir|$_cwd"
+    else
+        fact "   executable jar (-jar): not set on this JVM"
+    fi
+}
+
+# 3) the working directory of this JVM. A process started with neither -cp
+#    nor -jar loads from its own working directory (the default class path is
+#    "."), so it is a class root candidate on its own. Section D reports the
+#    same directory.
+_libs_cwd() {
+    _cwd="$(cwd_view "$pid")"
+    if [ -n "$_cwd" ]; then
+        fact "   working directory of this JVM: $_cwd"
+        _cwdn=0
+        for _sub in BOOT-INF/classes WEB-INF/classes classes; do
+            if [ -d "$_cwd/$_sub" ]; then
+                fact "     $_sub is present under it"
+                _appclass_record "dir|$_cwd/$_sub"
                 _cwdn=$((_cwdn + 1))
             fi
-            [ "$_cwdn" = 0 ] && fact "     no BOOT-INF/classes, WEB-INF/classes, classes directory or top-level class file under it"
+        done
+        if [ -n "$(_bounded find "$_cwd" -maxdepth 1 -name '*.class' -type f 2>/dev/null | head -n 1)" ]; then
+            fact "     class files are present directly under it"
+            _appclass_record "dir|$_cwd"
+            _cwdn=$((_cwdn + 1))
+        fi
+        [ "$_cwdn" = 0 ] && fact "     no BOOT-INF/classes, WEB-INF/classes, classes directory or top-level class file under it"
+    else
+        fact "   working directory of this JVM: n/a ($(_rwhy "$pid" .))"
+    fi
+}
+
+# _libs_classes_under ROOT DEPTH TMPNAME WHERE WITH_LIB -> search ROOT for
+# WEB-INF/classes directories (_find_classes), print and record each one, and
+# with WITH_LIB=1 list the jars of the lib directory beside it.
+_libs_classes_under() {
+    _find_classes "$1" "$(_tmp "$3")" "$2"
+    if [ -s "$(_tmp "$3")" ]; then
+        fact "     WEB-INF/classes directories under $4 ($(cat "$(_tmp find.note)"); first 12):"
+        while IFS= read -r _w; do
+            [ -n "$_w" ] || continue
+            printf '             %s\n' "$_w"
+            _appclass_record "dir|$_w"
+            [ "$5" = 1 ] && [ -d "${_w%/classes}/lib" ] && list_jars "               " "${_w%/classes}/lib" 120
+        done < "$(_tmp "$3")"
+    else
+        fact "     WEB-INF/classes directories under $4: none found ($(cat "$(_tmp find.note)"))"
+    fi
+}
+
+# WebLogic names the server with -Dweblogic.Name and starts it in the domain
+# directory; -Ddomain.home is not set by the stock start scripts. The domain
+# is therefore read from the DOMAIN_HOME variable of the process and from its
+# working directory, and the deployment staging area is
+# servers/<weblogic.Name>/tmp/_WL_user/.
+_libs_weblogic() {
+    _wn="$(_jvm_sysprop "$pid" weblogic.Name)"
+    [ -n "$_wn" ] || return 0
+    _wdh=""
+    for _cand in "$(_proc_env "$pid" DOMAIN_HOME)" .; do
+        [ -n "$_cand" ] || continue
+        _fsc="$(_rpath "$pid" "$_cand")"
+        [ -n "$_fsc" ] && [ -d "$_fsc/servers/$_wn" ] && { _wdh="$_cand"; break; }
+    done
+    if [ -z "$_wdh" ]; then
+        fact "   weblogic domain directory (weblogic.Name=$_wn): n/a (neither DOMAIN_HOME nor the process working directory holds servers/$_wn readable by this run)"
+        return 0
+    fi
+    _fsd="$(_rpath "$pid" "$_wdh")"
+    [ "$_wdh" = . ] && _wdh="$_fsd"
+    fact "   weblogic domain directory (weblogic.Name=$_wn; from DOMAIN_HOME or the process working directory): $_wdh"
+    [ -d "$_fsd/lib" ] && list_jars "             " "$_fsd/lib" 60
+    _wst="$_fsd/servers/$_wn/tmp/_WL_user"
+    if [ -d "$_wst" ]; then
+        _probe_ls "     staging directory servers/$_wn/tmp/_WL_user (deployment units, first 60)" "$_wst" 60
+        _libs_classes_under "$_wst" 7 wl "the staging area" 1
+    else
+        fact "     staging directory servers/$_wn/tmp/_WL_user: absent"
+    fi
+    _libs_wl_sources
+}
+
+# the deployment sources config.xml names (archives or exploded dirs)
+_libs_wl_sources() {
+    _wcx="$(_vfix "$_fsd/config/config.xml")"
+    if [ ! -r "$_wcx" ]; then
+        fact "     config/config.xml: n/a ($(_path_why "$_fsd/config/config.xml"))"
+        return 0
+    fi
+    _wsp="$(grep -o '<source-path>[^<]*</source-path>' "$_wcx" 2>/dev/null | sed 's/<source-path>//; s/<\/source-path>//' | sort -u | head -n 40)"
+    if [ -z "$_wsp" ]; then
+        fact "     deployment source paths in config/config.xml: none"
+        return 0
+    fi
+    fact "     deployment source paths in config/config.xml (<source-path>, first 40):"
+    printf '%s\n' "$_wsp" | while IFS= read -r _sp1; do
+        [ -n "$_sp1" ] || continue
+        case "$_sp1" in /*) _spa="$(_rview "$pid" "$_sp1")" ;; *) _spa="$(_vfix "$_fsd/$_sp1")" ;; esac
+        _spc="$(_vfix "$_spa/WEB-INF/classes")"
+        if [ -d "$_spc" ]; then
+            printf '             %s   (exploded, WEB-INF/classes present)\n' "$_sp1"; _appclass_record "dir|$_spc"
+        elif [ -f "$_spa" ]; then
+            printf '             %s   (archive, read in place)\n' "$_sp1"; _appclass_record "archive|$_spa"
+        elif [ -d "$_spa" ]; then
+            printf '             %s   (directory)\n' "$_sp1"
         else
-            fact "   working directory of this JVM: n/a ($(_rwhy "$pid" .))"
+            printf '             %s   (path not found from here)\n' "$_sp1"
         fi
-        # 4) server deploy and lib directories derived from this JVM's own -D
-        _cb="$(_jvm_sysprop "$pid" catalina.base)"; _ch="$(_jvm_sysprop "$pid" catalina.home)"
-        _jb="$(_jvm_sysprop "$pid" jboss.home.dir)"; _jsb="$(_jvm_sysprop "$pid" jboss.server.base.dir)"
-        _je="$(_jvm_sysprop "$pid" jeus.home)"; _dh="$(_jvm_sysprop "$pid" domain.home)"
-        # GlassFish / Payara name the instance directory with com.sun.aas.instanceRoot;
-        # its deployments are expanded under <instanceRoot>/applications/<app>/
-        _gr="$(_jvm_sysprop "$pid" com.sun.aas.instanceRoot)"
-        # WebLogic names the server with -Dweblogic.Name and starts it in the
-        # domain directory; -Ddomain.home is not set by the stock start
-        # scripts. The domain is therefore read from the process working
-        # directory and from the DOMAIN_HOME variable of the process, and the
-        # deployment staging area is servers/<weblogic.Name>/tmp/_WL_user/.
-        _wn="$(_jvm_sysprop "$pid" weblogic.Name)"
-        if [ -n "$_wn" ]; then
-            _wdh=""
-            for _cand in "$(_proc_env "$pid" DOMAIN_HOME)" .; do
-                [ -n "$_cand" ] || continue
-                _fsc="$(_rpath "$pid" "$_cand")"
-                [ -n "$_fsc" ] && [ -d "$_fsc/servers/$_wn" ] && { _wdh="$_cand"; break; }
-            done
-            if [ -n "$_wdh" ]; then
-                _fsd="$(_rpath "$pid" "$_wdh")"
-                [ "$_wdh" = . ] && _wdh="$_fsd"
-                fact "   weblogic domain directory (weblogic.Name=$_wn; from DOMAIN_HOME or the process working directory): $_wdh"
-                [ -d "$_fsd/lib" ] && list_jars "             " "$_fsd/lib" 60
-                _wst="$_fsd/servers/$_wn/tmp/_WL_user"
-                if [ -d "$_wst" ]; then
-                    _probe_ls "     staging directory servers/$_wn/tmp/_WL_user (deployment units, first 60)" "$_wst" 60
-                    _find_classes "$_wst" "$(_tmp wl)" 7
-                    if [ -s "$(_tmp wl)" ]; then
-                        fact "     WEB-INF/classes directories under the staging area ($(cat "$(_tmp find.note)"); first 12):"
-                        while IFS= read -r _w; do
-                            [ -n "$_w" ] || continue
-                            printf '             %s\n' "$_w"
-                            _appclass_record "dir|$_w"
-                            [ -d "${_w%/classes}/lib" ] && list_jars "               " "${_w%/classes}/lib" 120
-                        done < "$(_tmp wl)"
-                    else
-                        fact "     WEB-INF/classes directories under the staging area: none found ($(cat "$(_tmp find.note)"))"
-                    fi
-                else
-                    fact "     staging directory servers/$_wn/tmp/_WL_user: absent"
-                fi
-                # the deployment sources config.xml names (archives or exploded dirs)
-                _wcx="$(_vfix "$_fsd/config/config.xml")"
-                if [ -r "$_wcx" ]; then
-                    _wsp="$(grep -o '<source-path>[^<]*</source-path>' "$_wcx" 2>/dev/null | sed 's/<source-path>//; s/<\/source-path>//' | sort -u | head -n 40)"
-                    if [ -n "$_wsp" ]; then
-                        fact "     deployment source paths in config/config.xml (<source-path>, first 40):"
-                        printf '%s\n' "$_wsp" | while IFS= read -r _sp1; do
-                            [ -n "$_sp1" ] || continue
-                            case "$_sp1" in /*) _spa="$(_rview "$pid" "$_sp1")" ;; *) _spa="$(_vfix "$_fsd/$_sp1")" ;; esac
-                            _spc="$(_vfix "$_spa/WEB-INF/classes")"
-                            if [ -d "$_spc" ]; then
-                                printf '             %s   (exploded, WEB-INF/classes present)\n' "$_sp1"; _appclass_record "dir|$_spc"
-                            elif [ -f "$_spa" ]; then
-                                printf '             %s   (archive, read in place)\n' "$_sp1"; _appclass_record "archive|$_spa"
-                            elif [ -d "$_spa" ]; then
-                                printf '             %s   (directory)\n' "$_sp1"
-                            else
-                                printf '             %s   (path not found from here)\n' "$_sp1"
-                            fi
-                        done
-                    else
-                        fact "     deployment source paths in config/config.xml: none"
-                    fi
-                else
-                    fact "     config/config.xml: n/a ($(_path_why "$_fsd/config/config.xml"))"
-                fi
-            else
-                fact "   weblogic domain directory (weblogic.Name=$_wn): n/a (neither DOMAIN_HOME nor the process working directory holds servers/$_wn readable by this run)"
-            fi
-        fi
-        # catalina.base and catalina.home are one directory in a single-instance
-        # install and two in a split install; list each distinct path once
-        _seen_d=""
-        for _d in "$_cb" "$_ch"; do
-            [ -n "$_d" ] || continue
-            case "$_seen_d" in *"|$_d|"*) continue ;; esac
-            _seen_d="$_seen_d|$_d|"
-            _fsd="$(_rpath "$pid" "$_d")"
-            [ -n "$_fsd" ] || { fact "   server directory (catalina): $_d — n/a ($(_rwhy "$pid" "$_d"))"; continue; }
-            fact "   server directory (catalina): $_d"
-            list_jars "             " "$_fsd/lib" 120
-            # the appBase of an instance is whatever server.xml says it is;
-            # <instance>/webapps is only the shipped default, so both are read
-            _abs="$(printf '%s\n' "$_fsd/webapps"; tomcat_app_bases "$pid" "$_fsd")"
-            _abs="$(printf '%s\n' "$_abs" | grep . | sort -u)"
-            printf '%s\n' "$_abs" | while IFS= read -r _ab; do
-                [ -n "$_ab" ] && webapp_roots "             " "$_ab" 120
-            done
-            # a context can point its docBase outside every appBase
-            printf '%s\n' "$_abs" > "$(_tmp abs)" 2>/dev/null
-            _dbs="$(tomcat_doc_bases "$pid" "$_fsd" "$(_tmp abs)" | sort -u)"
-            if [ -n "$_dbs" ]; then
-                printf '%s\n' "$_dbs" | while IFS= read -r _db; do
-                    [ -n "$_db" ] || continue
-                    if [ -d "$_db/WEB-INF/classes" ]; then
-                        fact "         docBase $_db (WEB-INF/classes present)"
-                        _appclass_record "dir|$_db/WEB-INF/classes"
-                    elif [ -f "$_db" ]; then
-                        fact "         docBase $_db (archive, read in place)"
-                        _appclass_record "archive|$_db"
-                    else
-                        fact "         docBase $_db: no WEB-INF/classes under it"
-                    fi
-                    [ -d "$_db/WEB-INF/lib" ] && list_jars "               " "$_db/WEB-INF/lib" 120
-                done
-            else
-                fact "         docBase entries in server.xml or conf/<engine>/<host>/*.xml: none"
-            fi
+    done
+}
+
+# catalina.base and catalina.home are one directory in a single-instance
+# install and two in a split install; list each distinct path once
+_libs_catalina() {
+    _seen_d=""
+    for _d in "$(_jvm_sysprop "$pid" catalina.base)" "$(_jvm_sysprop "$pid" catalina.home)"; do
+        [ -n "$_d" ] || continue
+        case "$_seen_d" in *"|$_d|"*) continue ;; esac
+        _seen_d="$_seen_d|$_d|"
+        _fsd="$(_rpath "$pid" "$_d")"
+        [ -n "$_fsd" ] || { fact "   server directory (catalina): $_d — n/a ($(_rwhy "$pid" "$_d"))"; continue; }
+        fact "   server directory (catalina): $_d"
+        list_jars "             " "$_fsd/lib" 120
+        # the appBase of an instance is whatever server.xml says it is;
+        # <instance>/webapps is only the shipped default, so both are read
+        _abs="$(printf '%s\n' "$_fsd/webapps"; tomcat_app_bases "$pid" "$_fsd")"
+        _abs="$(printf '%s\n' "$_abs" | grep . | sort -u)"
+        printf '%s\n' "$_abs" | while IFS= read -r _ab; do
+            [ -n "$_ab" ] && webapp_roots "             " "$_ab" 120
         done
-        _seen_t=""
-        for _d in "$(_jvm_sysprop "$pid" jetty.base)" "$(_jvm_sysprop "$pid" jetty.home)"; do
-            [ -n "$_d" ] || continue
-            case "$_seen_t" in *"|$_d|"*) continue ;; esac
-            _seen_t="$_seen_t|$_d|"
-            _fsd="$(_rpath "$pid" "$_d")"
-            [ -n "$_fsd" ] || { fact "   server directory (jetty): $_d — n/a ($(_rwhy "$pid" "$_d"))"; continue; }
-            fact "   server directory (jetty): $_d"
-            list_jars "             " "$_fsd/lib" 120
-            webapp_roots "             " "$_fsd/webapps" 120 "webapps directory"
-        done
-        if [ -n "$_jb" ]; then
-            fact "   server directory (jboss.home.dir): $_jb"
-            _fsd="$(_rpath "$pid" "$_jb")"
-            if [ -n "$_fsd" ]; then
-                list_jars "             " "$_fsd/lib" 60
-                for _dd in "$_fsd"/server/*/deploy "$_fsd"/server/*/lib "$_fsd"/standalone/deployments; do
-                    [ -d "$_dd" ] && list_deploy "             " "$_dd"
-                done
-            else
-                fact "     n/a ($(_rwhy "$pid" "$_jb"))"
-            fi
+        _libs_doc_bases
+    done
+}
+
+# a Tomcat context can point its docBase outside every appBase
+_libs_doc_bases() {
+    printf '%s\n' "$_abs" > "$(_tmp abs)" 2>/dev/null
+    _dbs="$(tomcat_doc_bases "$pid" "$_fsd" "$(_tmp abs)" | sort -u)"
+    if [ -z "$_dbs" ]; then
+        fact "         docBase entries in server.xml or conf/<engine>/<host>/*.xml: none"
+        return 0
+    fi
+    printf '%s\n' "$_dbs" | while IFS= read -r _db; do
+        [ -n "$_db" ] || continue
+        if [ -d "$_db/WEB-INF/classes" ]; then
+            fact "         docBase $_db (WEB-INF/classes present)"
+            _appclass_record "dir|$_db/WEB-INF/classes"
+        elif [ -f "$_db" ]; then
+            fact "         docBase $_db (archive, read in place)"
+            _appclass_record "archive|$_db"
+        else
+            fact "         docBase $_db: no WEB-INF/classes under it"
         fi
-        if [ -n "$_jsb" ]; then
-            _fsd="$(_rpath "$pid" "$_jsb")"
-            if [ -n "$_fsd" ]; then fact "   server base directory (jboss.server.base.dir): $_jsb"; list_deploy "             " "$_fsd/deployments"
-            else fact "   server base directory (jboss.server.base.dir): $_jsb — n/a ($(_rwhy "$pid" "$_jsb"))"; fi
-        fi
-        for _d in "$_je" "$_dh" "$_gr"; do
-            [ -n "$_d" ] || continue
-            _fsd="$(_rpath "$pid" "$_d")"
-            [ -n "$_fsd" ] || { fact "   server directory: $_d — n/a ($(_rwhy "$pid" "$_d"))"; continue; }
-            fact "   server directory: $_d"
-            _probe_ls "     listing (first 40 lines)" "$_fsd" 40
-            [ -d "$_fsd/lib" ] && list_jars "             " "$_fsd/lib" 60
-            [ -d "$_fsd/applications" ] && _probe_ls "     applications directory listing (first 40 lines)" "$_fsd/applications" 40
-            # these products compose the staging path of a deployment at
-            # runtime, so the class roots are found by searching for them
-            # rather than by naming a layout
-            _find_classes "$_fsd" "$(_tmp wi)" 10
-            if [ -s "$(_tmp wi)" ]; then
-                fact "     WEB-INF/classes directories under it ($(cat "$(_tmp find.note)"); first 12):"
-                while IFS= read -r _w; do
-                    [ -n "$_w" ] || continue
-                    printf '             %s\n' "$_w"
-                    _appclass_record "dir|$_w"
-                done < "$(_tmp wi)"
-            else
-                fact "     WEB-INF/classes directories under it: none found ($(cat "$(_tmp find.note)"))"
-            fi
-        done
-        # 4) open jar files held by the process — covers layouts none of the
-        #    above describe (custom launchers, exploded frameworks)
-        if ls "/proc/$pid/fd" >/dev/null 2>&1; then
-            # the link target is everything after " -> ", so a path with
-            # spaces stays whole and a "(deleted)" suffix stays visible
-            _oj="$(ls -l "/proc/$pid/fd" 2>/dev/null | sed -n 's/^.* -> //p' | grep -i -E '\.jar( \(deleted\))?$' | grep -v -i 'whatap.agent' | sort -u)"
-            _ojn="$(printf '%s\n' "$_oj" | grep -c .)"
-            fact "   jar files currently open by this process: ${_ojn:-0} (first 120 printed)"
-            printf '%s\n' "$_oj" | head -n 120 | while IFS= read -r _l; do
-                [ -n "$_l" ] || continue
-                printf '             %s\n' "$_l"
-                case "$_l" in *" (deleted)") continue ;; esac
-                _lib_record "${_l##*/}"
-                _ojv="$(_rpath "$pid" "$_l")"
-                [ -n "$_ojv" ] && _path_record "file|$_ojv"
+        [ -d "$_db/WEB-INF/lib" ] && list_jars "               " "$_db/WEB-INF/lib" 120
+    done
+}
+
+_libs_jetty() {
+    _seen_t=""
+    for _d in "$(_jvm_sysprop "$pid" jetty.base)" "$(_jvm_sysprop "$pid" jetty.home)"; do
+        [ -n "$_d" ] || continue
+        case "$_seen_t" in *"|$_d|"*) continue ;; esac
+        _seen_t="$_seen_t|$_d|"
+        _fsd="$(_rpath "$pid" "$_d")"
+        [ -n "$_fsd" ] || { fact "   server directory (jetty): $_d — n/a ($(_rwhy "$pid" "$_d"))"; continue; }
+        fact "   server directory (jetty): $_d"
+        list_jars "             " "$_fsd/lib" 120
+        webapp_roots "             " "$_fsd/webapps" 120 "webapps directory"
+    done
+}
+
+_libs_jboss() {
+    _jb="$(_jvm_sysprop "$pid" jboss.home.dir)"; _jsb="$(_jvm_sysprop "$pid" jboss.server.base.dir)"
+    if [ -n "$_jb" ]; then
+        fact "   server directory (jboss.home.dir): $_jb"
+        _fsd="$(_rpath "$pid" "$_jb")"
+        if [ -n "$_fsd" ]; then
+            list_jars "             " "$_fsd/lib" 60
+            for _dd in "$_fsd"/server/*/deploy "$_fsd"/server/*/lib "$_fsd"/standalone/deployments; do
+                [ -d "$_dd" ] && list_deploy "             " "$_dd"
             done
         else
-            fact "   open jar files: n/a (permission denied: /proc/$pid/fd)"
+            fact "     n/a ($(_rwhy "$pid" "$_jb"))"
         fi
-        _LIBSINK=""
+    fi
+    if [ -n "$_jsb" ]; then
+        _fsd="$(_rpath "$pid" "$_jsb")"
+        if [ -n "$_fsd" ]; then fact "   server base directory (jboss.server.base.dir): $_jsb"; list_deploy "             " "$_fsd/deployments"
+        else fact "   server base directory (jboss.server.base.dir): $_jsb — n/a ($(_rwhy "$pid" "$_jsb"))"; fi
+    fi
+}
+
+# JEUS (jeus.home), -Ddomain.home, and GlassFish / Payara, which name the
+# instance directory with com.sun.aas.instanceRoot and expand deployments
+# under <instanceRoot>/applications/<app>/. These products compose the
+# staging path of a deployment at runtime, so the class roots are found by
+# searching for them rather than by naming a layout.
+_libs_other() {
+    for _d in "$(_jvm_sysprop "$pid" jeus.home)" "$(_jvm_sysprop "$pid" domain.home)" "$(_jvm_sysprop "$pid" com.sun.aas.instanceRoot)"; do
+        [ -n "$_d" ] || continue
+        _fsd="$(_rpath "$pid" "$_d")"
+        [ -n "$_fsd" ] || { fact "   server directory: $_d — n/a ($(_rwhy "$pid" "$_d"))"; continue; }
+        fact "   server directory: $_d"
+        _probe_ls "     listing (first 40 lines)" "$_fsd" 40
+        [ -d "$_fsd/lib" ] && list_jars "             " "$_fsd/lib" 60
+        [ -d "$_fsd/applications" ] && _probe_ls "     applications directory listing (first 40 lines)" "$_fsd/applications" 40
+        _libs_classes_under "$_fsd" 10 wi "it" 0
+    done
+}
+
+# 5) open jar files held by the process — covers layouts none of the above
+#    describe (custom launchers, exploded frameworks)
+_libs_openfds() {
+    if ! ls "/proc/$pid/fd" >/dev/null 2>&1; then
+        fact "   open jar files: n/a (permission denied: /proc/$pid/fd)"
+        return 0
+    fi
+    # the link target is everything after " -> ", so a path with spaces stays
+    # whole and a "(deleted)" suffix stays visible
+    _oj="$(ls -l "/proc/$pid/fd" 2>/dev/null | sed -n 's/^.* -> //p' | grep -i -E '\.jar( \(deleted\))?$' | grep -v -i 'whatap.agent' | sort -u)"
+    _ojn="$(printf '%s\n' "$_oj" | grep -c .)"
+    fact "   jar files currently open by this process: ${_ojn:-0} (first 120 printed)"
+    printf '%s\n' "$_oj" | head -n 120 | while IFS= read -r _l; do
+        [ -n "$_l" ] || continue
+        printf '             %s\n' "$_l"
+        case "$_l" in *" (deleted)") continue ;; esac
+        _lib_record "${_l##*/}"
+        _ojv="$(_rpath "$pid" "$_l")"
+        [ -n "$_ojv" ] && _path_record "file|$_ojv"
     done
 }
 
@@ -3198,7 +3257,7 @@ _rep_logging() {
         # console destination and on-disk server logs
         fact "console destination and server log directories of each attached JVM:"
         for pid in $D_MARKED; do
-            printf '        pid %s stdout -> %s\n' "$pid" "$(readlink "/proc/$pid/fd/1" 2>/dev/null || echo 'n/a (permission denied or gone)')"
+            printf '        pid %s stdout -> %s\n' "$pid" "$(_link_or_na "/proc/$pid/fd/1")"
             _cb="$(_jvm_sysprop "$pid" catalina.base)"
             _jsb="$(_jvm_sysprop "$pid" jboss.server.base.dir)"
             _lds=0
@@ -3348,65 +3407,85 @@ _rep_tier2() {
     fi
     _TDUMPS=0
     true > "$(_tmp tframes)" 2>/dev/null
-    if [ "$OPT_THREADS" != 0 ] 2>/dev/null; then
-        _tn="$OPT_THREADS"
-        [ "$_tn" -ge 1 ] 2>/dev/null || _tn=1
-        _tp=0
-        for pid in $D_MARKED; do
-            if ! _jvm_confirmed "$pid"; then
-                fact "-- thread dump pid $pid: n/a (${_NOTCONF})"
-                _flag threads_fail "pid $pid: ${_NOTCONF}"
-                continue
-            fi
-            _tp=$((_tp + 1))
-            [ "$_tp" -gt 3 ] && { fact "-- remaining attached JVMs not dumped (cap: 3)"; break; }
-            warn "[Tier2] thread dump: pid $pid x$_tn — pauses the target JVM at a safepoint for each dump"
-            _k=1
-            while [ "$_k" -le "$_tn" ]; do
-                _td="$(_tmp tdump)"
-                _tool=""
-                if have jstack; then _tool="jstack -l"
-                elif have jcmd; then _tool="jcmd Thread.print -l"; fi
-                if [ -n "$_tool" ]; then
-                    # a dump of a large JVM outlasts the per-command cap
-                    _ct="$CMD_TIMEOUT"; CMD_TIMEOUT=60
-                    if [ "$_tool" = "jstack -l" ]; then _bounded jstack -l "$pid" > "$_td" 2>&1
-                    else _bounded jcmd "$pid" Thread.print -l > "$_td" 2>&1; fi
-                    _trc=$?
-                    CMD_TIMEOUT="$_ct"
-                    if [ "$_trc" = 0 ] && grep -q '^"' "$_td" 2>/dev/null; then
-                        fact "-- thread dump pid $pid ($_k/$_tn) via $_tool (first 5000 lines):"
-                        head -n 5000 "$_td" 2>/dev/null | while IFS= read -r _l; do printf '        %s\n' "$_l"; done
-                        cat "$_td" >> "$(_tmp tframes)" 2>/dev/null
-                        _TDUMPS=$((_TDUMPS + 1))
-                        _flag threads_ok "pid $pid"
-                    else
-                        if [ "$_trc" = 124 ]; then _tw="timed out: 60s"
-                        elif [ "$_trc" = 0 ]; then _tw="no thread header in the output: $(head -n 1 "$_td" 2>/dev/null | cut -c1-120)"
-                        else _tw="exit $_trc: $(head -n 1 "$_td" 2>/dev/null | cut -c1-120)"; fi
-                        fact "-- thread dump pid $pid ($_k/$_tn) via $_tool: n/a ($_tw)"
-                        _flag threads_fail "$_tool $pid: $_tw"
-                    fi
-                else
-                    warn "[Tier2] jstack and jcmd absent: sending SIGQUIT to pid $pid — the dump goes to that process's stdout"
-                    if _kerr="$(kill -3 "$pid" 2>&1)"; then
-                        fact "-- thread dump pid $pid ($_k/$_tn): jstack and jcmd absent; SIGQUIT sent, output goes to the process stdout shown in section D"
-                        _flag threads_fail "pid $pid: jstack and jcmd absent; SIGQUIT sent, the dump is in the process stdout, not in this report"
-                    else
-                        fact "-- thread dump pid $pid ($_k/$_tn): jstack and jcmd absent; SIGQUIT not sent: ${_kerr:-kill -3 failed}"
-                        _flag threads_fail "pid $pid: jstack and jcmd absent, and kill -3 failed: ${_kerr:-nonzero exit}"
-                    fi
-                fi
-                [ "$_k" -lt "$_tn" ] && sleep 2
-                _k=$((_k + 1))
-            done
-        done
-        [ "$_tp" = 0 ] && [ -z "$(echo $D_MARKED)" ] && fact "thread dumps: n/a (no JVM carrying a WhaTap attach marker)"
+    [ "$OPT_THREADS" != 0 ] 2>/dev/null && _tier2_threads
+    _tier2_dumpfiles
+    if [ "${_TDUMPS:-0}" -gt 0 ] && [ -s "$(_tmp tframes)" ]; then
+        _tier2_frames
+        _tier2_threadnames
+        _tier2_otherapm
     fi
-    # Dump files taken elsewhere enter the same counts. No JVM is contacted;
-    # the file is read as it is, and which JVM produced it is whatever the
-    # reader knows about the file.
-    # one path per line: a dump file name may carry spaces (console downloads do)
+    [ "$OPT_JCMD" != 0 ] && _tier2_jcmd
+    return 0
+}
+
+# --threads: _tn dumps of each attached JVM (cap 3 JVMs)
+_tier2_threads() {
+    _tn="$OPT_THREADS"
+    [ "$_tn" -ge 1 ] 2>/dev/null || _tn=1
+    _tp=0
+    for pid in $D_MARKED; do
+        if ! _jvm_confirmed "$pid"; then
+            fact "-- thread dump pid $pid: n/a (${_NOTCONF})"
+            _flag threads_fail "pid $pid: ${_NOTCONF}"
+            continue
+        fi
+        _tp=$((_tp + 1))
+        [ "$_tp" -gt 3 ] && { fact "-- remaining attached JVMs not dumped (cap: 3)"; break; }
+        warn "[Tier2] thread dump: pid $pid x$_tn — pauses the target JVM at a safepoint for each dump"
+        _k=1
+        while [ "$_k" -le "$_tn" ]; do
+            _tool=""
+            if have jstack; then _tool="jstack -l"
+            elif have jcmd; then _tool="jcmd Thread.print -l"; fi
+            if [ -n "$_tool" ]; then _tier2_dump_one; else _tier2_sigquit; fi
+            [ "$_k" -lt "$_tn" ] && sleep 2
+            _k=$((_k + 1))
+        done
+    done
+    [ "$_tp" = 0 ] && [ -z "$(echo $D_MARKED)" ] && fact "thread dumps: n/a (no JVM carrying a WhaTap attach marker)"
+}
+
+# dump $_k of $_tn of $pid with $_tool
+_tier2_dump_one() {
+    _td="$(_tmp tdump)"
+    # a dump of a large JVM outlasts the per-command cap
+    _ct="$CMD_TIMEOUT"; CMD_TIMEOUT=60
+    if [ "$_tool" = "jstack -l" ]; then _bounded jstack -l "$pid" > "$_td" 2>&1
+    else _bounded jcmd "$pid" Thread.print -l > "$_td" 2>&1; fi
+    _trc=$?
+    CMD_TIMEOUT="$_ct"
+    if [ "$_trc" = 0 ] && grep -q '^"' "$_td" 2>/dev/null; then
+        fact "-- thread dump pid $pid ($_k/$_tn) via $_tool (first 5000 lines):"
+        head -n 5000 "$_td" 2>/dev/null | while IFS= read -r _l; do printf '        %s\n' "$_l"; done
+        cat "$_td" >> "$(_tmp tframes)" 2>/dev/null
+        _TDUMPS=$((_TDUMPS + 1))
+        _flag threads_ok "pid $pid"
+    else
+        if [ "$_trc" = 124 ]; then _tw="timed out: 60s"
+        elif [ "$_trc" = 0 ]; then _tw="no thread header in the output: $(head -n 1 "$_td" 2>/dev/null | cut -c1-120)"
+        else _tw="exit $_trc: $(head -n 1 "$_td" 2>/dev/null | cut -c1-120)"; fi
+        fact "-- thread dump pid $pid ($_k/$_tn) via $_tool: n/a ($_tw)"
+        _flag threads_fail "$_tool $pid: $_tw"
+    fi
+}
+
+# jstack and jcmd absent: the JVM writes the dump to its own stdout
+_tier2_sigquit() {
+    warn "[Tier2] jstack and jcmd absent: sending SIGQUIT to pid $pid — the dump goes to that process's stdout"
+    if _kerr="$(kill -3 "$pid" 2>&1)"; then
+        fact "-- thread dump pid $pid ($_k/$_tn): jstack and jcmd absent; SIGQUIT sent, output goes to the process stdout shown in section D"
+        _flag threads_fail "pid $pid: jstack and jcmd absent; SIGQUIT sent, the dump is in the process stdout, not in this report"
+    else
+        fact "-- thread dump pid $pid ($_k/$_tn): jstack and jcmd absent; SIGQUIT not sent: ${_kerr:-kill -3 failed}"
+        _flag threads_fail "pid $pid: jstack and jcmd absent, and kill -3 failed: ${_kerr:-nonzero exit}"
+    fi
+}
+
+# Dump files taken elsewhere enter the same counts. No JVM is contacted; the
+# file is read as it is, and which JVM produced it is whatever the reader
+# knows about the file. One path per line: a dump file name may carry spaces
+# (console downloads do).
+_tier2_dumpfiles() {
     while IFS= read -r _df; do
         [ -n "$_df" ] || continue
         if [ ! -e "$_df" ]; then fact "-- supplied dump file $_df: n/a (path not found)"; _flag dump_fail "$_df: path not found"; continue; fi
@@ -3420,104 +3499,114 @@ _rep_tier2() {
     done <<EOF_DUMPS
 $OPT_DUMPS
 EOF_DUMPS
-    if [ "${_TDUMPS:-0}" -gt 0 ]; then
-        # Frame frequency over the dumps above. A transaction entry point
-        # that no weaving module covers is read off the frames that recur in
-        # every dump, and counting them by hand across N dumps is the step the
-        # field repeats on every such case. The three buckets are defined by
-        # the package prefixes printed with them; no frame is filtered away.
-        if [ -s "$(_tmp tframes)" ]; then
-            grep -E '^[[:space:]]*at ' "$(_tmp tframes)" 2>/dev/null \
-                | sed 's/^[[:space:]]*at //; s/(.*$//' \
-                | sort | uniq -c | sort -rn > "$(_tmp tfreq)" 2>/dev/null
-            _fq_n="$(grep -c . "$(_tmp tfreq)" 2>/dev/null)"
-            fact "-- stack frame frequency over the $_TDUMPS dump(s) above: ${_fq_n:-0} distinct frames"
-            fact "   counted from the 'at <class>.<method>' lines of every thread, at any stack depth"
-            fact "   bucket 1 of 3 — JDK and JVM-vendor frames (package starts with java. javax. jakarta. sun. jdk. com.sun. oracle. org.graalvm.), top 20:"
-            grep -E '[0-9]+ (java|javax|jakarta|sun|jdk|com\.sun|oracle|org\.graalvm)\.' "$(_tmp tfreq)" 2>/dev/null | head -n 20 > "$(_tmp tb)" 2>/dev/null
-            if [ -s "$(_tmp tb)" ]; then _indent '        ' < "$(_tmp tb)"; else printf '        (no frame in this bucket)\n'; fi
-            fact "   bucket 2 of 3 — WhaTap agent frames (package starts with whatap.), top 20:"
-            grep -E '[0-9]+ whatap\.' "$(_tmp tfreq)" 2>/dev/null | head -n 20 > "$(_tmp tb)" 2>/dev/null
-            if [ -s "$(_tmp tb)" ]; then _indent '        ' < "$(_tmp tb)"; else printf '        (no frame in this bucket)\n'; fi
-            fact "   bucket 3 of 3 — every remaining frame, top 80:"
-            grep -vE '[0-9]+ (java|javax|jakarta|sun|jdk|com\.sun|oracle|org\.graalvm|whatap)\.' "$(_tmp tfreq)" 2>/dev/null | head -n 80 > "$(_tmp tb)" 2>/dev/null
-            if [ -s "$(_tmp tb)" ]; then _indent '        ' < "$(_tmp tb)"; else printf '        (no frame in this bucket)\n'; fi
-            # Thread-level counts. On an idle JVM the frames carry no application
-            # class at all, while the thread NAMES still do (cache regions named
-            # after entity classes, a scheduler instance id, a pool prefix), so
-            # the names are counted separately from the frames.
-            grep '^"' "$(_tmp tframes)" 2>/dev/null | sed 's/^"\([^"]*\)".*$/\1/' > "$(_tmp tnames)" 2>/dev/null
-            _thn="$(grep -c . "$(_tmp tnames)" 2>/dev/null)"
-            fact "-- thread header lines over the $_TDUMPS dump(s): ${_thn:-0}"
-            fact "   thread states (java.lang.Thread.State lines, counted):"
-            grep -oE 'java\.lang\.Thread\.State: [A-Z_]+' "$(_tmp tframes)" 2>/dev/null | sed 's/^java.lang.Thread.State: //' | sort | uniq -c | sort -rn > "$(_tmp tb)" 2>/dev/null
-            if [ -s "$(_tmp tb)" ]; then _indent '        ' < "$(_tmp tb)"; else printf '        (no state line in the dump text)\n'; fi
-            fact "   thread name shapes, every digit run replaced by N so pool members collapse into one line (names that are themselves a dotted class-like name are counted in the next block instead), top 40:"
-            sed 's/[0-9][0-9]*/N/g' "$(_tmp tnames)" 2>/dev/null | grep -vE '^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_$][A-Za-z0-9_$]*){2,}$' | sort | uniq -c | sort -rn | head -n 40 > "$(_tmp tb)" 2>/dev/null
-            if [ -s "$(_tmp tb)" ]; then _indent '        ' < "$(_tmp tb)"; else printf '        (no thread header line in the dump text)\n'; fi
-            grep -oE '[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_$][A-Za-z0-9_$]*){2,}' "$(_tmp tnames)" 2>/dev/null | sort | uniq -c | sort -rn > "$(_tmp tdot)" 2>/dev/null
-            fact "   package roots of dotted names carried inside thread names (first three dot-separated parts, thread count):"
-            awk '{ n=split($2, p, "."); if (n >= 3) print $1, p[1] "." p[2] "." p[3] }' "$(_tmp tdot)" 2>/dev/null | awk '{ c[$2]+=$1 } END { for (k in c) print c[k], k }' | sort -rn | head -n 20 > "$(_tmp tb)" 2>/dev/null
-            if [ -s "$(_tmp tb)" ]; then _indent '        ' < "$(_tmp tb)"; else printf '        (none)\n'; fi
-            fact "   the dotted names themselves (three or more parts, as written), distinct, top 80:"
-            head -n 80 "$(_tmp tdot)" > "$(_tmp tb)" 2>/dev/null
-            if [ -s "$(_tmp tb)" ]; then _indent '        ' < "$(_tmp tb)"; else printf '        (none)\n'; fi
-            # Other APM agents on the same JVM show up as frames and threads of
-            # their own packages. The prefix list is fixed and printed verbatim.
-            # <frame package prefix>:<word looked for in thread names, case-insensitive>
-            _OTHERAPM="oracle.apmaas.:apmaas com.dynatrace.:dynatrace com.appdynamics.:appdynamics com.newrelic.:newrelic io.opentelemetry.javaagent.:opentelemetry com.instana.:instana datadog.trace.:datadog scouter.:scouter com.jennifersoft.:jennifer com.ibm.tivoli.:tivoli co.elastic.apm.:elastic"
-            fact "   frames and thread names of other APM agents on the same JVM (fixed list of frame-package prefix and thread-name word, printed here verbatim; an entry with no match is not listed):"
-            fact "   $_OTHERAPM"
-            _oam=0
-            for _op in $_OTHERAPM; do
-                _opp="${_op%%:*}"; _opw="${_op#*:}"
-                _ope="$(printf '%s' "$_opp" | sed 's/\./\\./g')"
-                _ofc="$(grep -E "^ *[0-9]+ ${_ope}" "$(_tmp tfreq)" 2>/dev/null | awk '{s+=$1} END{print s+0}')"
-                _otc="$(grep -c -i "$_opw" "$(_tmp tnames)" 2>/dev/null)"
-                if [ "${_ofc:-0}" -gt 0 ] || [ "${_otc:-0}" -gt 0 ]; then
-                    _oam=$((_oam + 1))
-                    printf '        %s  frames=%s  thread names containing "%s" (case-insensitive)=%s\n' "$_opp" "${_ofc:-0}" "$_opw" "${_otc:-0}"
-                fi
-            done
-            [ "$_oam" = 0 ] && printf '        (no frame or thread name under any listed prefix)\n'
+}
+
+# _tb_print EMPTY-NOTE -> $(_tmp tb) indented, or the note when it is empty
+_tb_print() {
+    if [ -s "$(_tmp tb)" ]; then _indent '        ' < "$(_tmp tb)"; else printf '        %s\n' "$1"; fi
+}
+
+# Frame frequency over the dumps above. A transaction entry point that no
+# weaving module covers is read off the frames that recur in every dump. The
+# three buckets are defined by the package prefixes printed with them; no
+# frame is filtered away.
+_tier2_frames() {
+    grep -E '^[[:space:]]*at ' "$(_tmp tframes)" 2>/dev/null \
+        | sed 's/^[[:space:]]*at //; s/(.*$//' \
+        | sort | uniq -c | sort -rn > "$(_tmp tfreq)" 2>/dev/null
+    _fq_n="$(grep -c . "$(_tmp tfreq)" 2>/dev/null)"
+    fact "-- stack frame frequency over the $_TDUMPS dump(s) above: ${_fq_n:-0} distinct frames"
+    fact "   counted from the 'at <class>.<method>' lines of every thread, at any stack depth"
+    fact "   bucket 1 of 3 — JDK and JVM-vendor frames (package starts with java. javax. jakarta. sun. jdk. com.sun. oracle. org.graalvm.), top 20:"
+    grep -E '[0-9]+ (java|javax|jakarta|sun|jdk|com\.sun|oracle|org\.graalvm)\.' "$(_tmp tfreq)" 2>/dev/null | head -n 20 > "$(_tmp tb)" 2>/dev/null
+    _tb_print '(no frame in this bucket)'
+    fact "   bucket 2 of 3 — WhaTap agent frames (package starts with whatap.), top 20:"
+    grep -E '[0-9]+ whatap\.' "$(_tmp tfreq)" 2>/dev/null | head -n 20 > "$(_tmp tb)" 2>/dev/null
+    _tb_print '(no frame in this bucket)'
+    fact "   bucket 3 of 3 — every remaining frame, top 80:"
+    grep -vE '[0-9]+ (java|javax|jakarta|sun|jdk|com\.sun|oracle|org\.graalvm|whatap)\.' "$(_tmp tfreq)" 2>/dev/null | head -n 80 > "$(_tmp tb)" 2>/dev/null
+    _tb_print '(no frame in this bucket)'
+}
+
+# Thread-level counts. On an idle JVM the frames carry no application class
+# at all, while the thread NAMES still do (cache regions named after entity
+# classes, a scheduler instance id, a pool prefix), so the names are counted
+# separately from the frames.
+_tier2_threadnames() {
+    grep '^"' "$(_tmp tframes)" 2>/dev/null | sed 's/^"\([^"]*\)".*$/\1/' > "$(_tmp tnames)" 2>/dev/null
+    _thn="$(grep -c . "$(_tmp tnames)" 2>/dev/null)"
+    fact "-- thread header lines over the $_TDUMPS dump(s): ${_thn:-0}"
+    fact "   thread states (java.lang.Thread.State lines, counted):"
+    grep -oE 'java\.lang\.Thread\.State: [A-Z_]+' "$(_tmp tframes)" 2>/dev/null | sed 's/^java.lang.Thread.State: //' | sort | uniq -c | sort -rn > "$(_tmp tb)" 2>/dev/null
+    _tb_print '(no state line in the dump text)'
+    fact "   thread name shapes, every digit run replaced by N so pool members collapse into one line (names that are themselves a dotted class-like name are counted in the next block instead), top 40:"
+    sed 's/[0-9][0-9]*/N/g' "$(_tmp tnames)" 2>/dev/null | grep -vE '^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_$][A-Za-z0-9_$]*){2,}$' | sort | uniq -c | sort -rn | head -n 40 > "$(_tmp tb)" 2>/dev/null
+    _tb_print '(no thread header line in the dump text)'
+    grep -oE '[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_$][A-Za-z0-9_$]*){2,}' "$(_tmp tnames)" 2>/dev/null | sort | uniq -c | sort -rn > "$(_tmp tdot)" 2>/dev/null
+    fact "   package roots of dotted names carried inside thread names (first three dot-separated parts, thread count):"
+    awk '{ n=split($2, p, "."); if (n >= 3) print $1, p[1] "." p[2] "." p[3] }' "$(_tmp tdot)" 2>/dev/null | awk '{ c[$2]+=$1 } END { for (k in c) print c[k], k }' | sort -rn | head -n 20 > "$(_tmp tb)" 2>/dev/null
+    _tb_print '(none)'
+    fact "   the dotted names themselves (three or more parts, as written), distinct, top 80:"
+    head -n 80 "$(_tmp tdot)" > "$(_tmp tb)" 2>/dev/null
+    _tb_print '(none)'
+}
+
+# Other APM agents on the same JVM show up as frames and threads of their own
+# packages. The prefix list is fixed and printed verbatim.
+# <frame package prefix>:<word looked for in thread names, case-insensitive>
+_tier2_otherapm() {
+    _OTHERAPM="oracle.apmaas.:apmaas com.dynatrace.:dynatrace com.appdynamics.:appdynamics com.newrelic.:newrelic io.opentelemetry.javaagent.:opentelemetry com.instana.:instana datadog.trace.:datadog scouter.:scouter com.jennifersoft.:jennifer com.ibm.tivoli.:tivoli co.elastic.apm.:elastic"
+    fact "   frames and thread names of other APM agents on the same JVM (fixed list of frame-package prefix and thread-name word, printed here verbatim; an entry with no match is not listed):"
+    fact "   $_OTHERAPM"
+    _oam=0
+    for _op in $_OTHERAPM; do
+        _opp="${_op%%:*}"; _opw="${_op#*:}"
+        _ope="$(printf '%s' "$_opp" | sed 's/\./\\./g')"
+        _ofc="$(grep -E "^ *[0-9]+ ${_ope}" "$(_tmp tfreq)" 2>/dev/null | awk '{s+=$1} END{print s+0}')"
+        _otc="$(grep -c -i "$_opw" "$(_tmp tnames)" 2>/dev/null)"
+        if [ "${_ofc:-0}" -gt 0 ] || [ "${_otc:-0}" -gt 0 ]; then
+            _oam=$((_oam + 1))
+            printf '        %s  frames=%s  thread names containing "%s" (case-insensitive)=%s\n' "$_opp" "${_ofc:-0}" "$_opw" "${_otc:-0}"
         fi
+    done
+    [ "$_oam" = 0 ] && printf '        (no frame or thread name under any listed prefix)\n'
+}
+
+# --jcmd. A JVM whose options are not in /proc is queried here too, whether
+# or not it carries an attach marker: /proc showed nothing about it, so this
+# output is the only verbatim record of what it runs.
+_tier2_jcmd() {
+    if ! have jcmd; then
+        fact "jcmd data: n/a (command not found: jcmd)"
+        _flag jcmd_fail "command not found: jcmd"
+        return 0
     fi
-    if [ "$OPT_JCMD" != 0 ]; then
-        if ! have jcmd; then
-            fact "jcmd data: n/a (command not found: jcmd)"
-            _flag jcmd_fail "command not found: jcmd"
-        else
-            # A JVM whose options are not in /proc is queried here too, whether
-            # or not it carries an attach marker: /proc showed nothing about
-            # it, so this output is the only verbatim record of what it runs.
-            _jp=0; _jseen=""
-            for pid in $D_MARKED $D_JVM_NOARGS; do
-                case "$_jseen" in *"|$pid|"*) continue ;; esac
-                _jseen="$_jseen|$pid|"
-                if ! _jvm_confirmed "$pid"; then
-                    fact "-- jcmd $pid: n/a (${_NOTCONF})"
-                    _flag jcmd_fail "pid $pid: ${_NOTCONF}"
-                    continue
-                fi
-                _jp=$((_jp + 1))
-                [ "$_jp" -gt 3 ] && { fact "-- remaining JVMs not queried (cap: 3)"; break; }
-                warn "[Tier2] jcmd: pid $pid — uses the JVM attach mechanism on the target process"
-                for _jq in VM.command_line VM.system_properties VM.flags VM.version; do
-                    _jo="$(_bounded jcmd "$pid" "$_jq" 2>&1)"; _jrc=$?
-                    if [ "$_jrc" = 0 ] && [ -n "$_jo" ]; then
-                        _emit_labeled "-- jcmd $pid $_jq" "$_jo"
-                        _flag jcmd_ok "$pid $_jq"
-                    else
-                        if [ "$_jrc" = 124 ]; then _jw="timed out: ${CMD_TIMEOUT}s"
-                        else _jw="exit $_jrc: $(printf '%s\n' "$_jo" | head -n 1 | cut -c1-120)"; fi
-                        fact "-- jcmd $pid $_jq: n/a ($_jw)"
-                        _flag jcmd_fail "jcmd $pid $_jq: $_jw"
-                    fi
-                done
-            done
-            [ "$_jp" = 0 ] && [ -z "$_jseen" ] && fact "jcmd data: n/a (no JVM carrying a WhaTap attach marker, and none whose options are absent from /proc)"
+    _jp=0; _jseen=""
+    for pid in $D_MARKED $D_JVM_NOARGS; do
+        case "$_jseen" in *"|$pid|"*) continue ;; esac
+        _jseen="$_jseen|$pid|"
+        if ! _jvm_confirmed "$pid"; then
+            fact "-- jcmd $pid: n/a (${_NOTCONF})"
+            _flag jcmd_fail "pid $pid: ${_NOTCONF}"
+            continue
         fi
-    fi
+        _jp=$((_jp + 1))
+        [ "$_jp" -gt 3 ] && { fact "-- remaining JVMs not queried (cap: 3)"; break; }
+        warn "[Tier2] jcmd: pid $pid — uses the JVM attach mechanism on the target process"
+        for _jq in VM.command_line VM.system_properties VM.flags VM.version; do
+            _jo="$(_bounded jcmd "$pid" "$_jq" 2>&1)"; _jrc=$?
+            if [ "$_jrc" = 0 ] && [ -n "$_jo" ]; then
+                _emit_labeled "-- jcmd $pid $_jq" "$_jo"
+                _flag jcmd_ok "$pid $_jq"
+            else
+                if [ "$_jrc" = 124 ]; then _jw="timed out: ${CMD_TIMEOUT}s"
+                else _jw="exit $_jrc: $(printf '%s\n' "$_jo" | head -n 1 | cut -c1-120)"; fi
+                fact "-- jcmd $pid $_jq: n/a ($_jw)"
+                _flag jcmd_fail "jcmd $pid $_jq: $_jw"
+            fi
+        done
+    done
+    [ "$_jp" = 0 ] && [ -z "$_jseen" ] && fact "jcmd data: n/a (no JVM carrying a WhaTap attach marker, and none whose options are absent from /proc)"
 }
 
 # [14] M. Library detail pack — only when explicitly requested
@@ -3592,7 +3681,7 @@ _rep_libpack() {
         for _fq in $OPT_CLASSES; do
             _rel="$(printf '%s' "$_fq" | tr '.' '/').class"
             for pid in $D_MARKED; do
-                _jarp="$(_all_jvm_args "$pid" 2>/dev/null | awk 'p=="-jar"{print; exit} {p=$0}')"
+                _jarp="$(_jvm_opt_val "$pid" -jar)"
                 [ -n "$_jarp" ] || continue
                 _fsj2="$(_rpath "$pid" "$_jarp")"
                 [ -n "$_fsj2" ] || continue
@@ -3634,182 +3723,197 @@ _rep_appclasses() {
     _APPPAT="Controller Action Servlet Handler Endpoint Resource Service Facade Manager Delegate Listener Consumer Processor Job Task Batch Adapter Gateway"
     if [ "$OPT_APPCLASSES" = 0 ]; then
         fact "not requested (--appclasses absent)"
-    else
-        # jars named with --library join the roots below
-        [ -n "$_LIBROOTS" ] || _build_libroots
-        if [ -n "$OPT_LIBS" ] || [ "$OPT_LIBALL" = 1 ]; then
-            _lrn="$(grep -c . "$_LIBROOTS" 2>/dev/null)"
-            fact "-- jars named with --library that join this index: ${_lrn:-0} (cap 60)"
-        fi
-        if [ ! -s "$_APPSINK" ] && [ ! -s "$_LIBROOTS" ]; then
-            fact "requested, but section F enumerated no application class root (no directory classpath entry, no WEB-INF/classes, no BOOT-INF/classes) and no jar was named with --library"
-        else
-        fact "-- a leading BOOT-INF/classes/ or WEB-INF/classes/ segment is removed from each class name below"
-        { sort -u "$_APPSINK" 2>/dev/null; head -n 60 "$_LIBROOTS" 2>/dev/null; } > "$(_tmp approots.u)" 2>/dev/null
-        _NAMES="$(_tmp appnames)"
-        true > "$_NAMES" 2>/dev/null
-        _rn=0
-        while IFS= read -r _rec; do
-            [ -n "$_rec" ] || continue
-            _rn=$((_rn + 1))
-            _rcap=12; [ -s "$_LIBROOTS" ] && _rcap=72
-            [ "$_rn" -gt "$_rcap" ] && { fact "-- cap reached: $_rcap class roots read, later roots skipped"; break; }
-            case "$_rec" in
-                dir\|*)
-                    _rt="${_rec#dir|}"
-                    case "$_rt" in /proc/[0-9]*/root*) _rt="$(_vfix "$_rt")" ;; esac
-                    if [ ! -d "$_rt" ]; then fact "-- directory root $_rt: n/a (path not found)"; continue; fi
-                    if [ ! -r "$_rt" ]; then fact "-- directory root $_rt: n/a (permission denied)"; continue; fi
-                    _bounded find "$_rt" -name '*.class' -type f > "$(_tmp rootcls.all)" 2>/dev/null; _frc=$?
-                    head -n 20000 "$(_tmp rootcls.all)" > "$(_tmp rootcls)" 2>/dev/null
-                    _cnt="$(grep -c . "$(_tmp rootcls)" 2>/dev/null)"
-                    fact "-- directory root $_rt: ${_cnt:-0} class files (read bound: 20000)$( [ "$_frc" = 124 ] && echo "; find timed out at ${CMD_TIMEOUT}s, the count is partial")"
-                    # A deployment unit can ship the application's own code as
-                    # jars next to this directory rather than as class files in
-                    # it. When the directory holds nothing, the count of the
-                    # sibling lib directory is the fact that says where else to
-                    # look; --library <name> then details those jars (section M).
-                    if [ "${_cnt:-0}" -eq 0 ]; then
-                        _sib="${_rt%/classes}/lib"
-                        if [ -d "$_sib" ]; then
-                            _sibn="$(_names "$_sib" | grep -i -c '\.jar$')"
-                            fact "   sibling ${_sib}: ${_sibn:-0} jar files"
-                        else
-                            fact "   sibling ${_sib}: absent"
-                        fi
-                    fi
-                    while IFS= read -r _cf; do
-                        _fq="${_cf#"$_rt"/}"; _fq="${_fq%.class}"
-                        _fq="${_fq#BOOT-INF/classes/}"; _fq="${_fq#WEB-INF/classes/}"
-                        printf '%s\n' "$_fq" | tr '/' '.' >> "$_NAMES" 2>/dev/null
-                    done < "$(_tmp rootcls)"
-                    ;;
-                libjar\|*)
-                    _rt="${_rec#libjar|}"
-                    _fsl="$(_rpath "" "$_rt")"
-                    if [ -z "$_fsl" ]; then fact "-- named jar $_rt: n/a ($(_path_why "$_rt"))"; continue; fi
-                    _lst="$(_zlist "$_fsl" '*.class')"; _zrc=$?
-                    if [ "$_zrc" != 0 ] && [ "$_zrc" != 11 ]; then fact "-- named jar $_rt: n/a ($(_zwhy))"; continue; fi
-                    _lst="$(printf '%s\n' "$_lst" | grep -v '^META-INF/versions/')"
-                    _cnt="$(printf '%s\n' "$_lst" | grep -c .)"
-                    fact "-- named jar $(basename "$_rt"): ${_cnt:-0} class entries (named with --library)"
-                    printf '%s\n' "$_lst" | head -n 20000 | while IFS= read -r _ce; do
-                        [ -n "$_ce" ] || continue
-                        _fq="${_ce%.class}"
-                        _fq="${_fq#BOOT-INF/classes/}"; _fq="${_fq#WEB-INF/classes/}"
-                        printf '%s\n' "$_fq" | tr '/' '.' >> "$_NAMES" 2>/dev/null
-                    done
-                    ;;
-                archive\|*)
-                    _rt="${_rec#archive|}"
-                    if [ ! -f "$_rt" ]; then fact "-- archive root $_rt: n/a (path not found)"; continue; fi
-                    _lst="$(_zlist "$_rt" 'WEB-INF/classes/*.class' 'BOOT-INF/classes/*.class')"; _zrc=$?
-                    if [ "$_zrc" != 0 ] && [ "$_zrc" != 11 ]; then fact "-- archive root $_rt: n/a ($(_zwhy))"; continue; fi
-                    _cnt="$(printf '%s\n' "$_lst" | grep -c .)"
-                    fact "-- archive root $_rt: ${_cnt:-0} class entries under WEB-INF/classes or BOOT-INF/classes (read bound: 20000)"
-                    printf '%s\n' "$_lst" | head -n 20000 | while IFS= read -r _ce; do
-                        [ -n "$_ce" ] || continue
-                        _fq="${_ce#WEB-INF/classes/}"; _fq="${_fq#BOOT-INF/classes/}"; _fq="${_fq%.class}"
-                        printf '%s\n' "$_fq" | tr '/' '.' >> "$_NAMES" 2>/dev/null
-                    done
-                    ;;
-            esac
-        done < "$(_tmp approots.u)"
-        if [ ! -s "$_NAMES" ]; then
-            fact "no class file was read from the enumerated roots"
-        else
-            sort -u "$_NAMES" > "${_NAMES}.u" 2>/dev/null
-            _tot="$(grep -c . "${_NAMES}.u" 2>/dev/null)"
-            fact "-- distinct application classes: ${_tot:-0}"
-            fact "-- package histogram, class count per package (top 40):"
-            sed 's/\.[^.]*$//; t; s/.*/(default package)/' "${_NAMES}.u" 2>/dev/null | sort | uniq -c | sort -rn | head -n 40 | _indent '        '
-            fact "-- name-pattern index over a fixed pattern list carried by this collector, printed verbatim:"
-            fact "   $_APPPAT"
-            for _p in $_APPPAT; do
-                _mn="$(grep -E "(^|\.)[^.]*${_p}[^.]*$" "${_NAMES}.u" 2>/dev/null | grep -c .)"
-                [ "${_mn:-0}" -eq 0 ] && continue
-                fact "   *${_p}*: ${_mn} (first 60)"
-                grep -E "(^|\.)[^.]*${_p}[^.]*$" "${_NAMES}.u" 2>/dev/null | head -n 60 | _indent '        '
-            done
-            fact "-- classes matching none of those patterns: $(grep -vE "(^|\.)[^.]*($(printf '%s' "$_APPPAT" | tr ' ' '|'))[^.]*$" "${_NAMES}.u" 2>/dev/null | grep -c .)"
-            fact "-- full class list (first 2000, alphabetical):"
-            head -n 2000 "${_NAMES}.u" 2>/dev/null | _indent '        '
-            # --class-refs: which of these classes name a given type. A class
-            # file carries every type it implements, extends, calls or
-            # references as a UTF8 constant-pool entry in internal form, so the
-            # scan is a byte search of the class files of the same roots. It
-            # reports "names it", never "implements it".
-            if [ -n "$OPT_REFS" ]; then
-                _refdir="$(_tmp refx)"
-                for _tk in $OPT_REFS; do
-                    _tki="$(printf '%s' "$_tk" | tr '.' '/')"
-                    _hits="$(_tmp refhits)"; true > "$_hits" 2>/dev/null
-                    _rr=0
-                    while IFS= read -r _rrec; do
-                        [ -n "$_rrec" ] || continue
-                        _rr=$((_rr + 1)); [ "$_rr" -gt 72 ] && break
-                        case "$_rrec" in
-                            dir\|*)
-                                _rt="${_rrec#dir|}"
-                                case "$_rt" in /proc/[0-9]*/root*) _rt="$(_vfix "$_rt")" ;; esac
-                                [ -d "$_rt" ] || continue
-                                _bounded grep -rlF -a --include='*.class' -- "$_tki" "$_rt" 2>/dev/null | head -n 400 \
-                                  | while IFS= read -r _hf; do
-                                        _fq="${_hf#"$_rt"/}"; _fq="${_fq%.class}"
-                                        _fq="${_fq#BOOT-INF/classes/}"; _fq="${_fq#WEB-INF/classes/}"
-                                        printf '%s\n' "$_fq" | tr '/' '.' >> "$_hits" 2>/dev/null
-                                    done
-                                ;;
-                            libjar\|*|archive\|*)
-                                case "$_rrec" in libjar\|*) _rt="${_rrec#libjar|}" ;; *) _rt="${_rrec#archive|}" ;; esac
-                                _fsr="$(_rpath "" "$_rt")"
-                                [ -n "$_fsr" ] || continue
-                                have unzip || continue
-                                _sz="$(wc -c < "$_fsr" 2>/dev/null)"
-                                if [ -n "$_sz" ] && [ "$_sz" -gt 83886080 ] 2>/dev/null; then
-                                    fact "   $_rt: skipped for this scan (above the 80 MB unpack bound)"
-                                    continue
-                                fi
-                                _rmtmp "$_refdir"; mkdir -p "$_refdir" 2>/dev/null || continue
-                                _bounded unzip -qq -o -d "$_refdir" "$_fsr" '*.class' >/dev/null 2>&1
-                                _bounded grep -rlF -a --include='*.class' -- "$_tki" "$_refdir" 2>/dev/null | head -n 400 \
-                                  | while IFS= read -r _hf; do
-                                        _fq="${_hf#"$_refdir"/}"; _fq="${_fq%.class}"
-                                        _fq="${_fq#BOOT-INF/classes/}"; _fq="${_fq#WEB-INF/classes/}"
-                                        printf '%s\n' "$_fq" | tr '/' '.' >> "$_hits" 2>/dev/null
-                                    done
-                                _rmtmp "$_refdir"
-                                ;;
-                        esac
-                    done < "$(_tmp approots.u)"
-                    sort -u "$_hits" > "${_hits}.u" 2>/dev/null
-                    _hn="$(grep -c . "${_hits}.u" 2>/dev/null)"
-                    fact "-- classes naming $_tk in their bytecode: ${_hn:-0} (byte search for the internal form $_tki in the class files of the roots above)"
-                    if [ "${_hn:-0}" -gt 0 ]; then
-                        head -n 200 "${_hits}.u" 2>/dev/null | _indent '        '
-                    else
-                        printf '        (no class of these roots carries the token)\n'
-                    fi
-                done
-            fi
-            # Join with section L: which classes of THIS index appear as frames in
-            # the dumps counted there. A zero is a fact worth a line — it says the
-            # dumps were taken while no application code was on any stack.
-            if [ -s "$(_tmp tfreq)" ]; then
-                awk 'NR==FNR { a[$0]=1; next } { c=$2; sub(/\.[^.]*$/, "", c); if (c in a) print }' "${_NAMES}.u" "$(_tmp tfreq)" > "$(_tmp tjoin)" 2>/dev/null
-                _tjn="$(grep -c . "$(_tmp tjoin)" 2>/dev/null)"
-                _tjs="$(awk '{s+=$1} END{print s+0}' "$(_tmp tjoin)" 2>/dev/null)"
-                fact "-- frames in the section L dump(s) whose class is in this index: ${_tjn:-0} distinct frames, ${_tjs:-0} occurrences (top 60):"
-                if [ "${_tjn:-0}" -gt 0 ]; then
-                    head -n 60 "$(_tmp tjoin)" 2>/dev/null | _indent '        '
+        return 0
+    fi
+    # jars named with --library join the roots below
+    [ -n "$_LIBROOTS" ] || _build_libroots
+    if [ -n "$OPT_LIBS" ] || [ "$OPT_LIBALL" = 1 ]; then
+        _lrn="$(grep -c . "$_LIBROOTS" 2>/dev/null)"
+        fact "-- jars named with --library that join this index: ${_lrn:-0} (cap 60)"
+    fi
+    if [ ! -s "$_APPSINK" ] && [ ! -s "$_LIBROOTS" ]; then
+        fact "requested, but section F enumerated no application class root (no directory classpath entry, no WEB-INF/classes, no BOOT-INF/classes) and no jar was named with --library"
+        return 0
+    fi
+    fact "-- a leading BOOT-INF/classes/ or WEB-INF/classes/ segment is removed from each class name below"
+    { sort -u "$_APPSINK" 2>/dev/null; head -n 60 "$_LIBROOTS" 2>/dev/null; } > "$(_tmp approots.u)" 2>/dev/null
+    _NAMES="$(_tmp appnames)"
+    true > "$_NAMES" 2>/dev/null
+    _rn=0
+    while IFS= read -r _rec; do
+        [ -n "$_rec" ] || continue
+        _rn=$((_rn + 1))
+        _rcap=12; [ -s "$_LIBROOTS" ] && _rcap=72
+        [ "$_rn" -gt "$_rcap" ] && { fact "-- cap reached: $_rcap class roots read, later roots skipped"; break; }
+        _appcls_root "$_rec"
+    done < "$(_tmp approots.u)"
+    if [ ! -s "$_NAMES" ]; then
+        fact "no class file was read from the enumerated roots"
+        return 0
+    fi
+    sort -u "$_NAMES" > "${_NAMES}.u" 2>/dev/null
+    _appcls_index
+    [ -n "$OPT_REFS" ] && _appcls_refs
+    _appcls_tjoin
+}
+
+# _appcls_names_from PREFIX -> read class paths on stdin, drop PREFIX/, the
+# .class suffix and a leading BOOT-INF/classes/ or WEB-INF/classes/, and
+# append the dotted names to FILE ($2, default $_NAMES)
+_appcls_names_from() {
+    while IFS= read -r _cf; do
+        [ -n "$_cf" ] || continue
+        _fq="${_cf#"$1"}"; _fq="${_fq%.class}"
+        _fq="${_fq#BOOT-INF/classes/}"; _fq="${_fq#WEB-INF/classes/}"
+        printf '%s\n' "$_fq" | tr '/' '.' >> "${2:-$_NAMES}" 2>/dev/null
+    done
+}
+
+# _appcls_root RECORD -> the class names of one root (dir|, libjar| or
+# archive|) into $_NAMES, with its count line
+_appcls_root() {
+    case "$1" in
+        dir\|*)
+            _rt="${1#dir|}"
+            case "$_rt" in /proc/[0-9]*/root*) _rt="$(_vfix "$_rt")" ;; esac
+            if [ ! -d "$_rt" ]; then fact "-- directory root $_rt: n/a (path not found)"; return 0; fi
+            if [ ! -r "$_rt" ]; then fact "-- directory root $_rt: n/a (permission denied)"; return 0; fi
+            _bounded find "$_rt" -name '*.class' -type f > "$(_tmp rootcls.all)" 2>/dev/null; _frc=$?
+            head -n 20000 "$(_tmp rootcls.all)" > "$(_tmp rootcls)" 2>/dev/null
+            _cnt="$(grep -c . "$(_tmp rootcls)" 2>/dev/null)"
+            fact "-- directory root $_rt: ${_cnt:-0} class files (read bound: 20000)$( [ "$_frc" = 124 ] && echo "; find timed out at ${CMD_TIMEOUT}s, the count is partial")"
+            # An empty directory may mean the unit ships its own code as jars
+            # beside it; the sibling lib count says where else to look, and
+            # --library <name> details those jars (section M).
+            if [ "${_cnt:-0}" -eq 0 ]; then
+                _sib="${_rt%/classes}/lib"
+                if [ -d "$_sib" ]; then
+                    _sibn="$(_names "$_sib" | grep -i -c '\.jar$')"
+                    fact "   sibling ${_sib}: ${_sibn:-0} jar files"
                 else
-                    printf '        (no frame of any counted dump belongs to a class in this index)\n'
+                    fact "   sibling ${_sib}: absent"
                 fi
-            else
-                fact "-- frames in the section L dump(s) whose class is in this index: n/a (no thread dump was counted in this run: --threads and --dump-file absent, or no dump text)"
             fi
+            _appcls_names_from "$_rt/" < "$(_tmp rootcls)"
+            ;;
+        libjar\|*)
+            _rt="${1#libjar|}"
+            _fsl="$(_rpath "" "$_rt")"
+            if [ -z "$_fsl" ]; then fact "-- named jar $_rt: n/a ($(_path_why "$_rt"))"; return 0; fi
+            _lst="$(_zlist "$_fsl" '*.class')"; _zrc=$?
+            if [ "$_zrc" != 0 ] && [ "$_zrc" != 11 ]; then fact "-- named jar $_rt: n/a ($(_zwhy))"; return 0; fi
+            _lst="$(printf '%s\n' "$_lst" | grep -v '^META-INF/versions/')"
+            _cnt="$(printf '%s\n' "$_lst" | grep -c .)"
+            fact "-- named jar $(basename "$_rt"): ${_cnt:-0} class entries (named with --library)"
+            printf '%s\n' "$_lst" | head -n 20000 | _appcls_names_from ""
+            ;;
+        archive\|*)
+            _rt="${1#archive|}"
+            if [ ! -f "$_rt" ]; then fact "-- archive root $_rt: n/a (path not found)"; return 0; fi
+            _lst="$(_zlist "$_rt" 'WEB-INF/classes/*.class' 'BOOT-INF/classes/*.class')"; _zrc=$?
+            if [ "$_zrc" != 0 ] && [ "$_zrc" != 11 ]; then fact "-- archive root $_rt: n/a ($(_zwhy))"; return 0; fi
+            _cnt="$(printf '%s\n' "$_lst" | grep -c .)"
+            fact "-- archive root $_rt: ${_cnt:-0} class entries under WEB-INF/classes or BOOT-INF/classes (read bound: 20000)"
+            # WEB-INF/classes/ is removed before BOOT-INF/classes/ here
+            printf '%s\n' "$_lst" | head -n 20000 | while IFS= read -r _ce; do
+                [ -n "$_ce" ] || continue
+                _fq="${_ce#WEB-INF/classes/}"; _fq="${_fq#BOOT-INF/classes/}"; _fq="${_fq%.class}"
+                printf '%s\n' "$_fq" | tr '/' '.' >> "$_NAMES" 2>/dev/null
+            done
+            ;;
+    esac
+}
+
+# the distinct names: package histogram, name-pattern index, full list
+_appcls_index() {
+    _tot="$(grep -c . "${_NAMES}.u" 2>/dev/null)"
+    fact "-- distinct application classes: ${_tot:-0}"
+    fact "-- package histogram, class count per package (top 40):"
+    sed 's/\.[^.]*$//; t; s/.*/(default package)/' "${_NAMES}.u" 2>/dev/null | sort | uniq -c | sort -rn | head -n 40 | _indent '        '
+    fact "-- name-pattern index over a fixed pattern list carried by this collector, printed verbatim:"
+    fact "   $_APPPAT"
+    for _p in $_APPPAT; do
+        _mn="$(grep -E "(^|\.)[^.]*${_p}[^.]*$" "${_NAMES}.u" 2>/dev/null | grep -c .)"
+        [ "${_mn:-0}" -eq 0 ] && continue
+        fact "   *${_p}*: ${_mn} (first 60)"
+        grep -E "(^|\.)[^.]*${_p}[^.]*$" "${_NAMES}.u" 2>/dev/null | head -n 60 | _indent '        '
+    done
+    fact "-- classes matching none of those patterns: $(grep -vE "(^|\.)[^.]*($(printf '%s' "$_APPPAT" | tr ' ' '|'))[^.]*$" "${_NAMES}.u" 2>/dev/null | grep -c .)"
+    fact "-- full class list (first 2000, alphabetical):"
+    head -n 2000 "${_NAMES}.u" 2>/dev/null | _indent '        '
+}
+
+# --class-refs: which of these classes name a given type. A class file
+# carries every type it implements, extends, calls or references as a UTF8
+# constant-pool entry in internal form, so the scan is a byte search of the
+# class files of the same roots. It reports "names it", never "implements it".
+_appcls_refs() {
+    _refdir="$(_tmp refx)"
+    for _tk in $OPT_REFS; do
+        _tki="$(printf '%s' "$_tk" | tr '.' '/')"
+        _hits="$(_tmp refhits)"; true > "$_hits" 2>/dev/null
+        _rr=0
+        while IFS= read -r _rrec; do
+            [ -n "$_rrec" ] || continue
+            _rr=$((_rr + 1)); [ "$_rr" -gt 72 ] && break
+            _appcls_ref_root "$_rrec"
+        done < "$(_tmp approots.u)"
+        sort -u "$_hits" > "${_hits}.u" 2>/dev/null
+        _hn="$(grep -c . "${_hits}.u" 2>/dev/null)"
+        fact "-- classes naming $_tk in their bytecode: ${_hn:-0} (byte search for the internal form $_tki in the class files of the roots above)"
+        if [ "${_hn:-0}" -gt 0 ]; then
+            head -n 200 "${_hits}.u" 2>/dev/null | _indent '        '
+        else
+            printf '        (no class of these roots carries the token)\n'
         fi
+    done
+}
+
+# _appcls_ref_root RECORD -> the classes of one root that carry $_tki, into $_hits
+_appcls_ref_root() {
+    case "$1" in
+        dir\|*)
+            _rt="${1#dir|}"
+            case "$_rt" in /proc/[0-9]*/root*) _rt="$(_vfix "$_rt")" ;; esac
+            [ -d "$_rt" ] || return 0
+            _bounded grep -rlF -a --include='*.class' -- "$_tki" "$_rt" 2>/dev/null | head -n 400 \
+                | _appcls_names_from "$_rt/" "$_hits"
+            ;;
+        libjar\|*|archive\|*)
+            case "$1" in libjar\|*) _rt="${1#libjar|}" ;; *) _rt="${1#archive|}" ;; esac
+            _fsr="$(_rpath "" "$_rt")"
+            [ -n "$_fsr" ] || return 0
+            have unzip || return 0
+            _sz="$(wc -c < "$_fsr" 2>/dev/null)"
+            if [ -n "$_sz" ] && [ "$_sz" -gt 83886080 ] 2>/dev/null; then
+                fact "   $_rt: skipped for this scan (above the 80 MB unpack bound)"
+                return 0
+            fi
+            _rmtmp "$_refdir"; mkdir -p "$_refdir" 2>/dev/null || return 0
+            _bounded unzip -qq -o -d "$_refdir" "$_fsr" '*.class' >/dev/null 2>&1
+            _bounded grep -rlF -a --include='*.class' -- "$_tki" "$_refdir" 2>/dev/null | head -n 400 \
+                | _appcls_names_from "$_refdir/" "$_hits"
+            _rmtmp "$_refdir"
+            ;;
+    esac
+}
+
+# Join with section L: which classes of THIS index appear as frames in the
+# dumps counted there. A zero is a fact worth a line — it says the dumps were
+# taken while no application code was on any stack.
+_appcls_tjoin() {
+    if [ -s "$(_tmp tfreq)" ]; then
+        awk 'NR==FNR { a[$0]=1; next } { c=$2; sub(/\.[^.]*$/, "", c); if (c in a) print }' "${_NAMES}.u" "$(_tmp tfreq)" > "$(_tmp tjoin)" 2>/dev/null
+        _tjn="$(grep -c . "$(_tmp tjoin)" 2>/dev/null)"
+        _tjs="$(awk '{s+=$1} END{print s+0}' "$(_tmp tjoin)" 2>/dev/null)"
+        fact "-- frames in the section L dump(s) whose class is in this index: ${_tjn:-0} distinct frames, ${_tjs:-0} occurrences (top 60):"
+        if [ "${_tjn:-0}" -gt 0 ]; then
+            head -n 60 "$(_tmp tjoin)" 2>/dev/null | _indent '        '
+        else
+            printf '        (no frame of any counted dump belongs to a class in this index)\n'
         fi
+    else
+        fact "-- frames in the section L dump(s) whose class is in this index: n/a (no thread dump was counted in this run: --threads and --dump-file absent, or no dump text)"
     fi
 }
 

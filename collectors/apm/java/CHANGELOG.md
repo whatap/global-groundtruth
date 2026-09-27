@@ -5,6 +5,10 @@ first. Every change to the script bumps its `VERSION` and adds one entry at
 the top of this list (docs/authoring-guide.md, step 2); `tools/validate.sh`
 checks that the newest entry is the script's `VERSION`.
 
+- **0.13.5** — Split _rep_libs, _rep_tier2, _rep_appclasses and _rep_conf into
+  per-subsection functions; -jar/-cp extraction is _jvm_opt_val, /proc link
+  reads are _link_or_na, the WEB-INF/classes search is _libs_classes_under.
+  Report content unchanged.
 - **0.13.4** — Shared code in synced blocks (R2 refactor): the skeleton's emit
   helpers now hold _optval, _emit_labeled, _tool_rows (the [1] tool table) and
   _indent (the indent loops), and its run helpers hold probe and read_proc.
