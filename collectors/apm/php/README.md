@@ -1,6 +1,11 @@
 # collectors/apm/php — WhaTap PHP APM agent collector
 
-> **Status: SEEDED (v0.2).** `collect-apmphp.sh` is a working Tier-0 collector
+> **Status: SEEDED (v0.2; validated at `collect-apmphp.sh` 0.7.2 on
+> 2026-09-27 against the real agent: whatap-php 2.14-2 rpm on Rocky 9 (PHP 8.2
+> php-fpm + nginx, systemd `whatap-php.service`) and the Alpine tarball on
+> `php:8.3-fpm-alpine` (`whatap_php_static` started by the wrapper); as root,
+> as a web user and as another user, bash and `sh -s`; no collection server was
+> reachable).** `collect-apmphp.sh` is a working Tier-0 collector
 > seeded by the Global team (CONTRACT rule 4 — interim ownership). Ongoing
 > ownership belongs to the PHP agent developers once handed over.
 
@@ -82,7 +87,9 @@ per-version FPM units, and the module the live workers actually mapped. Binary
 discovery covers the distro packages, Sury/ondrej, Remi, SCL, cPanel
 EasyApache, Plesk, CloudLinux alt-php, LiteSpeed lsphp and source builds; ini
 scan dirs are taken from each runtime's own `php -i` rather than from a path
-list, so an unlisted layout still reports correctly.
+list, so an unlisted layout still reports correctly. `php-cgi -i` prints
+phpinfo() as HTML (the CGI SAPI); its table rows are read as the
+`name => value` lines the CLI prints, so php-cgi gets the same facts.
 
 ## One field command
 

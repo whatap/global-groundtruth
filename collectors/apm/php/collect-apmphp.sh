@@ -56,6 +56,14 @@ export LC_ALL=C
 
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-apmphp"
+# 0.7.2  A php-cgi binary's php -i (HTML: the CGI SAPI prints phpinfo() as a
+#        page) is read as the text form the CLI prints; it was matched as
+#        text, so php-cgi showed "PHP n/a, SAPI n/a", "ini scan dir: none
+#        configured" and "whatap.* directives registered: no" while it
+#        loads whatap.so from /etc/php.d (Rocky 9, whatap-php 2.14-2 rpm,
+#        2026-09-27). A service file reached by two paths (/lib ->
+#        usr/lib) is dumped once. Report: section 3 and 6 carry php-cgi's
+#        values; section 7 loses the second copy of the unit file.
 # 0.7.1  main is the apm group block `apm: main`; report unchanged. A --file run
 #        on a host without hostname(1) names the report after
 #        /proc/sys/kernel/hostname, else `uname -n`, and so does Target (both
@@ -79,7 +87,7 @@ COLLECTOR_NAME="whatap-apmphp"
 # 0.5.2  A directory this uid can read but not enter lists its names again
 #        (the refactor's _names dropped them; ls did not).
 # 0.5.1  Readability refactor; report unchanged.
-VERSION="0.7.1"
+VERSION="0.7.2"
 DOMAIN="apm"
 TARGET="host/$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || uname -n 2>/dev/null || echo unknown)"
 
@@ -761,6 +769,18 @@ php_info() {
     [ -x "$php" ] || return 1
     _bounded "$php" -i > "$_infofile" 2>"$_errfile"
     [ -s "$_infofile" ] || return 1
+    # The CGI SAPI prints phpinfo() as HTML; its rows become the CLI's
+    # "name => value[ => value]" lines, so every reader below matches both.
+    if grep -q '<td class="e">' "$_infofile" 2>/dev/null; then
+        local _t _h
+        _t="$(printf '\t')" _h="$(_tmp probe.info.html)"
+        mv -f "$_infofile" "$_h" 2>/dev/null || return 0
+        sed -e 's|<h1 class="p">PHP Version \([^<]*\)</h1>|PHP Version => \1|' \
+            -e "s|</td><td class=\"v\">|$_t|g" -e 's|<[^>]*>||g' \
+            -e 's|&nbsp;| |g; s|&quot;|"|g; s|&lt;|<|g; s|&gt;|>|g; s|&#039;|'"'"'|g; s|&amp;|\&|g' "$_h" 2>/dev/null \
+            | awk -F"$_t" '{ o = ""; for (i = 1; i <= NF; i++) { f = $i; sub(/^ +/, "", f); sub(/ +$/, "", f); o = (i > 1) ? o " => " f : f } print o }' \
+            > "$_infofile" 2>/dev/null
+    fi
     return 0
 }
 
@@ -965,6 +985,13 @@ _add_svc() {  # _add_svc PATH
     local p="$1"
     [ -f "$p" ] || return
     case "$D_SERVICE_FILES" in *"|$p|"*) return ;; esac
+    # the same file under another name (/lib -> usr/lib) is dumped once
+    local q o="$IFS"
+    IFS='|'
+    for q in $D_SERVICE_FILES; do
+        [ -n "$q" ] && [ "$p" -ef "$q" ] && { IFS="$o"; return; }
+    done
+    IFS="$o"
     D_SERVICE_FILES="$D_SERVICE_FILES|$p|"
 }
 
