@@ -462,10 +462,8 @@ else
     # after another they took 130s, most of it k8s alone.
     cols="$(cd "$ROOT" && git ls-files 'collectors/*.sh')"
     for c in $cols; do
-        b="$(basename "$c" .sh)"; extra=""
-        [ "$b" = collect-collmysql ] && extra=--no-sudo
-        # shellcheck disable=SC2086
-        (cd "$R" && timeout 400 bash "$ROOT/$c" --stdout $extra </dev/null > "$R/$b.txt" 2> "$R/$b.err") &
+        b="$(basename "$c" .sh)"
+        (cd "$R" && timeout 400 bash "$ROOT/$c" --stdout </dev/null > "$R/$b.txt" 2> "$R/$b.err") &
         case "$c" in collectors/apm/*)
             if command -v dash >/dev/null 2>&1; then
                 (cd "$R" && timeout 400 dash -s -- --stdout < "$ROOT/$c" > "$R/$b.dash.txt" 2> "$R/$b.dash.err") &

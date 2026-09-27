@@ -25,6 +25,24 @@
 export LC_ALL=C
 
 # ---- collector metadata -----------------------------------------------------
+# 0.10.0 Every run samples: section J runs iostat -x and vmstat together for
+#        a 15s window (6 reports each, at a fifth of the window), and
+#        --window=DUR (N, Ns, Nm or Nh, 10s .. 24h) sets its length. It
+#        replaces --sample, which ran the two one after the other for about
+#        50s. J is a goal of every run, blocked only when the deadline cut
+#        or skipped the window or every sampler present failed; an absent
+#        sampler (no sysstat) or one failure of two is a fact line, and
+#        with neither installed the goal is not declared. [1]'s "sampling tier:" line is now "window:".
+#        --out DIR is where --file writes (checked before collecting: an
+#        unwritable one exits 1). Removed options exit 2 naming the
+#        replacement: --no-sudo (it did nothing since 0.8.0), --sample. A
+#        value option with an empty value, or with the next option taken for
+#        it, exits 2; --mysql-args takes a value that starts with '-' (it is
+#        the client's arguments), but not an empty one or one of this
+#        collector's own options (either form, e.g. --defaults-file=/x).
+#        A signal during the window stops the samplers (none is left
+#        running) and the report is written with what they wrote ("ended
+#        early: SIG...").
 # 0.9.0  Binary log sizes come from SHOW BINARY LOGS only: section C lists
 #        the directory once for the mtimes (no du; the listing sums the files
 #        only when SHOW BINARY LOGS gave no list), and section I takes the
@@ -65,7 +83,7 @@ export LC_ALL=C
 #        SHOW BINARY LOGS, a failed or capped decode, a NULL log_bin_basename and
 #        no local mysqld without arguments are gaps with reasons. Needs bash.
 COLLECTOR_NAME="whatap-collmysql"
-VERSION="0.9.0"
+VERSION="0.10.0"
 DOMAIN="collection-server"
 TARGET="collection-server-mysql/$(hostname 2>/dev/null || echo unknown)"
 
@@ -75,9 +93,16 @@ OPT_STDOUT=0
 OPT_QUIET=0
 OPT_BINLOG=0          # decode binary logs and attribute events per table
 BINLOG_FILES=2        # how many of the newest binary logs to decode
-OPT_SAMPLE=0          # interval iostat/vmstat sampling
-SAMPLE_SEC=5
-SAMPLE_COUNT=6
+OPT_OUT="."           # where --file writes
+# The window (section J) runs in every run: iostat -x and vmstat started
+# together, WIN_REPORTS reports each at a fifth of the window. No load on the
+# server, only wall clock. WIN_DEFAULT seconds unless --window=DUR sets it.
+WIN_DEFAULT=15
+WIN_SPEC=""
+WIN_GIVEN=0
+WIN_SECS=0
+WIN_REPORTS=6
+WIN_RESERVE=30        # seconds of the deadline kept for section K and the status
 # The /proc the binary logs are found through (a fake tree in tools/test-collmysql.sh).
 PROC_ROOT="${COLLMYSQL_PROC:-/proc}"
 # Caps come from the environment only, and are whole numbers 1..999999 or they
@@ -90,7 +115,7 @@ for _cv in CMD_TIMEOUT RUN_DEADLINE BINLOG_TIMEOUT PROMPT_TIMEOUT; do
     if [ -n "$_cx" ] && ! _cap_ok "$_cx"; then _CAP_BAD="$_CAP_BAD $_cv=$_cx"; unset "$_cv"; fi
 done
 # RUN_DEADLINE as the caller set it decides whether the deadline is raised to
-# fit a binlog decode and the samplers.
+# fit a binlog decode and the window.
 _RUN_DEADLINE_ENV="${RUN_DEADLINE:-}"
 BINLOG_TIMEOUT="${BINLOG_TIMEOUT:-300}"   # per-file cap for the mysqlbinlog decode
 # The most the -p prompt may wait, so an unanswered prompt does not spend the
@@ -99,7 +124,6 @@ PROMPT_TIMEOUT="${PROMPT_TIMEOUT:-60}"
 MYSQL_ARGS=""         # extra arguments handed to the mysql client
 DEFAULTS_FILE=""
 EXTRA_FILE=""
-OPT_NOSUDO=0
 
 usage() {
     cat <<EOF
@@ -110,10 +134,13 @@ explicit action flag so nothing starts by accident.
   $(basename "$0")                     print this help (no collection)
   $(basename "$0") --file              write the facts report -> ./$COLLECTOR_NAME-<host>-<UTC>.txt
   $(basename "$0") --stdout            print the facts report to stdout
+  $(basename "$0") --out DIR           output directory for --file (default: .)
 
   --defaults-file PATH        option file handed to the mysql client (credentials)
   --defaults-extra-file PATH  option file read in addition to the client's own
   --mysql-args "ARGS"         extra arguments for the mysql client, e.g. "-h 10.0.0.5 -P 3306 -u whatap -p"
+                              (one quoted word; it may start with '-', but may not
+                              be empty or one of this collector's own options)
                               A bare -p asks for the password once, on the terminal.
                               A password on the command line (-pSECRET,
                               --password=SECRET, ...) is refused (exit 2): use -p,
@@ -121,7 +148,10 @@ explicit action flag so nothing starts by accident.
   --binlog[=N]                decode the N newest binary logs and count events per
                               table (default N=$BINLOG_FILES). Reads log files; off by default.
                               Each file is streamed once and capped at ${BINLOG_TIMEOUT}s
-  --sample[=SEC]              add SEC-interval iostat/vmstat samples (default $SAMPLE_SEC s x $SAMPLE_COUNT)
+  --window=DUR                length of the interval samples every run takes
+                              (section J: iostat -x and vmstat together, $WIN_REPORTS reports
+                              each). DUR is N (seconds), Ns, Nm or Nh, 10s .. 24h;
+                              default ${WIN_DEFAULT}s. No load on the server, only wall clock.
   --quiet                     silence progress on stderr
 
 Privilege: the collector runs at the privilege it was started with and never
@@ -134,28 +164,59 @@ invoked with no connection arguments, so it uses its own option files
 (~/.my.cnf, /etc/my.cnf). Every section reports "n/a (<reason>)" when the client
 cannot connect, so a run without credentials still produces the host-side facts.
 
-Environment: CMD_TIMEOUT, RUN_DEADLINE, BINLOG_TIMEOUT, PROMPT_TIMEOUT (seconds).
+Environment (whole numbers 1..999999; another value is ignored with a warning):
+  CMD_TIMEOUT=N     cap on each external command, seconds (default 20)
+  RUN_DEADLINE=N    cap on the whole run, seconds (default 300, raised for
+                    the window and --binlog unless set)
+  BINLOG_TIMEOUT=N  cap on the --binlog decode of one file, seconds (default 300)
+  PROMPT_TIMEOUT=N  the most the -p prompt waits, seconds (default 60)
+  MYSQL_PWD         the password (read, then unset before any child starts)
 EOF
 }
 
 ARGC=$#
+# _removed MESSAGE -> an option that no longer exists: exit 2, naming what
+# replaced it (fd 3 is not open yet, so stderr)
+_removed() { printf '!! %s\n' "$1" >&2; exit 2; }
+# _optval NAME VALUE -> exit 2 when VALUE is empty or starts with '-' (then
+# the next option was taken for the value: `--out --file`)
+_optval() {
+    case "$2" in ''|-*) printf -- 'missing value for %s\n' "$1" >&2; exit 2 ;; esac
+}
+# _clientval VALUE -> exit 2 when the --mysql-args value is empty or is one
+# of this collector's own options (`--mysql-args --file`). A leading '-' is
+# its normal form: the value is the client's own arguments ("-h HOST -u USER").
+_clientval() {
+    case "$1" in
+        '') printf -- 'missing value for --mysql-args\n' >&2; exit 2 ;;
+        --file|--stdout|--quiet|--help|--out|--out=*|--binlog|--binlog=*|--window|--window=*|\
+        --defaults-file|--defaults-file=*|--defaults-extra-file|--defaults-extra-file=*|\
+        --mysql-args|--mysql-args=*|--no-sudo|--sample|--sample=*)
+            printf -- 'missing value for --mysql-args (got the collector option %s; quote the client arguments: --mysql-args "-h HOST -u USER -p")\n' "$1" >&2
+            exit 2 ;;
+    esac
+}
 while [ $# -gt 0 ]; do
     case "$1" in
         --file)    OPT_FILE=1 ;;
         --stdout)  OPT_STDOUT=1 ;;
         --quiet)   OPT_QUIET=1 ;;
-        # Field scripts written for 0.6/0.7 pass it; it changes nothing now.
-        --no-sudo) OPT_NOSUDO=1 ;;
+        --out)     _optval --out "${2:-}"; OPT_OUT="$2"; shift ;;
+        --out=*)   _optval --out "${1#*=}"; OPT_OUT="${1#*=}" ;;
+        --no-sudo)
+            _removed "--no-sudo is no longer an option: the collector never elevates itself; run it with sudo if needed" ;;
         --binlog)  OPT_BINLOG=1 ;;
-        --binlog=*) OPT_BINLOG=1; BINLOG_FILES="${1#*=}" ;;
-        --sample)  OPT_SAMPLE=1 ;;
-        --sample=*) OPT_SAMPLE=1; SAMPLE_SEC="${1#*=}" ;;
-        --defaults-file) shift; DEFAULTS_FILE="${1:-}" ;;
-        --defaults-file=*) DEFAULTS_FILE="${1#*=}" ;;
-        --defaults-extra-file) shift; EXTRA_FILE="${1:-}" ;;
-        --defaults-extra-file=*) EXTRA_FILE="${1#*=}" ;;
-        --mysql-args) shift; MYSQL_ARGS="${1:-}" ;;
-        --mysql-args=*) MYSQL_ARGS="${1#*=}" ;;
+        --binlog=*) _optval --binlog= "${1#*=}"; OPT_BINLOG=1; BINLOG_FILES="${1#*=}" ;;
+        --sample|--sample=*)
+            _removed "--sample was merged into --window: every run samples for ${WIN_DEFAULT}s; use --window=DUR (e.g. --window=60s) for a longer window" ;;
+        --window)  _optval --window "${2:-}"; WIN_GIVEN=1; WIN_SPEC="$2"; shift ;;
+        --window=*) _optval --window "${1#*=}"; WIN_GIVEN=1; WIN_SPEC="${1#*=}" ;;
+        --defaults-file) _optval --defaults-file "${2:-}"; DEFAULTS_FILE="$2"; shift ;;
+        --defaults-file=*) _optval --defaults-file "${1#*=}"; DEFAULTS_FILE="${1#*=}" ;;
+        --defaults-extra-file) _optval --defaults-extra-file "${2:-}"; EXTRA_FILE="$2"; shift ;;
+        --defaults-extra-file=*) _optval --defaults-extra-file "${1#*=}"; EXTRA_FILE="${1#*=}" ;;
+        --mysql-args) _clientval "${2:-}"; MYSQL_ARGS="$2"; shift ;;
+        --mysql-args=*) _clientval "${1#*=}"; MYSQL_ARGS="${1#*=}" ;;
         -h|--help) usage; exit 0 ;;
         *) printf 'unknown argument: %s\n' "$1" >&2; usage >&2; exit 2 ;;
     esac
@@ -1024,7 +1085,7 @@ _binlog_proc() {
         l="${_bl_rows%"$_nl"}"; l="${l##*"$_nl"}"; set -f; set -- $l; set +f; last="${1:-}"; lsz="${2:-}"
     fi
     for d in "$PROC_ROOT"/[0-9]*; do
-        c=""; IFS= read -r c < "$d/comm" 2>/dev/null
+        c=""; { IFS= read -r c < "$d/comm"; } 2>/dev/null
         case "$c" in mysqld|mariadbd) ;; *) continue ;; esac
         p="${d##*/}"
         st=""; IFS= read -r st < "$d/stat" 2>/dev/null; st="${st##*) }"
@@ -1150,6 +1211,130 @@ _bl_newest() {
 
 
 # ---- report body ------------------------------------------------------------
+# ---- the window (section J) -----------------------------------------------
+# _win_secs DUR -> seconds for N, Ns, Nm or Nh (10 .. 86400); 1 when not one
+_win_secs() {
+    local v="$1" n u
+    case "$v" in
+        *s) u=1;    n="${v%s}" ;;
+        *m) u=60;   n="${v%m}" ;;
+        *h) u=3600; n="${v%h}" ;;
+        *)  u=1;    n="$v" ;;
+    esac
+    case "$n" in ''|*[!0-9]*|0*) return 1 ;; esac
+    [ "${#n}" -le 6 ] || return 1
+    n=$((n * u))
+    [ "$n" -ge 10 ] && [ "$n" -le 86400 ] || return 1
+    printf '%s' "$n"
+}
+
+# _window -> section J. iostat -x and vmstat measure the same seconds only when
+# they run at the same time, so both start together as bounded background
+# jobs, WIN_REPORTS reports each at a fifth of the window; their output, stderr
+# and exit status go to files in the private directory. A window the run
+# deadline would cut is shortened (WIN_RESERVE is kept for the sections after
+# it) and says so; one under 10s is not run. Either blocks the goal. The
+# samplers only add detail: one that is absent (no sysstat) or fails is a fact
+# line; the goal is blocked only when every sampler present failed, and is not
+# declared when neither is installed.
+# _win_on_sig SIG -> while the window runs, the first INT / TERM / HUP stops
+# the samplers and ends the window; the report is still written with what
+# they wrote. A second one aborts, as outside the window.
+_WIN_SIG=""
+_WIN_PIDS=""
+_win_on_sig() {
+    local p
+    for p in $_WIN_PIDS; do _kill_tree TERM "$p"; done
+    if [ -n "$_WIN_SIG" ]; then
+        _run_cleanup
+        case "$1" in HUP) exit 129 ;; INT) exit 130 ;; *) exit 143 ;; esac
+    fi
+    _WIN_SIG="$1"
+}
+
+_window() {
+    local w="$WIN_SECS" left iv len cap d t lab rc cut="" rnd="" why="" pkg ok_n=0 p t0 t1
+    if ! have iostat && ! have vmstat; then
+        fact "window: not run (no sampler installed)"
+        fact "iostat -x: n/a (command not found: iostat, sysstat)"
+        fact "vmstat: n/a (command not found: vmstat, procps)"
+        return
+    fi
+    left=$((RUN_DEADLINE - $(_elapsed) - WIN_RESERVE))
+    if [ "$left" -lt 10 ]; then
+        fact "window: n/a (not run: the run deadline (${RUN_DEADLINE}s) leaves under 10s for it)"
+        missed window "not run: the run deadline (${RUN_DEADLINE}s) left under 10s for the window"
+        return
+    fi
+    [ "$left" -lt "$w" ] && w="$left"
+    # the real length: WIN_REPORTS - 1 whole intervals
+    iv=$((w / (WIN_REPORTS - 1))); len=$((iv * (WIN_REPORTS - 1))); cap=$((len + 30))
+    if [ "$w" != "$WIN_SECS" ]; then
+        cut="cut from ${WIN_SECS}s to ${len}s by the run deadline (${RUN_DEADLINE}s)"
+        warn "window: the run deadline (${RUN_DEADLINE}s) cuts the window to ${len}s of ${WIN_SECS}s"
+    fi
+    rnd=""; [ -z "$cut" ] && [ "$len" != "$WIN_SECS" ] && rnd="${WIN_SECS}s rounded down to $((WIN_REPORTS - 1)) whole ${iv}s intervals"
+    if [ -z "$_tmp_dir" ]; then
+        fact "window: n/a (no private temp directory for the samplers' output)"
+        missed window "no private temp directory for the samplers' output"
+        return
+    fi
+    d="$(_tmp win)"; mkdir -p "$d" 2>/dev/null
+    fact "window: ${len}s${cut:+ ($cut)}${rnd:+ ($rnd)}, from $(date '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null || echo n/a); interval ${iv}s, $WIN_REPORTS reports each"
+    progress "window: iostat -x and vmstat for ${len}s"
+    t0="$(_elapsed)"; _WIN_PIDS=""; _WIN_SIG=""
+    for t in iostat vmstat; do
+        have "$t" || continue
+        ( if [ "$t" = iostat ]; then set -- iostat -x "$iv" "$WIN_REPORTS"; else set -- vmstat "$iv" "$WIN_REPORTS"; fi
+          CMD_TIMEOUT="$cap" _bounded "$@" > "$d/$t.out" 2> "$d/$t.err"
+          echo $? > "$d/$t.rc" ) &
+        _WIN_PIDS="$_WIN_PIDS $!"
+    done
+    # set after the fork, so the jobs keep the run helpers' traps
+    trap '_win_on_sig INT' INT
+    trap '_win_on_sig TERM' TERM
+    trap '_win_on_sig HUP' HUP
+    # a trapped signal returns wait early; then the jobs are stopped and waited
+    for p in $_WIN_PIDS; do
+        while kill -0 "$p" 2>/dev/null; do wait "$p" 2>/dev/null; done
+    done
+    t1="$(_elapsed)"
+    trap '_run_cleanup; exit 129' HUP
+    trap '_run_cleanup; exit 130' INT
+    trap '_run_cleanup; exit 143' TERM
+    _WIN_PIDS=""
+    if [ -n "$_WIN_SIG" ]; then
+        fact "ended early: SIG$_WIN_SIG after $((t1 - t0))s of ${len}s; what follows is what the samplers wrote until then"
+        warn "window: SIG$_WIN_SIG after $((t1 - t0))s of ${len}s; writing the report with what was collected (a second one aborts)"
+    fi
+    for t in iostat vmstat; do
+        if [ "$t" = iostat ]; then lab="iostat -x $iv $WIN_REPORTS"; pkg=sysstat
+        else lab="vmstat $iv $WIN_REPORTS"; pkg=procps; fi
+        if ! have "$t"; then
+            fact "$lab: n/a (command not found: $t, $pkg)"; continue
+        fi
+        rc="$(cat "$d/$t.rc" 2>/dev/null)"
+        if [ -n "$_WIN_SIG" ] && [ "$rc" != 0 ]; then
+            if [ -s "$d/$t.out" ]; then _emit_labeled "$lab (stopped by SIG$_WIN_SIG)" "$(cat "$d/$t.out")"
+            else fact "$lab: n/a (stopped by SIG$_WIN_SIG before any output)"; fi
+        elif [ "$rc" = 124 ]; then
+            if _past_deadline; then fact "$lab: n/a (run deadline reached: ${RUN_DEADLINE}s)"; why="$why${why:+; }$t: run deadline reached"
+            else fact "$lab: n/a (timed out: ${cap}s)"; why="$why${why:+; }$t: timed out (${cap}s)"; fi
+        elif [ "$rc" != 0 ]; then
+            _errfile="$d/$t.err"; fact "$lab: n/a ($(_classify_err))"
+            why="$why${why:+; }$t: $(_classify_err)"; _errfile="$(_tmp probe.err)"
+        elif [ ! -s "$d/$t.out" ]; then
+            fact "$lab: n/a (empty output)"; why="$why${why:+; }$t: empty output"
+        else
+            _emit_labeled "$lab" "$(cat "$d/$t.out")"; ok_n=$((ok_n + 1))
+        fi
+    done
+    if [ -n "$_WIN_SIG" ]; then missed window "ended early by SIG$_WIN_SIG after $((t1 - t0))s of ${len}s"
+    elif [ -n "$cut" ]; then missed window "window $cut"
+    elif [ "$ok_n" -eq 0 ]; then missed window "every sampler failed: $why"
+    else got window; fi
+}
+
 run_report() {
     emit_header
 
@@ -1161,6 +1346,9 @@ run_report() {
     goal login  "mysql login"
     goal host   "host-side facts (process, sockets, disk)"
     [ "$OPT_BINLOG" = 1 ] && goal binlog "binary log content attribution"
+    # The samplers only add detail: with neither installed the window has no
+    # input, so no goal (J's fact lines say what is missing).
+    { have iostat || have vmstat; } && goal window "interval samples (iostat -x, vmstat) over the window"
 
     section "Collection environment"
     fact "bash: ${BASH_VERSION:-unknown}"
@@ -1207,7 +1395,9 @@ run_report() {
     # collector; it does not claim that sudo would fix this login.
     else missed login "$MYSQL_WHY${_PW_WHY:+; $_PW_WHY}$(_priv_hint)"; fi
     fact "binlog decode tier: $([ "$OPT_BINLOG" = 1 ] && echo "on (newest $BINLOG_FILES files)" || echo "off")"
-    fact "sampling tier: $([ "$OPT_SAMPLE" = 1 ] && echo "on (${SAMPLE_SEC}s x ${SAMPLE_COUNT})" || echo "off")"
+    if have iostat || have vmstat; then
+        fact "window: ${WIN_SECS}s$([ "$WIN_GIVEN" = 1 ] && echo " (--window)" || echo " (default)")"
+    else fact "window: not run (no sampler installed)"; fi
 
     section "A. Server identity and version"
     # Which account the server matched, not which one was asked for. They differ
@@ -1586,14 +1776,7 @@ EOF
     fi
 
     section "J. Interval samples"
-    if [ "$OPT_SAMPLE" != 1 ]; then
-        fact "n/a (not requested: --sample not given)"
-    else
-        _ct="$CMD_TIMEOUT"; CMD_TIMEOUT=$(( SAMPLE_SEC * SAMPLE_COUNT + 30 ))
-        probe "iostat -x" iostat -x "$SAMPLE_SEC" "$SAMPLE_COUNT"
-        probe "vmstat" vmstat "$SAMPLE_SEC" "$SAMPLE_COUNT"
-        CMD_TIMEOUT="$_ct"
-    fi
+    _window
 
     section "K. MySQL error log"
     ERRLOG="$(mysql_val "SELECT @@log_error" 2>/dev/null)"
@@ -1613,7 +1796,6 @@ EOF
 # ---- main -------------------------------------------------------------------
 exec 3>&2
 [ -n "$_CAP_BAD" ] && warn "ignored from the environment (not a whole number 1..999999 without leading zeros):$_CAP_BAD; the defaults are used"
-[ "$OPT_NOSUDO" = 1 ] && warn "--no-sudo is no longer needed: the collector never elevates"
 
 [ "$ARGC" -eq 0 ] && { usage; exit 0; }
 
@@ -1627,14 +1809,18 @@ _need_int() {
     case "$2" in ''|*[!0-9]*) warn "$1 takes a non-negative integer; got '$2'"; exit 2 ;; esac
 }
 _need_int --binlog "$BINLOG_FILES"
-_need_int --sample "$SAMPLE_SEC"
 [ "$BINLOG_FILES" -lt 1 ] && BINLOG_FILES=1
-[ "$SAMPLE_SEC" -lt 1 ] && SAMPLE_SEC=1
+if [ "$WIN_GIVEN" = 1 ]; then
+    WIN_SECS="$(_win_secs "$WIN_SPEC")" \
+        || { warn "--window takes DUR from 10s to 24h: N (seconds), Ns, Nm or Nh; got '$WIN_SPEC'"; exit 2; }
+else
+    WIN_SECS="$WIN_DEFAULT"
+fi
 # The decode is capped per file; the run deadline is raised to fit it and the
-# samplers (iostat and vmstat run one after the other), unless the caller set one.
+# window (its two samplers run at the same time), unless the caller set one.
 if [ -z "$_RUN_DEADLINE_ENV" ]; then
     [ "$OPT_BINLOG" = 1 ] && RUN_DEADLINE=$((RUN_DEADLINE + BINLOG_FILES * BINLOG_TIMEOUT))
-    [ "$OPT_SAMPLE" = 1 ] && RUN_DEADLINE=$((RUN_DEADLINE + 2 * (SAMPLE_SEC * SAMPLE_COUNT + 30)))
+    RUN_DEADLINE=$((RUN_DEADLINE + WIN_SECS + 30))
 fi
 
 # The private directory first, because the client option file goes into it.
@@ -1644,6 +1830,15 @@ _load_password
 _init_probe
 _build_client_argv
 _resolve_mysql
+# The output directory is checked before collecting, so an unwritable one
+# fails at once rather than after a full run.
+if [ "$OPT_STDOUT" != 1 ]; then
+    mkdir -p "$OPT_OUT" 2>/dev/null
+    if [ ! -d "$OPT_OUT" ] || [ ! -w "$OPT_OUT" ] || [ ! -x "$OPT_OUT" ]; then
+        warn "the report was not written: output directory $OPT_OUT is not writable by uid $(id -u 2>/dev/null || echo '?')"
+        exit 1
+    fi
+fi
 # An identity only. Whether the login worked is the status section's business.
 TARGET="collection-server-mysql/$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || echo unknown)"
 
@@ -1654,7 +1849,7 @@ if [ "$OPT_STDOUT" = 1 ]; then
 else
     HOST="$(hostname 2>/dev/null || echo unknown)"
     TS="$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null || echo unknown)"
-    OUTFILE="./$COLLECTOR_NAME-$HOST-$TS.txt"
+    OUTFILE="$OPT_OUT/$COLLECTOR_NAME-$HOST-$TS.txt"
     progress "collecting facts (read-only) -> writing $OUTFILE"
     # Written as root when the operator ran it with sudo, so give it back to
     # them; otherwise they cannot move or delete their own report.

@@ -163,8 +163,9 @@ echo "== 1. the collector never elevates or re-runs itself =="
 out="$(PATH="$S" bash "$C" --stdout --mysql-args "-u x" </dev/null 2>/dev/null)"
 has "[1] states the privilege it was started with" "$out" "privilege: not root (uid $UID_NOW)"
 chk "sudo is never executed" "" "$(cat "$STUBLOG")"
-err="$(PATH="$S" bash "$C" --stdout --no-sudo --mysql-args "-u x" </dev/null 2>&1 >/dev/null)"
-has "--no-sudo is accepted, and warns that it is no longer needed" "$err" "--no-sudo is no longer needed: the collector never elevates"
+err="$(PATH="$S" bash "$C" --stdout --no-sudo --mysql-args "-u x" </dev/null 2>&1 >/dev/null)"; rc=$?
+chk "0.10.0: --no-sudo is removed (exit 2)" "2" "$rc"
+has "and the message says why and what to do" "$err" "--no-sudo is no longer an option: the collector never elevates itself; run it with sudo if needed"
 for o in "--mysql-pwfd 0" "--mysql-pwsrc terminal" "--mysql-pwfile /etc/hostname" "--run-marker /x/ggt.y/started" "--env CMD_TIMEOUT=5"; do
     # shellcheck disable=SC2086
     chk "$o is gone (unknown, exit 2)" "2" "$(PATH="$S" bash "$C" --stdout $o </dev/null >/dev/null 2>&1; echo $?)"
@@ -220,23 +221,23 @@ echo "== 6. the binlog decode is obtained only when every file decoded =="
 # mysqlbinlog's and resolved the goal as obtained before decoding anything.
 D2="$ROOT/binlogs2"; mkdir -p "$D2"; : >| "$D2/mysql-bin.000001"; : >| "$D2/mysql-bin.000002"
 export MYSQL_BL_ROWS='mysql-bin.000001\t0\nmysql-bin.000002\t0'
-out="$(MYSQLBINLOG_MODE=mixed BINLOG_BASE_ANS="$D2/mysql-bin" PATH="$S" bash "$C" --stdout --no-sudo --binlog --mysql-args "-u x" </dev/null 2>/dev/null)"
+out="$(MYSQLBINLOG_MODE=mixed BINLOG_BASE_ANS="$D2/mysql-bin" PATH="$S" bash "$C" --stdout --binlog --mysql-args "-u x" </dev/null 2>/dev/null)"
 if printf '%s' "$out" | grep -qF "row events (count): 2" \
    && printf '%s' "$out" | grep -qF "binary log content attribution — mysql-bin.000002: mysqlbinlog exit 1, permission denied"; then
     ok "one file decoded, one refused: the decoded one is counted and the refused one blocks the goal"
 else bad "one file decoded, one refused: counted, and blocked by the refused one" "both" "$(printf '%s' "$out" | grep -m2 'row events\|binary log content attribution —')"; fi
-out="$(MYSQLBINLOG_MODE=fail BINLOG_BASE_ANS="$D2/mysql-bin" PATH="$S" bash "$C" --stdout --no-sudo --binlog --mysql-args "-u x" </dev/null 2>/dev/null)"
+out="$(MYSQLBINLOG_MODE=fail BINLOG_BASE_ANS="$D2/mysql-bin" PATH="$S" bash "$C" --stdout --binlog --mysql-args "-u x" </dev/null 2>/dev/null)"
 has "every file refused: INCOMPLETE" "$out" "status: INCOMPLETE"
 hasnt "and not obtained" "$out" "obtained: mysql login, host-side facts (process, sockets, disk), binary log content attribution"
 t0=$(date +%s)
-out="$(MYSQLBINLOG_MODE=hang BINLOG_TIMEOUT=2 BINLOG_BASE_ANS="$D2/mysql-bin" PATH="$S" bash "$C" --stdout --no-sudo --binlog=1 --mysql-args "-u x" </dev/null 2>/dev/null)"
+out="$(MYSQLBINLOG_MODE=hang BINLOG_TIMEOUT=2 BINLOG_BASE_ANS="$D2/mysql-bin" PATH="$S" bash "$C" --stdout --binlog=1 --mysql-args "-u x" </dev/null 2>/dev/null)"
 t1=$(date +%s)
 has "a decode at its cap is partial and blocked" "$out" "decode stopped at the 2s cap (partial)"
 [ $((t1 - t0)) -le 30 ] && ok "and the cap binds ($((t1 - t0))s)" || bad "the cap binds" "<= 30s" "$((t1 - t0))s"
-out="$(BINLOG_BASE_ANS=NULL PATH="$S" bash "$C" --stdout --no-sudo --binlog --mysql-args "-u x" </dev/null 2>/dev/null)"
+out="$(BINLOG_BASE_ANS=NULL PATH="$S" bash "$C" --stdout --binlog --mysql-args "-u x" </dev/null 2>/dev/null)"
 has "a NULL basename is unresolved, not the cwd" "$out" "binary log directory not resolved: @@log_bin_basename is NULL"
 hasnt "and nothing is decoded" "$out" "decoding the"
-out="$(MYSQL_FAIL=1 PATH="$S" bash "$C" --stdout --no-sudo --binlog --mysql-args "-u x" </dev/null 2>/dev/null)"
+out="$(MYSQL_FAIL=1 PATH="$S" bash "$C" --stdout --binlog --mysql-args "-u x" </dev/null 2>/dev/null)"
 has "no login: the basename was not queried, and says so" "$out" "binlog directory: n/a (not queried: access denied)"
 unset MYSQL_BL_ROWS
 
@@ -300,9 +301,11 @@ err="$(CMD_TIMEOUT=0030 PATH="$S" bash "$C" --stdout --mysql-args "-u x" </dev/n
 has "a leading zero is refused, and the warning says why" "$err" "(not a whole number 1..999999 without leading zeros): CMD_TIMEOUT=0030"
 out="$(MYSQL_SLEEP=5 RUN_DEADLINE=2 PATH="$S" bash "$C" --stdout --mysql-args "-u x" </dev/null 2>/dev/null)"
 has "a login cut by the run deadline says so, not 'timed out: 20s'" "$out" "mysql connection: run deadline reached (2s) before the login"
-out="$(PATH="$S" bash "$C" --stdout --sample=1 </dev/null 2>/dev/null)"
-has "--sample: the deadline covers both samplers" "$out" "run deadline(s): 372"
-out="$(MYSQL_BL_DENY=1 MYSQLBINLOG_MODE=ok BINLOG_BASE_ANS="$D2/mysql-bin" PATH="$S" bash "$C" --stdout --no-sudo --binlog --mysql-args "-u x" </dev/null 2>/dev/null)"
+out="$(PATH="$S" bash "$C" --stdout </dev/null 2>/dev/null)"
+has "the default window raises the deadline by its length and 30s" "$out" "run deadline(s): 345"
+out="$(PATH="$S" bash "$C" --stdout --window=1m </dev/null 2>/dev/null)"
+has "--window=1m: the deadline covers the window once (the samplers run together)" "$out" "run deadline(s): 390"
+out="$(MYSQL_BL_DENY=1 MYSQLBINLOG_MODE=ok BINLOG_BASE_ANS="$D2/mysql-bin" PATH="$S" bash "$C" --stdout --binlog --mysql-args "-u x" </dev/null 2>/dev/null)"
 if printf '%s' "$out" | grep -qF "binary logs: n/a (SHOW BINARY LOGS: access denied)" \
    && printf '%s' "$out" | grep -qF "binary log content attribution — SHOW BINARY LOGS: access denied"; then
     ok "ERROR 1227 on SHOW BINARY LOGS is n/a with the error, and blocks the binlog goal"
@@ -366,18 +369,18 @@ chk "and no sudo was run by any case above" "" "$(cat "$STUBLOG")"
 echo "== 10. client arguments are words, not a string to re-split =="
 DF="$ROOT/my dir/my.cnf"; mkdir -p "$ROOT/my dir"; printf '[client]\nuser=x\n' > "$DF"
 W="$ROOT/globdir"; mkdir -p "$W"; : >| "$W/xa"; : >| "$W/xb"; : >| "$A"
-( cd "$W" && STUBARGS="$A" PATH="$S" bash "$C" --stdout --no-sudo --defaults-file "$DF" --mysql-args "-u x*" </dev/null >/dev/null 2>&1 )
+( cd "$W" && STUBARGS="$A" PATH="$S" bash "$C" --stdout --defaults-file "$DF" --mysql-args "-u x*" </dev/null >/dev/null 2>&1 )
 chk "a --defaults-file path with a space is one argument" "1" "$(grep -cxF -- "--defaults-file=$DF" "$A" | awk '{print ($1>0)}')"
 chk "a glob character is not expanded against the cwd" "1" "$(grep -cxF -- 'x*' "$A" | awk '{print ($1>0)}')"
 hasnt "no cwd file name arrives as an argument" "$(cat "$A")" "xa"
 
 echo "== 11. nowhere to log in is blocked, not an answer =="
 if ! ps -eo args 2>/dev/null | grep -qE '[m]ysqld|[m]ariadbd'; then
-    out="$(MYSQL_FAIL=1 PATH="$S" bash "$C" --stdout --no-sudo </dev/null 2>/dev/null)"
+    out="$(MYSQL_FAIL=1 PATH="$S" bash "$C" --stdout </dev/null 2>/dev/null)"
     has "the reason names --mysql-args" "$out" "mysql login — no local mysqld found and no --mysql-args given"
     has "and the run is INCOMPLETE" "$out" "status: INCOMPLETE"
 else skip "the no-local-mysqld case (a mysqld runs on this machine)"; fi
-chk "a bad --binlog count exits 2" "2" "$(PATH="$S" bash "$C" --stdout --no-sudo --binlog=two </dev/null >/dev/null 2>&1; echo $?)"
+chk "a bad --binlog count exits 2" "2" "$(PATH="$S" bash "$C" --stdout --binlog=two </dev/null >/dev/null 2>&1; echo $?)"
 
 echo "== 12. round 7: a no-value flag, TCP logins, a word after -p =="
 : >| "$A"
@@ -420,7 +423,7 @@ echo "ls \$*" >> "$LSLOG"
 exec "$REAL_LS" "\$@"
 EOF
 D3="$ROOT/binlogs3"; mkdir -p "$D3"; : >| "$D3/mysql-bin.000001"; printf 'abcdefg' >| "$D3/mysql-bin.000002"
-out="$(MYSQL_BL_ROWS='mysql-bin.000001\t100\nmysql-bin.000002\t5' BINLOG_BASE_ANS="$D3/mysql-bin" PATH="$S14" bash "$C" --stdout --no-sudo --binlog --mysql-args "-u x" </dev/null 2>/dev/null)"
+out="$(MYSQL_BL_ROWS='mysql-bin.000001\t100\nmysql-bin.000002\t5' BINLOG_BASE_ANS="$D3/mysql-bin" PATH="$S14" bash "$C" --stdout --binlog --mysql-args "-u x" </dev/null 2>/dev/null)"
 has "the decoded file's size is the server's" "$out" "file: mysql-bin.000002 (5 bytes)"
 has "and the older one's too, newest first" "$out" "file: mysql-bin.000001 (100 bytes)"
 [ "$(printf '%s' "$out" | grep -n 'file: mysql-bin.00000[12]' | head -1 | grep -c 000002)" = 1 ] \
@@ -429,29 +432,29 @@ chk "one directory listing for the whole run" "1" "$(grep -c . "$LSLOG")"
 hasnt "no directory total next to the server's" "$out" "(directory listing)"
 has "the listing still carries the mtimes" "$out" "newest binlog files (mtime, bytes):"
 : >| "$LSLOG"
-out="$(MYSQL_BL_DENY=1 BINLOG_BASE_ANS="$D3/mysql-bin" PATH="$S14" bash "$C" --stdout --no-sudo --binlog --mysql-args "-u x" </dev/null 2>/dev/null)"
+out="$(MYSQL_BL_DENY=1 BINLOG_BASE_ANS="$D3/mysql-bin" PATH="$S14" bash "$C" --stdout --binlog --mysql-args "-u x" </dev/null 2>/dev/null)"
 has "SHOW BINARY LOGS refused: the listing sums the files" "$out" "total: 2 files, 7 bytes (directory listing)"
 has "and the decode's sizes come from the directory" "$out" "file: mysql-bin.000002 (7 bytes)"
-out="$(MYSQL_BL_ROWS='mysql-bin.000008\t5\nmysql-bin.000009\t5' BINLOG_BASE_ANS="$D3/mysql-bin" PATH="$S14" bash "$C" --stdout --no-sudo --binlog --mysql-args "-u x" </dev/null 2>/dev/null)"
+out="$(MYSQL_BL_ROWS='mysql-bin.000008\t5\nmysql-bin.000009\t5' BINLOG_BASE_ANS="$D3/mysql-bin" PATH="$S14" bash "$C" --stdout --binlog --mysql-args "-u x" </dev/null 2>/dev/null)"
 has "the server's newest log is not in the process's directory: not the server, blocked" "$out" "binary log content attribution — the server's process (pid file $ROOT/run/mysqld.pid) is not on this host: no local mysqld/mariadbd is it: 4242(no mysql-bin.000009, the server's newest log)"
 
 echo "== 15. 0.9.0: every selected file is decoded, or named; another host's files are not the server's =="
-out="$(MYSQL_BL_ROWS='mysql-bin.000000\t300\nmysql-bin.000001\t100\nmysql-bin.000002\t5' BINLOG_BASE_ANS="$D3/mysql-bin" PATH="$S" bash "$C" --stdout --no-sudo --binlog=3 --mysql-args "-u x" </dev/null 2>/dev/null)"
+out="$(MYSQL_BL_ROWS='mysql-bin.000000\t300\nmysql-bin.000001\t100\nmysql-bin.000002\t5' BINLOG_BASE_ANS="$D3/mysql-bin" PATH="$S" bash "$C" --stdout --binlog=3 --mysql-args "-u x" </dev/null 2>/dev/null)"
 R3="$FP/4242/root$D3"
 has "a selected file that is not there is named in the section" "$out" "skipped: mysql-bin.000000 (listed by SHOW BINARY LOGS; $R3/mysql-bin.000000 is not a file on this host)"
 has "and blocks the goal, though the others decoded" "$out" "binary log content attribution — mysql-bin.000000: not a file at $R3/mysql-bin.000000 on this host"
 has "the others are still decoded" "$out" "file: mysql-bin.000002 (5 bytes)"
 D4="$ROOT/binlogs4"; mkdir -p "$D4"; : >| "$D4/mysql-bin.000001"
-out="$(MYSQL_BL_ROWS='mysql-bin.000001\t0\nmysql-bin.000001\t0' BINLOG_BASE_ANS="$D4/mysql-bin" BINLOG_INDEX_ANS="$ROOT/noindex" PATH="$S" bash "$C" --stdout --no-sudo --binlog=2 --mysql-args "-u x" </dev/null 2>/dev/null)"
+out="$(MYSQL_BL_ROWS='mysql-bin.000001\t0\nmysql-bin.000001\t0' BINLOG_BASE_ANS="$D4/mysql-bin" BINLOG_INDEX_ANS="$ROOT/noindex" PATH="$S" bash "$C" --stdout --binlog=2 --mysql-args "-u x" </dev/null 2>/dev/null)"
 has "a name listed twice with no index: said, and blocked" "$out" "binary log content attribution — none of the 2 newest files SHOW BINARY LOGS lists was decoded: mysql-bin.000001: listed 2 times, no readable index to tell them apart"
 printf '%s\n' "$D3/mysql-bin.000001" "$D4/mysql-bin.000001" >| "$ROOT/index15"
-out="$(MYSQL_BL_ROWS='mysql-bin.000001\t0\nmysql-bin.000001\t0' BINLOG_BASE_ANS="$D4/mysql-bin" BINLOG_INDEX_ANS="$ROOT/index15" PATH="$S" bash "$C" --stdout --no-sudo --binlog=2 --mysql-args "-u x" </dev/null 2>/dev/null)"
+out="$(MYSQL_BL_ROWS='mysql-bin.000001\t0\nmysql-bin.000001\t0' BINLOG_BASE_ANS="$D4/mysql-bin" BINLOG_INDEX_ANS="$ROOT/index15" PATH="$S" bash "$C" --stdout --binlog=2 --mysql-args "-u x" </dev/null 2>/dev/null)"
 has "with a readable index both are decoded, each named by its path" "$out" "file: $FP/4242/root$D4/mysql-bin.000001 (0 bytes)"
 has "the other too" "$out" "file: $R3/mysql-bin.000001 (0 bytes)"
 has "and the goal is obtained" "$out" "obtained: mysql login, host-side facts (process, sockets, disk), binary log content attribution"
 echo "  -- 0.9.0: the files are the server process's, found through /proc/<pid>/root --"
 BL2='mysql-bin.000001\t0\nmysql-bin.000002\t7'
-run15() { MYSQL_BL_ROWS="$BL2" BINLOG_BASE_ANS="$D3/mysql-bin" PATH="$S" bash "$C" --stdout --no-sudo --binlog=2 --mysql-args "-u x" </dev/null 2>/dev/null; }
+run15() { MYSQL_BL_ROWS="$BL2" BINLOG_BASE_ANS="$D3/mysql-bin" PATH="$S" bash "$C" --stdout --binlog=2 --mysql-args "-u x" </dev/null 2>/dev/null; }
 out="$(run15)"
 has "the server's process: one fact says how the files were found" "$(nt "$out")" "binlog files: via pid 4242 (connection local (Localhost via UNIX socket); pid file $ROOT/run/mysqld.pid, read through $FP/4242/root, holds its pid 4242, written Ns after the server started, holds the newest log mysql-bin.000002), $FP/4242/root$D3"
 has "and they are decoded" "$out" "obtained: mysql login, host-side facts (process, sockets, disk), binary log content attribution"
@@ -553,16 +556,16 @@ has "a zombie mysqld is not a candidate" "$out" "no mysqld or mariadbd process r
 rm -rf "$FP/4249"; pidf "$ROOT/run/mysqld.pid" 4242; mv "$ROOT/p4242" "$FP/4242"
 # a rotation between SHOW BINARY LOGS and the listing: asked once more
 : >| "$D3/mysql-bin.000003"; BLC="$ROOT/blcount"; : >| "$BLC"
-out="$(BLCOUNT="$BLC" MYSQL_BL_ROWS2='mysql-bin.000001\t0\nmysql-bin.000002\t7\nmysql-bin.000003\t0' MYSQL_BL_ROWS="$BL2" BINLOG_BASE_ANS="$D3/mysql-bin" PATH="$S" bash "$C" --stdout --no-sudo --binlog=1 --mysql-args "-u x" </dev/null 2>/dev/null)"
+out="$(BLCOUNT="$BLC" MYSQL_BL_ROWS2='mysql-bin.000001\t0\nmysql-bin.000002\t7\nmysql-bin.000003\t0' MYSQL_BL_ROWS="$BL2" BINLOG_BASE_ANS="$D3/mysql-bin" PATH="$S" bash "$C" --stdout --binlog=1 --mysql-args "-u x" </dev/null 2>/dev/null)"
 has "a log newer than the listed newest, listed when asked again: the server" "$out" "binlog files: via pid 4242"
 has "and the new newest is the one decoded" "$out" "file: mysql-bin.000003 (0 bytes)"
 chk "SHOW BINARY LOGS asked twice" "2" "$(wc -l < "$BLC" | tr -d ' ')"
 : >| "$BLC"
-out="$(BLCOUNT="$BLC" MYSQL_BL_ROWS2="$BL2" MYSQL_BL_ROWS="$BL2" BINLOG_BASE_ANS="$D3/mysql-bin" PATH="$S" bash "$C" --stdout --no-sudo --binlog=1 --mysql-args "-u x" </dev/null 2>/dev/null)"
+out="$(BLCOUNT="$BLC" MYSQL_BL_ROWS2="$BL2" MYSQL_BL_ROWS="$BL2" BINLOG_BASE_ANS="$D3/mysql-bin" PATH="$S" bash "$C" --stdout --binlog=1 --mysql-args "-u x" </dev/null 2>/dev/null)"
 has "still not listed when asked again: not the server, with the fresh newest" "$out" "4242(holds mysql-bin.000003, which SHOW BINARY LOGS does not list (asked again; its newest: mysql-bin.000002))"
 # rotated again between the listing and the second ask: the listing's newest is listed, not last
 : >| "$D3/mysql-bin.000003"; : >| "$BLC"
-out="$(BLCOUNT="$BLC" MYSQL_BL_ROWS2='mysql-bin.000001\t0\nmysql-bin.000002\t7\nmysql-bin.000003\t0\nmysql-bin.000004\t0' MYSQL_BL_ROWS="$BL2" BINLOG_BASE_ANS="$D3/mysql-bin" PATH="$S" bash "$C" --stdout --no-sudo --binlog=1 --mysql-args "-u x" </dev/null 2>/dev/null)"
+out="$(BLCOUNT="$BLC" MYSQL_BL_ROWS2='mysql-bin.000001\t0\nmysql-bin.000002\t7\nmysql-bin.000003\t0\nmysql-bin.000004\t0' MYSQL_BL_ROWS="$BL2" BINLOG_BASE_ANS="$D3/mysql-bin" PATH="$S" bash "$C" --stdout --binlog=1 --mysql-args "-u x" </dev/null 2>/dev/null)"
 has "the listing's newest listed among newer ones: the server" "$out" "binlog files: via pid 4242"
 rm -f "$D3/mysql-bin.000003"
 mv "$FP/4242" "$ROOT/p4242"
@@ -602,9 +605,107 @@ if [ "$UID_NOW" != 0 ]; then
     has "and decoded" "$out" "obtained: mysql login, host-side facts (process, sockets, disk), binary log content attribution"
     chmod 755 "$ROOT/lockedroot"; rm -rf "$FP/4246"; mv "$ROOT/p4242" "$FP/4242"
 else skip "the unreadable-root cases (root enters every root)"; fi
-out="$(MYSQL_BL_PARTIAL='mysql-bin.000001\t100' BINLOG_BASE_ANS="$D3/mysql-bin" PATH="$S" bash "$C" --stdout --no-sudo --mysql-args "-u x" </dev/null 2>/dev/null)"
+out="$(MYSQL_BL_PARTIAL='mysql-bin.000001\t100' BINLOG_BASE_ANS="$D3/mysql-bin" PATH="$S" bash "$C" --stdout --mysql-args "-u x" </dev/null 2>/dev/null)"
 has "a failed SHOW BINARY LOGS is n/a" "$out" "binary logs: n/a (SHOW BINARY LOGS: "
 has "and its partial rows are not used: the listing sums the files" "$out" "total: 2 files, 7 bytes (directory listing)"
+
+echo "== 16. 0.10.0: options: removed ones, values, --out =="
+for o in "--sample|--sample was merged into --window" "--sample=5|--sample was merged into --window" \
+         "--window|missing value for --window" "--window --file|missing value for --window" \
+         "--window=5|--window takes DUR from 10s to 24h" "--window=25h|--window takes DUR from 10s to 24h" \
+         "--window=1x|--window takes DUR from 10s to 24h" "--out|missing value for --out" \
+         "--out=|missing value for --out" "--binlog=|missing value for --binlog=" \
+         "--defaults-file|missing value for --defaults-file" \
+         "--defaults-extra-file --file|missing value for --defaults-extra-file" \
+         "--mysql-args|missing value for --mysql-args" "--mysql-args=|missing value for --mysql-args" \
+         "--mysql-args --file|missing value for --mysql-args (got the collector option --file" \
+         "--mysql-args --defaults-file=/x|missing value for --mysql-args (got the collector option --defaults-file=/x" \
+         "--mysql-args=--defaults-extra-file=/x|missing value for --mysql-args (got the collector option --defaults-extra-file=/x"; do
+    a="${o%%|*}"; want="${o#*|}"; : >| "$A"
+    # shellcheck disable=SC2086
+    err="$(STUBARGS="$A" PATH="$S" bash "$C" --stdout $a </dev/null 2>&1 >/dev/null)"; rc=$?
+    chk "$a exits 2" "2" "$rc"
+    has "$a says so" "$err" "$want"
+    chk "$a: before any child" "0" "$(wc -l < "$A" | tr -d ' ')"
+done
+: >| "$A"
+PATH="$S" STUBARGS="$A" bash "$C" --stdout --mysql-args "-h 127.0.0.1 -u x" </dev/null >/dev/null 2>&1
+chk "--mysql-args takes a value that starts with '-'" "1" "$(grep -cxF -- '127.0.0.1' "$A" | awk '{print ($1>0)}')"
+O16="$ROOT/out16"
+( cd "$ROOT" && PATH="$S" bash "$C" --file --out "$O16" --mysql-args "-u x" </dev/null >/dev/null 2>&1 )
+chk "--file --out DIR writes the report there (the directory is made)" "1" "$(ls "$O16"/whatap-collmysql-*.txt 2>/dev/null | wc -l | tr -d ' ')"
+if [ "$UID_NOW" != 0 ]; then
+    RO="$ROOT/ro16"; mkdir -p "$RO"; chmod 555 "$RO"; : >| "$A"
+    err="$(STUBARGS="$A" PATH="$S" bash "$C" --file --out "$RO" --mysql-args "-u x" </dev/null 2>&1 >/dev/null)"; rc=$?
+    chk "an unwritable --out exits 1" "1" "$rc"
+    has "and says so" "$err" "output directory $RO is not writable by uid"
+    hasnt "before any section ran" "$err" ">> [1]"
+    chmod 755 "$RO"
+else skip "the unwritable --out case (root writes anywhere)"; fi
+
+echo "== 17. 0.10.0: the window: iostat -x and vmstat together, in every run =="
+S17="$ROOT/stub17"; stub_clone "$S" "$S17"
+for t in iostat vmstat; do
+    stub_write "$S17/$t" <<'EOF'
+#!/bin/sh
+# prints its arguments, then sleeps what the real tool would: (count - 1) x interval
+iv=""; for a in "$@"; do case "$a" in -*) ;; *) [ -z "$iv" ] && iv="$a" ;; esac; n="$a"; done
+echo "$(basename "$0") start $(date +%s) args $*"
+sleep $(( iv * (n - 1) ))
+echo "$(basename "$0") end $(date +%s)"
+EOF
+done
+t0=$(date +%s)
+out="$(PATH="$S17" bash "$C" --stdout --window=10 --mysql-args "-u x" </dev/null 2>/dev/null)"
+t1=$(date +%s)
+has "[1] names the window" "$out" "window: 10s (--window)"
+has "J: the window's interval and report count" "$out" "interval 2s, 6 reports each"
+has "iostat -x ran over the window, with interval and count" "$out" "iostat start"
+has "with interval and count" "$out" "args -x 2 6"
+has "vmstat ran over it too" "$out" "vmstat start"
+a17="$(printf '%s\n' "$out" | awk '/iostat start/{print $3}')"; b17="$(printf '%s\n' "$out" | awk '/vmstat start/{print $3}')"
+[ -n "$a17" ] && [ -n "$b17" ] && [ $((a17 - b17)) -le 1 ] && [ $((b17 - a17)) -le 1 ] \
+    && ok "they started together ($a17, $b17)" || bad "started together" "within 1s" "$a17 / $b17"
+[ $((t1 - t0)) -le 18 ] && ok "one window, not two ($((t1 - t0))s for a 10s window)" || bad "one window" "<= 18s" "$((t1 - t0))s"
+has "the goal is obtained" "$(printf '%s\n' "$out" | grep '^    obtained:')" "interval samples"
+out="$(RUN_DEADLINE=45 PATH="$S17" bash "$C" --stdout --window=1m --mysql-args "-u x" </dev/null 2>/dev/null)"
+has "a caller's deadline cuts the window, and J says so" "$out" "(cut from 60s to 10s by the run deadline (45s))"
+has "J states the real length" "$out" "window: 10s (cut from"
+has "and the goal is blocked with it" "$out" "window cut from 60s to 10s by the run deadline (45s)"
+RUN_DEADLINE=47 PATH="$S17" bash "$C" --stdout --window=1m --mysql-args "-u x" </dev/null >| "$ROOT/o17c" 2>| "$ROOT/e17c"
+l1="$(sed -n 's/.*cuts the window to \([0-9]*\)s of 60s.*/\1/p' "$ROOT/e17c")"
+l2="$(sed -n 's/^    window: \([0-9]*\)s (cut from 60s to \([0-9]*\)s.*/\1 \2/p' "$ROOT/o17c")"
+chk "the terminal and J state the same real length (a multiple of the interval)" "$l1 $l1" "$l2"
+[ -n "$l1" ] && [ $((l1 % 5)) = 0 ] && ok "and it is whole intervals (${l1}s)" || bad "whole intervals" "a multiple of 5" "$l1"
+O17="$ROOT/o17"
+PATH="$S17" bash "$C" --stdout --window=60 --mysql-args "-u x" </dev/null >| "$O17" 2>/dev/null & c17=$!
+w17=0; until grep -q '^    window: 60s, from' "$O17" 2>/dev/null || [ "$w17" -ge 60 ]; do sleep 1; w17=$((w17 + 1)); done
+sleep 2; t0=$(date +%s); kill -TERM "$c17"; wait "$c17"; rc17=$?; t1=$(date +%s)
+out="$(cat "$O17")"
+chk "TERM in the window: the report is still written (exit 0)" "0" "$rc17"
+[ $((t1 - t0)) -le 10 ] && ok "and at once ($((t1 - t0))s)" || bad "ends at once" "<= 10s" "$((t1 - t0))s"
+has "J says it ended early" "$out" "ended early: SIGTERM after"
+has "and keeps what the samplers wrote" "$out" "iostat -x 12 6 (stopped by SIGTERM):"
+has "the goal is blocked with it" "$out" "over the window — ended early by SIGTERM after"
+has "the report reaches its footer" "$out" "==== END OF COLLECTION"
+chk "no sampler left running" "" "$(pgrep -f "$S17/(iostat|vmstat)" 2>/dev/null | head -1)"
+out="$(RUN_DEADLINE=20 PATH="$S17" bash "$C" --stdout --mysql-args "-u x" </dev/null 2>/dev/null)"
+has "a deadline that leaves under 10s: not run" "$out" "window: n/a (not run: the run deadline (20s) leaves under 10s for it)"
+out="$(PATH="$S" bash "$C" --stdout --mysql-args "-u x" </dev/null 2>/dev/null)"
+has "neither sampler installed: a fact line each" "$out" "iostat -x: n/a (command not found: iostat, sysstat)"
+has "vmstat too" "$out" "vmstat: n/a (command not found: vmstat, procps)"
+hasnt "and no window goal is declared" "$out" "interval samples (iostat -x, vmstat)"
+has "[1] says the window did not run" "$(printf '%s\n' "$out" | sed -n '/^\[1\]/,/^\[2\]/p')" "window: not run (no sampler installed)"
+S17b="$ROOT/stub17b"; stub_clone "$S17" "$S17b"; rm -f "$S17b/iostat"
+out="$(PATH="$S17b" bash "$C" --stdout --window=10 --mysql-args "-u x" </dev/null 2>/dev/null)"
+has "no sysstat, vmstat present: iostat is a fact line" "$out" "iostat -x 2 6: n/a (command not found: iostat, sysstat)"
+has "and the goal is obtained" "$(printf '%s\n' "$out" | grep '^    obtained:')" "interval samples"
+stub_write "$S17b/vmstat" <<'EOF'
+#!/bin/sh
+echo "vmstat: broken" >&2; exit 1
+EOF
+out="$(PATH="$S17b" bash "$C" --stdout --window=10 --mysql-args "-u x" </dev/null 2>/dev/null)"
+has "every sampler present failed: the goal is blocked" "$out" "interval samples (iostat -x, vmstat) over the window — every sampler failed: vmstat: error: vmstat: broken"
 
 echo; echo "PASS=$PASS FAIL=$FAIL SKIP=$SKIP"
 [ "$FAIL" -eq 0 ]

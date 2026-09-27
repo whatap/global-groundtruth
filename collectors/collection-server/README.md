@@ -104,6 +104,48 @@ one command, hand over one file (CONTRACT rule 3):
 ./collect-collserver.sh --help          # all options
 ```
 
+**Options** (14): `--file`, `--stdout`, `--bundle`, `--quiet`, `--home DIR`,
+`--out DIR`, `--hours N`, `--with-rotated[=DAYS]`, `--threads[=N]`, `--histo`,
+`--heap`, `--du`, `--time-ref[=SRV]`, `--help`. A value option with no value,
+or with the next option taken for it (`--out --file`), exits 2.
+
+| option | what it does |
+|---|---|
+| `--home DIR` | forces `WHATAP_HOME` (else auto-resolved, see (a)) |
+| `--out DIR` | where `--file` / `--bundle` write (default `.`); checked before collecting, an unwritable one exits 1 |
+| `--hours N` | journal window in hours (default 24): the report's journal errors (G) and the bundle's journal |
+| `--with-rotated[=DAYS]` | bundle: also copy rotated logs from the last DAYS days (default 14) |
+| `--threads[=N]`, `--histo`, `--heap`, `--du` | Tier 2, bundle only (below) |
+| `--time-ref[=SRV]` | Tier 0 opt-in: compare the clock to an external NTP/HTTP source |
+
+`--threads`, `--histo`, `--heap`, `--du` and `--with-rotated` work on the
+bundle only. Given without `--bundle` they are not run, and the terminal
+names them (`!! not run: --threads --du (bundle only; add --bundle to collect
+them)`); the run deadline is not raised for them.
+
+**Environment** (whole numbers 1..999999; another value is ignored with a
+warning, and the default is used):
+
+| variable | default | what it bounds |
+|---|---|---|
+| `CMD_TIMEOUT` | 20 | each external command, seconds |
+| `RUN_DEADLINE` | 300 | the whole run, seconds; raised for the Tier 2 probes unless set |
+| `LOG_FILE_MB` | 5 | bundle: each copied log, MB (a larger file is tail-copied) |
+| `LOG_TOTAL_MB` | 100 | bundle: all copied logs together, MB |
+
+`WHATAP_HOME` in the environment is one of the candidates `--home` overrides.
+
+**Options removed in 0.11.0.** Each exits 2 with a message naming its replacement:
+
+| removed | use instead |
+|---|---|
+| `--max-log-mb M` | `LOG_FILE_MB=M` in the environment (default 5) |
+| `--max-total-mb M` | `LOG_TOTAL_MB=M` in the environment (default 100) |
+| `--log-days N` | `--with-rotated=N` (it only ever applied with `--with-rotated`) |
+
+A runbook line `--bundle --with-rotated --log-days 30 --max-total-mb 300` is
+now `LOG_TOTAL_MB=300 ./collect-collserver.sh --bundle --with-rotated=30`.
+
 While it runs, each phase is narrated on **stderr** (`>> ...`) so you can see it
 working on a slow host; the report itself stays clean. A collection needs an
 explicit action flag — running `./collect-collserver.sh` with no arguments just prints help,
@@ -120,10 +162,10 @@ so nothing starts by accident.
 
   Logs decide the size of a bundle, so they have their own rules. Current
   (non-rotated) logs are copied; rotated ones need `--with-rotated`. Each file is
-  capped at `--max-log-mb` (default 5) and all of them together at
-  `--max-total-mb` (default 100); a file over the per-file cap is tail-copied so
-  its newest end survives. With `--with-rotated`, `--log-days` (default 14)
-  bounds how far back to go.
+  capped at `LOG_FILE_MB` (default 5) and all of them together at
+  `LOG_TOTAL_MB` (default 100), both from the environment; a file over the
+  per-file cap is tail-copied so its newest end survives. `--with-rotated=DAYS`
+  (default 14) bounds how far back to go.
 
   **Whatever is not copied is written down.** `logs/SELECTION.txt` lists every
   candidate with its state (`kept` / `truncated` / `dropped`), its size and the
@@ -149,7 +191,7 @@ whole run under `RUN_DEADLINE` (300 s, raised for Tier 2: jstack is capped at
 journal keeps the newest 20,000 lines per unit. The bundle is assembled in the
 run's private temp directory (removed on exit, Ctrl-C, hang-up), so an
 interrupted run leaves no copy behind. Numeric options that are not
-non-negative integers exit 2 before anything runs; an unwritable `--out` or a
+non-negative integers (`--with-rotated=DAYS`: 1..999999, no leading zero) exit 2 before anything runs; an unwritable `--out` or a
 failed `tar` exits 1 and says so. Under sudo, both the `.txt` and the
 `.tar.gz` are handed back to the invoking user.
 
@@ -197,6 +239,9 @@ and re-validate after edits:
   | 0.4.0 `--max-total-mb 5` | 260,084 | 3,310,276 | 15 | 112 |
   | 0.4.0 `--with-rotated` | 19,871,166 | 104,846,391 | 70 | 57 |
   | 0.4.0 `--with-rotated --max-total-mb 50` | 8,274,635 | 52,434,658 | 58 | 69 |
+
+  (0.4.0 took the caps as options; since 0.11.0 `--max-total-mb 5` is
+  `LOG_TOTAL_MB=5` in the environment.)
 
   Defaults cut the copied logs from 412 MB to 13 MB and the archive from 63.3 MB
   to 0.53 MB. The total cap binds where it should: with `--with-rotated` the
@@ -465,6 +510,8 @@ hand over one file (CONTRACT rule 3):
 
 **Options** (10): `--file`, `--stdout`, `--bundle`, `--quiet`, `--home DIR`,
 `--out DIR`, `--window=DUR[@START]`, `--filesizes[=PATH]`, `--zdb`, `--help`.
+Since 0.8.1 `--out`, `--home`, `--window` and `--filesizes=` with no value, or
+with the next option taken for it (`--out --file`), exit 2 naming the option.
 
 **Environment** (whole numbers; another value is ignored with a warning, and the
 default is used):
@@ -523,8 +570,12 @@ default is used):
   txgs, the counters and `-r`/`-w`, not by a pair block. After the window, each
   job gets 5 s for its last block; an early end (signal, deadline) stops them at
   once.
-- `iostat` absent (no sysstat) while ZFS is present blocks the window goal
-  (`iostat -x: command not found (sysstat)`), like a missing `zpool`.
+- The window goal's inputs are the txgs, the kstat deltas and `zpool iostat`;
+  a missing `zpool` blocks it. `iostat -x` only adds the block-device view:
+  since 0.8.1 an absent (no sysstat), failed or stopped `iostat` is a fact line
+  in section O (`not delivered: iostat -x: command not found (sysstat)`) and
+  does not block the goal (docs/output-format.md, "A tool that only adds
+  detail").
 
 **Options removed in 0.8.0.** Each exits 2 with a message naming its replacement:
 
@@ -730,7 +781,10 @@ One `.txt` report, sections `[1]` and A..K:
   I/O by event name. This is what attributes load to a caller.
 - **H. Current activity** — processlist, thread counters, `max_connections`.
 - **I. Binary log content attribution** — opt-in, see below.
-- **J. Interval samples** — opt-in `iostat -x` and `vmstat`.
+- **J. Interval samples** — every run: `iostat -x` and `vmstat` started
+  together over a 15 s window (`--window=DUR` sets it), six reports each. The
+  first report of each is the average since boot, the other five cover the
+  window.
 - **K. MySQL error log** — the resolved `log_error` tail, or the journal.
 
 ### (b) Delivery mechanism
@@ -740,9 +794,52 @@ One `.txt` report, sections `[1]` and A..K:
 sudo ./collect-collmysql.sh --stdout                # root over the unix socket; root-only files
 ./collect-collmysql.sh --file --defaults-file ~/.my.cnf
 ./collect-collmysql.sh --file --mysql-args "-h 10.0.0.5 -u whatap -p"
-./collect-collmysql.sh --file --binlog --sample     # add the two opt-in tiers
+./collect-collmysql.sh --file --binlog --window=60s # the binlog decode, a 60 s window
+./collect-collmysql.sh --file --out /tmp/case       # write the report under /tmp/case
 ./collect-collmysql.sh                              # no arguments -> prints help
 ```
+
+**Options** (10): `--file`, `--stdout`, `--quiet`, `--out DIR`,
+`--defaults-file PATH`, `--defaults-extra-file PATH`, `--mysql-args "ARGS"`,
+`--binlog[=N]`, `--window=DUR`, `--help`.
+
+| option | what it does |
+|---|---|
+| `--out DIR` | where `--file` writes (default `.`); made if missing, checked before collecting, an unwritable one exits 1 |
+| `--defaults-file PATH`, `--defaults-extra-file PATH` | option files for the mysql client (credentials) |
+| `--mysql-args "ARGS"` | the client's own arguments (`-h`, `-P`, `-u`, a bare `-p`) |
+| `--binlog[=N]` | Tier 2: decode the N newest binary logs (default 2) |
+| `--window=DUR` | the length of section J's window: `N` (seconds), `Ns`, `Nm` or `Nh`, 10 s .. 24 h (default 15 s) |
+
+A value option with no value, or with the next option taken for it
+(`--out --file`, `--window --file`), exits 2 before anything runs.
+`--mysql-args` is the exception to the leading-dash rule, because its value
+is the client's arguments and starts with `-` (`--mysql-args "-h 10.0.0.5 -u
+whatap"`, or `--mysql-args="-h 10.0.0.5"`). It still exits 2 when the value is empty
+or is exactly one of this collector's own options (`--mysql-args --file`: the
+client arguments were forgotten). Quote the client arguments as one word.
+
+**Environment** (whole numbers 1..999999; another value is ignored with a
+warning, and the default is used):
+
+| variable | default | what it bounds |
+|---|---|---|
+| `CMD_TIMEOUT` | 20 | each external command, seconds |
+| `RUN_DEADLINE` | 300 | the whole run, seconds; raised by the window + 30 s and by the `--binlog` decode unless set |
+| `BINLOG_TIMEOUT` | 300 | the `--binlog` decode of one file, seconds |
+| `PROMPT_TIMEOUT` | 60 | the `-p` prompt, seconds |
+
+`MYSQL_PWD` is a password source (below), not a cap.
+
+**Options removed in 0.10.0.** Each exits 2 with a message naming its replacement:
+
+| removed | use instead |
+|---|---|
+| `--no-sudo` | nothing: the collector never elevates itself (since 0.8.0 the flag did nothing); run it with `sudo` when root is needed |
+| `--sample[=SEC]` | nothing for 15 s (every run has a window); `--window=DUR` for longer (`--sample` took about 50 s: `iostat` then `vmstat`, 5 s x 6 each) |
+
+A 0.6/0.7 runbook line `./collect-collmysql.sh --file --no-sudo --sample` is
+now `./collect-collmysql.sh --file` (or `--file --window=60s`).
 
 With no option file and no `--mysql-args`, the mysql client is invoked with no
 connection arguments and uses its own option files. A run without credentials
@@ -763,7 +860,7 @@ section and on the terminal, never in a fact line. On a failed login the hint on
 run was not elevated, as in every collector; it does not claim that sudo would
 fix the login (a TCP login, or a password account, is decided by the server). Under sudo the `--file`
 report is handed back to the invoking user. `--no-sudo`, which 0.6/0.7 needed,
-is accepted and warns that it is no longer needed.
+exits 2 since 0.10.0 (see the removed options above).
 
 **Passwords never go on a command line.** A command line is readable by every
 account in `ps` and `/proc/<pid>/cmdline`. So the collector hands the password
@@ -803,8 +900,8 @@ password with that reason in `[1]`. A bare `-p` with no terminal (`ssh host
 'cmd'`, cron) is not passed to the client and the report says so. The caps
 come from the environment only (`CMD_TIMEOUT`, `RUN_DEADLINE`, `BINLOG_TIMEOUT`,
 `PROMPT_TIMEOUT`, whole numbers 1..999999); a bad value is dropped with a
-warning. `--sample` raises the deadline by both samplers (2 x (SEC x 6 + 30));
-`[1]` prints the deadline the run used.
+warning. The window raises the deadline by its length plus 30 s (its two
+samplers run at the same time); `[1]` prints the deadline the run used.
 
 The script needs bash and says so, exit 2, under `sh`. It runs from stdin
 (`bash -s -- --stdout < collect-collmysql.sh`) like any other invocation.
@@ -817,8 +914,26 @@ the process table locally, and fall back to `n/a (...)` when run from elsewhere.
 - **Tier 0** (the default `--file` / `--stdout` report) runs `SHOW` statements,
   `information_schema` and `performance_schema` queries, and near-instant local
   reads. No table scan of user data, no log decode.
-- **Tier 1** — `--sample[=SEC]` adds `iostat -x` and `vmstat` samples (default
-  5 s x 6, so about 30 seconds of wall clock). Read-only.
+- **The window** (every run, section J) — `iostat -x` and `vmstat`, started
+  together as bounded background jobs, six reports each at a fifth of the
+  window (15 s: 3 s intervals). It puts no load on the server, only wall
+  clock, so it is in the default run; `--window=DUR` sets its length. It is a
+  goal of every run. The samplers only add detail, so one that is absent
+  (`iostat -x 3 6: n/a (command not found: iostat, sysstat)`) or fails is a
+  fact line in J; the goal is blocked only when the deadline cuts or skips the
+  window or when every sampler present failed. With neither installed the
+  window has no input, so the goal is not declared and J's fact lines say what
+  is missing. A caller's `RUN_DEADLINE` that would
+  cut the window shortens it (30 s are kept for section K and the status) and
+  says so in J, on the terminal and in the status, with the real length (whole
+  intervals of a fifth, so a 14 s remainder is a 10 s window); one that leaves
+  it under 10 s means it is not run, and `[1]` says `window: not run (no
+  sampler installed)` when neither sampler is there. A first `INT`, `TERM` or
+  `HUP` during the window stops both samplers (none is left running) and the
+  report is still written: J says `ended early: SIG... after Xs of Ys` and
+  keeps what the samplers had written, and the goal is blocked with the same
+  words. A second signal aborts the run. Until 0.9.0 this was `--sample`, which ran the two
+  samplers one after the other (about 50 s).
 - **Tier 2** — `--binlog[=N]` decodes the N newest binary logs (default 2) with
   `mysqlbinlog --base64-output=DECODE-ROWS` and counts row events per table.
   This reads whole log files, so it costs I/O proportional to their size and is
@@ -1002,6 +1117,7 @@ something sensitive:
   in it ends the run first; a word after a bare `-p` is printed, since the
   client takes it as a database name).
 - **Section I** prints table names and event counts, not the decoded rows.
+- **Section J** prints the block device names `iostat -x` lists.
 
 - **The password** this collector was given is never printed; `[1]` says only
   where it came from. It exists, for the run, in the mode-600 option file of the
