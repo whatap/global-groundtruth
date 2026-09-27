@@ -5,6 +5,19 @@ Every change to the script bumps its `VERSION` and adds one entry at the top
 of this list (docs/authoring-guide.md, step 2); `tools/validate.sh` checks
 that the newest entry is the script's `VERSION`.
 
+- **0.7.4** — Shared code in synced blocks (R2 refactor): the skeleton's emit
+  helpers now hold _optval, _emit_labeled, _tool_rows (the [1] tool table) and
+  _indent (the indent loops), and its run helpers hold probe and read_proc.
+  New apm blocks: report helpers (environment head, cgroup in section 2,
+  container markers in the container section), machine arch, conf bytes;
+  resolve_fs and _sock_list joined the path and file blocks. The machine arch
+  line is read from probe's output (PROBE_OUT); its text is unchanged in every
+  case the old parse handled. Report change: APM_INTERP_CAP is checked by
+  _cap_or, so an ignored value is a `!!` line on the terminal instead of a
+  fact line in section 3, and a leading zero (010) is ignored instead of read
+  as 10. A value option without its value exits 2 without printing the usage
+  after the message. Compared with 0.7.3 on this host and in
+  jjsong-ggt-apm-php-rocky:1: reports equal but live values.
 - **0.7.3** — [1]'s privilege line says when uid 0 has no CAP_SYS_PTRACE (bit 19
   of CapEff; the default in docker and k8s): "root without
   CAP_SYS_PTRACE (other uids' /proc/\<pid>/environ, root, cwd are not

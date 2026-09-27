@@ -458,7 +458,8 @@ done
 dups=""
 for f in $(cd "$ROOT" && git ls-files 'collectors/*collect-*.sh'); do
     for n in _section_n=0 emit_header section subsection fact emit_footer progress have \
-             warn _bounded _bounded_in _tmp _run_init goal got na missed emit_status _note_privilege _note_boot; do
+             warn _bounded _bounded_in _tmp _run_init goal got na missed emit_status _note_privilege _note_boot \
+             _emit_labeled _optval probe read_proc; do
         case "$n" in *=*) re="^$n$" ;; *) re="^[[:space:]]*(function[[:space:]]+)?${n}[[:space:]]*\(\)" ;; esac
         [ "$(grep -cE "$re" "$ROOT/$f")" = 1 ] || dups="$dups $f:$n"
     done

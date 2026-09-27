@@ -37,6 +37,9 @@ The starter for a new collector. It already emits the shared report shape
    | `try CMD [ARGS]`       | the command's output as fact lines, or a bare `n/a`            |
    | `probe "label" CMD…`   | output as facts, or `label: n/a (<why>)` — the reasoned form   |
    | `read_proc "label" P`  | a `/proc` or `/sys` file's content, or a classified reason     |
+   | `_emit_labeled L BODY` | `L: BODY`, or `L:` and BODY's lines indented under it         |
+   | `_tool_rows [--path] T…` | the `[1]` tool table rows: `present` (with its path) / `absent` |
+   | `… \| _indent PREFIX`  | stdin with PREFIX before each line                             |
    | `_bounded CMD…`        | runs CMD under `CMD_TIMEOUT` and `RUN_DEADLINE`; 124 on a cap  |
    | `_bounded_in FILE CMD…`| the same, with FILE as CMD's stdin (never `< FILE` on `_bounded`) |
    | `SLOW_SEC`             | a bounded call this long or longer is named in the status (3s) |
@@ -87,8 +90,11 @@ prints usage** (a collection needs an explicit `--file` / `--stdout`), and it
 collected. Add your collector's own options to it by the option conventions of
 guideline 5 (one opt-in per feature, caps through the environment).
 
-The `probe` / `read_proc` reasoned-absence helpers below them are recommended
-but optional — keep, trim, or extend them for your domain. See guideline 4.
+`probe` and `read_proc` are in the synced run helpers; the `_init_probe` and
+`_classify_err` they rely on are the collector's own (the reasoned-absence
+helpers below them): keep, trim, or extend them for your domain. See
+guideline 4. The emit helpers come before the CLI harness, because the option
+loop calls `_optval`.
 
 Five blocks are **synced**, not just copied: emit helpers, privilege, boot
 time, run helpers and collection completeness. Each runs from its `# ---- <name> — DO NOT EDIT`

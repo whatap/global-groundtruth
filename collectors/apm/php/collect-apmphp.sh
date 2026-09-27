@@ -31,60 +31,9 @@ export LC_ALL=C
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-apmphp"
 # History: CHANGELOG.md (next to this file).
-VERSION="0.7.3"
+VERSION="0.7.4"
 DOMAIN="apm"
 TARGET="host/$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || uname -n 2>/dev/null || echo unknown)"
-
-# ---- CLI harness — DO NOT EDIT ----------------------------------------------
-OPT_FILE=0        # write the report to a .txt file
-OPT_STDOUT=0      # print the report to stdout
-OPT_QUIET=0       # suppress progress narration on stderr
-OPT_OUT=""        # --out DIR: directory of the --file report (empty = .)
-
-usage() {
-    cat <<EOF
-$COLLECTOR_NAME $VERSION — a WhaTap Global Groundtruth collector (facts only).
-Collects PHP APM agent facts from the host or container where the PHP
-application runs (run it inside the container for containerized apps, e.g.
-kubectl exec / docker exec, as root or as the web server user where possible).
-
-Run with no arguments (or --help) to print this help; a collection needs an
-explicit action flag so nothing starts by accident.
-
-  $(basename "$0")            print this help (no collection)
-  $(basename "$0") --file     write the facts report -> ./$COLLECTOR_NAME-<host>-<UTC>.txt
-  $(basename "$0") --stdout   print the facts report to stdout
-  $(basename "$0") --quiet .. silence progress on stderr (add to --file / --stdout)
-  $(basename "$0") --out DIR  output directory for --file (default: .)
-
-Environment:
-  APM_INTERP_CAP=N  php binaries detailed per run (default 10, 1..999999)
-EOF
-}
-
-# _optval OPTION VALUE [ARGC] -> exit 2 when OPTION, which takes a value, has
-# none: VALUE is empty (`--out=`, or OPTION last, ARGC < 2: a `shift` past the
-# end stops dash with its own message) or starts with `-` (`--out --stdout`
-# would otherwise take the next option as the value)
-_optval() {
-    case "${3:-2}:$2" in
-        [01]:*|*:|*:-*) printf 'missing value for %s\n' "$1" >&2; usage >&2; exit 2 ;;
-    esac
-}
-
-ARGC=$#
-while [ $# -gt 0 ]; do
-    case "$1" in
-        --file)    OPT_FILE=1 ;;
-        --stdout)  OPT_STDOUT=1 ;;
-        --quiet)   OPT_QUIET=1 ;;
-        --out)     _optval "$1" "${2-}" $#; OPT_OUT="$2"; shift ;;
-        --out=*)   _optval --out "${1#*=}"; OPT_OUT="${1#*=}" ;;
-        -h|--help) usage; exit 0 ;;
-        *) printf 'unknown argument: %s\n' "$1" >&2; usage >&2; exit 2 ;;
-    esac
-    shift
-done
 
 # ---- emit helpers — DO NOT EDIT ---------------------------------------------
 # The report shape (../../docs/output-format.md): header, numbered sections,
@@ -113,7 +62,89 @@ fact()       { printf '    %s\n' "$1"; }
 emit_footer() { printf '\n==== END OF COLLECTION (no diagnosis by design) ====\n'; }
 progress()   { [ "$OPT_QUIET" = 1 ] && return; printf '>> %s\n' "$*" >&3 2>/dev/null; }
 have()       { command -v "$1" >/dev/null 2>&1; }
+
+# _indent PREFIX -> stdin with PREFIX before every line; a last line without a
+# newline is kept (and ended)
+_indent() { awk -v p="$1" '{ print p $0 }'; }
+
+# _emit_labeled LABEL BODY -> "LABEL: BODY" for a one-line BODY; else "LABEL:"
+# and BODY's lines under it, indented
+_emit_labeled() {
+    local label="$1" body="$2" n
+    n="$(printf '%s\n' "$body" | wc -l | tr -d ' ')"
+    if [ "${n:-0}" -le 1 ]; then
+        fact "$label: $body"
+    else
+        fact "$label:"
+        printf '%s\n' "$body" | _indent '        '
+    fi
+}
+
+# _tool_rows [--path] TOOL... -> one row per TOOL for the environment section's
+# tool table: "present" or "absent", with --path "present (PATH)". The path is
+# read back from a file in the run's directory, not a $(...) (a fork per tool);
+# without the directory it is looked up again.
+_tool_rows() {
+    local wp=0 t p
+    [ "${1:-}" = --path ] && { wp=1; shift; }
+    for t in "$@"; do
+        if ! command -v "$t" >/dev/null 2>&1; then printf '        %-12s absent\n' "$t"; continue; fi
+        [ "$wp" = 1 ] || { printf '        %-12s present\n' "$t"; continue; }
+        p=""
+        [ -n "$_tmp_dir" ] && { command -v "$t" > "$_tmp_dir/cmdv"; } 2>/dev/null && IFS= read -r p < "$_tmp_dir/cmdv"
+        [ -n "$p" ] || p="$(command -v "$t" 2>/dev/null)"
+        printf '        %-12s present (%s)\n' "$t" "$p"
+    done
+}
+
+# _optval NAME VALUE -> exit 2 when VALUE is empty or starts with '-' (then the
+# next option was taken for the value: `--out --stdout`). This block comes
+# before the option loop, which calls it.
+_optval() {
+    case "$2" in ''|-*) printf -- 'missing value for %s\n' "$1" >&2; exit 2 ;; esac
+}
 # ---- end emit helpers
+
+# ---- CLI harness — DO NOT EDIT ----------------------------------------------
+OPT_FILE=0        # write the report to a .txt file
+OPT_STDOUT=0      # print the report to stdout
+OPT_QUIET=0       # suppress progress narration on stderr
+OPT_OUT=""        # --out DIR: directory of the --file report (empty = .)
+
+usage() {
+    cat <<EOF
+$COLLECTOR_NAME $VERSION — a WhaTap Global Groundtruth collector (facts only).
+Collects PHP APM agent facts from the host or container where the PHP
+application runs (run it inside the container for containerized apps, e.g.
+kubectl exec / docker exec, as root or as the web server user where possible).
+
+Run with no arguments (or --help) to print this help; a collection needs an
+explicit action flag so nothing starts by accident.
+
+  $(basename "$0")            print this help (no collection)
+  $(basename "$0") --file     write the facts report -> ./$COLLECTOR_NAME-<host>-<UTC>.txt
+  $(basename "$0") --stdout   print the facts report to stdout
+  $(basename "$0") --quiet .. silence progress on stderr (add to --file / --stdout)
+  $(basename "$0") --out DIR  output directory for --file (default: .)
+
+Environment:
+  APM_INTERP_CAP=N  php binaries detailed per run (default 10, 1..999999)
+EOF
+}
+
+ARGC=$#
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --file)    OPT_FILE=1 ;;
+        --stdout)  OPT_STDOUT=1 ;;
+        --quiet)   OPT_QUIET=1 ;;
+        --out)     _optval "$1" "${2-}"; OPT_OUT="$2"; shift ;;
+        --out=*)   _optval --out "${1#*=}"; OPT_OUT="${1#*=}" ;;
+        -h|--help) usage; exit 0 ;;
+        *) printf 'unknown argument: %s\n' "$1" >&2; usage >&2; exit 2 ;;
+    esac
+    shift
+done
 
 # ---- privilege — DO NOT EDIT ------------------------------------------------
 # What a run can read depends on the privilege it was given: a fact about this
@@ -182,6 +213,8 @@ _note_boot() {
 # _bounded CMD... every external command under CMD_TIMEOUT and RUN_DEADLINE.
 # _tmp NAME       a path in this run's private directory, removed on exit.
 # _report_to_file --file mode's write; fails when the file is not written whole.
+# probe, read_proc  a command's output or a file's content as facts, or n/a with
+#                 the reason (guideline 4).
 # Constraints:
 # - POSIX sh only (apm collectors run under `sh -s`, often dash or busybox):
 #   no SECONDS, no `type -t`, no ${v//x/y} outside a BASH_VERSION guard.
@@ -431,6 +464,47 @@ _report_to_file() {
         return 1
     fi
 }
+
+# probe "label" CMD [ARGS...] -> output as facts, or "label: n/a (<why>)".
+# CMD may be a file, a shell function or a builtin; _bounded caps all three. A
+# non-zero exit that still printed something is reported with its output, since
+# for many commands the exit code is the answer (systemctl is-active prints
+# "inactive" and exits 3). The reason of a failure is the collector's
+# _classify_err, reading _errfile. PROBE_OUT / PROBE_RC: the last probe's stdout
+# and exit status (127 when nothing ran), so a caller that also parses the
+# output runs the command once.
+PROBE_OUT=""; PROBE_RC=127
+# shellcheck disable=SC2034  # PROBE_OUT / PROBE_RC are read by the caller
+probe() {
+    local label="$1" out rc; shift
+    PROBE_OUT=""; PROBE_RC=127
+    [ -n "$(_cmd_kind "$1")" ] || { fact "$label: n/a (command not found: $1)"; return; }
+    out="$(_bounded "$@" 2>"$_errfile")"; rc=$?
+    PROBE_OUT="$out"; PROBE_RC="$rc"
+    if [ "$rc" -eq 124 ]; then
+        if _past_deadline; then fact "$label: n/a (run deadline reached: ${RUN_DEADLINE}s)"
+        else fact "$label: n/a (timed out: ${CMD_TIMEOUT}s)"; fi
+        return
+    fi
+    if [ "$rc" -ne 0 ]; then
+        [ -n "$out" ] && { _emit_labeled "$label (exit $rc)" "$out"; return; }
+        fact "$label: n/a ($(_classify_err))"; return
+    fi
+    [ -z "$out" ] && { fact "$label: n/a (empty output)"; return; }
+    _emit_labeled "$label" "$out"
+}
+
+# read_proc "label" PATH [LINES] -> a /proc or /sys file's content (its last
+# LINES lines when LINES is given), or "label: n/a (<why>)".
+read_proc() {
+    local label="$1" path="$2" cap="${3:-0}" out
+    [ -e "$path" ] || { fact "$label: n/a (path not found: $path)"; return; }
+    [ -r "$path" ] || { fact "$label: n/a (permission denied: $path)"; return; }
+    if [ "$cap" -gt 0 ] 2>/dev/null; then out="$(tail -n "$cap" "$path" 2>/dev/null)"
+    else out="$(cat "$path" 2>/dev/null)"; fi
+    [ -z "$out" ] && { fact "$label: n/a (empty output)"; return; }
+    _emit_labeled "$label" "$out"
+}
 # ---- end run helpers
 
 # ---- collection completeness — DO NOT EDIT ----------------------------------
@@ -584,48 +658,6 @@ _classify_err() {
     else echo "nonzero exit"; fi
 }
 
-_emit_labeled() {
-    local label="$1" body="$2" n
-    n="$(printf '%s\n' "$body" | wc -l | tr -d ' ')"
-    if [ "${n:-0}" -le 1 ]; then
-        fact "$label: $body"
-    else
-        fact "$label:"
-        printf '%s\n' "$body" | while IFS= read -r _l || [ -n "$_l" ]; do printf '        %s\n' "$_l"; done
-    fi
-}
-
-# probe "label" CMD [ARGS...] -> output as facts, or "label: n/a (<why>)".
-# CMD may be a file, a shell function or a builtin; _bounded caps all three. A
-# non-zero exit that still printed something is reported with its output.
-probe() {
-    local label="$1"; shift
-    [ -n "$(_cmd_kind "$1")" ] || { fact "$label: n/a (command not found: $1)"; return; }
-    local out rc
-    out="$(_bounded "$@" 2>"$_errfile")"; rc=$?
-    if [ "$rc" -eq 124 ]; then
-        if _past_deadline; then fact "$label: n/a (run deadline reached: ${RUN_DEADLINE}s)"
-        else fact "$label: n/a (timed out: ${CMD_TIMEOUT}s)"; fi
-        return
-    fi
-    if [ "$rc" -ne 0 ]; then
-        [ -n "$out" ] && { _emit_labeled "$label (exit $rc)" "$out"; return; }
-        fact "$label: n/a ($(_classify_err))"; return
-    fi
-    [ -z "$out" ] && { fact "$label: n/a (empty output)"; return; }
-    _emit_labeled "$label" "$out"
-}
-
-# read_proc "label" PATH -> content of a /proc or /sys file, or a reason.
-read_proc() {
-    local label="$1" path="$2" out
-    [ -e "$path" ] || { fact "$label: n/a (path not found: $path)"; return; }
-    [ -r "$path" ] || { fact "$label: n/a (permission denied: $path)"; return; }
-    out="$(cat "$path" 2>/dev/null)"
-    [ -z "$out" ] && { fact "$label: n/a (empty output)"; return; }
-    _emit_labeled "$label" "$out"
-}
-
 # _names DIR -> the names in DIR, as `ls DIR` lists them (no dot files, sorted).
 # Only an unmatched glob is skipped: in a DIR this uid can read but not enter,
 # -e fails on every entry although ls lists them all.
@@ -666,21 +698,20 @@ _file_lines() {
     [ -s "$path" ] || { fact "$label: (empty file)"; return; }
     total="$(wc -l < "$path" 2>/dev/null | tr -d ' ')"
     fact "$label ($w $cap of ${total:-?} lines):"
-    "$how" -n "$cap" "$path" 2>/dev/null | while IFS= read -r _l || [ -n "$_l" ]; do printf '        %s\n' "$_l"; done
+    "$how" -n "$cap" "$path" 2>/dev/null | _indent '        '
+}
+
+# _sock_list TOOL FLAGS PORTS [NAMES] -> the socket table lines matching the
+# ERE NAMES (default whatap) or naming one of PORTS (space-separated), header
+# kept, first 50; exits with TOOL's status
+_sock_list() {
+    local pat rc
+    pat=":($(printf '%s' "$3" | tr -s ' ' '|' | sed 's/^|//; s/|$//'))([^0-9]|\$)"
+    "$1" "$2" > "$(_tmp sock.out)"; rc=$?
+    awk -v p="$pat" -v n="${4:-whatap}" '(NR <= 2 && /State|Proto|Recv-Q/) || $0 ~ n || $0 ~ p' "$(_tmp sock.out)" 2>/dev/null | head -n 50
+    return "$rc"
 }
 # ---- end apm: file helpers
-
-# conf_bytes "label" PATH -> byte-level facts a plain `cat` hides: total bytes
-# and CR (\r, 0x0D) count. Windows-edited ini files reach Linux hosts through
-# support cases; the reader compares these numbers against the dumped text.
-conf_bytes() {
-    local label="$1" path="$2" sz cr
-    [ -e "$path" ] || return
-    [ -r "$path" ] || return
-    sz="$(wc -c < "$path" 2>/dev/null | tr -d ' ')"
-    cr="$(tr -dc '\r' < "$path" 2>/dev/null | wc -c | tr -d ' ')"
-    fact "$label: size ${sz:-?} bytes, CR (0x0D) bytes: ${cr:-?}"
-}
 
 # file_facts "label" PATH -> ls -l line, size, mtime and (when available) the
 # SHA-256 of a binary artifact, so two hosts can be compared byte-for-byte.
@@ -844,25 +875,9 @@ D_PHP_LIVE=""       # "exe|pid" of running php processes, newline-joined
 D_SCAN_UNRES=""     # relative ini scan dir entries no process cwd resolved
 # PHP binaries detailed per run. APM_INTERP_CAP in the environment raises it
 # (the CLI flags are a shared block).
-D_PHP_CAP=10 D_CAP_NOTE=""   # set in discover
+D_PHP_CAP=10   # set in discover
 D_PHPINI_WHATAP=""  # php.ini files carrying whatap lines, filled in by section 6
 D_DEFAULT_HOME="/usr/whatap/php"
-
-# resolve_fs PATH -> a readable filesystem view of PATH: the path itself if it
-# exists here, otherwise the same path seen through the root of a discovered
-# agent/web process (/proc/<pid>/root<PATH>). Empty if neither is visible. This
-# lets the collector run from an ephemeral debug container and still read the
-# target's files.
-resolve_fs() {
-    local p="$1" pid
-    # a relative path is never read against the collector's own cwd
-    case "$p" in /*) ;; *) return 1 ;; esac
-    [ -e "$p" ] && { printf '%s\n' "$p"; return; }
-    for pid in $D_AGENT_PIDS $D_WEB_PIDS $D_ALT_PIDS; do
-        [ -e "/proc/$pid/root$p" ] && { printf '%s\n' "/proc/$pid/root$p"; return; }
-    done
-    return 1
-}
 
 # ---- apm: path helpers — DO NOT EDIT ----------------------------------------
 # members: apmnodejs apmphp apmpython
@@ -944,6 +959,25 @@ _add_home() {  # _add_home PATH SOURCE
     case "$p" in *"$_nl"*|*"|"*) D_ODD="$D_ODD \"$(_quote_nl "$p")\"" D_ODD_HOME=1; return ;; esac
     case "$_nl$D_HOMES" in *"$_nl$p|"*) return ;; esac
     if [ -n "$D_HOMES" ]; then D_HOMES="$D_HOMES$_nl$p|$s"; else D_HOMES="$p|$s"; fi
+}
+
+# resolve_fs PATH -> prints a readable filesystem view of PATH: the path itself
+# if it exists here, otherwise the same path seen through the root of a
+# discovered agent or application process (/proc/<pid>/root<PATH>). Empty if
+# neither is visible. This lets the collector run from a kubectl-debug
+# ephemeral container (or any different mount namespace) and still read the
+# target's files. The pid lists are each member's own (nodejs: GO APP, python:
+# GO APP ODOO, php: AGENT WEB ALT); the ones a member does not have are empty.
+resolve_fs() {
+    local p="$1" pid
+    # a relative path is never read against the collector's own cwd
+    case "$p" in /*) ;; *) return 1 ;; esac
+    [ -e "$p" ] && { printf '%s\n' "$p"; return; }
+    # shellcheck disable=SC2154  # each member sets only its own lists
+    for pid in $D_GO_PIDS $D_APP_PIDS $D_ODOO_PIDS $D_AGENT_PIDS $D_WEB_PIDS $D_ALT_PIDS; do
+        [ -e "/proc/$pid/root$p" ] && { printf '%s\n' "/proc/$pid/root$p"; return; }
+    done
+    return 1
 }
 # ---- end apm: path helpers
 
@@ -1050,7 +1084,7 @@ _proc_start() {
 
 discover() {
     progress "discovery: php binaries, web/app processes, agent home, ini files"
-    _cap_from APM_INTERP_CAP "${APM_INTERP_CAP:-}" 10; D_PHP_CAP="$_cap" D_CAP_NOTE="$_cap_note"
+    D_PHP_CAP="$(_cap_or APM_INTERP_CAP "${APM_INTERP_CAP:-10}" 10)"
     local c p pid comm exe a0 cmd cwd envh d _php _alt
 
     case "$(id -u 2>/dev/null)" in
@@ -1256,6 +1290,92 @@ _ports_add() {
 _uniq_ports() { [ "$#" -gt 0 ] || return 0; printf '%s\n' "$@" | sort -un | tr '\n' ' ' | sed 's/ $//'; }
 # ---- end apm: numbers
 
+# ---- apm: report helpers — DO NOT EDIT -------------------------------------
+# members: apmjava apmnodejs apmphp apmpython
+# _env_head -> the opening facts of the environment section: shell, uid,
+# privilege, boot time and the collector's cwd
+_env_head() {
+    section "Collection environment"
+    if [ -n "${BASH_VERSION:-}" ]; then fact "shell: bash $BASH_VERSION"
+    else fact "shell: POSIX sh (non-bash)"; fi
+    fact "uid: $(id -u 2>/dev/null || echo unknown) ($(id -un 2>/dev/null || echo unknown))"
+    _note_privilege
+    fact "privilege: $PRIV_WHY"
+    _note_boot
+    fact "collector cwd: $(pwd 2>/dev/null || echo unknown)"
+}
+
+# _cgroup_facts -> the cgroup version and the memory and cpu limits as this
+# process's cgroup sees them (container-vs-host metric questions need them)
+_cgroup_facts() {
+    if [ -f /sys/fs/cgroup/cgroup.controllers ]; then
+        fact "cgroup: v2 (unified)"
+        read_proc "cgroup memory.max" /sys/fs/cgroup/memory.max
+        read_proc "cgroup cpu.max" /sys/fs/cgroup/cpu.max
+    elif [ -d /sys/fs/cgroup/memory ]; then
+        fact "cgroup: v1"
+        read_proc "cgroup memory.limit_in_bytes" /sys/fs/cgroup/memory/memory.limit_in_bytes
+        read_proc "cgroup cpu cfs_quota_us" /sys/fs/cgroup/cpu/cpu.cfs_quota_us
+        read_proc "cgroup cpu cfs_period_us" /sys/fs/cgroup/cpu/cpu.cfs_period_us
+    else
+        fact "cgroup: n/a (path not found: /sys/fs/cgroup)"
+    fi
+}
+
+# _container_facts -> the container markers, KUBERNETES_SERVICE_HOST and this
+# process's cgroup lines
+_container_facts() {
+    local m
+    fact "container markers:"
+    for m in /.dockerenv /run/.containerenv; do
+        if [ -e "$m" ]; then printf '        %-22s present\n' "$m"; else printf '        %-22s absent\n' "$m"; fi
+    done
+    if [ -n "${KUBERNETES_SERVICE_HOST:-}" ]; then
+        printf '        %-22s %s\n' "KUBERNETES_SERVICE_HOST" "$KUBERNETES_SERVICE_HOST"
+    else
+        printf '        %-22s not set\n' "KUBERNETES_SERVICE_HOST"
+    fi
+    probe "self cgroup (first 5 lines)" head -n 5 /proc/self/cgroup
+}
+# ---- end apm: report helpers
+
+# ---- apm: machine arch — DO NOT EDIT ---------------------------------------
+# members: apmnodejs apmphp apmpython
+# _kernel_arch -> the kernel line (uname -srm) and the machine arch, its last
+# field (uname prints the fields in its own order, and a kernel release has no
+# blank). Read from probe's PROBE_OUT: one uname call, no parse of the fact
+# line. Without a machine field the reason is the kernel line's.
+_kernel_arch() {
+    probe "kernel" uname -srm
+    case "$PROBE_RC:$PROBE_OUT" in
+        0:*" "*) fact "machine arch: ${PROBE_OUT##* }" ;;
+        *:*" "*) fact "machine arch (exit $PROBE_RC): ${PROBE_OUT##* }" ;;
+        127:)    fact "machine arch: n/a (command not found: uname)" ;;
+        124:)    if _past_deadline; then fact "machine arch: n/a (run deadline reached: ${RUN_DEADLINE}s)"
+                 else fact "machine arch: n/a (timed out: ${CMD_TIMEOUT}s)"; fi ;;
+        0:)      fact "machine arch: n/a (empty output)" ;;
+        *:)      fact "machine arch: n/a ($(_classify_err))" ;;
+        *)       fact "machine arch: n/a (no machine field in the uname -srm output)" ;;
+    esac
+}
+# ---- end apm: machine arch
+
+# ---- apm: conf bytes — DO NOT EDIT -----------------------------------------
+# members: apmnodejs apmphp
+# conf_bytes "label" PATH -> byte-level facts a plain `cat` hides: total bytes
+# and CR (\r, 0x0D) count. Windows-edited config files reach Linux hosts
+# through support cases; the reader compares these numbers against the dumped
+# text. Nothing when PATH is absent or unreadable (the dump says why).
+conf_bytes() {
+    local label="$1" path="$2" sz cr
+    [ -e "$path" ] || return
+    [ -r "$path" ] || return
+    sz="$(wc -c < "$path" 2>/dev/null | tr -d ' ')"
+    cr="$(tr -dc '\r' < "$path" 2>/dev/null | wc -c | tr -d ' ')"
+    fact "$label: size ${sz:-?} bytes, CR (0x0D) bytes: ${cr:-?}"
+}
+# ---- end apm: conf bytes
+
 # ---- apm: output directory — DO NOT EDIT ------------------------------------
 # members: apmjava apmnodejs apmphp apmpython
 # _out_check -> for --file, makes sure the --out directory (OPT_OUT, default:
@@ -1278,16 +1398,6 @@ _out_check() {
     return 0
 }
 # ---- end apm: output directory
-
-# _cap_from NAME VALUE DEFAULT -> sets _cap to VALUE when it is 1..999999, else
-# to DEFAULT, and _cap_note to why VALUE was ignored (empty when unset or used)
-_cap_from() {
-    local v
-    _cap="$3" _cap_note=""
-    [ -n "$2" ] || return 0
-    if v="$(_num_norm "$2" 6)" && [ "$v" -ge 1 ]; then _cap="$v"; return 0; fi
-    _cap_note="$1=$(_quote_nl "$2") ignored (not a number 1..999999), using $3"
-}
 
 # _net_ports -> sets _udp_ports / _tcp_ports to the ports the readable whatap
 # ini files name, or 6600 when none names one, and states which it used
@@ -1317,15 +1427,6 @@ EOF
     _tcp_ports="$_pl" _tcp_label="$_pl"
     fact "tcp port filter: 6600$_plab"
     [ -n "$_pbad" ] && fact "tcp port values ignored (not a port 1..65535): $_pbad"
-}
-# _sock_list TOOL FLAGS PORTS -> the socket table lines naming whatap or one of
-# PORTS (space-separated), header kept, first 50; exits with TOOL's status
-_sock_list() {
-    local pat rc
-    pat=":($(printf '%s' "$3" | tr -s ' ' '|' | sed 's/^|//; s/|$//'))([^0-9]|\$)"
-    "$1" "$2" > "$(_tmp sock.out)"; rc=$?
-    awk -v p="$pat" '(NR <= 2 && /State|Proto|Recv-Q/) || /whatap/ || $0 ~ p' "$(_tmp sock.out)" 2>/dev/null | head -n 50
-    return "$rc"
 }
 
 # _nonblank_head FILE N -> FILE without blank and ;-comment lines, first N;
@@ -1449,54 +1550,22 @@ run_report() {
 # [1] capability preamble: every downstream "command not found" is
 # pre-explained here.
 _rep_env() {
-    section "Collection environment"
-    if [ -n "${BASH_VERSION:-}" ]; then fact "shell: bash $BASH_VERSION"
-    else fact "shell: POSIX sh (non-bash)"; fi
-    fact "uid: $(id -u 2>/dev/null || echo unknown) ($(id -un 2>/dev/null || echo unknown))"
-    _note_privilege
-    fact "privilege: $PRIV_WHY"
-    _note_boot
-    fact "collector cwd: $(pwd 2>/dev/null || echo unknown)"
+    _env_head
     fact "tools:"
-    for t in php php-fpm apachectl httpd apache2 nginx ipcs ss netstat systemctl rpm dpkg apk readlink timeout stat awk tr sha256sum; do
-        _which "$t"
-        if [ -n "$_wp" ]; then printf '        %-12s present (%s)\n' "$t" "$_wp"
-        else printf '        %-12s absent\n' "$t"; fi
-    done
+    _tool_rows --path php php-fpm apachectl httpd apache2 nginx ipcs ss netstat systemctl rpm dpkg apk readlink timeout stat awk tr sha256sum
 }
 
 # [2] host / platform
 _rep_host() {
     section "Host / platform"
-    # the machine is the last field of `uname -srm` (uname prints the fields
-    # in its own order, and a kernel release has no blank)
-    _k="$(probe "kernel" uname -srm)"
-    printf '%s\n' "$_k"
-    case "$_k" in
-        "    kernel: n/a ("*) fact "machine arch: n/a (${_k#    kernel: n/a (}" ;;
-        "    kernel: "*" "*)  fact "machine arch: ${_k##* }" ;;
-        "    kernel (exit "*" "*)
-                             _e="${_k#    kernel (exit }"; fact "machine arch (exit ${_e%%)*}): ${_k##* }" ;;
-        *)                   fact "machine arch: n/a (no machine field in the uname -srm output)" ;;
-    esac
+    _kernel_arch
     read_proc "os-release" /etc/os-release
     if have ldd; then probe "libc" sh -c "ldd --version 2>&1 | head -n 1"
     else fact "libc: n/a (command not found: ldd)"; fi
     probe "cpu count (nproc)" nproc
     fact "memory:"
-    grep -E '^(MemTotal|MemAvailable)' /proc/meminfo 2>/dev/null | while IFS= read -r _l; do printf '        %s\n' "$_l"; done
-    if [ -f /sys/fs/cgroup/cgroup.controllers ]; then
-        fact "cgroup: v2 (unified)"
-        read_proc "cgroup memory.max" /sys/fs/cgroup/memory.max
-        read_proc "cgroup cpu.max" /sys/fs/cgroup/cpu.max
-    elif [ -d /sys/fs/cgroup/memory ]; then
-        fact "cgroup: v1"
-        read_proc "cgroup memory.limit_in_bytes" /sys/fs/cgroup/memory/memory.limit_in_bytes
-        read_proc "cgroup cpu cfs_quota_us" /sys/fs/cgroup/cpu/cpu.cfs_quota_us
-        read_proc "cgroup cpu cfs_period_us" /sys/fs/cgroup/cpu/cpu.cfs_period_us
-    else
-        fact "cgroup: n/a (path not found: /sys/fs/cgroup)"
-    fi
+    grep -E '^(MemTotal|MemAvailable)' /proc/meminfo 2>/dev/null | _indent '        '
+    _cgroup_facts
     probe "local time" date
     probe "utc time" date -u
     probe "pid 1 command" sh -c "tr '\0' ' ' < /proc/1/cmdline | cut -c1-160"
@@ -1517,7 +1586,6 @@ _rep_runtimes() {
     _which php-fpm
     [ -n "$_wp" ] && _fpm_path_key="$(readlink -f "$_wp" 2>/dev/null || echo "$_wp")"
     _php_total="$(printf '%s\n' "$D_PHP_BINS" | grep -c .)"
-    [ -n "$D_CAP_NOTE" ] && fact "$D_CAP_NOTE"
     # newline-split, no globbing; fd 9 so a probe reading stdin cannot eat it
     while IFS= read -r php <&9; do
         [ -n "$php" ] || continue
@@ -1666,11 +1734,7 @@ EOF
 _rep_web() {
     section "Web server / application server layer"
     fact "web / application server binaries on PATH:"
-    for c in httpd apache2 apachectl php-fpm php5-fpm php-cgi nginx lighttpd frankenphp rr; do
-        _which "$c"; p="$_wp"
-        if [ -n "$p" ]; then printf '        %-12s present (%s)\n' "$c" "$p"
-        else printf '        %-12s absent\n' "$c"; fi
-    done
+    _tool_rows --path httpd apache2 apachectl php-fpm php5-fpm php-cgi nginx lighttpd frankenphp rr
     for c in apachectl httpd apache2; do
         if have "$c"; then
             probe "$c -V (MPM, SERVER_CONFIG_FILE, compile settings)" sh -c "$c -V 2>&1 | head -n 30"
@@ -1888,7 +1952,7 @@ EOF
         _hit=1
         D_PHPINI_WHATAP="$D_PHPINI_WHATAP $p"
         fact "   -- $p (${_c} whatap line(s)):"
-        grep -n -i whatap "$p" 2>/dev/null | head -n 30 | while IFS= read -r _l; do printf '           %s\n' "$_l"; done
+        grep -n -i whatap "$p" 2>/dev/null | head -n 30 | _indent '           '
     done
     [ "$_hit" = 0 ] && fact "   none found"
     fact "ini directory trees present:"
@@ -2099,7 +2163,7 @@ _rep_logs() {
         _m="$(tail -n 300 "$p" 2>/dev/null | grep -E 'whatap|WA[0-9]{3}|Whatap' | tail -n 40)"
         if [ -n "$_m" ]; then
             fact "   -- $p (matching lines, last 40):"
-            printf '%s\n' "$_m" | while IFS= read -r _l; do printf '        %s\n' "$_l"; done
+            printf '%s\n' "$_m" | _indent '        '
         else
             fact "   -- $p: no whatap / WA-coded line in the last 300 lines"
         fi
@@ -2110,16 +2174,7 @@ _rep_logs() {
 # [10] container / orchestration context
 _rep_k8s() {
     section "Container / Kubernetes context"
-    fact "container markers:"
-    for m in /.dockerenv /run/.containerenv; do
-        if [ -e "$m" ]; then printf '        %-22s present\n' "$m"; else printf '        %-22s absent\n' "$m"; fi
-    done
-    if [ -n "${KUBERNETES_SERVICE_HOST:-}" ]; then
-        printf '        %-22s %s\n' "KUBERNETES_SERVICE_HOST" "$KUBERNETES_SERVICE_HOST"
-    else
-        printf '        %-22s not set\n' "KUBERNETES_SERVICE_HOST"
-    fi
-    probe "self cgroup (first 5 lines)" head -n 5 /proc/self/cgroup
+    _container_facts
     printf '%s\n' "$D_HOMES" | while IFS='|' read -r home _src; do
         [ -n "$home" ] || continue
         fshome="$(resolve_fs "$home")" || { fact "container.conf in $home: n/a ($(_absent_why "$home" "$_src"))"; continue; }

@@ -5,6 +5,13 @@ change to the script bumps its `VERSION` and adds one entry at the top of this
 list (docs/authoring-guide.md, step 2); `tools/validate.sh` checks that the
 newest entry is the script's `VERSION`.
 
+- **0.11.2** — Shared code in synced blocks (R2 refactor): the skeleton's emit
+  helpers now hold _optval, _emit_labeled, _tool_rows (the [1] tool table) and
+  _indent (the indent loops), and its run helpers hold probe and read_proc.
+  Report change: probe (helm version, helm history, helm values) prints the
+  output of a command that exits non-zero under "label (exit N):" instead of
+  "label: n/a (...)". No goal reads that text. Compared with 0.11.1 on this
+  host: reports equal but live values (operator log lines).
 - **0.11.1** — [1]'s privilege line says when uid 0 has no CAP_SYS_PTRACE (bit 19
   of CapEff; the default in docker and k8s): "root without
   CAP_SYS_PTRACE (other uids' /proc/\<pid>/environ, root, cwd are not

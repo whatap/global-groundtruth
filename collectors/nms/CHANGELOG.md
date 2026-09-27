@@ -5,6 +5,12 @@ change to the script bumps its `VERSION` and adds one entry at the top of this
 list (docs/authoring-guide.md, step 2); `tools/validate.sh` checks that the
 newest entry is the script's `VERSION`.
 
+- **0.7.2** — Shared code in synced blocks (R2 refactor): the skeleton's emit
+  helpers now hold _optval, _emit_labeled, _tool_rows (the [1] tool table) and
+  _indent (the indent loops), and its run helpers hold probe and read_proc.
+  _classify_err, _proc_hidden and _self_tree are the new host group block (db,
+  nms; templates/groups/host.sh). Report unchanged (compared with 0.7.1 on
+  this host).
 - **0.7.1** — [1]'s privilege line says when uid 0 has no CAP_SYS_PTRACE (bit 19
   of CapEff; the default in docker and k8s): "root without
   CAP_SYS_PTRACE (other uids' /proc/\<pid>/environ, root, cwd are not

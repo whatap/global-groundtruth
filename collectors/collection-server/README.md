@@ -21,8 +21,8 @@
 > and what is inside those logs, InnoDB I/O counters. They are each
 > self-contained; running any combination is fine and normal.
 
-The helpers the three share word for word (option checks, `read_proc`, the
-`/proc` cmdline scan, the systemd cache, the `--out` check, ...) are the group
+The helpers the three share word for word (the removed-option check, the
+`/proc` cmdline scan, the systemd helpers, the `--out` check, ...) are the group
 blocks `collection-server: <name>`, owned by
 [templates/groups/collection-server.sh](../../templates/groups/collection-server.sh):
 edit them there and run `tools/sync-shared-block.sh --apply`.

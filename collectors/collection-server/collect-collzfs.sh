@@ -48,9 +48,79 @@ export LC_ALL=C
 # ---- collector metadata -----------------------------------------------------
 # History: CHANGELOG.md, section collect-collzfs.sh (next to this file).
 COLLECTOR_NAME="whatap-collzfs"
-VERSION="0.8.5"
+VERSION="0.8.6"
 DOMAIN="collection-server"
 TARGET="collection-server-zfs/$(hostname 2>/dev/null || echo unknown)"   # refined after pool discovery
+
+# ---- emit helpers — DO NOT EDIT ---------------------------------------------
+# The report shape (../../docs/output-format.md): header, numbered sections,
+# facts, footer. progress narrates on fd 3 (the terminal saved in main), never
+# into the report, and --quiet silences it; keep its text a fact about the run.
+_section_n=0
+
+emit_header() {
+    printf '==== WhaTap Global Groundtruth Collection ====\n'
+    printf 'Collector:      %s\n' "$COLLECTOR_NAME"
+    printf 'Version:        %s\n' "$VERSION"
+    printf 'Timestamp(UTC): %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown)"
+    printf 'Domain:         %s\n' "$DOMAIN"
+    printf 'Target:         %s\n' "$TARGET"
+    printf '===============================================\n'
+}
+
+# section "A. TITLE" -> the next numbered section, [n] A. TITLE, narrated too
+section() {
+    _section_n=$((_section_n + 1))
+    printf '\n[%d] %s\n' "$_section_n" "$1"
+    progress "[$_section_n] $1"
+}
+subsection() { printf '\n    -- %s --\n' "$1"; }
+fact()       { printf '    %s\n' "$1"; }
+emit_footer() { printf '\n==== END OF COLLECTION (no diagnosis by design) ====\n'; }
+progress()   { [ "$OPT_QUIET" = 1 ] && return; printf '>> %s\n' "$*" >&3 2>/dev/null; }
+have()       { command -v "$1" >/dev/null 2>&1; }
+
+# _indent PREFIX -> stdin with PREFIX before every line; a last line without a
+# newline is kept (and ended)
+_indent() { awk -v p="$1" '{ print p $0 }'; }
+
+# _emit_labeled LABEL BODY -> "LABEL: BODY" for a one-line BODY; else "LABEL:"
+# and BODY's lines under it, indented
+_emit_labeled() {
+    local label="$1" body="$2" n
+    n="$(printf '%s\n' "$body" | wc -l | tr -d ' ')"
+    if [ "${n:-0}" -le 1 ]; then
+        fact "$label: $body"
+    else
+        fact "$label:"
+        printf '%s\n' "$body" | _indent '        '
+    fi
+}
+
+# _tool_rows [--path] TOOL... -> one row per TOOL for the environment section's
+# tool table: "present" or "absent", with --path "present (PATH)". The path is
+# read back from a file in the run's directory, not a $(...) (a fork per tool);
+# without the directory it is looked up again.
+_tool_rows() {
+    local wp=0 t p
+    [ "${1:-}" = --path ] && { wp=1; shift; }
+    for t in "$@"; do
+        if ! command -v "$t" >/dev/null 2>&1; then printf '        %-12s absent\n' "$t"; continue; fi
+        [ "$wp" = 1 ] || { printf '        %-12s present\n' "$t"; continue; }
+        p=""
+        [ -n "$_tmp_dir" ] && { command -v "$t" > "$_tmp_dir/cmdv"; } 2>/dev/null && IFS= read -r p < "$_tmp_dir/cmdv"
+        [ -n "$p" ] || p="$(command -v "$t" 2>/dev/null)"
+        printf '        %-12s present (%s)\n' "$t" "$p"
+    done
+}
+
+# _optval NAME VALUE -> exit 2 when VALUE is empty or starts with '-' (then the
+# next option was taken for the value: `--out --stdout`). This block comes
+# before the option loop, which calls it.
+_optval() {
+    case "$2" in ''|-*) printf -- 'missing value for %s\n' "$1" >&2; exit 2 ;; esac
+}
+# ---- end emit helpers
 
 # ---- options ----------------------------------------------------------------
 OPT_FILE=0           # write the report to a .txt file
@@ -167,11 +237,6 @@ ARGC=$#              # 0 args -> usage (handled in main, below)
 # _removed MESSAGE -> an option that no longer exists: exit 2, naming what
 # replaced it (fd 3 is not open yet, so stderr)
 _removed() { printf '!! %s\n' "$1" >&2; exit 2; }
-# _optval NAME VALUE -> exit 2 when VALUE is empty or starts with '-' (then
-# the next option was taken for the value: `--out --file`)
-_optval() {
-    case "$2" in ''|-*) printf -- 'missing value for %s\n' "$1" >&2; exit 2 ;; esac
-}
 # ---- end collection-server: options
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -205,35 +270,6 @@ while [ $# -gt 0 ]; do
     esac
     shift
 done
-
-# ---- emit helpers — DO NOT EDIT ---------------------------------------------
-# The report shape (../../docs/output-format.md): header, numbered sections,
-# facts, footer. progress narrates on fd 3 (the terminal saved in main), never
-# into the report, and --quiet silences it; keep its text a fact about the run.
-_section_n=0
-
-emit_header() {
-    printf '==== WhaTap Global Groundtruth Collection ====\n'
-    printf 'Collector:      %s\n' "$COLLECTOR_NAME"
-    printf 'Version:        %s\n' "$VERSION"
-    printf 'Timestamp(UTC): %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown)"
-    printf 'Domain:         %s\n' "$DOMAIN"
-    printf 'Target:         %s\n' "$TARGET"
-    printf '===============================================\n'
-}
-
-# section "A. TITLE" -> the next numbered section, [n] A. TITLE, narrated too
-section() {
-    _section_n=$((_section_n + 1))
-    printf '\n[%d] %s\n' "$_section_n" "$1"
-    progress "[$_section_n] $1"
-}
-subsection() { printf '\n    -- %s --\n' "$1"; }
-fact()       { printf '    %s\n' "$1"; }
-emit_footer() { printf '\n==== END OF COLLECTION (no diagnosis by design) ====\n'; }
-progress()   { [ "$OPT_QUIET" = 1 ] && return; printf '>> %s\n' "$*" >&3 2>/dev/null; }
-have()       { command -v "$1" >/dev/null 2>&1; }
-# ---- end emit helpers
 
 blk() { printf '        %s\n' "$1"; }
 
@@ -324,6 +360,8 @@ _note_boot() {
 # _bounded CMD... every external command under CMD_TIMEOUT and RUN_DEADLINE.
 # _tmp NAME       a path in this run's private directory, removed on exit.
 # _report_to_file --file mode's write; fails when the file is not written whole.
+# probe, read_proc  a command's output or a file's content as facts, or n/a with
+#                 the reason (guideline 4).
 # Constraints:
 # - POSIX sh only (apm collectors run under `sh -s`, often dash or busybox):
 #   no SECONDS, no `type -t`, no ${v//x/y} outside a BASH_VERSION guard.
@@ -573,6 +611,47 @@ _report_to_file() {
         return 1
     fi
 }
+
+# probe "label" CMD [ARGS...] -> output as facts, or "label: n/a (<why>)".
+# CMD may be a file, a shell function or a builtin; _bounded caps all three. A
+# non-zero exit that still printed something is reported with its output, since
+# for many commands the exit code is the answer (systemctl is-active prints
+# "inactive" and exits 3). The reason of a failure is the collector's
+# _classify_err, reading _errfile. PROBE_OUT / PROBE_RC: the last probe's stdout
+# and exit status (127 when nothing ran), so a caller that also parses the
+# output runs the command once.
+PROBE_OUT=""; PROBE_RC=127
+# shellcheck disable=SC2034  # PROBE_OUT / PROBE_RC are read by the caller
+probe() {
+    local label="$1" out rc; shift
+    PROBE_OUT=""; PROBE_RC=127
+    [ -n "$(_cmd_kind "$1")" ] || { fact "$label: n/a (command not found: $1)"; return; }
+    out="$(_bounded "$@" 2>"$_errfile")"; rc=$?
+    PROBE_OUT="$out"; PROBE_RC="$rc"
+    if [ "$rc" -eq 124 ]; then
+        if _past_deadline; then fact "$label: n/a (run deadline reached: ${RUN_DEADLINE}s)"
+        else fact "$label: n/a (timed out: ${CMD_TIMEOUT}s)"; fi
+        return
+    fi
+    if [ "$rc" -ne 0 ]; then
+        [ -n "$out" ] && { _emit_labeled "$label (exit $rc)" "$out"; return; }
+        fact "$label: n/a ($(_classify_err))"; return
+    fi
+    [ -z "$out" ] && { fact "$label: n/a (empty output)"; return; }
+    _emit_labeled "$label" "$out"
+}
+
+# read_proc "label" PATH [LINES] -> a /proc or /sys file's content (its last
+# LINES lines when LINES is given), or "label: n/a (<why>)".
+read_proc() {
+    local label="$1" path="$2" cap="${3:-0}" out
+    [ -e "$path" ] || { fact "$label: n/a (path not found: $path)"; return; }
+    [ -r "$path" ] || { fact "$label: n/a (permission denied: $path)"; return; }
+    if [ "$cap" -gt 0 ] 2>/dev/null; then out="$(tail -n "$cap" "$path" 2>/dev/null)"
+    else out="$(cat "$path" 2>/dev/null)"; fi
+    [ -z "$out" ] && { fact "$label: n/a (empty output)"; return; }
+    _emit_labeled "$label" "$out"
+}
 # ---- end run helpers
 
 # ---- collection completeness — DO NOT EDIT ----------------------------------
@@ -708,19 +787,6 @@ EOF
 _errfile=""
 _init_probe() { _errfile="$(_tmp probe.err)"; }
 
-# _emit_labeled LABEL BODY -> "LABEL: BODY" for a one-line BODY; else "LABEL:"
-# and BODY's lines under it, indented
-_emit_labeled() {
-    local label="$1" body="$2" n
-    n="$(printf '%s\n' "$body" | wc -l | tr -d ' ')"
-    if [ "${n:-0}" -le 1 ]; then
-        fact "$label: $body"
-    else
-        fact "$label:"
-        printf '%s\n' "$body" | while IFS= read -r _l || [ -n "$_l" ]; do printf '        %s\n' "$_l"; done
-    fi
-}
-
 # _why_124 -> why a bounded call returned 124: the run deadline, or its own cap
 # (the same two wordings as probe)
 _why_124() {
@@ -728,18 +794,6 @@ _why_124() {
     else printf 'timed out: %ss' "$CMD_TIMEOUT"; fi
 }
 
-# read_proc "label" PATH [LINES] -> a /proc or /sys file's content (its last
-# LINES lines when LINES is given), or "label: n/a (<why>)".
-read_proc() {
-    local label="$1" path="$2" cap="${3:-0}"
-    if [ ! -e "$path" ]; then fact "$label: n/a (path not found: $path)"; return; fi
-    if [ ! -r "$path" ]; then fact "$label: n/a (permission denied: $path)"; return; fi
-    local out
-    if [ "$cap" -gt 0 ] 2>/dev/null; then out="$(tail -n "$cap" "$path" 2>"$_errfile")"
-    else out="$(cat "$path" 2>"$_errfile")"; fi
-    if [ -z "$out" ]; then fact "$label: n/a (empty output)"; return; fi
-    _emit_labeled "$label" "$out"
-}
 # ---- end collection-server: probe helpers
 
 # ---- collection-server: file helpers — DO NOT EDIT --------------------------
@@ -751,7 +805,7 @@ dump_file() {
     if [ ! -e "$path" ]; then fact "n/a (path not found: $path)"; return; fi
     if [ ! -r "$path" ]; then fact "n/a (permission denied: $path)"; return; fi
     if [ ! -s "$path" ]; then fact "(empty file)"; return; fi
-    head -n "$cap" "$path" 2>/dev/null | while IFS= read -r _l || [ -n "$_l" ]; do printf '        %s\n' "$_l"; done
+    head -n "$cap" "$path" 2>/dev/null | _indent '        '
 }
 
 # fstype_of PATH / source_of PATH -> the filesystem type / the source (device
@@ -789,10 +843,26 @@ _path_state() {
     while [ ! -e "$a" ] && [ "$a" != / ] && [ "$a" != . ]; do a="$(dirname "$a")"; done
     if [ -x "$a" ]; then printf absent; else printf unlistable; fi
 }
+
+# resolve_yardbase -> YARDBASE from WHOME: yard.conf's yardbase, else
+# WHOME/yardbase; a relative value is taken relative to WHOME
+YARDBASE=""
+resolve_yardbase() {
+    local v
+    if [ -n "$WHOME" ] && [ -f "$WHOME/conf/yard.conf" ]; then
+        v="$(grep -E '^[[:space:]]*yardbase[[:space:]]*=' "$WHOME/conf/yard.conf" 2>/dev/null | tail -n1 | cut -d= -f2- | tr -d ' \r')"
+        [ -n "$v" ] && YARDBASE="$v"
+    fi
+    if [ -z "$YARDBASE" ] && [ -n "$WHOME" ] && [ -d "$WHOME/yardbase" ]; then YARDBASE="$WHOME/yardbase"; fi
+    # resolve relative to WHATAP_HOME
+    case "$YARDBASE" in
+        ""|/*) : ;;
+        *) [ -n "$WHOME" ] && YARDBASE="$WHOME/$YARDBASE" ;;
+    esac
+}
 # ---- end collection-server: file helpers
 
-# probe "label" CMD [ARGS...] -> emits output as facts, or "label: n/a (<why>)".
-# Every call goes through _bounded (run helpers): a pool that hangs costs at most
+# probe (run helpers) goes through _bounded: a pool that hangs costs at most
 # CMD_TIMEOUT per call and the run still reaches its footer.
 # Fail fast: a zpool or zfs whose discovery call hit the cap is not asked again.
 # One hung pool would otherwise cost CMD_TIMEOUT for each of forty calls.
@@ -808,33 +878,16 @@ _skip_why() {
     esac
 }
 
-# PROBE_OUT / PROBE_RC: the last probe's stdout and exit status (127 when the
-# command was not run), so a caller that also parses the output asks once.
-PROBE_OUT=""; PROBE_RC=127
-probe() {
-    local label="$1"; shift
-    PROBE_OUT=""; PROBE_RC=127
-    [ -n "$(_cmd_kind "$1")" ] || { fact "$label: n/a (command not found: $1)"; return; }
-    _hung "$1" && { fact "$label: n/a ($(_skip_why "$1"))"; return; }
-    local out rc
-    out="$(_bounded "$@" 2>"$_errfile")"; rc=$?
-    PROBE_OUT="$out"; PROBE_RC="$rc"
-    if [ "$rc" -eq 124 ]; then
-        if _past_deadline; then fact "$label: n/a (run deadline reached: ${RUN_DEADLINE}s)"
-        else fact "$label: n/a (timed out: ${CMD_TIMEOUT}s)"; fi
-        return
-    fi
-    if [ "$rc" -ne 0 ]; then
-        [ -n "$out" ] && { _emit_labeled "$label (exit $rc)" "$out"; return; }
-        fact "$label: n/a ($(_classify_err))"; return
-    fi
-    [ -z "$out" ] && { fact "$label: n/a (empty output)"; return; }
-    _emit_labeled "$label" "$out"
+# zprobe "label" CMD... -> probe (run helpers), except that a zpool or zfs that
+# hung earlier is not run again
+zprobe() {
+    if _hung "$2"; then PROBE_OUT=""; PROBE_RC=127; fact "$1: n/a ($(_skip_why "$2"))"
+    else probe "$@"; fi
 }
 
 # probe_t SECS "label" CMD... -> probe capped at SECS (bash restores the
 # prefix assignment when the function returns)
-probe_t() { local t="$1"; shift; CMD_TIMEOUT="$t" probe "$@"; }
+probe_t() { local t="$1"; shift; CMD_TIMEOUT="$t" zprobe "$@"; }
 
 # probe_pipe "label" REQBIN 'shell pipeline' -> probe a pipeline, but classify a
 # missing primary binary as "command not found: REQBIN" rather than as sh output.
@@ -952,11 +1005,29 @@ _is_whatap_server() {
 # ---- end collection-server: process scan
 
 
-# ---- collection-server: systemd cache — DO NOT EDIT -------------------------
+# ---- collection-server: systemd — DO NOT EDIT -------------------------------
 # members: collserver collzfs
-# What the member's _sd_prefetch read with one `systemctl show` for every unit
-# the run asks about: sd_show answers from here and asks systemctl only for a
-# unit that was not prefetched.
+# _sd ARGS... -> systemctl ARGS, bounded, stderr dropped. No `--value` (systemd
+# <230, Ubuntu 16.04, lacks it). Bounded: systemctl waits on D-Bus, and a wedged
+# systemd would hang every call. Fail fast: once one call hits the cap, the rest
+# are skipped rather than each costing CMD_TIMEOUT again. The mark is a file in
+# the run's private directory because most calls run inside $(...), where a
+# variable would not survive.
+_sd() {
+    local mark="" rc
+    [ -n "$_tmp_dir" ] && mark="$_tmp_dir/systemctl.hung"
+    [ -n "$mark" ] && [ -e "$mark" ] && return 124
+    _bounded systemctl "$@" 2>/dev/null; rc=$?
+    if [ "$rc" -eq 124 ] && [ -n "$mark" ]; then
+        true > "$mark" 2>/dev/null
+        warn "systemctl did not answer within ${CMD_TIMEOUT}s; further systemctl calls are skipped"
+    fi
+    return "$rc"
+}
+
+# What _sd_prefetch read with one `systemctl show` for every unit the run asks
+# about: sd_show answers from here and asks systemctl only for a unit that was
+# not prefetched.
 _SD_CACHE=""   # lines: <unit><TAB><Prop>=<value>
 _SD_KNOWN=" "  # units the prefetch answered for
 # _sd_cached PROP UNIT -> the prefetched value; false when UNIT was not prefetched
@@ -970,7 +1041,6 @@ $_SD_CACHE
 EOF
     return 0
 }
-# ---- end collection-server: systemd cache
 
 # _sd_prefetch UNIT... -> one `systemctl show` for every unit this run asks
 # about, not one per question, into _SD_CACHE. It prints one block per unit
@@ -979,7 +1049,7 @@ EOF
 _sd_prefetch() {
     have systemctl || return 0
     local out line id="" blk=""
-    out="$(_sdq show -p Id -p LoadState -p WorkingDirectory -p NRestarts "$@")"
+    out="$(_sd show -p Id -p LoadState -p WorkingDirectory -p NRestarts "$@")"
     [ -n "$out" ] || return 0
     # A trailing blank line closes the last block.
     while IFS= read -r line; do
@@ -1002,14 +1072,18 @@ $out
 
 EOF
 }
-_sdq() { _bounded systemctl "$@" 2>/dev/null; }
+
+# sd_show PROP UNIT -> the unit's property value; sd_state is-active|is-enabled
+# UNIT -> systemctl's answer; unit_loaded UNIT -> UNIT is loaded. UNIT is the
+# full name (whatap-server.service, zfs.target).
 sd_show() {
     have systemctl || return 0
     _sd_cached "$1" "$2" && return 0
-    _bounded systemctl show -p "$1" "$2" 2>/dev/null | cut -d= -f2-
+    _sd show -p "$1" "$2" | cut -d= -f2-
 }
-sd_state() { _bounded systemctl "$1" "$2" 2>/dev/null; }
+sd_state() { _sd "$1" "$2"; }
 unit_loaded() { [ "$(sd_show LoadState "$1")" = "loaded" ]; }
+# ---- end collection-server: systemd
 
 # param NAME -> "NAME = value" from /sys/module/zfs/parameters, with a reason.
 # A tunable that is absent is a fact about this build, not a collection failure.
@@ -1122,7 +1196,6 @@ has_property() {
 WHATAP_UNITS="yard proxy gateway keeper account notihub eureka front router billing crane flexreport"
 WHOME=""
 WHOME_SRC=""
-YARDBASE=""
 
 # A whatap JVM seen during resolve_home, and those whose cwd this uid could not
 # read: then "not resolved" is not an answer (the paths goal is blocked).
@@ -1173,19 +1246,6 @@ EOF
         WHOME="$(cd "$sd/.." && pwd)"; WHOME_SRC="script parent dir"; return
     fi
     WHOME=""; WHOME_SRC="n/a (not resolved)"
-}
-
-resolve_yardbase() {
-    local v
-    if [ -n "$WHOME" ] && [ -f "$WHOME/conf/yard.conf" ]; then
-        v="$(grep -E '^[[:space:]]*yardbase[[:space:]]*=' "$WHOME/conf/yard.conf" 2>/dev/null | tail -n1 | cut -d= -f2- | tr -d ' \r')"
-        [ -n "$v" ] && YARDBASE="$v"
-    fi
-    if [ -z "$YARDBASE" ] && [ -n "$WHOME" ] && [ -d "$WHOME/yardbase" ]; then YARDBASE="$WHOME/yardbase"; fi
-    case "$YARDBASE" in
-        ""|/*) : ;;
-        *) [ -n "$WHOME" ] && YARDBASE="$WHOME/$YARDBASE" ;;
-    esac
 }
 
 # =============================================================================
@@ -1419,11 +1479,8 @@ _rep_env() {
     # The whole run is bounded by this, raised for what this run was asked to do.
     fact "run deadline(s): $RUN_DEADLINE"
     fact "tools:"
-    local t
-    for t in zfs zpool zdb arcstat arc_summary findmnt df stat lsblk iostat modinfo dkms \
-             systemctl journalctl dmesg timeout tar awk find sort head tail nproc free; do
-        if command -v "$t" >/dev/null 2>&1; then printf '        %-12s present\n' "$t"; else printf '        %-12s absent\n' "$t"; fi
-    done
+    _tool_rows zfs zpool zdb arcstat arc_summary findmnt df stat lsblk iostat modinfo dkms \
+        systemctl journalctl dmesg timeout tar awk find sort head tail nproc free
     fact "kstat tree ($KSTAT_DIR): $( [ -d "$KSTAT_DIR" ] && echo present || echo 'absent (path not found)' )"
     fact "module parameter dir (/sys/module/zfs/parameters): $( [ -d /sys/module/zfs/parameters ] && echo present || echo 'absent (path not found)' )"
     fact "ZFS present on this host: $( [ "$ZFS_ON_HOST" = 1 ] && echo yes || echo 'no (zfs/zpool commands and kstat tree all absent)' )"
@@ -1454,7 +1511,7 @@ _win_tier() {
 # -- A. ZFS software & kernel module --------------------------------------
 _rep_a() {
     section "A. ZFS software & kernel module"
-    probe "zfs version" zfs version
+    zprobe "zfs version" zfs version
     read_proc "kmod version (/sys/module/zfs/version)" /sys/module/zfs/version
     read_proc "spl version (/sys/module/spl/version)" /sys/module/spl/version
     probe_pipe "modinfo zfs (selected)" modinfo \
@@ -1612,7 +1669,7 @@ _rep_b() {
 # -- C. Pool topology & allocation classes --------------------------------
 _rep_c() {
     section "C. Pool topology & allocation classes"
-    probe "zpool list -v (raw)" zpool list -v
+    zprobe "zpool list -v (raw)" zpool list -v
     ZLIST_V="$PROBE_OUT"; ZLIST_V_RC="$PROBE_RC"
     subsection "per-top-level-vdev usage by allocation class (derived from zpool list -v)"
     local cv; cv="$(printf '%s\n' "$ZLIST_V" | zpool_class_view)"
@@ -1634,10 +1691,10 @@ _rep_c() {
         if [ -n "$zst" ]; then _emit_labeled "zpool status -vt (verbose + trim state per vdev)" "$zst"
         else fact "zpool status -vt (verbose + trim state per vdev): n/a (empty output)"; fi
     else
-        probe "zpool status -v" zpool status -v
-        probe "zpool status -t (trim state per vdev)" zpool status -t
+        zprobe "zpool status -v" zpool status -v
+        zprobe "zpool status -t (trim state per vdev)" zpool status -t
     fi
-    probe "zpool status -x (health summary)" zpool status -x
+    zprobe "zpool status -x (health summary)" zpool status -x
     subsection "metaslab / allocator counters (global kstat)"
     read_proc "metaslab_stats" "$KSTAT_DIR/metaslab_stats"
     subsection "vdev device paths"
@@ -1653,10 +1710,10 @@ _rep_c() {
 _rep_d() {
     local p
     section "D. Pool properties, features & capacity"
-    probe "zpool list" zpool list
+    zprobe "zpool list" zpool list
     for p in $ZPOOLS; do
         subsection "$p"
-        probe "zpool get all $p" zpool get all "$p"
+        zprobe "zpool get all $p" zpool get all "$p"
     done
     [ -z "$ZPOOLS" ] && fact "zpool get all: n/a ($(_nopool_why))"
     subsection "dataset space overview (zfs list -o space)"
@@ -1819,9 +1876,9 @@ _rep_j() {
     # Interval values over a span of time are --window's (section O).
     section "J. I/O request size & latency distribution"
     subsection "cumulative since boot (instant kstat read)"
-    probe "zpool iostat -v" zpool iostat -v
-    probe "zpool iostat -lv (latency)" zpool iostat -lv
-    probe "zpool iostat -qv (queue depth, instantaneous)" zpool iostat -qv
+    zprobe "zpool iostat -v" zpool iostat -v
+    zprobe "zpool iostat -lv (latency)" zpool iostat -lv
+    zprobe "zpool iostat -qv (queue depth, instantaneous)" zpool iostat -qv
     probe_pipe "zpool iostat -r (request size histogram, first 400 lines)" zpool \
         "zpool iostat -r 2>/dev/null | head -n 400 || true"
     probe_pipe "zpool iostat -w (latency histogram, first 400 lines)" zpool \

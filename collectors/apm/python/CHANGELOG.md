@@ -5,6 +5,21 @@ first. Every change to the script bumps its `VERSION` and adds one entry at
 the top of this list (docs/authoring-guide.md, step 2); `tools/validate.sh`
 checks that the newest entry is the script's `VERSION`.
 
+- **0.10.4** — Shared code in synced blocks (R2 refactor): the skeleton's emit
+  helpers now hold _optval, _emit_labeled, _tool_rows (the [1] tool table) and
+  _indent (the indent loops), and its run helpers hold probe and read_proc.
+  New apm blocks: report helpers (environment head, cgroup, container markers)
+  and machine arch; resolve_fs, _sock_list and _scan_gaps joined the path,
+  file and environ blocks. Report changes: the machine arch line comes from
+  probe's output instead of a temp file, so when uname timed out, hit the
+  deadline or failed it gives that reason (it said "no machine field in the
+  uname -srm output"), and a non-zero exit with output reads "machine arch
+  (exit N): ..."; the normal line is unchanged. APM_INTERP_CAP is checked by
+  _cap_or: an ignored value is a `!!` line on the terminal instead of a fact
+  line in the runtime section, and a leading zero (08) is ignored instead of
+  read as 8. A value option without its value exits 2 without printing the
+  usage after the message. Compared with 0.10.3 on this host and in
+  jjsong-ggt-apm-python:1: reports equal but live values.
 - **0.10.3** — [1]'s privilege line says when uid 0 has no CAP_SYS_PTRACE (bit 19
   of CapEff; the default in docker and k8s): "root without
   CAP_SYS_PTRACE (other uids' /proc/\<pid>/environ, root, cwd are not

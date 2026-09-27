@@ -27,9 +27,79 @@ export LC_ALL=C
 # ---- collector metadata -----------------------------------------------------
 # History: CHANGELOG.md, section collect-collmysql.sh (next to this file).
 COLLECTOR_NAME="whatap-collmysql"
-VERSION="0.10.3"
+VERSION="0.10.4"
 DOMAIN="collection-server"
 TARGET="collection-server-mysql/$(hostname 2>/dev/null || echo unknown)"
+
+# ---- emit helpers — DO NOT EDIT ---------------------------------------------
+# The report shape (../../docs/output-format.md): header, numbered sections,
+# facts, footer. progress narrates on fd 3 (the terminal saved in main), never
+# into the report, and --quiet silences it; keep its text a fact about the run.
+_section_n=0
+
+emit_header() {
+    printf '==== WhaTap Global Groundtruth Collection ====\n'
+    printf 'Collector:      %s\n' "$COLLECTOR_NAME"
+    printf 'Version:        %s\n' "$VERSION"
+    printf 'Timestamp(UTC): %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown)"
+    printf 'Domain:         %s\n' "$DOMAIN"
+    printf 'Target:         %s\n' "$TARGET"
+    printf '===============================================\n'
+}
+
+# section "A. TITLE" -> the next numbered section, [n] A. TITLE, narrated too
+section() {
+    _section_n=$((_section_n + 1))
+    printf '\n[%d] %s\n' "$_section_n" "$1"
+    progress "[$_section_n] $1"
+}
+subsection() { printf '\n    -- %s --\n' "$1"; }
+fact()       { printf '    %s\n' "$1"; }
+emit_footer() { printf '\n==== END OF COLLECTION (no diagnosis by design) ====\n'; }
+progress()   { [ "$OPT_QUIET" = 1 ] && return; printf '>> %s\n' "$*" >&3 2>/dev/null; }
+have()       { command -v "$1" >/dev/null 2>&1; }
+
+# _indent PREFIX -> stdin with PREFIX before every line; a last line without a
+# newline is kept (and ended)
+_indent() { awk -v p="$1" '{ print p $0 }'; }
+
+# _emit_labeled LABEL BODY -> "LABEL: BODY" for a one-line BODY; else "LABEL:"
+# and BODY's lines under it, indented
+_emit_labeled() {
+    local label="$1" body="$2" n
+    n="$(printf '%s\n' "$body" | wc -l | tr -d ' ')"
+    if [ "${n:-0}" -le 1 ]; then
+        fact "$label: $body"
+    else
+        fact "$label:"
+        printf '%s\n' "$body" | _indent '        '
+    fi
+}
+
+# _tool_rows [--path] TOOL... -> one row per TOOL for the environment section's
+# tool table: "present" or "absent", with --path "present (PATH)". The path is
+# read back from a file in the run's directory, not a $(...) (a fork per tool);
+# without the directory it is looked up again.
+_tool_rows() {
+    local wp=0 t p
+    [ "${1:-}" = --path ] && { wp=1; shift; }
+    for t in "$@"; do
+        if ! command -v "$t" >/dev/null 2>&1; then printf '        %-12s absent\n' "$t"; continue; fi
+        [ "$wp" = 1 ] || { printf '        %-12s present\n' "$t"; continue; }
+        p=""
+        [ -n "$_tmp_dir" ] && { command -v "$t" > "$_tmp_dir/cmdv"; } 2>/dev/null && IFS= read -r p < "$_tmp_dir/cmdv"
+        [ -n "$p" ] || p="$(command -v "$t" 2>/dev/null)"
+        printf '        %-12s present (%s)\n' "$t" "$p"
+    done
+}
+
+# _optval NAME VALUE -> exit 2 when VALUE is empty or starts with '-' (then the
+# next option was taken for the value: `--out --stdout`). This block comes
+# before the option loop, which calls it.
+_optval() {
+    case "$2" in ''|-*) printf -- 'missing value for %s\n' "$1" >&2; exit 2 ;; esac
+}
+# ---- end emit helpers
 
 # ---- CLI harness ------------------------------------------------------------
 OPT_FILE=0
@@ -49,17 +119,9 @@ WIN_REPORTS=6
 WIN_RESERVE=30        # seconds of the deadline kept for section K and the status
 # The /proc the binary logs are found through (a fake tree in tools/test-collmysql.sh).
 PROC_ROOT="${COLLMYSQL_PROC:-/proc}"
-# Caps come from the environment only, and are whole numbers 1..999999 or they
-# are dropped here, before anything reads them (the rule of _cap_or in the run
-# helpers). _CAP_BAD is warned about once fd 3 is open.
-_cap_ok() { case "$1" in ''|*[!0-9]*|0*) return 1 ;; esac; [ "${#1}" -le 6 ]; }
-_CAP_BAD=""
-for _cv in CMD_TIMEOUT RUN_DEADLINE BINLOG_TIMEOUT PROMPT_TIMEOUT; do
-    eval "_cx=\${$_cv:-}"
-    if [ -n "$_cx" ] && ! _cap_ok "$_cx"; then _CAP_BAD="$_CAP_BAD $_cv=$_cx"; unset "$_cv"; fi
-done
-# RUN_DEADLINE as the caller set it decides whether the deadline is raised to
-# fit a binlog decode and the window.
+# Caps come from the environment only; main checks them with _cap_or (run
+# helpers). RUN_DEADLINE as the caller set it decides whether the deadline is
+# raised to fit a binlog decode and the window.
 _RUN_DEADLINE_ENV="${RUN_DEADLINE:-}"
 BINLOG_TIMEOUT="${BINLOG_TIMEOUT:-300}"   # per-file cap for the mysqlbinlog decode
 # The most the -p prompt may wait, so an unanswered prompt does not spend the
@@ -91,7 +153,7 @@ explicit action flag so nothing starts by accident.
                               MYSQL_PWD or an option file.
   --binlog[=N]                decode the N newest binary logs and count events per
                               table (default N=$BINLOG_FILES). Reads log files; off by default.
-                              Each file is streamed once and capped at ${BINLOG_TIMEOUT}s
+                              Each file is streamed once and capped at BINLOG_TIMEOUT seconds (below)
   --window=DUR                length of the interval samples every run takes
                               (section J: iostat -x and vmstat together, $WIN_REPORTS reports
                               each). DUR is N (seconds), Ns, Nm or Nh, 10s .. 24h;
@@ -124,11 +186,6 @@ ARGC=$#
 # _removed MESSAGE -> an option that no longer exists: exit 2, naming what
 # replaced it (fd 3 is not open yet, so stderr)
 _removed() { printf '!! %s\n' "$1" >&2; exit 2; }
-# _optval NAME VALUE -> exit 2 when VALUE is empty or starts with '-' (then
-# the next option was taken for the value: `--out --file`)
-_optval() {
-    case "$2" in ''|-*) printf -- 'missing value for %s\n' "$1" >&2; exit 2 ;; esac
-}
 # ---- end collection-server: options
 # _clientval VALUE -> exit 2 when the --mysql-args value is empty or is one
 # of this collector's own options (`--mysql-args --file`). A leading '-' is
@@ -169,35 +226,6 @@ while [ $# -gt 0 ]; do
     esac
     shift
 done
-
-# ---- emit helpers — DO NOT EDIT ---------------------------------------------
-# The report shape (../../docs/output-format.md): header, numbered sections,
-# facts, footer. progress narrates on fd 3 (the terminal saved in main), never
-# into the report, and --quiet silences it; keep its text a fact about the run.
-_section_n=0
-
-emit_header() {
-    printf '==== WhaTap Global Groundtruth Collection ====\n'
-    printf 'Collector:      %s\n' "$COLLECTOR_NAME"
-    printf 'Version:        %s\n' "$VERSION"
-    printf 'Timestamp(UTC): %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown)"
-    printf 'Domain:         %s\n' "$DOMAIN"
-    printf 'Target:         %s\n' "$TARGET"
-    printf '===============================================\n'
-}
-
-# section "A. TITLE" -> the next numbered section, [n] A. TITLE, narrated too
-section() {
-    _section_n=$((_section_n + 1))
-    printf '\n[%d] %s\n' "$_section_n" "$1"
-    progress "[$_section_n] $1"
-}
-subsection() { printf '\n    -- %s --\n' "$1"; }
-fact()       { printf '    %s\n' "$1"; }
-emit_footer() { printf '\n==== END OF COLLECTION (no diagnosis by design) ====\n'; }
-progress()   { [ "$OPT_QUIET" = 1 ] && return; printf '>> %s\n' "$*" >&3 2>/dev/null; }
-have()       { command -v "$1" >/dev/null 2>&1; }
-# ---- end emit helpers
 
 sub()  { printf '        %s\n' "$1"; }
 
@@ -268,6 +296,8 @@ _note_boot() {
 # _bounded CMD... every external command under CMD_TIMEOUT and RUN_DEADLINE.
 # _tmp NAME       a path in this run's private directory, removed on exit.
 # _report_to_file --file mode's write; fails when the file is not written whole.
+# probe, read_proc  a command's output or a file's content as facts, or n/a with
+#                 the reason (guideline 4).
 # Constraints:
 # - POSIX sh only (apm collectors run under `sh -s`, often dash or busybox):
 #   no SECONDS, no `type -t`, no ${v//x/y} outside a BASH_VERSION guard.
@@ -517,6 +547,47 @@ _report_to_file() {
         return 1
     fi
 }
+
+# probe "label" CMD [ARGS...] -> output as facts, or "label: n/a (<why>)".
+# CMD may be a file, a shell function or a builtin; _bounded caps all three. A
+# non-zero exit that still printed something is reported with its output, since
+# for many commands the exit code is the answer (systemctl is-active prints
+# "inactive" and exits 3). The reason of a failure is the collector's
+# _classify_err, reading _errfile. PROBE_OUT / PROBE_RC: the last probe's stdout
+# and exit status (127 when nothing ran), so a caller that also parses the
+# output runs the command once.
+PROBE_OUT=""; PROBE_RC=127
+# shellcheck disable=SC2034  # PROBE_OUT / PROBE_RC are read by the caller
+probe() {
+    local label="$1" out rc; shift
+    PROBE_OUT=""; PROBE_RC=127
+    [ -n "$(_cmd_kind "$1")" ] || { fact "$label: n/a (command not found: $1)"; return; }
+    out="$(_bounded "$@" 2>"$_errfile")"; rc=$?
+    PROBE_OUT="$out"; PROBE_RC="$rc"
+    if [ "$rc" -eq 124 ]; then
+        if _past_deadline; then fact "$label: n/a (run deadline reached: ${RUN_DEADLINE}s)"
+        else fact "$label: n/a (timed out: ${CMD_TIMEOUT}s)"; fi
+        return
+    fi
+    if [ "$rc" -ne 0 ]; then
+        [ -n "$out" ] && { _emit_labeled "$label (exit $rc)" "$out"; return; }
+        fact "$label: n/a ($(_classify_err))"; return
+    fi
+    [ -z "$out" ] && { fact "$label: n/a (empty output)"; return; }
+    _emit_labeled "$label" "$out"
+}
+
+# read_proc "label" PATH [LINES] -> a /proc or /sys file's content (its last
+# LINES lines when LINES is given), or "label: n/a (<why>)".
+read_proc() {
+    local label="$1" path="$2" cap="${3:-0}" out
+    [ -e "$path" ] || { fact "$label: n/a (path not found: $path)"; return; }
+    [ -r "$path" ] || { fact "$label: n/a (permission denied: $path)"; return; }
+    if [ "$cap" -gt 0 ] 2>/dev/null; then out="$(tail -n "$cap" "$path" 2>/dev/null)"
+    else out="$(cat "$path" 2>/dev/null)"; fi
+    [ -z "$out" ] && { fact "$label: n/a (empty output)"; return; }
+    _emit_labeled "$label" "$out"
+}
 # ---- end run helpers
 
 # ---- collection completeness — DO NOT EDIT ----------------------------------
@@ -652,19 +723,6 @@ EOF
 _errfile=""
 _init_probe() { _errfile="$(_tmp probe.err)"; }
 
-# _emit_labeled LABEL BODY -> "LABEL: BODY" for a one-line BODY; else "LABEL:"
-# and BODY's lines under it, indented
-_emit_labeled() {
-    local label="$1" body="$2" n
-    n="$(printf '%s\n' "$body" | wc -l | tr -d ' ')"
-    if [ "${n:-0}" -le 1 ]; then
-        fact "$label: $body"
-    else
-        fact "$label:"
-        printf '%s\n' "$body" | while IFS= read -r _l || [ -n "$_l" ]; do printf '        %s\n' "$_l"; done
-    fi
-}
-
 # _why_124 -> why a bounded call returned 124: the run deadline, or its own cap
 # (the same two wordings as probe)
 _why_124() {
@@ -672,18 +730,6 @@ _why_124() {
     else printf 'timed out: %ss' "$CMD_TIMEOUT"; fi
 }
 
-# read_proc "label" PATH [LINES] -> a /proc or /sys file's content (its last
-# LINES lines when LINES is given), or "label: n/a (<why>)".
-read_proc() {
-    local label="$1" path="$2" cap="${3:-0}"
-    if [ ! -e "$path" ]; then fact "$label: n/a (path not found: $path)"; return; fi
-    if [ ! -r "$path" ]; then fact "$label: n/a (permission denied: $path)"; return; fi
-    local out
-    if [ "$cap" -gt 0 ] 2>/dev/null; then out="$(tail -n "$cap" "$path" 2>"$_errfile")"
-    else out="$(cat "$path" 2>"$_errfile")"; fi
-    if [ -z "$out" ]; then fact "$label: n/a (empty output)"; return; fi
-    _emit_labeled "$label" "$out"
-}
 # ---- end collection-server: probe helpers
 
 _classify_err() {
@@ -705,23 +751,6 @@ _classify_err() {
         [ -z "$line" ] && line="$(printf '%s' "$txt" | head -n1)"
         printf 'error: %s' "$(printf '%s' "$line" | cut -c1-120)"
     else echo "nonzero exit"; fi
-}
-
-# probe "label" CMD... -> output as facts, or "label: n/a (<why>)". Bounded by
-# _bounded (run helpers) at CMD_TIMEOUT and the run deadline.
-probe() {
-    local label="$1"; shift
-    [ -n "$(_cmd_kind "$1")" ] || { fact "$label: n/a (command not found: $1)"; return; }
-    local out rc
-    out="$(_bounded "$@" 2>"$_errfile")"; rc=$?
-    if [ "$rc" -eq 124 ]; then
-        if _past_deadline; then fact "$label: n/a (run deadline reached: ${RUN_DEADLINE}s)"
-        else fact "$label: n/a (timed out: ${CMD_TIMEOUT}s)"; fi
-        return
-    fi
-    [ "$rc" -ne 0 ] && { fact "$label: n/a ($(_classify_err))"; return; }
-    [ -z "$out" ] && { fact "$label: n/a (empty output)"; return; }
-    _emit_labeled "$label" "$out"
 }
 
 # ---- mysql client -----------------------------------------------------------
@@ -939,9 +968,7 @@ sql() {
     if [ -n "$var" ]; then
         # awk '{print $NF}' of the first line: a line with no field is kept whole
         _l="${out%%$'\n'*}"
-        # shellcheck disable=SC2086
-        set -f; set -- $_l; set +f
-        [ "$#" -gt 0 ] && eval "_l=\${$#}"
+        case "$_l" in *[![:space:]]*) _l="${_l%"${_l##*[![:space:]]}"}"; _l="${_l##*[[:space:]]}" ;; esac
         printf -v "$var" '%s' "$_l"
     fi
     [ "$rc" -eq 124 ] && { fact "$label: n/a ($(_why_124))"; return; }
@@ -1089,7 +1116,7 @@ EOF
         if [ -d "$d/root/." ]; then
             rt="$d/root"; how="read through $rt"; ns="$p"
             while IFS= read -r l; do
-                case "$l" in NSpid:*) set -f; set -- $l; set +f; eval "ns=\${$#}" ;; esac
+                case "$l" in NSpid:*) ns="${l##*[[:space:]]}" ;; esac
             done 2>/dev/null < "$d/status"
             # absent only when its directory could be searched (a datadir of
             # mode 700 hides it from a mysql-group user: unreadable, not absent)
@@ -1347,10 +1374,7 @@ run_report() {
     # The whole run is bounded by this, raised for what this run was asked to do.
     fact "run deadline(s): $RUN_DEADLINE"
     fact "tools:"
-    for t in mysql mysqlbinlog iostat vmstat ss findmnt lsblk timeout; do
-        if have "$t"; then sub "$(printf '%-12s present' "$t")"
-        else sub "$(printf '%-12s absent' "$t")"; fi
-    done
+    _tool_rows mysql mysqlbinlog iostat vmstat ss findmnt lsblk timeout
     fact "mysql client: ${MYSQL_BIN:-n/a (command not found)}"
     # What the connection was attempted with: it survives a refused login, which
     # never reaches section A. The password is never printed, only its source.
@@ -1745,7 +1769,7 @@ EOF
                     sub "events per table (count, table):"
                     awk -F'\t' '$1=="T"{printf "%12d %s\n", $2, $3}' "$_sum" \
                         | sort -rn | head -30 \
-                        | while IFS= read -r _l; do printf '            %s\n' "$_l"; done
+                        | _indent '            '
                 fi
                 sub "row events (count): ${_rows:-0}"
                 sub "transactions (BEGIN count): $(awk -F'\t' '$2=="begins"{print $3}' "$_sum")"
@@ -1804,7 +1828,13 @@ _out_dir_check() {
 
 # ---- main -------------------------------------------------------------------
 exec 3>&2
-[ -n "$_CAP_BAD" ] && warn "ignored from the environment (not a whole number 1..999999 without leading zeros):$_CAP_BAD; the defaults are used"
+# the caps (_run_init checks CMD_TIMEOUT); an ignored RUN_DEADLINE is not the caller's
+BINLOG_TIMEOUT="$(_cap_or BINLOG_TIMEOUT "$BINLOG_TIMEOUT" 300)"
+PROMPT_TIMEOUT="$(_cap_or PROMPT_TIMEOUT "$PROMPT_TIMEOUT" 60)"
+if [ -n "$_RUN_DEADLINE_ENV" ]; then
+    RUN_DEADLINE="$(_cap_or RUN_DEADLINE "$RUN_DEADLINE" 300)"
+    [ "$RUN_DEADLINE" = "$_RUN_DEADLINE_ENV" ] || _RUN_DEADLINE_ENV=""
+fi
 
 [ "$ARGC" -eq 0 ] && { usage; exit 0; }
 

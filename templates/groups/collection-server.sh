@@ -16,17 +16,17 @@
 # To change a helper here: edit this file, run --apply, bump each member's
 # VERSION and add its CHANGELOG entry, and compare the members' reports before
 # and after. To add a helper: it goes in only when it behaves the same in
-# every member; one that differs (probe, _classify_err, sd_show, resolve_home,
-# ...) stays in its collector.
+# every member; one that differs (_classify_err, resolve_home, ...) stays in its
+# collector.
 #
 # What the blocks rely on the members to define (before any call, at run time):
 #   from the skeleton blocks: fact, have, warn, _tmp, _bounded, _bounded_in,
 #     _past_deadline, _tab, CMD_TIMEOUT, RUN_DEADLINE
 #   probe helpers:    _run_init before _init_probe
-#   systemd cache:    _sd_prefetch (the member's) fills _SD_CACHE / _SD_KNOWN
+#   systemd:          _tmp_dir (the run's private directory, for the hung mark)
 #   main helpers:     OPT_OUT
-# Placement: the options block comes before the member's option loop, which
-# runs before the skeleton blocks; the others anywhere before main.
+# Placement: the options block comes before the member's option loop (after the
+# skeleton's emit helpers, which define _optval); the others anywhere before main.
 # Shell: bash 3.2+ (the members need bash); the file also parses under dash.
 # -----------------------------------------------------------------------------
 
@@ -35,11 +35,6 @@
 # _removed MESSAGE -> an option that no longer exists: exit 2, naming what
 # replaced it (fd 3 is not open yet, so stderr)
 _removed() { printf '!! %s\n' "$1" >&2; exit 2; }
-# _optval NAME VALUE -> exit 2 when VALUE is empty or starts with '-' (then
-# the next option was taken for the value: `--out --file`)
-_optval() {
-    case "$2" in ''|-*) printf -- 'missing value for %s\n' "$1" >&2; exit 2 ;; esac
-}
 # ---- end collection-server: options
 
 # ---- collection-server: probe helpers — DO NOT EDIT -------------------------
@@ -49,19 +44,6 @@ _optval() {
 _errfile=""
 _init_probe() { _errfile="$(_tmp probe.err)"; }
 
-# _emit_labeled LABEL BODY -> "LABEL: BODY" for a one-line BODY; else "LABEL:"
-# and BODY's lines under it, indented
-_emit_labeled() {
-    local label="$1" body="$2" n
-    n="$(printf '%s\n' "$body" | wc -l | tr -d ' ')"
-    if [ "${n:-0}" -le 1 ]; then
-        fact "$label: $body"
-    else
-        fact "$label:"
-        printf '%s\n' "$body" | while IFS= read -r _l || [ -n "$_l" ]; do printf '        %s\n' "$_l"; done
-    fi
-}
-
 # _why_124 -> why a bounded call returned 124: the run deadline, or its own cap
 # (the same two wordings as probe)
 _why_124() {
@@ -69,18 +51,6 @@ _why_124() {
     else printf 'timed out: %ss' "$CMD_TIMEOUT"; fi
 }
 
-# read_proc "label" PATH [LINES] -> a /proc or /sys file's content (its last
-# LINES lines when LINES is given), or "label: n/a (<why>)".
-read_proc() {
-    local label="$1" path="$2" cap="${3:-0}"
-    if [ ! -e "$path" ]; then fact "$label: n/a (path not found: $path)"; return; fi
-    if [ ! -r "$path" ]; then fact "$label: n/a (permission denied: $path)"; return; fi
-    local out
-    if [ "$cap" -gt 0 ] 2>/dev/null; then out="$(tail -n "$cap" "$path" 2>"$_errfile")"
-    else out="$(cat "$path" 2>"$_errfile")"; fi
-    if [ -z "$out" ]; then fact "$label: n/a (empty output)"; return; fi
-    _emit_labeled "$label" "$out"
-}
 # ---- end collection-server: probe helpers
 
 # ---- collection-server: file helpers — DO NOT EDIT --------------------------
@@ -92,7 +62,7 @@ dump_file() {
     if [ ! -e "$path" ]; then fact "n/a (path not found: $path)"; return; fi
     if [ ! -r "$path" ]; then fact "n/a (permission denied: $path)"; return; fi
     if [ ! -s "$path" ]; then fact "(empty file)"; return; fi
-    head -n "$cap" "$path" 2>/dev/null | while IFS= read -r _l || [ -n "$_l" ]; do printf '        %s\n' "$_l"; done
+    head -n "$cap" "$path" 2>/dev/null | _indent '        '
 }
 
 # fstype_of PATH / source_of PATH -> the filesystem type / the source (device
@@ -129,6 +99,23 @@ _path_state() {
     a="$(dirname "$p")"
     while [ ! -e "$a" ] && [ "$a" != / ] && [ "$a" != . ]; do a="$(dirname "$a")"; done
     if [ -x "$a" ]; then printf absent; else printf unlistable; fi
+}
+
+# resolve_yardbase -> YARDBASE from WHOME: yard.conf's yardbase, else
+# WHOME/yardbase; a relative value is taken relative to WHOME
+YARDBASE=""
+resolve_yardbase() {
+    local v
+    if [ -n "$WHOME" ] && [ -f "$WHOME/conf/yard.conf" ]; then
+        v="$(grep -E '^[[:space:]]*yardbase[[:space:]]*=' "$WHOME/conf/yard.conf" 2>/dev/null | tail -n1 | cut -d= -f2- | tr -d ' \r')"
+        [ -n "$v" ] && YARDBASE="$v"
+    fi
+    if [ -z "$YARDBASE" ] && [ -n "$WHOME" ] && [ -d "$WHOME/yardbase" ]; then YARDBASE="$WHOME/yardbase"; fi
+    # resolve relative to WHATAP_HOME
+    case "$YARDBASE" in
+        ""|/*) : ;;
+        *) [ -n "$WHOME" ] && YARDBASE="$WHOME/$YARDBASE" ;;
+    esac
 }
 # ---- end collection-server: file helpers
 
@@ -201,11 +188,29 @@ _is_whatap_server() {
 }
 # ---- end collection-server: process scan
 
-# ---- collection-server: systemd cache — DO NOT EDIT -------------------------
+# ---- collection-server: systemd — DO NOT EDIT -------------------------------
 # members: collserver collzfs
-# What the member's _sd_prefetch read with one `systemctl show` for every unit
-# the run asks about: sd_show answers from here and asks systemctl only for a
-# unit that was not prefetched.
+# _sd ARGS... -> systemctl ARGS, bounded, stderr dropped. No `--value` (systemd
+# <230, Ubuntu 16.04, lacks it). Bounded: systemctl waits on D-Bus, and a wedged
+# systemd would hang every call. Fail fast: once one call hits the cap, the rest
+# are skipped rather than each costing CMD_TIMEOUT again. The mark is a file in
+# the run's private directory because most calls run inside $(...), where a
+# variable would not survive.
+_sd() {
+    local mark="" rc
+    [ -n "$_tmp_dir" ] && mark="$_tmp_dir/systemctl.hung"
+    [ -n "$mark" ] && [ -e "$mark" ] && return 124
+    _bounded systemctl "$@" 2>/dev/null; rc=$?
+    if [ "$rc" -eq 124 ] && [ -n "$mark" ]; then
+        true > "$mark" 2>/dev/null
+        warn "systemctl did not answer within ${CMD_TIMEOUT}s; further systemctl calls are skipped"
+    fi
+    return "$rc"
+}
+
+# What _sd_prefetch read with one `systemctl show` for every unit the run asks
+# about: sd_show answers from here and asks systemctl only for a unit that was
+# not prefetched.
 _SD_CACHE=""   # lines: <unit><TAB><Prop>=<value>
 _SD_KNOWN=" "  # units the prefetch answered for
 # _sd_cached PROP UNIT -> the prefetched value; false when UNIT was not prefetched
@@ -219,7 +224,49 @@ $_SD_CACHE
 EOF
     return 0
 }
-# ---- end collection-server: systemd cache
+
+# _sd_prefetch UNIT... -> one `systemctl show` for every unit this run asks
+# about, not one per question, into _SD_CACHE. It prints one block per unit
+# (blank-line separated, properties in systemd's order); each block is filed
+# under its Id.
+_sd_prefetch() {
+    have systemctl || return 0
+    local out line id="" blk=""
+    out="$(_sd show -p Id -p LoadState -p WorkingDirectory -p NRestarts "$@")"
+    [ -n "$out" ] || return 0
+    # A trailing blank line closes the last block.
+    while IFS= read -r line; do
+        if [ -n "$line" ]; then
+            case "$line" in Id=*) id="${line#Id=}" ;; esac
+            blk="$blk$line$_nl"
+            continue
+        fi
+        if [ -n "$id" ]; then
+            _SD_KNOWN="$_SD_KNOWN$id "
+            while IFS= read -r line; do
+                [ -n "$line" ] && _SD_CACHE="$_SD_CACHE$id$_tab$line$_nl"
+            done <<EOB
+$blk
+EOB
+        fi
+        id=""; blk=""
+    done <<EOF
+$out
+
+EOF
+}
+
+# sd_show PROP UNIT -> the unit's property value; sd_state is-active|is-enabled
+# UNIT -> systemctl's answer; unit_loaded UNIT -> UNIT is loaded. UNIT is the
+# full name (whatap-server.service, zfs.target).
+sd_show() {
+    have systemctl || return 0
+    _sd_cached "$1" "$2" && return 0
+    _sd show -p "$1" "$2" | cut -d= -f2-
+}
+sd_state() { _sd "$1" "$2"; }
+unit_loaded() { [ "$(sd_show LoadState "$1")" = "loaded" ]; }
+# ---- end collection-server: systemd
 
 # ---- collection-server: window — DO NOT EDIT --------------------------------
 # members: collmysql collzfs

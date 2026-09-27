@@ -22,8 +22,12 @@
 #   from the skeleton blocks: fact, _tmp, _bounded, _cmd_kind, _past_deadline,
 #     _nl, CMD_TIMEOUT, RUN_DEADLINE
 #   probe helpers:    _errfile (set by the member's _init_probe)
-#   path helpers:     D_HOMES, D_UNREAD (the discovery records)
-#   environ readers:  D_UNREAD, and the _ev_<NAME> variables it sets
+#   report helpers:   read_proc, probe, _note_privilege, _note_boot (skeleton)
+#   machine arch:     probe's PROBE_OUT / PROBE_RC (skeleton)
+#   path helpers:     D_HOMES, D_UNREAD (the discovery records), and for
+#                     resolve_fs the member's pid lists D_<KIND>_PIDS
+#   environ readers:  D_UNREAD, D_HIDEPID (_scan_gaps), and the _ev_<NAME>
+#                     variables it sets
 #   numbers:          _pl, _plab, _pbad (the caller's port accumulators)
 #   output directory: OPT_OUT, OPT_STDOUT (the CLI harness), warn, _bounded
 #   main:             ARGC, OPT_FILE, OPT_STDOUT, OPT_OUT, COLLECTOR_NAME,
@@ -52,48 +56,6 @@ _classify_err() {
     esac
     if [ -n "$txt" ]; then printf 'error: %s' "$(printf '%s\n' "$txt" | awk 'NR == 1 { if (length($0) > 100) $0 = substr($0, 1, 45) "..." substr($0, length($0) - 51); print; exit }')"
     else echo "nonzero exit"; fi
-}
-
-_emit_labeled() {
-    local label="$1" body="$2" n
-    n="$(printf '%s\n' "$body" | wc -l | tr -d ' ')"
-    if [ "${n:-0}" -le 1 ]; then
-        fact "$label: $body"
-    else
-        fact "$label:"
-        printf '%s\n' "$body" | while IFS= read -r _l || [ -n "$_l" ]; do printf '        %s\n' "$_l"; done
-    fi
-}
-
-# probe "label" CMD [ARGS...] -> output as facts, or "label: n/a (<why>)".
-# CMD may be a file, a shell function or a builtin; _bounded caps all three. A
-# non-zero exit that still printed something is reported with its output.
-probe() {
-    local label="$1"; shift
-    [ -n "$(_cmd_kind "$1")" ] || { fact "$label: n/a (command not found: $1)"; return; }
-    local out rc
-    out="$(_bounded "$@" 2>"$_errfile")"; rc=$?
-    if [ "$rc" -eq 124 ]; then
-        if _past_deadline; then fact "$label: n/a (run deadline reached: ${RUN_DEADLINE}s)"
-        else fact "$label: n/a (timed out: ${CMD_TIMEOUT}s)"; fi
-        return
-    fi
-    if [ "$rc" -ne 0 ]; then
-        [ -n "$out" ] && { _emit_labeled "$label (exit $rc)" "$out"; return; }
-        fact "$label: n/a ($(_classify_err))"; return
-    fi
-    [ -z "$out" ] && { fact "$label: n/a (empty output)"; return; }
-    _emit_labeled "$label" "$out"
-}
-
-# read_proc "label" PATH -> content of a /proc or /sys file, or a reason.
-read_proc() {
-    local label="$1" path="$2" out
-    [ -e "$path" ] || { fact "$label: n/a (path not found: $path)"; return; }
-    [ -r "$path" ] || { fact "$label: n/a (permission denied: $path)"; return; }
-    out="$(cat "$path" 2>/dev/null)"
-    [ -z "$out" ] && { fact "$label: n/a (empty output)"; return; }
-    _emit_labeled "$label" "$out"
 }
 
 # _names DIR -> the names in DIR, as `ls DIR` lists them (no dot files, sorted).
@@ -136,7 +98,18 @@ _file_lines() {
     [ -s "$path" ] || { fact "$label: (empty file)"; return; }
     total="$(wc -l < "$path" 2>/dev/null | tr -d ' ')"
     fact "$label ($w $cap of ${total:-?} lines):"
-    "$how" -n "$cap" "$path" 2>/dev/null | while IFS= read -r _l || [ -n "$_l" ]; do printf '        %s\n' "$_l"; done
+    "$how" -n "$cap" "$path" 2>/dev/null | _indent '        '
+}
+
+# _sock_list TOOL FLAGS PORTS [NAMES] -> the socket table lines matching the
+# ERE NAMES (default whatap) or naming one of PORTS (space-separated), header
+# kept, first 50; exits with TOOL's status
+_sock_list() {
+    local pat rc
+    pat=":($(printf '%s' "$3" | tr -s ' ' '|' | sed 's/^|//; s/|$//'))([^0-9]|\$)"
+    "$1" "$2" > "$(_tmp sock.out)"; rc=$?
+    awk -v p="$pat" -v n="${4:-whatap}" '(NR <= 2 && /State|Proto|Recv-Q/) || $0 ~ n || $0 ~ p' "$(_tmp sock.out)" 2>/dev/null | head -n 50
+    return "$rc"
 }
 # ---- end apm: file helpers
 
@@ -254,6 +227,25 @@ _add_home() {  # _add_home PATH SOURCE
     case "$_nl$D_HOMES" in *"$_nl$p|"*) return ;; esac
     if [ -n "$D_HOMES" ]; then D_HOMES="$D_HOMES$_nl$p|$s"; else D_HOMES="$p|$s"; fi
 }
+
+# resolve_fs PATH -> prints a readable filesystem view of PATH: the path itself
+# if it exists here, otherwise the same path seen through the root of a
+# discovered agent or application process (/proc/<pid>/root<PATH>). Empty if
+# neither is visible. This lets the collector run from a kubectl-debug
+# ephemeral container (or any different mount namespace) and still read the
+# target's files. The pid lists are each member's own (nodejs: GO APP, python:
+# GO APP ODOO, php: AGENT WEB ALT); the ones a member does not have are empty.
+resolve_fs() {
+    local p="$1" pid
+    # a relative path is never read against the collector's own cwd
+    case "$p" in /*) ;; *) return 1 ;; esac
+    [ -e "$p" ] && { printf '%s\n' "$p"; return; }
+    # shellcheck disable=SC2154  # each member sets only its own lists
+    for pid in $D_GO_PIDS $D_APP_PIDS $D_ODOO_PIDS $D_AGENT_PIDS $D_WEB_PIDS $D_ALT_PIDS; do
+        [ -e "/proc/$pid/root$p" ] && { printf '%s\n' "/proc/$pid/root$p"; return; }
+    done
+    return 1
+}
 # ---- end apm: path helpers
 
 # ---- apm: environ readers — DO NOT EDIT -------------------------------------
@@ -292,6 +284,18 @@ _env_pick() {
         done
     done
     set +f; IFS="$_o"
+}
+
+# _scan_gaps -> the inputs of the agent-home search this run could not read,
+# as one phrase; empty when every one was read
+_scan_gaps() {
+    local n g=""
+    if [ -n "$D_UNREAD" ]; then
+        n="$(echo $D_UNREAD | wc -w | tr -d ' ')"
+        g="environ/cwd of $n candidate process(es) not readable by uid $(id -u 2>/dev/null || echo '?') (pids: $(echo $D_UNREAD | cut -d' ' -f1-10))"
+    fi
+    [ -n "$D_HIDEPID" ] && g="${g:+$g; }$D_HIDEPID"
+    printf '%s' "$g"
 }
 # ---- end apm: environ readers
 
@@ -339,6 +343,92 @@ _ports_add() {
 # _uniq_ports PORT... -> the distinct ports, space-joined (validated numbers only)
 _uniq_ports() { [ "$#" -gt 0 ] || return 0; printf '%s\n' "$@" | sort -un | tr '\n' ' ' | sed 's/ $//'; }
 # ---- end apm: numbers
+
+# ---- apm: report helpers — DO NOT EDIT -------------------------------------
+# members: apmjava apmnodejs apmphp apmpython
+# _env_head -> the opening facts of the environment section: shell, uid,
+# privilege, boot time and the collector's cwd
+_env_head() {
+    section "Collection environment"
+    if [ -n "${BASH_VERSION:-}" ]; then fact "shell: bash $BASH_VERSION"
+    else fact "shell: POSIX sh (non-bash)"; fi
+    fact "uid: $(id -u 2>/dev/null || echo unknown) ($(id -un 2>/dev/null || echo unknown))"
+    _note_privilege
+    fact "privilege: $PRIV_WHY"
+    _note_boot
+    fact "collector cwd: $(pwd 2>/dev/null || echo unknown)"
+}
+
+# _cgroup_facts -> the cgroup version and the memory and cpu limits as this
+# process's cgroup sees them (container-vs-host metric questions need them)
+_cgroup_facts() {
+    if [ -f /sys/fs/cgroup/cgroup.controllers ]; then
+        fact "cgroup: v2 (unified)"
+        read_proc "cgroup memory.max" /sys/fs/cgroup/memory.max
+        read_proc "cgroup cpu.max" /sys/fs/cgroup/cpu.max
+    elif [ -d /sys/fs/cgroup/memory ]; then
+        fact "cgroup: v1"
+        read_proc "cgroup memory.limit_in_bytes" /sys/fs/cgroup/memory/memory.limit_in_bytes
+        read_proc "cgroup cpu cfs_quota_us" /sys/fs/cgroup/cpu/cpu.cfs_quota_us
+        read_proc "cgroup cpu cfs_period_us" /sys/fs/cgroup/cpu/cpu.cfs_period_us
+    else
+        fact "cgroup: n/a (path not found: /sys/fs/cgroup)"
+    fi
+}
+
+# _container_facts -> the container markers, KUBERNETES_SERVICE_HOST and this
+# process's cgroup lines
+_container_facts() {
+    local m
+    fact "container markers:"
+    for m in /.dockerenv /run/.containerenv; do
+        if [ -e "$m" ]; then printf '        %-22s present\n' "$m"; else printf '        %-22s absent\n' "$m"; fi
+    done
+    if [ -n "${KUBERNETES_SERVICE_HOST:-}" ]; then
+        printf '        %-22s %s\n' "KUBERNETES_SERVICE_HOST" "$KUBERNETES_SERVICE_HOST"
+    else
+        printf '        %-22s not set\n' "KUBERNETES_SERVICE_HOST"
+    fi
+    probe "self cgroup (first 5 lines)" head -n 5 /proc/self/cgroup
+}
+# ---- end apm: report helpers
+
+# ---- apm: machine arch — DO NOT EDIT ---------------------------------------
+# members: apmnodejs apmphp apmpython
+# _kernel_arch -> the kernel line (uname -srm) and the machine arch, its last
+# field (uname prints the fields in its own order, and a kernel release has no
+# blank). Read from probe's PROBE_OUT: one uname call, no parse of the fact
+# line. Without a machine field the reason is the kernel line's.
+_kernel_arch() {
+    probe "kernel" uname -srm
+    case "$PROBE_RC:$PROBE_OUT" in
+        0:*" "*) fact "machine arch: ${PROBE_OUT##* }" ;;
+        *:*" "*) fact "machine arch (exit $PROBE_RC): ${PROBE_OUT##* }" ;;
+        127:)    fact "machine arch: n/a (command not found: uname)" ;;
+        124:)    if _past_deadline; then fact "machine arch: n/a (run deadline reached: ${RUN_DEADLINE}s)"
+                 else fact "machine arch: n/a (timed out: ${CMD_TIMEOUT}s)"; fi ;;
+        0:)      fact "machine arch: n/a (empty output)" ;;
+        *:)      fact "machine arch: n/a ($(_classify_err))" ;;
+        *)       fact "machine arch: n/a (no machine field in the uname -srm output)" ;;
+    esac
+}
+# ---- end apm: machine arch
+
+# ---- apm: conf bytes — DO NOT EDIT -----------------------------------------
+# members: apmnodejs apmphp
+# conf_bytes "label" PATH -> byte-level facts a plain `cat` hides: total bytes
+# and CR (\r, 0x0D) count. Windows-edited config files reach Linux hosts
+# through support cases; the reader compares these numbers against the dumped
+# text. Nothing when PATH is absent or unreadable (the dump says why).
+conf_bytes() {
+    local label="$1" path="$2" sz cr
+    [ -e "$path" ] || return
+    [ -r "$path" ] || return
+    sz="$(wc -c < "$path" 2>/dev/null | tr -d ' ')"
+    cr="$(tr -dc '\r' < "$path" 2>/dev/null | wc -c | tr -d ' ')"
+    fact "$label: size ${sz:-?} bytes, CR (0x0D) bytes: ${cr:-?}"
+}
+# ---- end apm: conf bytes
 
 # ---- apm: output directory — DO NOT EDIT ------------------------------------
 # members: apmjava apmnodejs apmphp apmpython

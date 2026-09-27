@@ -25,7 +25,7 @@ export LC_ALL=C
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-apmpython"
 # History: CHANGELOG.md (next to this file).
-VERSION="0.10.3"
+VERSION="0.10.4"
 DOMAIN="apm"
 TARGET="host/$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || uname -n 2>/dev/null || echo unknown)"
 
@@ -49,58 +49,6 @@ if [ -n "${PYTHONPATH:-}" ]; then
     fi
     unset _pp_new _pp_ifs _e
 fi
-
-# ---- CLI harness — DO NOT EDIT ----------------------------------------------
-OPT_FILE=0        # write the report to a .txt file
-OPT_STDOUT=0      # print the report to stdout
-OPT_QUIET=0       # suppress progress narration on stderr
-OPT_OUT=""        # --out DIR: directory of the --file report (empty = .)
-
-usage() {
-    cat <<EOF
-$COLLECTOR_NAME $VERSION — a WhaTap Global Groundtruth collector (facts only).
-Collects Python APM agent facts from the host or container where the Python
-application runs (run it inside the container for containerized apps, e.g.
-kubectl exec / docker exec).
-
-Run with no arguments (or --help) to print this help; a collection needs an
-explicit action flag so nothing starts by accident.
-
-  $(basename "$0")            print this help (no collection)
-  $(basename "$0") --file     write the facts report -> ./$COLLECTOR_NAME-<host>-<UTC>.txt
-  $(basename "$0") --stdout   print the facts report to stdout
-  $(basename "$0") --quiet .. silence progress on stderr (add to --file / --stdout)
-  $(basename "$0") --out DIR  output directory for --file (default: .)
-
-Environment:
-  APM_INTERP_CAP=N  python interpreters detailed per run (default 8, 1..999999)
-EOF
-}
-
-# _optval OPTION VALUE [ARGC] -> exit 2 when OPTION, which takes a value, has
-# none: VALUE is empty (`--out=`, or OPTION last, ARGC < 2: a `shift` past the
-# end stops dash with its own message) or starts with `-` (`--out --stdout`
-# would otherwise take the next option as the value)
-_optval() {
-    case "${3:-2}:$2" in
-        [01]:*|*:|*:-*) printf 'missing value for %s\n' "$1" >&2; usage >&2; exit 2 ;;
-    esac
-}
-
-ARGC=$#
-while [ $# -gt 0 ]; do
-    case "$1" in
-        --file)    OPT_FILE=1 ;;
-        --stdout)  OPT_STDOUT=1 ;;
-        --quiet)   OPT_QUIET=1 ;;
-        --out)     _optval "$1" "${2-}" $#; OPT_OUT="$2"; shift ;;
-        --out=*)   _optval --out "${1#*=}"; OPT_OUT="${1#*=}" ;;
-        --pip)     printf -- '--pip is no longer an option: pip list is now part of every run\n' >&2; exit 2 ;;
-        -h|--help) usage; exit 0 ;;
-        *) printf 'unknown argument: %s\n' "$1" >&2; usage >&2; exit 2 ;;
-    esac
-    shift
-done
 
 # ---- emit helpers — DO NOT EDIT ---------------------------------------------
 # The report shape (../../docs/output-format.md): header, numbered sections,
@@ -129,7 +77,90 @@ fact()       { printf '    %s\n' "$1"; }
 emit_footer() { printf '\n==== END OF COLLECTION (no diagnosis by design) ====\n'; }
 progress()   { [ "$OPT_QUIET" = 1 ] && return; printf '>> %s\n' "$*" >&3 2>/dev/null; }
 have()       { command -v "$1" >/dev/null 2>&1; }
+
+# _indent PREFIX -> stdin with PREFIX before every line; a last line without a
+# newline is kept (and ended)
+_indent() { awk -v p="$1" '{ print p $0 }'; }
+
+# _emit_labeled LABEL BODY -> "LABEL: BODY" for a one-line BODY; else "LABEL:"
+# and BODY's lines under it, indented
+_emit_labeled() {
+    local label="$1" body="$2" n
+    n="$(printf '%s\n' "$body" | wc -l | tr -d ' ')"
+    if [ "${n:-0}" -le 1 ]; then
+        fact "$label: $body"
+    else
+        fact "$label:"
+        printf '%s\n' "$body" | _indent '        '
+    fi
+}
+
+# _tool_rows [--path] TOOL... -> one row per TOOL for the environment section's
+# tool table: "present" or "absent", with --path "present (PATH)". The path is
+# read back from a file in the run's directory, not a $(...) (a fork per tool);
+# without the directory it is looked up again.
+_tool_rows() {
+    local wp=0 t p
+    [ "${1:-}" = --path ] && { wp=1; shift; }
+    for t in "$@"; do
+        if ! command -v "$t" >/dev/null 2>&1; then printf '        %-12s absent\n' "$t"; continue; fi
+        [ "$wp" = 1 ] || { printf '        %-12s present\n' "$t"; continue; }
+        p=""
+        [ -n "$_tmp_dir" ] && { command -v "$t" > "$_tmp_dir/cmdv"; } 2>/dev/null && IFS= read -r p < "$_tmp_dir/cmdv"
+        [ -n "$p" ] || p="$(command -v "$t" 2>/dev/null)"
+        printf '        %-12s present (%s)\n' "$t" "$p"
+    done
+}
+
+# _optval NAME VALUE -> exit 2 when VALUE is empty or starts with '-' (then the
+# next option was taken for the value: `--out --stdout`). This block comes
+# before the option loop, which calls it.
+_optval() {
+    case "$2" in ''|-*) printf -- 'missing value for %s\n' "$1" >&2; exit 2 ;; esac
+}
 # ---- end emit helpers
+
+# ---- CLI harness — DO NOT EDIT ----------------------------------------------
+OPT_FILE=0        # write the report to a .txt file
+OPT_STDOUT=0      # print the report to stdout
+OPT_QUIET=0       # suppress progress narration on stderr
+OPT_OUT=""        # --out DIR: directory of the --file report (empty = .)
+
+usage() {
+    cat <<EOF
+$COLLECTOR_NAME $VERSION — a WhaTap Global Groundtruth collector (facts only).
+Collects Python APM agent facts from the host or container where the Python
+application runs (run it inside the container for containerized apps, e.g.
+kubectl exec / docker exec).
+
+Run with no arguments (or --help) to print this help; a collection needs an
+explicit action flag so nothing starts by accident.
+
+  $(basename "$0")            print this help (no collection)
+  $(basename "$0") --file     write the facts report -> ./$COLLECTOR_NAME-<host>-<UTC>.txt
+  $(basename "$0") --stdout   print the facts report to stdout
+  $(basename "$0") --quiet .. silence progress on stderr (add to --file / --stdout)
+  $(basename "$0") --out DIR  output directory for --file (default: .)
+
+Environment:
+  APM_INTERP_CAP=N  python interpreters detailed per run (default 8, 1..999999)
+EOF
+}
+
+ARGC=$#
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --file)    OPT_FILE=1 ;;
+        --stdout)  OPT_STDOUT=1 ;;
+        --quiet)   OPT_QUIET=1 ;;
+        --out)     _optval "$1" "${2-}"; OPT_OUT="$2"; shift ;;
+        --out=*)   _optval --out "${1#*=}"; OPT_OUT="${1#*=}" ;;
+        --pip)     printf -- '--pip is no longer an option: pip list is now part of every run\n' >&2; exit 2 ;;
+        -h|--help) usage; exit 0 ;;
+        *) printf 'unknown argument: %s\n' "$1" >&2; usage >&2; exit 2 ;;
+    esac
+    shift
+done
 
 # ---- privilege — DO NOT EDIT ------------------------------------------------
 # What a run can read depends on the privilege it was given: a fact about this
@@ -198,6 +229,8 @@ _note_boot() {
 # _bounded CMD... every external command under CMD_TIMEOUT and RUN_DEADLINE.
 # _tmp NAME       a path in this run's private directory, removed on exit.
 # _report_to_file --file mode's write; fails when the file is not written whole.
+# probe, read_proc  a command's output or a file's content as facts, or n/a with
+#                 the reason (guideline 4).
 # Constraints:
 # - POSIX sh only (apm collectors run under `sh -s`, often dash or busybox):
 #   no SECONDS, no `type -t`, no ${v//x/y} outside a BASH_VERSION guard.
@@ -447,6 +480,47 @@ _report_to_file() {
         return 1
     fi
 }
+
+# probe "label" CMD [ARGS...] -> output as facts, or "label: n/a (<why>)".
+# CMD may be a file, a shell function or a builtin; _bounded caps all three. A
+# non-zero exit that still printed something is reported with its output, since
+# for many commands the exit code is the answer (systemctl is-active prints
+# "inactive" and exits 3). The reason of a failure is the collector's
+# _classify_err, reading _errfile. PROBE_OUT / PROBE_RC: the last probe's stdout
+# and exit status (127 when nothing ran), so a caller that also parses the
+# output runs the command once.
+PROBE_OUT=""; PROBE_RC=127
+# shellcheck disable=SC2034  # PROBE_OUT / PROBE_RC are read by the caller
+probe() {
+    local label="$1" out rc; shift
+    PROBE_OUT=""; PROBE_RC=127
+    [ -n "$(_cmd_kind "$1")" ] || { fact "$label: n/a (command not found: $1)"; return; }
+    out="$(_bounded "$@" 2>"$_errfile")"; rc=$?
+    PROBE_OUT="$out"; PROBE_RC="$rc"
+    if [ "$rc" -eq 124 ]; then
+        if _past_deadline; then fact "$label: n/a (run deadline reached: ${RUN_DEADLINE}s)"
+        else fact "$label: n/a (timed out: ${CMD_TIMEOUT}s)"; fi
+        return
+    fi
+    if [ "$rc" -ne 0 ]; then
+        [ -n "$out" ] && { _emit_labeled "$label (exit $rc)" "$out"; return; }
+        fact "$label: n/a ($(_classify_err))"; return
+    fi
+    [ -z "$out" ] && { fact "$label: n/a (empty output)"; return; }
+    _emit_labeled "$label" "$out"
+}
+
+# read_proc "label" PATH [LINES] -> a /proc or /sys file's content (its last
+# LINES lines when LINES is given), or "label: n/a (<why>)".
+read_proc() {
+    local label="$1" path="$2" cap="${3:-0}" out
+    [ -e "$path" ] || { fact "$label: n/a (path not found: $path)"; return; }
+    [ -r "$path" ] || { fact "$label: n/a (permission denied: $path)"; return; }
+    if [ "$cap" -gt 0 ] 2>/dev/null; then out="$(tail -n "$cap" "$path" 2>/dev/null)"
+    else out="$(cat "$path" 2>/dev/null)"; fi
+    [ -z "$out" ] && { fact "$label: n/a (empty output)"; return; }
+    _emit_labeled "$label" "$out"
+}
 # ---- end run helpers
 
 # ---- collection completeness — DO NOT EDIT ----------------------------------
@@ -599,48 +673,6 @@ _classify_err() {
     else echo "nonzero exit"; fi
 }
 
-_emit_labeled() {
-    local label="$1" body="$2" n
-    n="$(printf '%s\n' "$body" | wc -l | tr -d ' ')"
-    if [ "${n:-0}" -le 1 ]; then
-        fact "$label: $body"
-    else
-        fact "$label:"
-        printf '%s\n' "$body" | while IFS= read -r _l || [ -n "$_l" ]; do printf '        %s\n' "$_l"; done
-    fi
-}
-
-# probe "label" CMD [ARGS...] -> output as facts, or "label: n/a (<why>)".
-# CMD may be a file, a shell function or a builtin; _bounded caps all three. A
-# non-zero exit that still printed something is reported with its output.
-probe() {
-    local label="$1"; shift
-    [ -n "$(_cmd_kind "$1")" ] || { fact "$label: n/a (command not found: $1)"; return; }
-    local out rc
-    out="$(_bounded "$@" 2>"$_errfile")"; rc=$?
-    if [ "$rc" -eq 124 ]; then
-        if _past_deadline; then fact "$label: n/a (run deadline reached: ${RUN_DEADLINE}s)"
-        else fact "$label: n/a (timed out: ${CMD_TIMEOUT}s)"; fi
-        return
-    fi
-    if [ "$rc" -ne 0 ]; then
-        [ -n "$out" ] && { _emit_labeled "$label (exit $rc)" "$out"; return; }
-        fact "$label: n/a ($(_classify_err))"; return
-    fi
-    [ -z "$out" ] && { fact "$label: n/a (empty output)"; return; }
-    _emit_labeled "$label" "$out"
-}
-
-# read_proc "label" PATH -> content of a /proc or /sys file, or a reason.
-read_proc() {
-    local label="$1" path="$2" out
-    [ -e "$path" ] || { fact "$label: n/a (path not found: $path)"; return; }
-    [ -r "$path" ] || { fact "$label: n/a (permission denied: $path)"; return; }
-    out="$(cat "$path" 2>/dev/null)"
-    [ -z "$out" ] && { fact "$label: n/a (empty output)"; return; }
-    _emit_labeled "$label" "$out"
-}
-
 # _names DIR -> the names in DIR, as `ls DIR` lists them (no dot files, sorted).
 # Only an unmatched glob is skipped: in a DIR this uid can read but not enter,
 # -e fails on every entry although ls lists them all.
@@ -681,7 +713,18 @@ _file_lines() {
     [ -s "$path" ] || { fact "$label: (empty file)"; return; }
     total="$(wc -l < "$path" 2>/dev/null | tr -d ' ')"
     fact "$label ($w $cap of ${total:-?} lines):"
-    "$how" -n "$cap" "$path" 2>/dev/null | while IFS= read -r _l || [ -n "$_l" ]; do printf '        %s\n' "$_l"; done
+    "$how" -n "$cap" "$path" 2>/dev/null | _indent '        '
+}
+
+# _sock_list TOOL FLAGS PORTS [NAMES] -> the socket table lines matching the
+# ERE NAMES (default whatap) or naming one of PORTS (space-separated), header
+# kept, first 50; exits with TOOL's status
+_sock_list() {
+    local pat rc
+    pat=":($(printf '%s' "$3" | tr -s ' ' '|' | sed 's/^|//; s/|$//'))([^0-9]|\$)"
+    "$1" "$2" > "$(_tmp sock.out)"; rc=$?
+    awk -v p="$pat" -v n="${4:-whatap}" '(NR <= 2 && /State|Proto|Recv-Q/) || $0 ~ n || $0 ~ p' "$(_tmp sock.out)" 2>/dev/null | head -n 50
+    return "$rc"
 }
 # ---- end apm: file helpers
 
@@ -965,25 +1008,9 @@ D_HIDEPID=""
 D_PY_LIVE=""        # interpreter paths of running processes, newline-joined
 # Interpreters detailed and probed per run (set in discover). APM_INTERP_CAP
 # in the environment raises it (the CLI flags are a shared block).
-D_PY_CAP=8 D_CAP_NOTE=""
+D_PY_CAP=8
 D_LOCK_FILE="${WHATAP_LOCK_FILE:-/tmp/whatap-python.lock}"
 D_LLM_LOCK_FILE="/tmp/whatap-python-llm.lock"
-
-# resolve_fs PATH -> prints a readable filesystem view of PATH: the path itself
-# if it exists here, otherwise the same path seen through the root of a
-# discovered agent/app process (/proc/<pid>/root<PATH>). Empty if neither is
-# visible. This lets the collector run from a kubectl-debug ephemeral container
-# (or any different mount namespace) and still read the target's files.
-resolve_fs() {
-    local p="$1" pid
-    # a relative path is never read against the collector's own cwd
-    case "$p" in /*) ;; *) return 1 ;; esac
-    [ -e "$p" ] && { printf '%s\n' "$p"; return; }
-    for pid in $D_GO_PIDS $D_APP_PIDS $D_ODOO_PIDS; do
-        [ -e "/proc/$pid/root$p" ] && { printf '%s\n' "/proc/$pid/root$p"; return; }
-    done
-    return 1
-}
 
 # ---- apm: path helpers — DO NOT EDIT ----------------------------------------
 # members: apmnodejs apmphp apmpython
@@ -1066,6 +1093,25 @@ _add_home() {  # _add_home PATH SOURCE
     case "$_nl$D_HOMES" in *"$_nl$p|"*) return ;; esac
     if [ -n "$D_HOMES" ]; then D_HOMES="$D_HOMES$_nl$p|$s"; else D_HOMES="$p|$s"; fi
 }
+
+# resolve_fs PATH -> prints a readable filesystem view of PATH: the path itself
+# if it exists here, otherwise the same path seen through the root of a
+# discovered agent or application process (/proc/<pid>/root<PATH>). Empty if
+# neither is visible. This lets the collector run from a kubectl-debug
+# ephemeral container (or any different mount namespace) and still read the
+# target's files. The pid lists are each member's own (nodejs: GO APP, python:
+# GO APP ODOO, php: AGENT WEB ALT); the ones a member does not have are empty.
+resolve_fs() {
+    local p="$1" pid
+    # a relative path is never read against the collector's own cwd
+    case "$p" in /*) ;; *) return 1 ;; esac
+    [ -e "$p" ] && { printf '%s\n' "$p"; return; }
+    # shellcheck disable=SC2154  # each member sets only its own lists
+    for pid in $D_GO_PIDS $D_APP_PIDS $D_ODOO_PIDS $D_AGENT_PIDS $D_WEB_PIDS $D_ALT_PIDS; do
+        [ -e "/proc/$pid/root$p" ] && { printf '%s\n' "/proc/$pid/root$p"; return; }
+    done
+    return 1
+}
 # ---- end apm: path helpers
 
 # _add_pkg_dir DIR -> add DIR to D_PKG_DIRS once (membership bound by the
@@ -1140,11 +1186,23 @@ _env_pick() {
     done
     set +f; IFS="$_o"
 }
+
+# _scan_gaps -> the inputs of the agent-home search this run could not read,
+# as one phrase; empty when every one was read
+_scan_gaps() {
+    local n g=""
+    if [ -n "$D_UNREAD" ]; then
+        n="$(echo $D_UNREAD | wc -w | tr -d ' ')"
+        g="environ/cwd of $n candidate process(es) not readable by uid $(id -u 2>/dev/null || echo '?') (pids: $(echo $D_UNREAD | cut -d' ' -f1-10))"
+    fi
+    [ -n "$D_HIDEPID" ] && g="${g:+$g; }$D_HIDEPID"
+    printf '%s' "$g"
+}
 # ---- end apm: environ readers
 
 discover() {
     progress "discovery: interpreters, processes, agent homes"
-    _cap_from APM_INTERP_CAP "${APM_INTERP_CAP:-}" 8; D_PY_CAP="$_cap" D_CAP_NOTE="$_cap_note"
+    D_PY_CAP="$(_cap_or APM_INTERP_CAP "${APM_INTERP_CAP:-8}" 8)"
     local c p pid comm exe a0 cmd cwd envh _b _py _mk _pym="" _pyr="" _am="" _ar="" _unmk="" _d _o
     _env=""
 
@@ -1265,18 +1323,6 @@ EOF
     [ -d /whatap-agent ] && _add_home "/whatap-agent" "operator injection volume /whatap-agent"
 }
 
-# _scan_gaps -> the inputs of the agent-home search this run could not read,
-# as one phrase; empty when every one was read
-_scan_gaps() {
-    local n g=""
-    if [ -n "$D_UNREAD" ]; then
-        n="$(echo $D_UNREAD | wc -w | tr -d ' ')"
-        g="environ/cwd of $n candidate process(es) not readable by uid $(id -u 2>/dev/null || echo '?') (pids: $(echo $D_UNREAD | cut -d' ' -f1-10))"
-    fi
-    [ -n "$D_HIDEPID" ] && g="${g:+$g; }$D_HIDEPID"
-    printf '%s' "$g"
-}
-
 # _uncounted -> "; environ of N process(es) ... not counted", or nothing
 _uncounted() {
     [ -n "$D_UNCOUNTED" ] || return 0
@@ -1336,6 +1382,76 @@ _ports_add() {
 _uniq_ports() { [ "$#" -gt 0 ] || return 0; printf '%s\n' "$@" | sort -un | tr '\n' ' ' | sed 's/ $//'; }
 # ---- end apm: numbers
 
+# ---- apm: report helpers — DO NOT EDIT -------------------------------------
+# members: apmjava apmnodejs apmphp apmpython
+# _env_head -> the opening facts of the environment section: shell, uid,
+# privilege, boot time and the collector's cwd
+_env_head() {
+    section "Collection environment"
+    if [ -n "${BASH_VERSION:-}" ]; then fact "shell: bash $BASH_VERSION"
+    else fact "shell: POSIX sh (non-bash)"; fi
+    fact "uid: $(id -u 2>/dev/null || echo unknown) ($(id -un 2>/dev/null || echo unknown))"
+    _note_privilege
+    fact "privilege: $PRIV_WHY"
+    _note_boot
+    fact "collector cwd: $(pwd 2>/dev/null || echo unknown)"
+}
+
+# _cgroup_facts -> the cgroup version and the memory and cpu limits as this
+# process's cgroup sees them (container-vs-host metric questions need them)
+_cgroup_facts() {
+    if [ -f /sys/fs/cgroup/cgroup.controllers ]; then
+        fact "cgroup: v2 (unified)"
+        read_proc "cgroup memory.max" /sys/fs/cgroup/memory.max
+        read_proc "cgroup cpu.max" /sys/fs/cgroup/cpu.max
+    elif [ -d /sys/fs/cgroup/memory ]; then
+        fact "cgroup: v1"
+        read_proc "cgroup memory.limit_in_bytes" /sys/fs/cgroup/memory/memory.limit_in_bytes
+        read_proc "cgroup cpu cfs_quota_us" /sys/fs/cgroup/cpu/cpu.cfs_quota_us
+        read_proc "cgroup cpu cfs_period_us" /sys/fs/cgroup/cpu/cpu.cfs_period_us
+    else
+        fact "cgroup: n/a (path not found: /sys/fs/cgroup)"
+    fi
+}
+
+# _container_facts -> the container markers, KUBERNETES_SERVICE_HOST and this
+# process's cgroup lines
+_container_facts() {
+    local m
+    fact "container markers:"
+    for m in /.dockerenv /run/.containerenv; do
+        if [ -e "$m" ]; then printf '        %-22s present\n' "$m"; else printf '        %-22s absent\n' "$m"; fi
+    done
+    if [ -n "${KUBERNETES_SERVICE_HOST:-}" ]; then
+        printf '        %-22s %s\n' "KUBERNETES_SERVICE_HOST" "$KUBERNETES_SERVICE_HOST"
+    else
+        printf '        %-22s not set\n' "KUBERNETES_SERVICE_HOST"
+    fi
+    probe "self cgroup (first 5 lines)" head -n 5 /proc/self/cgroup
+}
+# ---- end apm: report helpers
+
+# ---- apm: machine arch — DO NOT EDIT ---------------------------------------
+# members: apmnodejs apmphp apmpython
+# _kernel_arch -> the kernel line (uname -srm) and the machine arch, its last
+# field (uname prints the fields in its own order, and a kernel release has no
+# blank). Read from probe's PROBE_OUT: one uname call, no parse of the fact
+# line. Without a machine field the reason is the kernel line's.
+_kernel_arch() {
+    probe "kernel" uname -srm
+    case "$PROBE_RC:$PROBE_OUT" in
+        0:*" "*) fact "machine arch: ${PROBE_OUT##* }" ;;
+        *:*" "*) fact "machine arch (exit $PROBE_RC): ${PROBE_OUT##* }" ;;
+        127:)    fact "machine arch: n/a (command not found: uname)" ;;
+        124:)    if _past_deadline; then fact "machine arch: n/a (run deadline reached: ${RUN_DEADLINE}s)"
+                 else fact "machine arch: n/a (timed out: ${CMD_TIMEOUT}s)"; fi ;;
+        0:)      fact "machine arch: n/a (empty output)" ;;
+        *:)      fact "machine arch: n/a ($(_classify_err))" ;;
+        *)       fact "machine arch: n/a (no machine field in the uname -srm output)" ;;
+    esac
+}
+# ---- end apm: machine arch
+
 # ---- apm: output directory — DO NOT EDIT ------------------------------------
 # members: apmjava apmnodejs apmphp apmpython
 # _out_check -> for --file, makes sure the --out directory (OPT_OUT, default:
@@ -1358,16 +1474,6 @@ _out_check() {
     return 0
 }
 # ---- end apm: output directory
-
-# _cap_from NAME VALUE DEFAULT -> sets _cap to VALUE when it is 1..999999, else
-# to DEFAULT, and _cap_note to why VALUE was ignored (empty when unset or used)
-_cap_from() {
-    local v
-    _cap="$3" _cap_note=""
-    [ -n "$2" ] || return 0
-    if v="$(_num_norm "$2" 6)" && [ "$v" -ge 1 ]; then _cap="$v"; return 0; fi
-    _cap_note="$1=$(_quote_nl "$2") ignored (not a number 1..999999), using $3"
-}
 
 # _registry_vals FILE -> the raw first field of each port registry line
 _registry_vals() { [ -r "$1" ] && awk 'NF { print $1 }' "$1" 2>/dev/null; return 0; }
@@ -1419,16 +1525,6 @@ EOF
     _tcp_ports="$_pl" _tcp_label="$_pl"
     fact "tcp port filter: 6600$_plab"
     [ -n "$_pbad" ] && fact "tcp port values ignored (not a port 1..65535): $_pbad"
-}
-
-# _sock_list TOOL FLAGS PORTS -> the socket table lines naming whatap or one of
-# PORTS (space-separated), header kept, first 50; exits with TOOL's status
-_sock_list() {
-    local pat rc
-    pat=":($(printf '%s' "$3" | tr -s ' ' '|' | sed 's/^|//; s/|$//'))([^0-9]|\$)"
-    "$1" "$2" > "$(_tmp sock.out)"; rc=$?
-    awk -v p="$pat" '(NR <= 2 && /State|Proto|Recv-Q/) || /whatap/ || $0 ~ p' "$(_tmp sock.out)" 2>/dev/null | head -n 50
-    return "$rc"
 }
 
 # _resolve_goals -> resolve `agent` and `conf` once, from what discovery and
@@ -1515,74 +1611,24 @@ run_report() {
 # [1] capability preamble: every downstream "command not found" is
 # pre-explained here.
 _rep_env() {
-    section "Collection environment"
-    if [ -n "${BASH_VERSION:-}" ]; then fact "shell: bash $BASH_VERSION"
-    else fact "shell: POSIX sh (non-bash)"; fi
-    fact "uid: $(id -u 2>/dev/null || echo unknown) ($(id -un 2>/dev/null || echo unknown))"
-    _note_privilege
-    fact "privilege: $PRIV_WHY"
-    _note_boot
-    fact "collector cwd: $(pwd 2>/dev/null || echo unknown)"
+    _env_head
     fact "PYTHONPATH entries removed from the interpreters this run starts:${_SELF_PYDROP:- none}"
     fact "tools:"
-    for t in python3 python pip3 ss netstat readlink timeout file stat awk tr; do
-        if command -v "$t" >/dev/null 2>&1; then printf '        %-12s present (%s)\n' "$t" "$(command -v "$t")"
-        else printf '        %-12s absent\n' "$t"; fi
-    done
-}
-
-# _uname_srm -> `uname -srm`, its output also kept in _tmp uname.out
-_uname_srm() {
-    local rc
-    uname -srm > "$(_tmp uname.out)"; rc=$?
-    cat "$(_tmp uname.out)" 2>/dev/null
-    return "$rc"
+    _tool_rows --path python3 python pip3 ss netstat readlink timeout file stat awk tr
 }
 
 # [2] host / platform
 _rep_host() {
     section "Host / platform"
-    # one uname call: the machine is its last field
-    if have uname; then
-        probe "kernel" _uname_srm
-        _un=""
-        { read -r _un < "$(_tmp uname.out)"; } 2>/dev/null
-        case "$_un" in
-            *" "*) fact "machine arch: ${_un##* }" ;;
-            *) fact "machine arch: n/a (no machine field in the uname -srm output)" ;;
-        esac
-    else
-        fact "kernel: n/a (command not found: uname)"
-        fact "machine arch: n/a (command not found: uname)"
-    fi
+    _kernel_arch
     read_proc "os-release" /etc/os-release
     probe "cpu count (nproc)" nproc
     fact "memory:"
-    grep -E '^(MemTotal|MemAvailable)' /proc/meminfo 2>/dev/null | while IFS= read -r _l; do printf '        %s\n' "$_l"; done
+    grep -E '^(MemTotal|MemAvailable)' /proc/meminfo 2>/dev/null | _indent '        '
     # container / cgroup context — memory and cpu limits as the container sees
     # them (facts behind container-vs-host metric questions)
-    if [ -f /sys/fs/cgroup/cgroup.controllers ]; then
-        fact "cgroup: v2 (unified)"
-        read_proc "cgroup memory.max" /sys/fs/cgroup/memory.max
-        read_proc "cgroup cpu.max" /sys/fs/cgroup/cpu.max
-    elif [ -d /sys/fs/cgroup/memory ]; then
-        fact "cgroup: v1"
-        read_proc "cgroup memory.limit_in_bytes" /sys/fs/cgroup/memory/memory.limit_in_bytes
-        read_proc "cgroup cpu cfs_quota_us" /sys/fs/cgroup/cpu/cpu.cfs_quota_us
-        read_proc "cgroup cpu cfs_period_us" /sys/fs/cgroup/cpu/cpu.cfs_period_us
-    else
-        fact "cgroup: n/a (path not found: /sys/fs/cgroup)"
-    fi
-    fact "container markers:"
-    for m in /.dockerenv /run/.containerenv; do
-        if [ -e "$m" ]; then printf '        %-22s present\n' "$m"; else printf '        %-22s absent\n' "$m"; fi
-    done
-    if [ -n "${KUBERNETES_SERVICE_HOST:-}" ]; then
-        printf '        %-22s %s\n' "KUBERNETES_SERVICE_HOST" "$KUBERNETES_SERVICE_HOST"
-    else
-        printf '        %-22s not set\n' "KUBERNETES_SERVICE_HOST"
-    fi
-    probe "self cgroup (first 5 lines)" head -n 5 /proc/self/cgroup
+    _cgroup_facts
+    _container_facts
     probe "local time" date
     probe "pid 1 command" sh -c "tr '\0' ' ' < /proc/1/cmdline | cut -c1-160"
 }
@@ -1597,7 +1643,6 @@ _rep_runtimes() {
     _py_whatap=0 _py_fail="" _py_probed=0 _py_unprobed_live=""
     _odoo_rel="" _odoo_miss=""
     _py_total="$(printf '%s\n' "$D_PY_EXES" | grep -c .)"
-    [ -n "$D_CAP_NOTE" ] && fact "$D_CAP_NOTE"
     # newline-split, no globbing: fd 9 carries the list, so a probe that
     # reads stdin cannot eat it
     while IFS= read -r py <&9; do
@@ -1827,7 +1872,7 @@ EOF
             _dists="$(_names "$sp" | grep -E '\.dist-info$|\.egg-info$|\.egg$' | sed 's/\.dist-info$//; s/\.egg-info$//')"
             if [ -n "$_dists" ]; then
                 printf '           installed distributions in %s (%s total, first 200):\n' "$sp" "$(printf '%s\n' "$_dists" | wc -l | tr -d ' ')"
-                printf '%s\n' "$_dists" | head -n 200 | while IFS= read -r _l; do printf '             %s\n' "$_l"; done
+                printf '%s\n' "$_dists" | head -n 200 | _indent '             '
             else
                 printf '           installed distributions: n/a (no dist-info/egg-info entries in %s)\n' "$sp"
             fi
@@ -1854,7 +1899,7 @@ _rep_procs() {
             printf '           cwd: %s\n' "$(readlink -f "/proc/$pid/cwd" 2>/dev/null || echo "n/a (permission denied or gone)")"
             printf '           uid/state: %s\n' "$(awk '/^Uid:/{u=$2} /^State:/{s=$2" "$3} END{print u" / "s}' "/proc/$pid/status" 2>/dev/null)"
             if [ -r "/proc/$pid/environ" ]; then
-                tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | grep -E '^(WHATAP_HOME|WHATAP_VERSION|whatap\.port|python\.version)=' | while IFS= read -r _l; do printf '           env %s\n' "$_l"; done
+                tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | grep -E '^(WHATAP_HOME|WHATAP_VERSION|whatap\.port|python\.version)=' | _indent '           env '
             else
                 printf '           env: n/a (permission denied: /proc/%s/environ)\n' "$pid"
             fi
@@ -1894,9 +1939,9 @@ _rep_procs() {
                 _so="$(awk '$NF ~ /site-packages\/.*\.so/ {print $NF}' "/proc/$pid/maps" 2>/dev/null | sort -u)"
                 if [ -n "$_so" ]; then
                     printf '           site-packages in use (from loaded C extensions):\n'
-                    printf '%s\n' "$_so" | sed 's#\(.*/site-packages\)/.*#\1#' | sort -u | while IFS= read -r _l; do printf '             %s\n' "$_l"; done
+                    printf '%s\n' "$_so" | sed 's#\(.*/site-packages\)/.*#\1#' | sort -u | _indent '             '
                     printf '           loaded C-extension packages:\n'
-                    printf '%s\n' "$_so" | sed 's#.*/site-packages/##' | sed 's#/.*##' | sed 's#\.cpython.*##; s#\.so.*##' | sort -u | head -n 40 | while IFS= read -r _l; do printf '             %s\n' "$_l"; done
+                    printf '%s\n' "$_so" | sed 's#.*/site-packages/##' | sed 's#/.*##' | sed 's#\.cpython.*##; s#\.so.*##' | sort -u | head -n 40 | _indent '             '
                 else
                     printf '           loaded C-extension packages: none in maps\n'
                 fi
@@ -2056,7 +2101,7 @@ EOF
         [ -f "$_fs" ] || continue
         _found_rel=1
         fact "odoo release file: $_fs"
-        grep -E '^(version|version_info|serie|product_name)' "$_fs" 2>/dev/null | head -n 6 | while IFS= read -r _l; do printf '        %s\n' "$_l"; done
+        grep -E '^(version|version_info|serie|product_name)' "$_fs" 2>/dev/null | head -n 6 | _indent '        '
     done 9<<EOF
 $_rcands
 EOF
@@ -2093,7 +2138,7 @@ EOF
             [ -r "$_fs" ] || { fact "-- odoo config $_oc: n/a (permission denied: $_fs)"; continue; }
             _skip="$(grep -cE '^[[:space:]]*(db_password|admin_passwd)[[:space:]]*=' "$_fs" 2>/dev/null)"
             fact "-- odoo config $_oc (data scope: db_password/admin_passwd lines not collected — ${_skip:-0} such line(s) omitted; first 200 lines):"
-            grep -vE '^[[:space:]]*(db_password|admin_passwd)[[:space:]]*=' "$_fs" 2>/dev/null | head -n 200 | while IFS= read -r _l; do printf '        %s\n' "$_l"; done
+            grep -vE '^[[:space:]]*(db_password|admin_passwd)[[:space:]]*=' "$_fs" 2>/dev/null | head -n 200 | _indent '        '
             # where the http-worker traceback goes: the logfile key, or stdout
             _lf="$(grep -E '^[[:space:]]*logfile[[:space:]]*=' "$_fs" 2>/dev/null | tail -n1 | cut -d= -f2- | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
             if [ -n "$_lf" ] && [ "$_lf" != "None" ] && [ "$_lf" != "False" ]; then

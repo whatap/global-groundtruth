@@ -185,8 +185,12 @@ delete it when the case is closed.
 Copied from [../../templates/collector-skeleton/](../../templates/collector-skeleton/),
 following [../../docs/authoring-guide.md](../../docs/authoring-guide.md) and
 [../../docs/collector-engineering.md](../../docs/collector-engineering.md)
-(MECE domains, load tiers, portability, reasoned absence). Keep to facts only
-and re-validate after edits:
+(MECE domains, load tiers, portability, reasoned absence). `_classify_err`,
+`_proc_hidden` and `_self_tree` are the group block `host: helpers`, shared
+with collect-db.sh and owned by
+[templates/groups/host.sh](../../templates/groups/host.sh): edit them there
+and run `tools/sync-shared-block.sh --apply`. Keep to facts only and
+re-validate after edits:
 
 ```sh
 ../../tools/validate.sh collect-nms.sh

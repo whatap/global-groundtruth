@@ -239,8 +239,9 @@ and every collector must keep them.
   - **Caps and time limits come from the environment**, never from options:
     `CMD_TIMEOUT`, `RUN_DEADLINE`, and per-collector `<THING>_<KIND>` names
     (`APM_INTERP_CAP`, `BINLOG_TIMEOUT`, `LOG_TAIL_LINES`). Validate them
-    with `_cap_or` / `_cap_from` (shared block): a value that is not a whole
-    number 1..999999 is named in a `!!` line and the default is used. List
+    with `_cap_or` (skeleton run helpers): a value that is not a whole
+    number 1..999999 without leading zeros is named in a `!!` line and the
+    default is used. List
     them in the help. No `--x-secs` / `--max-x` per feature.
   - **No `--no-X` for something off by default, no two options for the same
     thing, and no option that only tests need** (tests set the environment).

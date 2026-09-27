@@ -7,6 +7,13 @@ one entry at the top of its section (docs/authoring-guide.md, step 2);
 
 ## collect-collserver.sh
 
+- **0.11.5** — Shared code in synced blocks (R2 refactor): the skeleton's emit
+  helpers now hold _optval, _emit_labeled, _tool_rows (the [1] tool table) and
+  _indent (the indent loops), and its run helpers hold probe and read_proc.
+  The systemd helpers (_sd, _sd_prefetch, sd_show, sd_state, unit_loaded) and
+  resolve_yardbase are collection-server group blocks shared with collzfs;
+  sd_show, sd_state and unit_loaded take the full unit name. Report unchanged
+  (compared with 0.11.4 on this host).
 - **0.11.4** — [1]'s privilege line says when uid 0 has no CAP_SYS_PTRACE (bit 19
   of CapEff; the default in docker and k8s): "root without
   CAP_SYS_PTRACE (other uids' /proc/\<pid>/environ, root, cwd are not
@@ -64,6 +71,15 @@ one entry at the top of its section (docs/authoring-guide.md, step 2);
 
 ## collect-collzfs.sh
 
+- **0.8.6** — Shared code in synced blocks (R2 refactor): the skeleton's emit
+  helpers now hold _optval, _emit_labeled, _tool_rows (the [1] tool table) and
+  _indent (the indent loops), and its run helpers hold probe and read_proc.
+  The systemd helpers and resolve_yardbase are collection-server group blocks
+  shared with collserver, and probe is the skeleton's (zprobe skips a zpool or
+  zfs that hung earlier). Behaviour change: after one systemctl call hits its
+  cap the rest are skipped, with a `!!` line, as collserver does (each used to
+  wait CMD_TIMEOUT; their values were empty either way). Report unchanged
+  otherwise (compared with 0.8.5 on this host).
 - **0.8.5** — [1]'s privilege line says when uid 0 has no CAP_SYS_PTRACE (bit 19
   of CapEff; the default in docker and k8s): "root without
   CAP_SYS_PTRACE (other uids' /proc/\<pid>/environ, root, cwd are not
@@ -120,6 +136,20 @@ one entry at the top of its section (docs/authoring-guide.md, step 2);
   bundle, so the file count is there without a walk.
 
 ## collect-collmysql.sh
+
+- **0.10.4** — Shared code in synced blocks (R2 refactor): the skeleton's emit
+  helpers now hold _optval, _emit_labeled, _tool_rows (the [1] tool table) and
+  _indent (the indent loops), and its run helpers hold probe and read_proc.
+  Report change: a probe whose command exits non-zero with output prints that
+  output under "label (exit N):" instead of "label: n/a (...)", as the other
+  collectors do. The caps BINLOG_TIMEOUT, PROMPT_TIMEOUT, RUN_DEADLINE and
+  CMD_TIMEOUT are checked by _cap_or: an ignored value is one `!!` line per
+  variable ("NAME=V ignored (not a whole number 1..999999 without leading
+  zeros), using D") instead of one combined line; the rule is unchanged. The
+  last field of a line is cut without eval. Compared with 0.10.3 on this host:
+  reports equal but live values.
+  --help names BINLOG_TIMEOUT instead of printing its value, which is now
+  checked after the options.
 
 - **0.10.3** — [1]'s privilege line says when uid 0 has no CAP_SYS_PTRACE (bit 19
   of CapEff; the default in docker and k8s): "root without

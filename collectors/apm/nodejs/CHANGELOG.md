@@ -5,6 +5,16 @@ first. Every change to the script bumps its `VERSION` and adds one entry at
 the top of this list (docs/authoring-guide.md, step 2); `tools/validate.sh`
 checks that the newest entry is the script's `VERSION`.
 
+- **0.8.4** — Shared code in synced blocks (R2 refactor): the skeleton's emit
+  helpers now hold _optval, _emit_labeled, _tool_rows (the [1] tool table) and
+  _indent (the indent loops), and its run helpers hold probe and read_proc.
+  New apm blocks: report helpers (environment head, cgroup, container
+  markers), machine arch, conf bytes; resolve_fs, _sock_list and _scan_gaps
+  joined the path, file and environ blocks. The machine arch line is read from
+  probe's output (PROBE_OUT) instead of the indented fact line; its text is
+  unchanged in every case the old parse handled. A value option without its
+  value exits 2 without printing the usage after the message. Report unchanged
+  otherwise (compared with 0.8.3 on this host and in jjsong-ggt-apm-nodejs:1).
 - **0.8.3** — [1]'s privilege line says when uid 0 has no CAP_SYS_PTRACE (bit 19
   of CapEff; the default in docker and k8s): "root without
   CAP_SYS_PTRACE (other uids' /proc/\<pid>/environ, root, cwd are not

@@ -32,7 +32,7 @@ export LC_ALL=C
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-apmjava"
 # History: CHANGELOG.md (next to this file).
-VERSION="0.13.3"
+VERSION="0.13.4"
 DOMAIN="apm"
 TARGET="host/$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || uname -n 2>/dev/null || echo unknown)"
 
@@ -45,6 +45,76 @@ for _v in JAVA_TOOL_OPTIONS JDK_JAVA_OPTIONS _JAVA_OPTIONS; do
     eval "[ -n \"\${$_v+x}\" ]" && _SELF_JVMOPTS="$_SELF_JVMOPTS $_v"
 done
 unset JAVA_TOOL_OPTIONS JDK_JAVA_OPTIONS _JAVA_OPTIONS _v
+
+# ---- emit helpers — DO NOT EDIT ---------------------------------------------
+# The report shape (../../docs/output-format.md): header, numbered sections,
+# facts, footer. progress narrates on fd 3 (the terminal saved in main), never
+# into the report, and --quiet silences it; keep its text a fact about the run.
+_section_n=0
+
+emit_header() {
+    printf '==== WhaTap Global Groundtruth Collection ====\n'
+    printf 'Collector:      %s\n' "$COLLECTOR_NAME"
+    printf 'Version:        %s\n' "$VERSION"
+    printf 'Timestamp(UTC): %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown)"
+    printf 'Domain:         %s\n' "$DOMAIN"
+    printf 'Target:         %s\n' "$TARGET"
+    printf '===============================================\n'
+}
+
+# section "A. TITLE" -> the next numbered section, [n] A. TITLE, narrated too
+section() {
+    _section_n=$((_section_n + 1))
+    printf '\n[%d] %s\n' "$_section_n" "$1"
+    progress "[$_section_n] $1"
+}
+subsection() { printf '\n    -- %s --\n' "$1"; }
+fact()       { printf '    %s\n' "$1"; }
+emit_footer() { printf '\n==== END OF COLLECTION (no diagnosis by design) ====\n'; }
+progress()   { [ "$OPT_QUIET" = 1 ] && return; printf '>> %s\n' "$*" >&3 2>/dev/null; }
+have()       { command -v "$1" >/dev/null 2>&1; }
+
+# _indent PREFIX -> stdin with PREFIX before every line; a last line without a
+# newline is kept (and ended)
+_indent() { awk -v p="$1" '{ print p $0 }'; }
+
+# _emit_labeled LABEL BODY -> "LABEL: BODY" for a one-line BODY; else "LABEL:"
+# and BODY's lines under it, indented
+_emit_labeled() {
+    local label="$1" body="$2" n
+    n="$(printf '%s\n' "$body" | wc -l | tr -d ' ')"
+    if [ "${n:-0}" -le 1 ]; then
+        fact "$label: $body"
+    else
+        fact "$label:"
+        printf '%s\n' "$body" | _indent '        '
+    fi
+}
+
+# _tool_rows [--path] TOOL... -> one row per TOOL for the environment section's
+# tool table: "present" or "absent", with --path "present (PATH)". The path is
+# read back from a file in the run's directory, not a $(...) (a fork per tool);
+# without the directory it is looked up again.
+_tool_rows() {
+    local wp=0 t p
+    [ "${1:-}" = --path ] && { wp=1; shift; }
+    for t in "$@"; do
+        if ! command -v "$t" >/dev/null 2>&1; then printf '        %-12s absent\n' "$t"; continue; fi
+        [ "$wp" = 1 ] || { printf '        %-12s present\n' "$t"; continue; }
+        p=""
+        [ -n "$_tmp_dir" ] && { command -v "$t" > "$_tmp_dir/cmdv"; } 2>/dev/null && IFS= read -r p < "$_tmp_dir/cmdv"
+        [ -n "$p" ] || p="$(command -v "$t" 2>/dev/null)"
+        printf '        %-12s present (%s)\n' "$t" "$p"
+    done
+}
+
+# _optval NAME VALUE -> exit 2 when VALUE is empty or starts with '-' (then the
+# next option was taken for the value: `--out --stdout`). This block comes
+# before the option loop, which calls it.
+_optval() {
+    case "$2" in ''|-*) printf -- 'missing value for %s\n' "$1" >&2; exit 2 ;; esac
+}
+# ---- end emit helpers
 
 # ---- CLI harness — DO NOT EDIT ----------------------------------------------
 OPT_FILE=0        # write the report to a .txt file
@@ -123,16 +193,6 @@ Tier 2 (off by default; each announces its impact on stderr before running):
 EOF
 }
 
-# _optval OPTION VALUE [ARGC] -> exit 2 when OPTION, which takes a value, has
-# none: VALUE is empty (`--out=`, or OPTION last, ARGC < 2: a `shift` past the
-# end stops dash with its own message) or starts with `-` (`--out --stdout`
-# would otherwise take the next option as the value)
-_optval() {
-    case "${3:-2}:$2" in
-        [01]:*|*:|*:-*) printf 'missing value for %s\n' "$1" >&2; usage >&2; exit 2 ;;
-    esac
-}
-
 # _optnum OPTION VALUE -> exit 2 unless VALUE is a whole number 1..999999
 # without a leading zero (the range the environment caps take)
 _optnum() {
@@ -152,20 +212,20 @@ while [ $# -gt 0 ]; do
         --file)      OPT_FILE=1 ;;
         --stdout)    OPT_STDOUT=1 ;;
         --quiet)     OPT_QUIET=1 ;;
-        --out)       _optval "$1" "${2-}" $#; OPT_OUT="$2"; shift ;;
+        --out)       _optval "$1" "${2-}"; OPT_OUT="$2"; shift ;;
         --out=*)     _optval --out "${1#*=}"; OPT_OUT="${1#*=}" ;;
         --threads)   OPT_THREADS=1 ;;
         --threads=*) _optnum --threads "${1#*=}"; OPT_THREADS="${1#*=}" ;;
         --jcmd)      OPT_JCMD=1 ;;
-        --library)      _optval "$1" "${2-}" $#; shift; _addlib "$1" ;;
+        --library)      _optval "$1" "${2-}"; shift; _addlib "$1" ;;
         --library=*)    _optval --library "${1#*=}"; _addlib "${1#*=}" ;;
         --library-all)  printf "%s\n" "--library-all is no longer an option: use --library '*' (every enumerated jar, cap 40)" >&2; exit 2 ;;
-        --class)        _optval "$1" "${2-}" $#; shift; OPT_CLASSES="$OPT_CLASSES $1" ;;
+        --class)        _optval "$1" "${2-}"; shift; OPT_CLASSES="$OPT_CLASSES $1" ;;
         --class=*)      _optval --class "${1#*=}"; OPT_CLASSES="$OPT_CLASSES ${1#*=}" ;;
         --appclasses)   OPT_APPCLASSES=1 ;;
-        --class-refs)   _optval "$1" "${2-}" $#; shift; OPT_REFS="$OPT_REFS $1" ;;
+        --class-refs)   _optval "$1" "${2-}"; shift; OPT_REFS="$OPT_REFS $1" ;;
         --class-refs=*) _optval --class-refs "${1#*=}"; OPT_REFS="$OPT_REFS ${1#*=}" ;;
-        --dump-file)    _optval "$1" "${2-}" $#; shift; OPT_DUMPS="$OPT_DUMPS
+        --dump-file)    _optval "$1" "${2-}"; shift; OPT_DUMPS="$OPT_DUMPS
 $1" ;;
         --dump-file=*)  _optval --dump-file "${1#*=}"; OPT_DUMPS="$OPT_DUMPS
 ${1#*=}" ;;
@@ -176,35 +236,6 @@ ${1#*=}" ;;
 done
 # --class-refs searches the class roots the --appclasses index reads
 if [ -n "$OPT_REFS" ] && [ "$OPT_APPCLASSES" = 0 ]; then OPT_APPCLASSES=1 OPT_APPIMPLIED=1; fi
-
-# ---- emit helpers — DO NOT EDIT ---------------------------------------------
-# The report shape (../../docs/output-format.md): header, numbered sections,
-# facts, footer. progress narrates on fd 3 (the terminal saved in main), never
-# into the report, and --quiet silences it; keep its text a fact about the run.
-_section_n=0
-
-emit_header() {
-    printf '==== WhaTap Global Groundtruth Collection ====\n'
-    printf 'Collector:      %s\n' "$COLLECTOR_NAME"
-    printf 'Version:        %s\n' "$VERSION"
-    printf 'Timestamp(UTC): %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown)"
-    printf 'Domain:         %s\n' "$DOMAIN"
-    printf 'Target:         %s\n' "$TARGET"
-    printf '===============================================\n'
-}
-
-# section "A. TITLE" -> the next numbered section, [n] A. TITLE, narrated too
-section() {
-    _section_n=$((_section_n + 1))
-    printf '\n[%d] %s\n' "$_section_n" "$1"
-    progress "[$_section_n] $1"
-}
-subsection() { printf '\n    -- %s --\n' "$1"; }
-fact()       { printf '    %s\n' "$1"; }
-emit_footer() { printf '\n==== END OF COLLECTION (no diagnosis by design) ====\n'; }
-progress()   { [ "$OPT_QUIET" = 1 ] && return; printf '>> %s\n' "$*" >&3 2>/dev/null; }
-have()       { command -v "$1" >/dev/null 2>&1; }
-# ---- end emit helpers
 
 # ---- privilege — DO NOT EDIT ------------------------------------------------
 # What a run can read depends on the privilege it was given: a fact about this
@@ -273,6 +304,8 @@ _note_boot() {
 # _bounded CMD... every external command under CMD_TIMEOUT and RUN_DEADLINE.
 # _tmp NAME       a path in this run's private directory, removed on exit.
 # _report_to_file --file mode's write; fails when the file is not written whole.
+# probe, read_proc  a command's output or a file's content as facts, or n/a with
+#                 the reason (guideline 4).
 # Constraints:
 # - POSIX sh only (apm collectors run under `sh -s`, often dash or busybox):
 #   no SECONDS, no `type -t`, no ${v//x/y} outside a BASH_VERSION guard.
@@ -522,6 +555,47 @@ _report_to_file() {
         return 1
     fi
 }
+
+# probe "label" CMD [ARGS...] -> output as facts, or "label: n/a (<why>)".
+# CMD may be a file, a shell function or a builtin; _bounded caps all three. A
+# non-zero exit that still printed something is reported with its output, since
+# for many commands the exit code is the answer (systemctl is-active prints
+# "inactive" and exits 3). The reason of a failure is the collector's
+# _classify_err, reading _errfile. PROBE_OUT / PROBE_RC: the last probe's stdout
+# and exit status (127 when nothing ran), so a caller that also parses the
+# output runs the command once.
+PROBE_OUT=""; PROBE_RC=127
+# shellcheck disable=SC2034  # PROBE_OUT / PROBE_RC are read by the caller
+probe() {
+    local label="$1" out rc; shift
+    PROBE_OUT=""; PROBE_RC=127
+    [ -n "$(_cmd_kind "$1")" ] || { fact "$label: n/a (command not found: $1)"; return; }
+    out="$(_bounded "$@" 2>"$_errfile")"; rc=$?
+    PROBE_OUT="$out"; PROBE_RC="$rc"
+    if [ "$rc" -eq 124 ]; then
+        if _past_deadline; then fact "$label: n/a (run deadline reached: ${RUN_DEADLINE}s)"
+        else fact "$label: n/a (timed out: ${CMD_TIMEOUT}s)"; fi
+        return
+    fi
+    if [ "$rc" -ne 0 ]; then
+        [ -n "$out" ] && { _emit_labeled "$label (exit $rc)" "$out"; return; }
+        fact "$label: n/a ($(_classify_err))"; return
+    fi
+    [ -z "$out" ] && { fact "$label: n/a (empty output)"; return; }
+    _emit_labeled "$label" "$out"
+}
+
+# read_proc "label" PATH [LINES] -> a /proc or /sys file's content (its last
+# LINES lines when LINES is given), or "label: n/a (<why>)".
+read_proc() {
+    local label="$1" path="$2" cap="${3:-0}" out
+    [ -e "$path" ] || { fact "$label: n/a (path not found: $path)"; return; }
+    [ -r "$path" ] || { fact "$label: n/a (permission denied: $path)"; return; }
+    if [ "$cap" -gt 0 ] 2>/dev/null; then out="$(tail -n "$cap" "$path" 2>/dev/null)"
+    else out="$(cat "$path" 2>/dev/null)"; fi
+    [ -z "$out" ] && { fact "$label: n/a (empty output)"; return; }
+    _emit_labeled "$label" "$out"
+}
 # ---- end run helpers
 
 # ---- collection completeness — DO NOT EDIT ----------------------------------
@@ -696,48 +770,6 @@ _classify_err() {
     else echo "nonzero exit"; fi
 }
 
-_emit_labeled() {
-    local label="$1" body="$2" n
-    n="$(printf '%s\n' "$body" | wc -l | tr -d ' ')"
-    if [ "${n:-0}" -le 1 ]; then
-        fact "$label: $body"
-    else
-        fact "$label:"
-        printf '%s\n' "$body" | while IFS= read -r _l || [ -n "$_l" ]; do printf '        %s\n' "$_l"; done
-    fi
-}
-
-# probe "label" CMD [ARGS...] -> output as facts, or "label: n/a (<why>)".
-# CMD may be a file, a shell function or a builtin; _bounded caps all three. A
-# non-zero exit that still printed something is reported with its output.
-probe() {
-    local label="$1"; shift
-    [ -n "$(_cmd_kind "$1")" ] || { fact "$label: n/a (command not found: $1)"; return; }
-    local out rc
-    out="$(_bounded "$@" 2>"$_errfile")"; rc=$?
-    if [ "$rc" -eq 124 ]; then
-        if _past_deadline; then fact "$label: n/a (run deadline reached: ${RUN_DEADLINE}s)"
-        else fact "$label: n/a (timed out: ${CMD_TIMEOUT}s)"; fi
-        return
-    fi
-    if [ "$rc" -ne 0 ]; then
-        [ -n "$out" ] && { _emit_labeled "$label (exit $rc)" "$out"; return; }
-        fact "$label: n/a ($(_classify_err))"; return
-    fi
-    [ -z "$out" ] && { fact "$label: n/a (empty output)"; return; }
-    _emit_labeled "$label" "$out"
-}
-
-# read_proc "label" PATH -> content of a /proc or /sys file, or a reason.
-read_proc() {
-    local label="$1" path="$2" out
-    [ -e "$path" ] || { fact "$label: n/a (path not found: $path)"; return; }
-    [ -r "$path" ] || { fact "$label: n/a (permission denied: $path)"; return; }
-    out="$(cat "$path" 2>/dev/null)"
-    [ -z "$out" ] && { fact "$label: n/a (empty output)"; return; }
-    _emit_labeled "$label" "$out"
-}
-
 # _names DIR -> the names in DIR, as `ls DIR` lists them (no dot files, sorted).
 # Only an unmatched glob is skipped: in a DIR this uid can read but not enter,
 # -e fails on every entry although ls lists them all.
@@ -750,6 +782,55 @@ _names() {
     return 0
 }
 # ---- end apm: probe helpers
+
+# ---- apm: report helpers — DO NOT EDIT -------------------------------------
+# members: apmjava apmnodejs apmphp apmpython
+# _env_head -> the opening facts of the environment section: shell, uid,
+# privilege, boot time and the collector's cwd
+_env_head() {
+    section "Collection environment"
+    if [ -n "${BASH_VERSION:-}" ]; then fact "shell: bash $BASH_VERSION"
+    else fact "shell: POSIX sh (non-bash)"; fi
+    fact "uid: $(id -u 2>/dev/null || echo unknown) ($(id -un 2>/dev/null || echo unknown))"
+    _note_privilege
+    fact "privilege: $PRIV_WHY"
+    _note_boot
+    fact "collector cwd: $(pwd 2>/dev/null || echo unknown)"
+}
+
+# _cgroup_facts -> the cgroup version and the memory and cpu limits as this
+# process's cgroup sees them (container-vs-host metric questions need them)
+_cgroup_facts() {
+    if [ -f /sys/fs/cgroup/cgroup.controllers ]; then
+        fact "cgroup: v2 (unified)"
+        read_proc "cgroup memory.max" /sys/fs/cgroup/memory.max
+        read_proc "cgroup cpu.max" /sys/fs/cgroup/cpu.max
+    elif [ -d /sys/fs/cgroup/memory ]; then
+        fact "cgroup: v1"
+        read_proc "cgroup memory.limit_in_bytes" /sys/fs/cgroup/memory/memory.limit_in_bytes
+        read_proc "cgroup cpu cfs_quota_us" /sys/fs/cgroup/cpu/cpu.cfs_quota_us
+        read_proc "cgroup cpu cfs_period_us" /sys/fs/cgroup/cpu/cpu.cfs_period_us
+    else
+        fact "cgroup: n/a (path not found: /sys/fs/cgroup)"
+    fi
+}
+
+# _container_facts -> the container markers, KUBERNETES_SERVICE_HOST and this
+# process's cgroup lines
+_container_facts() {
+    local m
+    fact "container markers:"
+    for m in /.dockerenv /run/.containerenv; do
+        if [ -e "$m" ]; then printf '        %-22s present\n' "$m"; else printf '        %-22s absent\n' "$m"; fi
+    done
+    if [ -n "${KUBERNETES_SERVICE_HOST:-}" ]; then
+        printf '        %-22s %s\n' "KUBERNETES_SERVICE_HOST" "$KUBERNETES_SERVICE_HOST"
+    else
+        printf '        %-22s not set\n' "KUBERNETES_SERVICE_HOST"
+    fi
+    probe "self cgroup (first 5 lines)" head -n 5 /proc/self/cgroup
+}
+# ---- end apm: report helpers
 
 # ---- apm: output directory — DO NOT EDIT ------------------------------------
 # members: apmjava apmnodejs apmphp apmpython
@@ -791,7 +872,7 @@ _file_lines() {
     [ -s "$path" ] || { fact "$label: (empty file)"; return; }
     fact "$label ($end $cap lines; file size $(_fsize "$path") bytes):"
     if [ "$end" = last ]; then tail -n "$cap" "$path" 2>/dev/null; else head -n "$cap" "$path" 2>/dev/null; fi \
-        | while IFS= read -r _l || [ -n "$_l" ]; do printf '        %s\n' "$_l"; done
+        | _indent '        '
 }
 
 # conf_bytes "label" PATH -> byte-level facts a plain `cat` hides: total bytes
@@ -1141,7 +1222,7 @@ detail_jar() {
     _svc="$(grep '^META-INF/services/.' "$lst" | head -n 10)"
     if [ -n "$_svc" ]; then
         fact "       service provider entries:"
-        printf '%s\n' "$_svc" | while IFS= read -r _l; do printf '             %s\n' "$_l"; done
+        printf '%s\n' "$_svc" | _indent '             '
     fi
     # member signatures of the classes named with --class
     for _fq in $OPT_CLASSES; do
@@ -2269,23 +2350,9 @@ _probe_ls() { probe "$1" sh "$(_tmp ls_head.sh)" "$(_vfix "$2")" "$3"; }
 # [1] capability preamble: every downstream "command not found" is
 # pre-explained here.
 _rep_env() {
-    section "Collection environment"
-    if [ -n "${BASH_VERSION:-}" ]; then fact "shell: bash $BASH_VERSION"
-    else fact "shell: POSIX sh (non-bash)"; fi
-    fact "uid: $(id -u 2>/dev/null || echo unknown) ($(id -un 2>/dev/null || echo unknown))"
-    _note_privilege
-    fact "privilege: $PRIV_WHY"
-    _note_boot
-    fact "collector cwd: $(pwd 2>/dev/null || echo unknown)"
+    _env_head
     fact "tools:"
-    for t in java javap jstack jcmd jps unzip od sha256sum ss netstat lsof readlink timeout stat awk tr xargs getconf; do
-        # the path is read back from a file rather than a second lookup in
-        # a $(...); without the file (no run directory) it is looked up again
-        if [ -n "$_tmp_dir" ] && command -v "$t" > "$_tmp_dir/cmdv" 2>/dev/null && IFS= read -r _p < "$_tmp_dir/cmdv"; then
-            printf '        %-12s present (%s)\n' "$t" "$_p"
-        elif command -v "$t" >/dev/null 2>&1; then printf '        %-12s present (%s)\n' "$t" "$(command -v "$t")"
-        else printf '        %-12s absent\n' "$t"; fi
-    done
+    _tool_rows --path java javap jstack jcmd jps unzip od sha256sum ss netstat lsof readlink timeout stat awk tr xargs getconf
     fact "per-command cap: ${CMD_TIMEOUT}s; run deadline: ${RUN_DEADLINE}s"
     fact "Tier 2 flags: --threads=$OPT_THREADS  --jcmd=$OPT_JCMD (0 = not requested)"
     fact "JVM option variables removed from the JVMs this run starts:${_SELF_JVMOPTS:- none were set}"
@@ -2305,33 +2372,13 @@ _rep_host() {
     _mem="$(grep -E '^(MemTotal|MemAvailable|SwapTotal)' /proc/meminfo 2>/dev/null)"
     if [ -n "$_mem" ]; then
         fact "memory (/proc/meminfo):"
-        printf '%s\n' "$_mem" | while IFS= read -r _l; do printf '        %s\n' "$_l"; done
+        printf '%s\n' "$_mem" | _indent '        '
     else
         fact "memory: n/a (/proc/meminfo not readable)"
     fi
     read_proc "loadavg" /proc/loadavg
-    if [ -f /sys/fs/cgroup/cgroup.controllers ]; then
-        fact "cgroup: v2 (unified)"
-        read_proc "cgroup memory.max" /sys/fs/cgroup/memory.max
-        read_proc "cgroup cpu.max" /sys/fs/cgroup/cpu.max
-    elif [ -d /sys/fs/cgroup/memory ]; then
-        fact "cgroup: v1"
-        read_proc "cgroup memory.limit_in_bytes" /sys/fs/cgroup/memory/memory.limit_in_bytes
-        read_proc "cgroup cpu cfs_quota_us" /sys/fs/cgroup/cpu/cpu.cfs_quota_us
-        read_proc "cgroup cpu cfs_period_us" /sys/fs/cgroup/cpu/cpu.cfs_period_us
-    else
-        fact "cgroup: n/a (path not found: /sys/fs/cgroup)"
-    fi
-    fact "container markers:"
-    for m in /.dockerenv /run/.containerenv; do
-        if [ -e "$m" ]; then printf '        %-22s present\n' "$m"; else printf '        %-22s absent\n' "$m"; fi
-    done
-    if [ -n "${KUBERNETES_SERVICE_HOST:-}" ]; then
-        printf '        %-22s %s\n' "KUBERNETES_SERVICE_HOST" "$KUBERNETES_SERVICE_HOST"
-    else
-        printf '        %-22s not set\n' "KUBERNETES_SERVICE_HOST"
-    fi
-    probe "self cgroup (first 5 lines)" head -n 5 /proc/self/cgroup
+    _cgroup_facts
+    _container_facts
     probe "pid 1 command" sh -c "tr '\0' ' ' < /proc/1/cmdline | cut -c1-160"
     probe "local time" date
     probe "UTC time" date -u
@@ -2359,7 +2406,7 @@ _rep_runtimes() {
         _rel="$(dirname "$(dirname "$_jr")")/release"
         if [ -r "$_rel" ]; then
             fact "   $_rel:"
-            grep -E '^(JAVA_VERSION|IMPLEMENTOR|JAVA_VERSION_DATE|OS_ARCH)=' "$_rel" 2>/dev/null | while IFS= read -r _l; do printf '        %s\n' "$_l"; done
+            grep -E '^(JAVA_VERSION|IMPLEMENTOR|JAVA_VERSION_DATE|OS_ARCH)=' "$_rel" 2>/dev/null | _indent '        '
         else
             fact "   release file: n/a ($(_path_why "$_rel"))"
         fi
@@ -2384,7 +2431,7 @@ EOF
                 done
                 if [ -n "$_rf" ]; then
                     printf '           %s:\n' "$_rf"
-                    grep -E '^(JAVA_VERSION|IMPLEMENTOR|JAVA_VERSION_DATE|OS_ARCH)=' "$_rf" 2>/dev/null | while IFS= read -r _l; do printf '             %s\n' "$_l"; done
+                    grep -E '^(JAVA_VERSION|IMPLEMENTOR|JAVA_VERSION_DATE|OS_ARCH)=' "$_rf" 2>/dev/null | _indent '             '
                 else
                     printf '           release file: none readable in the four directories above the VM library\n'
                 fi
@@ -2450,7 +2497,7 @@ _rep_artifacts() {
         done | sort -u)"
         if [ -n "$_comp" ]; then
             fact "companion files next to an agent jar (names containing helper or whatap):"
-            printf '%s\n' "$_comp" | while IFS= read -r _l; do printf '        %s\n' "$_l"; done
+            printf '%s\n' "$_comp" | _indent '        '
         else
             fact "companion files next to an agent jar (names containing helper or whatap): none in the readable jar directories"
         fi
@@ -2492,7 +2539,7 @@ _rep_jvms() {
             printf '           stdout (fd 1) -> %s\n' "$(readlink "/proc/$pid/fd/1" 2>/dev/null || echo 'n/a (permission denied or gone)')"
             printf '           stderr (fd 2) -> %s\n' "$(readlink "/proc/$pid/fd/2" 2>/dev/null || echo 'n/a (permission denied or gone)')"
             printf '           cmdline (verbatim):\n'
-            tr '\0' '\n' 2>/dev/null < "/proc/$pid/cmdline" | while IFS= read -r _l; do printf '             %s\n' "$_l"; done
+            tr '\0' '\n' 2>/dev/null < "/proc/$pid/cmdline" | _indent '             '
             if ! _env_readable "$pid"; then
                 printf '           environ: n/a (permission denied: /proc/%s/environ); JAVA_TOOL_OPTIONS, JDK_JAVA_OPTIONS and _JAVA_OPTIONS of this process were not read\n' "$pid"
             fi
@@ -2618,7 +2665,7 @@ _rep_conf() {
                 | cut -c1-400)"
             if [ -n "$_wenv" ]; then
                 fact "   whatap-related environment variables of this process:"
-                printf '%s\n' "$_wenv" | while IFS= read -r _l; do printf '             %s\n' "$_l"; done
+                printf '%s\n' "$_wenv" | _indent '             '
             else
                 fact "   whatap-related environment variables of this process: none set"
             fi
@@ -2630,7 +2677,7 @@ _rep_conf() {
         _wsp="$(_all_jvm_args "$pid" | grep -i '^-Dwhatap' | cut -c1-300)"
         if [ -n "$_wsp" ]; then
             fact "   whatap system properties on the arguments of this process:"
-            printf '%s\n' "$_wsp" | while IFS= read -r _l; do printf '             %s\n' "$_l"; done
+            printf '%s\n' "$_wsp" | _indent '             '
         else
             fact "   whatap system properties on the arguments of this process: none set"
         fi
@@ -3023,7 +3070,7 @@ _rep_weaving() {
                 _pxn="$(printf '%s\n' "$_pxl" | grep -c .)"
                 fact "-- script plugin directory $home/plugin: ${_pxn:-0} .x file(s) (ls -l lines, first 40):"
                 if [ "${_pxn:-0}" -gt 0 ]; then
-                    printf '%s\n' "$_pxl" | head -n 40 | while IFS= read -r _l; do printf '             %s\n' "$_l"; done
+                    printf '%s\n' "$_pxl" | head -n 40 | _indent '             '
                 else
                     printf '             (directory present, no .x file)\n'
                 fi
@@ -3049,13 +3096,13 @@ _rep_weaving() {
             _wk="$(grep -nE '^[[:space:]]*(weaving|weaving_reserved|weaving_[A-Za-z0-9_]*|hook_service_[A-Za-z_]*|hook_method_[A-Za-z_]*|hook_component|instrumentation_[A-Za-z0-9_]*|_enable_asm_[a-z]*|_enable_emb_[a-z]*|trace_component_enabled|bci_ignore_packages)[[:space:]]*=' "$_fsc2" 2>/dev/null | head -n 60)"
             if [ -n "$_wk" ]; then
                 fact "-- pid $pid instrumentation settings (selected from the config file shown in section E, with line numbers):"
-                printf '%s\n' "$_wk" | while IFS= read -r _l; do printf '             %s\n' "$_l"; done
+                printf '%s\n' "$_wk" | _indent '             '
             else
                 fact "-- pid $pid instrumentation settings: no weaving / hook / instrumentation key set in $_cf2"
             fi
         fi
         _wenvp="$(_all_jvm_args "$pid" | grep -iE '^-D(weaving|hook_|instrumentation_)' | cut -c1-300)"
-        [ -n "$_wenvp" ] && printf '%s\n' "$_wenvp" | while IFS= read -r _l; do printf '             (argument) %s\n' "$_l"; done
+        [ -n "$_wenvp" ] && printf '%s\n' "$_wenvp" | _indent '             (argument) '
         # each name in the weaving list, against the weaving/<name>.jar
         # entries of the jar attached to THIS process
         _wlist=""
@@ -3162,7 +3209,7 @@ _rep_logging() {
                 _lds=$((_lds + 1))
                 printf '        pid %s log dir %s (newest 15 by mtime, ls -lt):\n' "$pid" "$_fsl"
                 # shellcheck disable=SC2010  # the ls -lt lines are the facts printed
-                ls -lt "$_fsl" 2>/dev/null | grep -v '^total ' | head -n 15 | while IFS= read -r _l; do printf '             %s\n' "$_l"; done
+                ls -lt "$_fsl" 2>/dev/null | grep -v '^total ' | head -n 15 | _indent '             '
             done
             [ "$_lds" = 0 ] && printf '        pid %s: no readable directory among%s%s logs, log (under the working directory)\n' "$pid" "${_cb:+ $_cb/logs,}" "${_jsb:+ $_jsb/log,}"
         done
@@ -3206,7 +3253,7 @@ _rep_agentlogs() {
                 _wa="$(tail -n 500 "$(_vfix "$_lv/$_ln.log")" 2>/dev/null | grep -oE '\[WA[0-9A-Za-z-]*\]' | sort | uniq -c | sort -rn | head -n 20)"
                 if [ -n "$_wa" ]; then
                     fact "   [WA*] codes in the last 500 lines of $_ln.log:"
-                    printf '%s\n' "$_wa" | while IFS= read -r _l; do printf '        %s\n' "$_l"; done
+                    printf '%s\n' "$_wa" | _indent '        '
                 else
                     fact "   [WA*] codes in the last 500 lines of $_ln.log: none"
                 fi
@@ -3388,13 +3435,13 @@ EOF_DUMPS
             fact "   counted from the 'at <class>.<method>' lines of every thread, at any stack depth"
             fact "   bucket 1 of 3 — JDK and JVM-vendor frames (package starts with java. javax. jakarta. sun. jdk. com.sun. oracle. org.graalvm.), top 20:"
             grep -E '[0-9]+ (java|javax|jakarta|sun|jdk|com\.sun|oracle|org\.graalvm)\.' "$(_tmp tfreq)" 2>/dev/null | head -n 20 > "$(_tmp tb)" 2>/dev/null
-            if [ -s "$(_tmp tb)" ]; then while IFS= read -r _l; do printf '        %s\n' "$_l"; done < "$(_tmp tb)"; else printf '        (no frame in this bucket)\n'; fi
+            if [ -s "$(_tmp tb)" ]; then _indent '        ' < "$(_tmp tb)"; else printf '        (no frame in this bucket)\n'; fi
             fact "   bucket 2 of 3 — WhaTap agent frames (package starts with whatap.), top 20:"
             grep -E '[0-9]+ whatap\.' "$(_tmp tfreq)" 2>/dev/null | head -n 20 > "$(_tmp tb)" 2>/dev/null
-            if [ -s "$(_tmp tb)" ]; then while IFS= read -r _l; do printf '        %s\n' "$_l"; done < "$(_tmp tb)"; else printf '        (no frame in this bucket)\n'; fi
+            if [ -s "$(_tmp tb)" ]; then _indent '        ' < "$(_tmp tb)"; else printf '        (no frame in this bucket)\n'; fi
             fact "   bucket 3 of 3 — every remaining frame, top 80:"
             grep -vE '[0-9]+ (java|javax|jakarta|sun|jdk|com\.sun|oracle|org\.graalvm|whatap)\.' "$(_tmp tfreq)" 2>/dev/null | head -n 80 > "$(_tmp tb)" 2>/dev/null
-            if [ -s "$(_tmp tb)" ]; then while IFS= read -r _l; do printf '        %s\n' "$_l"; done < "$(_tmp tb)"; else printf '        (no frame in this bucket)\n'; fi
+            if [ -s "$(_tmp tb)" ]; then _indent '        ' < "$(_tmp tb)"; else printf '        (no frame in this bucket)\n'; fi
             # Thread-level counts. On an idle JVM the frames carry no application
             # class at all, while the thread NAMES still do (cache regions named
             # after entity classes, a scheduler instance id, a pool prefix), so
@@ -3404,17 +3451,17 @@ EOF_DUMPS
             fact "-- thread header lines over the $_TDUMPS dump(s): ${_thn:-0}"
             fact "   thread states (java.lang.Thread.State lines, counted):"
             grep -oE 'java\.lang\.Thread\.State: [A-Z_]+' "$(_tmp tframes)" 2>/dev/null | sed 's/^java.lang.Thread.State: //' | sort | uniq -c | sort -rn > "$(_tmp tb)" 2>/dev/null
-            if [ -s "$(_tmp tb)" ]; then while IFS= read -r _l; do printf '        %s\n' "$_l"; done < "$(_tmp tb)"; else printf '        (no state line in the dump text)\n'; fi
+            if [ -s "$(_tmp tb)" ]; then _indent '        ' < "$(_tmp tb)"; else printf '        (no state line in the dump text)\n'; fi
             fact "   thread name shapes, every digit run replaced by N so pool members collapse into one line (names that are themselves a dotted class-like name are counted in the next block instead), top 40:"
             sed 's/[0-9][0-9]*/N/g' "$(_tmp tnames)" 2>/dev/null | grep -vE '^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_$][A-Za-z0-9_$]*){2,}$' | sort | uniq -c | sort -rn | head -n 40 > "$(_tmp tb)" 2>/dev/null
-            if [ -s "$(_tmp tb)" ]; then while IFS= read -r _l; do printf '        %s\n' "$_l"; done < "$(_tmp tb)"; else printf '        (no thread header line in the dump text)\n'; fi
+            if [ -s "$(_tmp tb)" ]; then _indent '        ' < "$(_tmp tb)"; else printf '        (no thread header line in the dump text)\n'; fi
             grep -oE '[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_$][A-Za-z0-9_$]*){2,}' "$(_tmp tnames)" 2>/dev/null | sort | uniq -c | sort -rn > "$(_tmp tdot)" 2>/dev/null
             fact "   package roots of dotted names carried inside thread names (first three dot-separated parts, thread count):"
             awk '{ n=split($2, p, "."); if (n >= 3) print $1, p[1] "." p[2] "." p[3] }' "$(_tmp tdot)" 2>/dev/null | awk '{ c[$2]+=$1 } END { for (k in c) print c[k], k }' | sort -rn | head -n 20 > "$(_tmp tb)" 2>/dev/null
-            if [ -s "$(_tmp tb)" ]; then while IFS= read -r _l; do printf '        %s\n' "$_l"; done < "$(_tmp tb)"; else printf '        (none)\n'; fi
+            if [ -s "$(_tmp tb)" ]; then _indent '        ' < "$(_tmp tb)"; else printf '        (none)\n'; fi
             fact "   the dotted names themselves (three or more parts, as written), distinct, top 80:"
             head -n 80 "$(_tmp tdot)" > "$(_tmp tb)" 2>/dev/null
-            if [ -s "$(_tmp tb)" ]; then while IFS= read -r _l; do printf '        %s\n' "$_l"; done < "$(_tmp tb)"; else printf '        (none)\n'; fi
+            if [ -s "$(_tmp tb)" ]; then _indent '        ' < "$(_tmp tb)"; else printf '        (none)\n'; fi
             # Other APM agents on the same JVM show up as frames and threads of
             # their own packages. The prefix list is fixed and printed verbatim.
             # <frame package prefix>:<word looked for in thread names, case-insensitive>
@@ -3675,18 +3722,18 @@ _rep_appclasses() {
             _tot="$(grep -c . "${_NAMES}.u" 2>/dev/null)"
             fact "-- distinct application classes: ${_tot:-0}"
             fact "-- package histogram, class count per package (top 40):"
-            sed 's/\.[^.]*$//; t; s/.*/(default package)/' "${_NAMES}.u" 2>/dev/null | sort | uniq -c | sort -rn | head -n 40 | while IFS= read -r _l; do printf '        %s\n' "$_l"; done
+            sed 's/\.[^.]*$//; t; s/.*/(default package)/' "${_NAMES}.u" 2>/dev/null | sort | uniq -c | sort -rn | head -n 40 | _indent '        '
             fact "-- name-pattern index over a fixed pattern list carried by this collector, printed verbatim:"
             fact "   $_APPPAT"
             for _p in $_APPPAT; do
                 _mn="$(grep -E "(^|\.)[^.]*${_p}[^.]*$" "${_NAMES}.u" 2>/dev/null | grep -c .)"
                 [ "${_mn:-0}" -eq 0 ] && continue
                 fact "   *${_p}*: ${_mn} (first 60)"
-                grep -E "(^|\.)[^.]*${_p}[^.]*$" "${_NAMES}.u" 2>/dev/null | head -n 60 | while IFS= read -r _l; do printf '        %s\n' "$_l"; done
+                grep -E "(^|\.)[^.]*${_p}[^.]*$" "${_NAMES}.u" 2>/dev/null | head -n 60 | _indent '        '
             done
             fact "-- classes matching none of those patterns: $(grep -vE "(^|\.)[^.]*($(printf '%s' "$_APPPAT" | tr ' ' '|'))[^.]*$" "${_NAMES}.u" 2>/dev/null | grep -c .)"
             fact "-- full class list (first 2000, alphabetical):"
-            head -n 2000 "${_NAMES}.u" 2>/dev/null | while IFS= read -r _l; do printf '        %s\n' "$_l"; done
+            head -n 2000 "${_NAMES}.u" 2>/dev/null | _indent '        '
             # --class-refs: which of these classes name a given type. A class
             # file carries every type it implements, extends, calls or
             # references as a UTF8 constant-pool entry in internal form, so the
@@ -3739,7 +3786,7 @@ _rep_appclasses() {
                     _hn="$(grep -c . "${_hits}.u" 2>/dev/null)"
                     fact "-- classes naming $_tk in their bytecode: ${_hn:-0} (byte search for the internal form $_tki in the class files of the roots above)"
                     if [ "${_hn:-0}" -gt 0 ]; then
-                        head -n 200 "${_hits}.u" 2>/dev/null | while IFS= read -r _l; do printf '        %s\n' "$_l"; done
+                        head -n 200 "${_hits}.u" 2>/dev/null | _indent '        '
                     else
                         printf '        (no class of these roots carries the token)\n'
                     fi
@@ -3754,7 +3801,7 @@ _rep_appclasses() {
                 _tjs="$(awk '{s+=$1} END{print s+0}' "$(_tmp tjoin)" 2>/dev/null)"
                 fact "-- frames in the section L dump(s) whose class is in this index: ${_tjn:-0} distinct frames, ${_tjs:-0} occurrences (top 60):"
                 if [ "${_tjn:-0}" -gt 0 ]; then
-                    head -n 60 "$(_tmp tjoin)" 2>/dev/null | while IFS= read -r _l; do printf '        %s\n' "$_l"; done
+                    head -n 60 "$(_tmp tjoin)" 2>/dev/null | _indent '        '
                 else
                     printf '        (no frame of any counted dump belongs to a class in this index)\n'
                 fi

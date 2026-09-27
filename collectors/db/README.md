@@ -23,6 +23,10 @@ them:
 `collect-db.sh` discovers which components are present on the host it runs on
 (dbx / dmx / prx / xos / xcub / dbxc processes, plus DB server processes) and
 emits the matching sections; what is absent is reported with its reason.
+Its `_classify_err`, `_proc_hidden` and `_self_tree` are the group block
+`host: helpers`, shared with collect-nms.sh and owned by
+[templates/groups/host.sh](../../templates/groups/host.sh): edit them there
+and run `tools/sync-shared-block.sh --apply`.
 
 ## Field procedure
 

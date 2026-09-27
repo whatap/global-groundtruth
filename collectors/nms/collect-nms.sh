@@ -31,9 +31,79 @@ export LC_ALL=C
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-nms"
 # History: CHANGELOG.md (next to this file).
-VERSION="0.7.1"
+VERSION="0.7.2"
 DOMAIN="nms"
 TARGET="host/$(hostname 2>/dev/null || echo unknown)"
+
+# ---- emit helpers — DO NOT EDIT ---------------------------------------------
+# The report shape (../../docs/output-format.md): header, numbered sections,
+# facts, footer. progress narrates on fd 3 (the terminal saved in main), never
+# into the report, and --quiet silences it; keep its text a fact about the run.
+_section_n=0
+
+emit_header() {
+    printf '==== WhaTap Global Groundtruth Collection ====\n'
+    printf 'Collector:      %s\n' "$COLLECTOR_NAME"
+    printf 'Version:        %s\n' "$VERSION"
+    printf 'Timestamp(UTC): %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown)"
+    printf 'Domain:         %s\n' "$DOMAIN"
+    printf 'Target:         %s\n' "$TARGET"
+    printf '===============================================\n'
+}
+
+# section "A. TITLE" -> the next numbered section, [n] A. TITLE, narrated too
+section() {
+    _section_n=$((_section_n + 1))
+    printf '\n[%d] %s\n' "$_section_n" "$1"
+    progress "[$_section_n] $1"
+}
+subsection() { printf '\n    -- %s --\n' "$1"; }
+fact()       { printf '    %s\n' "$1"; }
+emit_footer() { printf '\n==== END OF COLLECTION (no diagnosis by design) ====\n'; }
+progress()   { [ "$OPT_QUIET" = 1 ] && return; printf '>> %s\n' "$*" >&3 2>/dev/null; }
+have()       { command -v "$1" >/dev/null 2>&1; }
+
+# _indent PREFIX -> stdin with PREFIX before every line; a last line without a
+# newline is kept (and ended)
+_indent() { awk -v p="$1" '{ print p $0 }'; }
+
+# _emit_labeled LABEL BODY -> "LABEL: BODY" for a one-line BODY; else "LABEL:"
+# and BODY's lines under it, indented
+_emit_labeled() {
+    local label="$1" body="$2" n
+    n="$(printf '%s\n' "$body" | wc -l | tr -d ' ')"
+    if [ "${n:-0}" -le 1 ]; then
+        fact "$label: $body"
+    else
+        fact "$label:"
+        printf '%s\n' "$body" | _indent '        '
+    fi
+}
+
+# _tool_rows [--path] TOOL... -> one row per TOOL for the environment section's
+# tool table: "present" or "absent", with --path "present (PATH)". The path is
+# read back from a file in the run's directory, not a $(...) (a fork per tool);
+# without the directory it is looked up again.
+_tool_rows() {
+    local wp=0 t p
+    [ "${1:-}" = --path ] && { wp=1; shift; }
+    for t in "$@"; do
+        if ! command -v "$t" >/dev/null 2>&1; then printf '        %-12s absent\n' "$t"; continue; fi
+        [ "$wp" = 1 ] || { printf '        %-12s present\n' "$t"; continue; }
+        p=""
+        [ -n "$_tmp_dir" ] && { command -v "$t" > "$_tmp_dir/cmdv"; } 2>/dev/null && IFS= read -r p < "$_tmp_dir/cmdv"
+        [ -n "$p" ] || p="$(command -v "$t" 2>/dev/null)"
+        printf '        %-12s present (%s)\n' "$t" "$p"
+    done
+}
+
+# _optval NAME VALUE -> exit 2 when VALUE is empty or starts with '-' (then the
+# next option was taken for the value: `--out --stdout`). This block comes
+# before the option loop, which calls it.
+_optval() {
+    case "$2" in ''|-*) printf -- 'missing value for %s\n' "$1" >&2; exit 2 ;; esac
+}
+# ---- end emit helpers
 
 # ---- CLI harness -------------------------------------------------------------
 OPT_FILE=0        # write the report to a .txt file
@@ -67,12 +137,6 @@ explicit action flag so nothing starts by accident.
 EOF
 }
 
-# _optval NAME VALUE -> VALUE, or exit 2 when it is empty or starts with '-'
-# (then the next option was taken for the value: `--out --stdout`)
-_optval() {
-    case "$2" in ''|-*) printf -- 'missing value for %s\n' "$1" >&2; exit 2 ;; esac
-}
-
 ARGC=$#
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -94,35 +158,6 @@ while [ $# -gt 0 ]; do
     esac
     shift
 done
-
-# ---- emit helpers — DO NOT EDIT ---------------------------------------------
-# The report shape (../../docs/output-format.md): header, numbered sections,
-# facts, footer. progress narrates on fd 3 (the terminal saved in main), never
-# into the report, and --quiet silences it; keep its text a fact about the run.
-_section_n=0
-
-emit_header() {
-    printf '==== WhaTap Global Groundtruth Collection ====\n'
-    printf 'Collector:      %s\n' "$COLLECTOR_NAME"
-    printf 'Version:        %s\n' "$VERSION"
-    printf 'Timestamp(UTC): %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown)"
-    printf 'Domain:         %s\n' "$DOMAIN"
-    printf 'Target:         %s\n' "$TARGET"
-    printf '===============================================\n'
-}
-
-# section "A. TITLE" -> the next numbered section, [n] A. TITLE, narrated too
-section() {
-    _section_n=$((_section_n + 1))
-    printf '\n[%d] %s\n' "$_section_n" "$1"
-    progress "[$_section_n] $1"
-}
-subsection() { printf '\n    -- %s --\n' "$1"; }
-fact()       { printf '    %s\n' "$1"; }
-emit_footer() { printf '\n==== END OF COLLECTION (no diagnosis by design) ====\n'; }
-progress()   { [ "$OPT_QUIET" = 1 ] && return; printf '>> %s\n' "$*" >&3 2>/dev/null; }
-have()       { command -v "$1" >/dev/null 2>&1; }
-# ---- end emit helpers
 
 # ---- privilege — DO NOT EDIT ------------------------------------------------
 # What a run can read depends on the privilege it was given: a fact about this
@@ -191,6 +226,8 @@ _note_boot() {
 # _bounded CMD... every external command under CMD_TIMEOUT and RUN_DEADLINE.
 # _tmp NAME       a path in this run's private directory, removed on exit.
 # _report_to_file --file mode's write; fails when the file is not written whole.
+# probe, read_proc  a command's output or a file's content as facts, or n/a with
+#                 the reason (guideline 4).
 # Constraints:
 # - POSIX sh only (apm collectors run under `sh -s`, often dash or busybox):
 #   no SECONDS, no `type -t`, no ${v//x/y} outside a BASH_VERSION guard.
@@ -440,6 +477,47 @@ _report_to_file() {
         return 1
     fi
 }
+
+# probe "label" CMD [ARGS...] -> output as facts, or "label: n/a (<why>)".
+# CMD may be a file, a shell function or a builtin; _bounded caps all three. A
+# non-zero exit that still printed something is reported with its output, since
+# for many commands the exit code is the answer (systemctl is-active prints
+# "inactive" and exits 3). The reason of a failure is the collector's
+# _classify_err, reading _errfile. PROBE_OUT / PROBE_RC: the last probe's stdout
+# and exit status (127 when nothing ran), so a caller that also parses the
+# output runs the command once.
+PROBE_OUT=""; PROBE_RC=127
+# shellcheck disable=SC2034  # PROBE_OUT / PROBE_RC are read by the caller
+probe() {
+    local label="$1" out rc; shift
+    PROBE_OUT=""; PROBE_RC=127
+    [ -n "$(_cmd_kind "$1")" ] || { fact "$label: n/a (command not found: $1)"; return; }
+    out="$(_bounded "$@" 2>"$_errfile")"; rc=$?
+    PROBE_OUT="$out"; PROBE_RC="$rc"
+    if [ "$rc" -eq 124 ]; then
+        if _past_deadline; then fact "$label: n/a (run deadline reached: ${RUN_DEADLINE}s)"
+        else fact "$label: n/a (timed out: ${CMD_TIMEOUT}s)"; fi
+        return
+    fi
+    if [ "$rc" -ne 0 ]; then
+        [ -n "$out" ] && { _emit_labeled "$label (exit $rc)" "$out"; return; }
+        fact "$label: n/a ($(_classify_err))"; return
+    fi
+    [ -z "$out" ] && { fact "$label: n/a (empty output)"; return; }
+    _emit_labeled "$label" "$out"
+}
+
+# read_proc "label" PATH [LINES] -> a /proc or /sys file's content (its last
+# LINES lines when LINES is given), or "label: n/a (<why>)".
+read_proc() {
+    local label="$1" path="$2" cap="${3:-0}" out
+    [ -e "$path" ] || { fact "$label: n/a (path not found: $path)"; return; }
+    [ -r "$path" ] || { fact "$label: n/a (permission denied: $path)"; return; }
+    if [ "$cap" -gt 0 ] 2>/dev/null; then out="$(tail -n "$cap" "$path" 2>/dev/null)"
+    else out="$(cat "$path" 2>/dev/null)"; fi
+    [ -z "$out" ] && { fact "$label: n/a (empty output)"; return; }
+    _emit_labeled "$label" "$out"
+}
 # ---- end run helpers
 
 # ---- collection completeness — DO NOT EDIT ----------------------------------
@@ -568,10 +646,10 @@ EOF
 }
 # ---- end collection completeness
 
-# ---- reasoned-absence helpers --------------------------------------------------
-_errfile=""
-_init_probe() { _errfile="$(_tmp probe.err)"; }
-
+# ---- host: helpers — DO NOT EDIT --------------------------------------------
+# members: db nms
+# _classify_err -> the reason a probe failed, from _errfile: permission denied,
+# path not found, else the first line of the error (100 bytes)
 _classify_err() {
     local txt=""
     [ -f "$_errfile" ] && txt="$(cat "$_errfile" 2>/dev/null)"
@@ -583,39 +661,54 @@ _classify_err() {
     else echo "nonzero exit"; fi
 }
 
-_emit_labeled() {
-    local label="$1" body="$2" n
-    n="$(printf '%s\n' "$body" | wc -l | tr -d ' ')"
-    if [ "${n:-0}" -le 1 ]; then
-        fact "$label: $body"
-    else
-        fact "$label:"
-        printf '%s\n' "$body" | while IFS= read -r _l || [ -n "$_l" ]; do printf '        %s\n' "$_l"; done
+# _proc_hidden -> 0 when a non-root run sees /proc through hidepid=1|2|
+# invisible|noaccess, i.e. other users' processes are hidden or unreadable.
+# PROC_STATE says what the run knows about /proc visibility, for [1].
+PROC_STATE=""
+_proc_hidden() {
+    # hidepid=1|noaccess: other users' /proc/<pid> entries are listed but not
+    # readable; hidepid=2|invisible: they are not listed at all. A run holding
+    # the gid= group is exempt. Unread mountinfo is not "no hidepid".
+    local o hp g
+    if [ "$(id -u 2>/dev/null)" = 0 ]; then PROC_STATE="run as root (hidepid does not apply)"; return 1; fi
+    if [ ! -r /proc/self/mountinfo ]; then
+        PROC_STATE="n/a (/proc/self/mountinfo not readable; visibility of other users' processes unknown)"; return 0
     fi
+    # the last /proc mount in mountinfo is the one on top
+    o="$(awk '$5 == "/proc" {o = $6 "," $NF} END {print o}' /proc/self/mountinfo 2>/dev/null)"
+    if [ -z "$o" ]; then
+        PROC_STATE="n/a (no /proc mount in /proc/self/mountinfo; visibility of other users' processes unknown)"; return 0
+    fi
+    hp="$(printf '%s' "$o" | tr ',' '\n' | sed -n 's/^hidepid=//p' | tail -n1)"
+    g="$(printf '%s' "$o" | tr ',' '\n' | sed -n 's/^gid=//p' | tail -n1)"
+    case "$hp" in
+        ""|0|off) PROC_STATE="no hidepid option on the /proc mount"; return 1 ;;
+    esac
+    if [ -n "$g" ] && id -G 2>/dev/null | tr ' ' '\n' | grep -qx "$g"; then
+        PROC_STATE="mounted with hidepid=$hp, gid=$g, a group of this run (other users' processes readable)"; return 1
+    fi
+    case "$hp" in
+        1|noaccess) PROC_STATE="mounted with hidepid=$hp${g:+ (gid=$g is not a group of this run)}: other users' /proc/<pid> entries listed but not readable" ;;
+        *)          PROC_STATE="mounted with hidepid=$hp${g:+ (gid=$g is not a group of this run)}: other users' processes not listed" ;;
+    esac
+    return 0
 }
 
-# probe "label" CMD [ARGS...] -> output as facts, or "label: n/a (<why>)".
-# CMD may be a file, a shell function or a builtin; _bounded caps all three. A
-# non-zero exit that still printed something is reported with its output, since
-# for many commands the exit code is the answer (systemctl is-active prints
-# "inactive" and exits 3).
-probe() {
-    local label="$1"; shift
-    [ -n "$(_cmd_kind "$1")" ] || { fact "$label: n/a (command not found: $1)"; return; }
-    local out rc
-    out="$(_bounded "$@" 2>"$_errfile")"; rc=$?
-    if [ "$rc" -eq 124 ]; then
-        if _past_deadline; then fact "$label: n/a (run deadline reached: ${RUN_DEADLINE}s)"
-        else fact "$label: n/a (timed out: ${CMD_TIMEOUT}s)"; fi
-        return
-    fi
-    if [ "$rc" -ne 0 ]; then
-        [ -n "$out" ] && { _emit_labeled "$label (exit $rc)" "$out"; return; }
-        fact "$label: n/a ($(_classify_err))"; return
-    fi
-    [ -z "$out" ] && { fact "$label: n/a (empty output)"; return; }
-    _emit_labeled "$label" "$out"
+# _self_tree -> " pid " for this collector and each of its ancestors, so the
+# shell that started the collector is never counted as a component process
+_self_tree() {
+    local p="$$" n=0
+    while [ -n "$p" ] && [ "$p" != 0 ] && [ "$n" -lt 30 ]; do
+        printf ' %s ' "$p"
+        p="$(awk '/^PPid:/{print $2; exit}' "/proc/$p/status" 2>/dev/null)"
+        n=$((n + 1))
+    done
 }
+# ---- end host: helpers
+
+# ---- reasoned-absence helpers --------------------------------------------------
+_errfile=""
+_init_probe() { _errfile="$(_tmp probe.err)"; }
 
 # probe_merged: like probe but folds stderr into stdout (python --version etc.).
 probe_merged() {
@@ -660,16 +753,6 @@ curl_reach() {
     else fact "$url: ${out:-no -w output}; curl rc=$rc ($(_curl_rc_name "$rc"))"; fi
 }
 
-# read_proc "label" PATH -> content of a /proc or /sys file, or a reason.
-read_proc() {
-    local label="$1" path="$2" out
-    [ -e "$path" ] || { fact "$label: n/a (path not found: $path)"; return; }
-    [ -r "$path" ] || { fact "$label: n/a (permission denied: $path)"; return; }
-    out="$(cat "$path" 2>/dev/null)"
-    [ -z "$out" ] && { fact "$label: n/a (empty output)"; return; }
-    _emit_labeled "$label" "$out"
-}
-
 # _file_lines head|tail PATH N -> the first or last N lines of a file, indented,
 # or a reason. Configuration is dumped verbatim, never masked: a value has to be
 # readable to be checked against the other side (docs/authoring-guide.md step 3).
@@ -678,7 +761,7 @@ _file_lines() {
     [ -e "$path" ] || { fact "n/a (path not found: $path)"; return; }
     [ -r "$path" ] || { fact "n/a (permission denied: $path)"; return; }
     [ -s "$path" ] || { fact "(empty file)"; return; }
-    "$1" -n "$3" "$path" 2>/dev/null | while IFS= read -r _l || [ -n "$_l" ]; do printf '        %s\n' "$_l"; done
+    "$1" -n "$3" "$path" 2>/dev/null | _indent '        '
 }
 
 # file_meta PATH -> "bytes / mtime" one-liner for a file.
@@ -728,35 +811,6 @@ NMS_PIDS=""          # pids whose cmdline names wtnms / icmptcphealthd / whatap-
 PKG_SCAN=""          # which package manifests were read
 PROC_HIDDEN=""       # non-empty when /proc hides other users' processes
 PROC_SCAN_CUT=""     # non-empty when the /proc scan stopped early
-PROC_STATE=""         # what the run knows about /proc visibility, for [1]
-_proc_hidden() {
-    # hidepid=1|noaccess: other users' /proc/<pid> entries are listed but not
-    # readable; hidepid=2|invisible: they are not listed at all. A run holding
-    # the gid= group is exempt. Unread mountinfo is not "no hidepid".
-    local o hp g
-    if [ "$(id -u 2>/dev/null)" = 0 ]; then PROC_STATE="run as root (hidepid does not apply)"; return 1; fi
-    if [ ! -r /proc/self/mountinfo ]; then
-        PROC_STATE="n/a (/proc/self/mountinfo not readable; visibility of other users' processes unknown)"; return 0
-    fi
-    # the last /proc mount in mountinfo is the one on top
-    o="$(awk '$5 == "/proc" {o = $6 "," $NF} END {print o}' /proc/self/mountinfo 2>/dev/null)"
-    if [ -z "$o" ]; then
-        PROC_STATE="n/a (no /proc mount in /proc/self/mountinfo; visibility of other users' processes unknown)"; return 0
-    fi
-    hp="$(printf '%s' "$o" | tr ',' '\n' | sed -n 's/^hidepid=//p' | tail -n1)"
-    g="$(printf '%s' "$o" | tr ',' '\n' | sed -n 's/^gid=//p' | tail -n1)"
-    case "$hp" in
-        ""|0|off) PROC_STATE="no hidepid option on the /proc mount"; return 1 ;;
-    esac
-    if [ -n "$g" ] && id -G 2>/dev/null | tr ' ' '\n' | grep -qx "$g"; then
-        PROC_STATE="mounted with hidepid=$hp, gid=$g, a group of this run (other users' processes readable)"; return 1
-    fi
-    case "$hp" in
-        1|noaccess) PROC_STATE="mounted with hidepid=$hp${g:+ (gid=$g is not a group of this run)}: other users' /proc/<pid> entries listed but not readable" ;;
-        *)          PROC_STATE="mounted with hidepid=$hp${g:+ (gid=$g is not a group of this run)}: other users' processes not listed" ;;
-    esac
-    return 0
-}
 PKG_FAIL=""          # a package-manifest query that failed or timed out
 PKG_MANIFEST=""      # the rpm/dpkg file list of the package, when it answered
 # _pkg_list TOOL ARGS... -> fills PKG_MANIFEST; a "not installed" answer is an
@@ -772,17 +826,6 @@ _pkg_list() {
     if [ "$rc" -eq 124 ]; then PKG_FAIL="${PKG_FAIL:+$PKG_FAIL; }$1 $2 timed out (${CMD_TIMEOUT}s)"
     else PKG_FAIL="${PKG_FAIL:+$PKG_FAIL; }$1 $2 exit $rc${err:+: $err}"; fi
     return 1
-}
-# _self_tree -> this collector's own pid and its ancestors, so the parent shell
-# that ran "bash collect-nms.sh" (or a wrapper naming whatap-nms) is never
-# counted as an nms process
-_self_tree() {
-    local p="$$" n=0
-    while [ -n "$p" ] && [ "$p" != 0 ] && [ "$n" -lt 30 ]; do
-        printf ' %s ' "$p"
-        p="$(awk '/^PPid:/{print $2; exit}' "/proc/$p/status" 2>/dev/null)"
-        n=$((n + 1))
-    done
 }
 discover_root() {
     # match a path whose component is the whatap-nms directory itself, and skip
