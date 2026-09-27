@@ -5,6 +5,43 @@ first. Every change to the script bumps its `VERSION` and adds one entry at
 the top of this list (docs/authoring-guide.md, step 2); `tools/validate.sh`
 checks that the newest entry is the script's `VERSION`.
 
+- **0.15.0** — The default run prints the version facts that place an
+  environment in or out of the supported range; no flag added, goals
+  unchanged. Section D, per attached JVM (and per JVM whose environ was not
+  read): the application server's own version file, read as a file, never
+  by running a server tool — Tomcat `org/apache/catalina/util/ServerInfo.properties`
+  from `lib/catalina.jar` under `-Dcatalina.base`, else `-Dcatalina.home`
+  (comment lines left out); JBoss/WildFly `<jboss.home.dir>/version.txt`, and
+  `modules/system/layers/base/org/jboss/as/product/*/dir/META-INF/MANIFEST.MF`
+  only when it is absent; WebLogic `Implementation-Version` /
+  `Specification-Version` of `weblogic.jar` under `-Dweblogic.home` /
+  `-Dwls.home` (`lib/` or `server/lib/`); JEUS the version attributes of
+  `<jeus.home>/lib/system/jeus.jar`'s manifest; GlassFish/Payara
+  `Bundle-Version` of `modules/glassfish.jar` or `common-util.jar` under
+  `-Dcom.sun.aas.installRoot`; `n/a (home unknown: ...)` when the main class
+  or another property names the server but no home is set. The ls -l line
+  of every fd that points at a `whatap.agent*.jar` marked `(deleted)` (the
+  agent jar replaced on disk after the JVM started; F leaves the agent jar
+  out of its list). `ls -l` of the fatal error logs (content not read) in
+  the working directory, in the `-XX:ErrorFile` directory with that file
+  name pattern (`%p` as `*`, `%%` as `%`) and in `/tmp` (once per mount
+  namespace), first 10 of N by name (Slack
+  C08U55BRDLJ p1765421788557589, p1784696473992619: hs_err files pasted by
+  hand). Section C: `ls -ld /var/run/whatap` and `/var/run/whatap/agent`
+  once per run, in the collector's own view (Slack C08U55BRDLJ
+  p1789716743920059: a batch host logged `parent unwritable:
+  /var/run/whatap/agent`). Section B: when `<bin>/../release` is absent and
+  that directory is a `jre`, the release file one level up is read (Zulu 7:
+  `bin/java` links into `jre/`, and `/opt/zulu7/release` was missed; found
+  by the java-zoo lab target); `-version` also runs when the release file
+  read is that parent one or its `JAVA_VERSION` is `1.x` without an update
+  (Zulu 7's holds `1.7.0` only, and the update and vendor build are in
+  `-version`). Section F: a `/proc/<pid>/fd` whose links
+  this run cannot read (root without CAP_SYS_PTRACE) is `open jar files: n/a
+  (permission denied: ...)`; it was reported as 0 open jars. Verified on
+  Tomcat 9.0.122 (Temurin 17, dash) and WildFly 41.0.1.Final (JDK 25, bash)
+  with agent 2.2.77 attached by `-javaagent`, and on the java-zoo target;
+  WebLogic, JEUS and GlassFish/Payara are not verified.
 - **0.14.0** — Report reduced to what confirms a cause; no flag added or
   removed. Section K (Kubernetes / operator injection context) is gone, so L,
   M and N are now `[12]`–`[14]` (letters kept): the collector shell's

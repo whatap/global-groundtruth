@@ -32,7 +32,7 @@ export LC_ALL=C
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-apmjava"
 # History: CHANGELOG.md (next to this file).
-VERSION="0.14.0"
+VERSION="0.15.0"
 DOMAIN="apm"
 TARGET="host/$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || uname -n 2>/dev/null || echo unknown)"
 
@@ -1011,16 +1011,38 @@ _shell_java() {
     if [ -z "$jv" ]; then fact "java found via collector shell JAVA_HOME|PATH: none (JAVA_HOME ${JAVA_HOME:-not set}; no java on PATH)"; return; fi
     jr="$(readlink -f "$jv" 2>/dev/null || echo "$jv")"
     fact "-- java found via collector shell $src (not verified to be this JVM's binary): $jv (resolves to $jr)"
-    rel="$(dirname "$(dirname "$jr")")/release"
+    rel="$(_release_of "$jr")"
     if [ -r "$rel" ]; then
         fact "   $rel (verbatim, first 40 lines):"
         head -n 40 "$rel" 2>/dev/null | tr -d '\r' | _indent '        '
+        _is_java_launcher "$jr" && _release_thin "$jr" "$rel" && jvprobe "   version (separate short-lived JVM)" "$jv" -version
     elif _is_java_launcher "$jr"; then
         fact "   release file: n/a ($(_path_why "$rel"))"
         jvprobe "   version (separate short-lived JVM)" "$jv" -version
     else
         fact "   release file: n/a ($(_path_why "$rel")); -version not run (the binary is not named java)"
     fi
+}
+
+# _release_of JAVA -> the release file of the runtime a resolved java binary
+# belongs to: <bin>/../release; when that is absent and <bin>/.. is a jre
+# directory (a JDK 8-or-older layout whose bin/java links into jre/bin, Zulu 7),
+# <jre>/../release when it exists. The first path when neither does.
+_release_of() {
+    local d r
+    d="$(dirname "$(dirname "$1")")"
+    r="$d/release"
+    if [ ! -e "$r" ] && [ "${d##*/}" = jre ] && [ -e "${d%/*}/release" ]; then r="${d%/*}/release"; fi
+    printf '%s\n' "$r"
+}
+
+# _release_thin JAVA RELEASE -> success when the release file read for JAVA
+# does not carry the update and vendor build: it is the JDK's one above a jre
+# directory, or its JAVA_VERSION is 1.x without the _<update> (Zulu 7 writes
+# JAVA_VERSION="1.7.0" only). -version is then run as well.
+_release_thin() {
+    [ "$2" != "$(dirname "$(dirname "$1")")/release" ] && return 0
+    tr -d '\r' < "$2" 2>/dev/null | grep -qE '^JAVA_VERSION="?1\.[0-9]+(\.[0-9]+)?"?$'
 }
 
 # jvprobe "label" JAVA_EXE [ARGS...] -> run a DISCOVERED java launcher (a new,
@@ -2417,10 +2439,11 @@ _rep_runtimes() {
         _jr="$(readlink -f "$jv" 2>/dev/null || echo "$jv")"
         fact "-- java binary: $jv"
         fact "   resolves to: $_jr"
-        _rel="$(dirname "$(dirname "$_jr")")/release"
+        _rel="$(_release_of "$_jr")"
         if [ -r "$_rel" ]; then
             fact "   $_rel (verbatim, first 40 lines):"
             head -n 40 "$_rel" 2>/dev/null | tr -d '\r' | _indent '        '
+            _release_thin "$_jr" "$_rel" && jvprobe "   version (separate short-lived JVM)" "$jv" -version
         else
             fact "   release file: n/a ($(_path_why "$_rel"))"
             jvprobe "   version (separate short-lived JVM)" "$jv" -version
@@ -2445,10 +2468,12 @@ EOF
         _ar="$(readlink -f "$_av" 2>/dev/null || echo "$_av")"
         _a0res=1
         fact "   argv[0]: $_a0 (resolves to $_ar)"
-        _rel="$(dirname "$(dirname "$_ar")")/release"
+        _rel="$(_release_of "$_ar")"
         if [ -r "$_rel" ]; then
             fact "   $_rel (verbatim, first 40 lines):"
             head -n 40 "$_rel" 2>/dev/null | tr -d '\r' | _indent '        '
+            _is_java_launcher "$_a0" && _is_java_launcher "$_ar" && _release_thin "$_ar" "$_rel" \
+                && jvprobe "   version (separate short-lived JVM)" "$_ar" -version
         elif _is_java_launcher "$_a0" && _is_java_launcher "$_ar"; then
             fact "   release file: n/a ($(_path_why "$_rel"))"
             jvprobe "   version (separate short-lived JVM)" "$_ar" -version
@@ -2545,6 +2570,13 @@ _rep_artifacts() {
             fact "companion files next to an agent jar (names containing helper or whatap): none in the readable jar directories"
         fi
     fi
+    # the runtime directory the agents share, in the collector's own view: a
+    # batch host's agent logged "parent unwritable: /var/run/whatap/agent",
+    # a directory a co-located infra agent reads
+    for _vr in /var/run/whatap /var/run/whatap/agent; do
+        if [ -e "$_vr" ] || [ -L "$_vr" ]; then probe "ls -ld $_vr" ls -ld "$_vr"
+        else fact "ls -ld $_vr: n/a ($(_path_why "$_vr"))"; fi
+    done
 }
 
 # [5] D. JVM processes and how the agent is attached
@@ -2615,6 +2647,7 @@ _rep_jvms() {
                 fi
                 printf '             %s   (%s)\n' "$_l" "$_ex"
             done
+            _agent_deleted_fds "$pid"
             for _ev in JAVA_TOOL_OPTIONS JDK_JAVA_OPTIONS _JAVA_OPTIONS JAVA_OPTS CATALINA_OPTS JAVA_OPTIONS; do
                 _v="$(_proc_env "$pid" "$_ev")"
                 if [ -n "$_v" ]; then printf '           env %s=%s\n' "$_ev" "$(printf '%s' "$_v" | cut -c1-400)"; fi
@@ -2631,6 +2664,8 @@ _rep_jvms() {
             fi
             [ "$_smk" = 0 ] && printf '             none of the listed server properties is set on this JVM\n'
             _jvm_program "$pid"
+            _srv_versions "$pid"
+            _hs_err_files "$pid"
         done
     fi
 }
@@ -2677,6 +2712,211 @@ _jvm_noargs_line() {
                     printf '           VM options: no JVM-only argument in /proc/%s/cmdline (the arguments above are the launcher'"'"'s own); the options the launcher passed to the VM were not read\n' "$pid" ;;
             esac ;;
     esac
+}
+
+# _agent_deleted_fds PID -> the ls -l lines of /proc/PID/fd that point at a
+# whatap.agent*.jar marked (deleted): the jar the JVM opened at start was
+# replaced or removed on disk afterwards. Section F leaves the agent jar out
+# of its open-file list, so this is the one place those fds show.
+_agent_deleted_fds() {
+    local pid="$1" out
+    # a listable fd directory whose links cannot be read (root without
+    # CAP_SYS_PTRACE, another uid) prints no " -> " at all
+    out="$(ls -l "/proc/$pid/fd" 2>/dev/null)"
+    case "$out" in
+        *" -> "*) ;;
+        *) printf '           open fds to a (deleted) whatap.agent*.jar: n/a (permission denied: the links of /proc/%s/fd)\n' "$pid"; return 0 ;;
+    esac
+    out="$(printf '%s\n' "$out" | grep -iE -- '-> .*/whatap\.agent[^/]*\.jar \(deleted\)$')"
+    if [ -z "$out" ]; then
+        printf '           open fds to a (deleted) whatap.agent*.jar: none\n'
+        return 0
+    fi
+    printf '           open fds to a (deleted) whatap.agent*.jar (ls -l /proc/%s/fd, verbatim):\n' "$pid"
+    printf '%s\n' "$out" | head -n 20 | _indent '             '
+}
+
+# _srv_first PID CANDIDATE... -> sets _SRV_P (the first candidate path, as
+# PID names it, that exists) and _SRV_V (the path this run reads it through);
+# status 1 with the reason of each candidate in _SRV_WHY when none exists.
+# Not called in $(...), so the three variables reach the caller.
+_srv_first() {
+    local pid="$1" c v
+    shift
+    _SRV_P=""; _SRV_V=""; _SRV_WHY=""
+    for c in "$@"; do
+        [ -n "$c" ] || continue
+        if v="$(_rpath "$pid" "$c")"; then _SRV_P="$c"; _SRV_V="$v"; return 0; fi
+        _SRV_WHY="$_SRV_WHY${_SRV_WHY:+; }$(_rwhy "$pid" "$c")"
+    done
+    return 1
+}
+
+# _srv_entry LABEL JAR ENTRY REGEX -> the lines of one entry of JAR that match
+# REGEX (case-insensitive), verbatim, under LABEL; read with unzip -p, never
+# loaded or run
+_srv_entry() {
+    local label="$1" jar="$2" ent="$3" re="$4" out rc
+    if ! have unzip; then printf '             %s: n/a (command not found: unzip)\n' "$label"; return; fi
+    out="$(_bounded unzip -p "$jar" "$ent" 2>"$_errfile")"; rc=$?
+    case "$rc" in
+        0)   ;;
+        11)  printf '             %s: no %s entry in this jar\n' "$label" "$ent"; return ;;
+        124) printf '             %s: n/a (timed out: %ss)\n' "$label" "$CMD_TIMEOUT"; return ;;
+        *)   printf '             %s: n/a (unzip exit %s: %s)\n' "$label" "$rc" "$(_unzip_why "$_errfile")"; return ;;
+    esac
+    out="$(printf '%s\n' "$out" | tr -d '\r' | grep -iE -- "$re" | head -n 20 | cut -c1-200)"
+    if [ -z "$out" ]; then printf '             %s: no line matching %s in %s\n' "$label" "$re" "$ent"; return; fi
+    printf '             %s:\n' "$label"
+    printf '%s\n' "$out" | _indent '               '
+}
+
+# _srv_versions PID -> the version file of each application server this JVM
+# names by a -D home property (or, with no home, by its main class: then n/a
+# with the reason). Files only; no server tool is run. Spring Boot's
+# Spring-Boot-Version is in section F (bootjar_facts), not repeated here.
+_srv_versions() {
+    local pid="$1" n=0 a cb ch jh wh wl je gi hv f k
+    a="$(_all_jvm_args "$pid")"
+    cb="$(_jvm_sysprop "$pid" catalina.base)"; ch="$(_jvm_sysprop "$pid" catalina.home)"
+    [ "$cb" = "$ch" ] && ch=""
+    jh="$(_jvm_sysprop "$pid" jboss.home.dir)"
+    wh="$(_jvm_sysprop "$pid" weblogic.home)"; wl="$(_jvm_sysprop "$pid" wls.home)"
+    [ "$wh" = "$wl" ] && wl=""
+    je="$(_jvm_sysprop "$pid" jeus.home)"
+    gi="$(_jvm_sysprop "$pid" com.sun.aas.installRoot)"
+    printf '           server version files (read as files; no server tool is run):\n'
+    # Tomcat: catalina.base/lib comes before catalina.home/lib on its common loader
+    if [ -n "$cb$ch" ]; then
+        n=$((n + 1))
+        if _srv_first "$pid" "${cb:+$cb/lib/catalina.jar}" "${ch:+$ch/lib/catalina.jar}"; then
+            _srv_entry "Tomcat $_SRV_P, org/apache/catalina/util/ServerInfo.properties (verbatim, comment lines left out)" \
+                "$_SRV_V" org/apache/catalina/util/ServerInfo.properties '^[^#!]'
+        else
+            printf '             Tomcat lib/catalina.jar: n/a (%s)\n' "$_SRV_WHY"
+        fi
+    elif printf '%s\n' "$a" | grep -qx 'org\.apache\.catalina\.startup\.Bootstrap'; then
+        n=$((n + 1))
+        printf '             Tomcat lib/catalina.jar: n/a (home unknown: main class org.apache.catalina.startup.Bootstrap without -Dcatalina.base or -Dcatalina.home)\n'
+    fi
+    # JBoss / WildFly: version.txt; the product module manifest only without it
+    if [ -n "$jh" ]; then
+        n=$((n + 1))
+        if _srv_first "$pid" "$jh/version.txt"; then
+            printf '             JBoss/WildFly %s (verbatim, first 10 lines):\n' "$_SRV_P"
+            head -n 10 "$(_vfix "$_SRV_V")" 2>/dev/null | tr -d '\r' | cut -c1-200 | _indent '               '
+        else
+            printf '             JBoss/WildFly %s/version.txt: n/a (%s)\n' "$jh" "$_SRV_WHY"
+            k=-1
+            if hv="$(_rpath "$pid" "$jh")"; then
+                k=0
+                for f in "$hv"/modules/system/layers/base/org/jboss/as/product/*/dir/META-INF/MANIFEST.MF; do
+                    f="$(_vfix "$f")"
+                    [ -r "$f" ] || continue
+                    k=$((k + 1)); [ "$k" -gt 3 ] && break
+                    printf '             JBoss/WildFly %s%s (verbatim, first 20 lines):\n' "$jh" "${f#"$(_vfix "$hv")"}"
+                    head -n 20 "$f" 2>/dev/null | tr -d '\r' | grep . | cut -c1-200 | _indent '               '
+                done
+            fi
+            [ "$k" = 0 ] && printf '             JBoss/WildFly %s/modules/system/layers/base/org/jboss/as/product/*/dir/META-INF/MANIFEST.MF: none found\n' "$jh"
+        fi
+    elif printf '%s\n' "$a" | grep -q 'jboss-modules\.jar$'; then
+        n=$((n + 1))
+        printf '             JBoss/WildFly version.txt: n/a (home unknown: jboss-modules.jar without -Djboss.home.dir)\n'
+    fi
+    # WebLogic: weblogic.jar under WL_HOME/server/lib; the start scripts set
+    # weblogic.home and wls.home to WL_HOME/server
+    if [ -n "$wh$wl" ]; then
+        n=$((n + 1))
+        if _srv_first "$pid" "${wh:+$wh/lib/weblogic.jar}" "${wh:+$wh/server/lib/weblogic.jar}" \
+                             "${wl:+$wl/lib/weblogic.jar}" "${wl:+$wl/server/lib/weblogic.jar}"; then
+            _srv_entry "WebLogic $_SRV_P, META-INF/MANIFEST.MF" "$_SRV_V" META-INF/MANIFEST.MF '^(Implementation-Version|Specification-Version):'
+        else
+            printf '             WebLogic weblogic.jar: n/a (%s)\n' "$_SRV_WHY"
+        fi
+    elif [ -n "$(_jvm_sysprop "$pid" weblogic.Name)" ] || printf '%s\n' "$a" | grep -qx 'weblogic\.Server'; then
+        n=$((n + 1))
+        printf '             WebLogic weblogic.jar: n/a (home unknown: -Dweblogic.Name or main class weblogic.Server without -Dweblogic.home or -Dwls.home)\n'
+    fi
+    # JEUS: the manifest of lib/system/jeus.jar (jeusadmin would contact a server)
+    if [ -n "$je" ]; then
+        n=$((n + 1))
+        if _srv_first "$pid" "$je/lib/system/jeus.jar"; then
+            _srv_entry "JEUS $_SRV_P, META-INF/MANIFEST.MF" "$_SRV_V" META-INF/MANIFEST.MF '^(Implementation-|Specification-|Bundle-Version:)'
+        else
+            printf '             JEUS lib/system/jeus.jar: n/a (%s)\n' "$_SRV_WHY"
+        fi
+    elif printf '%s\n' "$a" | grep -q '^jeus\.'; then
+        n=$((n + 1))
+        printf '             JEUS lib/system/jeus.jar: n/a (home unknown: a jeus.* main class without -Djeus.home)\n'
+    fi
+    # GlassFish / Payara: installRoot is the glassfish directory of the product
+    if [ -n "$gi" ]; then
+        n=$((n + 1))
+        if _srv_first "$pid" "$gi/modules/glassfish.jar" "$gi/modules/common-util.jar" \
+                             "$gi/glassfish/modules/glassfish.jar" "$gi/glassfish/modules/common-util.jar"; then
+            _srv_entry "GlassFish/Payara $_SRV_P, META-INF/MANIFEST.MF" "$_SRV_V" META-INF/MANIFEST.MF '^Bundle-Version:'
+        else
+            printf '             GlassFish/Payara modules/glassfish.jar, common-util.jar: n/a (%s)\n' "$_SRV_WHY"
+        fi
+    elif [ -n "$(_jvm_sysprop "$pid" com.sun.aas.instanceRoot)" ] || printf '%s\n' "$a" | grep -qx 'com\.sun\.enterprise\.glassfish\.bootstrap\.ASMain'; then
+        n=$((n + 1))
+        printf '             GlassFish/Payara modules/glassfish.jar: n/a (home unknown: -Dcom.sun.aas.instanceRoot or main class ASMain without -Dcom.sun.aas.installRoot)\n'
+    fi
+    [ "$n" = 0 ] && printf '             none: no Tomcat, JBoss/WildFly, WebLogic, JEUS or GlassFish/Payara home property or main class on this JVM\n'
+    return 0
+}
+
+# _hs_err_files PID -> ls -l of the JVM fatal error logs (content not read):
+# in the working directory, in the -XX:ErrorFile directory (its file name
+# pattern, %p as * and %% as %), and in /tmp once per mount namespace, all
+# as the JVM resolves them
+_HS_TMP_SEEN=""
+_hs_err_files() {
+    local pid="$1" ef ed="" ep="" mk m
+    ef="$(_all_jvm_args "$pid" | sed -n 's/^-XX:ErrorFile=//p' | tail -n 1)"
+    printf '           fatal error logs (ls -l; content not read; -XX:ErrorFile %s):\n' "${ef:-not set}"
+    _hs_err_dir "$pid" . 'hs_err_pid*.log' "working directory$(readlink "/proc/$pid/cwd" 2>/dev/null | sed 's/^/ /')"
+    if [ -n "$ef" ]; then
+        case "$ef" in */*) ed="${ef%/*}"; [ -n "$ed" ] || ed=/ ;; *) ed=. ;; esac
+        # %p is the pid, %% a literal %
+        ep="$(printf '%s' "${ef##*/}" | awk '{ o = ""; while ((i = index($0, "%")) > 0) { c = substr($0, i + 1, 1)
+              o = o substr($0, 1, i - 1) (c == "p" ? "*" : c == "%" ? "%" : "%" c); $0 = substr($0, i + 2) } print o $0 }')"
+        [ "$ed" = . ] && [ "$ep" = 'hs_err_pid*.log' ] || _hs_err_dir "$pid" "$ed" "$ep" "-XX:ErrorFile directory $ed"
+    fi
+    [ "$ed" = /tmp ] && [ "$ep" = 'hs_err_pid*.log' ] && return 0
+    # /tmp once per mount namespace (an unreadable namespace link: per JVM)
+    mk="$(readlink "/proc/$pid/ns/mnt" 2>/dev/null)"
+    case "$_HS_TMP_SEEN" in
+        *"|$mk="*) [ -n "$mk" ] && { m="${_HS_TMP_SEEN#*"|$mk="}"; printf '             hs_err_pid*.log in /tmp: listed under pid %s (same mount namespace)\n' "${m%%|*}"; return 0; } ;;
+    esac
+    [ -n "$mk" ] && _HS_TMP_SEEN="$_HS_TMP_SEEN|$mk=$pid|"
+    _hs_err_dir "$pid" /tmp 'hs_err_pid*.log' /tmp
+    return 0
+}
+
+# _hs_err_dir PID DIR PATTERN LABEL -> "ls -ld" of the first 10 files in DIR
+# (as PID resolves it) matching PATTERN, sorted by name, with the count
+_hs_err_dir() {
+    local pid="$1" d="$2" pat="$3" lbl="$4" v f n=0 l="" c
+    if ! v="$(_rpath "$pid" "$d")"; then
+        printf '             %s in %s: n/a (%s)\n' "$pat" "$lbl" "$(_rwhy "$pid" "$d")"; return 0
+    fi
+    v="$(_vfix "$v")"
+    [ -d "$v" ] || { printf '             %s in %s: n/a (not a directory: %s)\n' "$pat" "$lbl" "$d"; return 0; }
+    { [ -r "$v" ] && [ -x "$v" ]; } || { printf '             %s in %s: n/a (permission denied: %s)\n' "$pat" "$lbl" "$d"; return 0; }
+    # shellcheck disable=SC2086  # PATTERN is a glob
+    for f in "$v"/$pat; do
+        [ -e "$f" ] || [ -L "$f" ] || continue
+        n=$((n + 1))
+        [ "$n" -le 10 ] && l="$l${f##*/}$_nl"
+    done
+    if [ "$n" = 0 ]; then printf '             %s in %s: none\n' "$pat" "$lbl"; return 0; fi
+    if [ "$n" -gt 10 ]; then c="first 10 of $n"; else c="$n"; fi
+    printf '             %s in %s (%s):\n' "$pat" "$lbl" "$c"
+    # shellcheck disable=SC2086  # one file name per line, globbing off
+    ( cd "$v" 2>/dev/null || exit 0; IFS="$_nl"; set -f; _bounded ls -ld -- $l ) 2>/dev/null | _indent '               '
+    return 0
 }
 
 # [6] E. Agent home resolution and configuration
@@ -3156,9 +3396,16 @@ _libs_openfds() {
         fact "   open jar files: n/a (permission denied: /proc/$pid/fd)"
         return 0
     fi
+    # a listable fd directory whose links cannot be read (root without
+    # CAP_SYS_PTRACE) prints no " -> " at all
+    _ofl="$(ls -l "/proc/$pid/fd" 2>/dev/null)"
+    case "$_ofl" in
+        *" -> "*) ;;
+        *) fact "   open jar files: n/a (permission denied: the links of /proc/$pid/fd)"; return 0 ;;
+    esac
     # the link target is everything after " -> ", so a path with spaces stays
     # whole and a "(deleted)" suffix stays visible
-    _oj="$(ls -l "/proc/$pid/fd" 2>/dev/null | sed -n 's/^.* -> //p' | grep -i -E '\.jar( \(deleted\))?$' | grep -v -i 'whatap.agent' | sort -u)"
+    _oj="$(printf '%s\n' "$_ofl" | sed -n 's/^.* -> //p' | grep -i -E '\.jar( \(deleted\))?$' | grep -v -i 'whatap.agent' | sort -u)"
     _ojn="$(printf '%s\n' "$_oj" | grep -c .)"
     fact "   jar files currently open by this process: ${_ojn:-0} (first 120 printed)"
     printf '%s\n' "$_oj" | head -n 120 | while IFS= read -r _l; do
