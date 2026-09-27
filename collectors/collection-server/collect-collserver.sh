@@ -24,7 +24,7 @@ export LC_ALL=C
 # ---- collector metadata -----------------------------------------------------
 # History: CHANGELOG.md, section collect-collserver.sh (next to this file).
 COLLECTOR_NAME="whatap-collserver"
-VERSION="0.11.5"
+VERSION="0.11.6"
 DOMAIN="collection-server"
 TARGET="collection-server/$(hostname 2>/dev/null || echo unknown)"   # refined after WHATAP_HOME is resolved
 
@@ -1170,36 +1170,10 @@ time_ref_probe() {
 }
 
 # =============================================================================
-# Report body (Tier 0 — MECE domains A..G)
+# Report body: one _rep_<x> per section (Tier 0 — MECE domains A..G)
 # =============================================================================
-run_report() {
-    emit_header
-
-    # What this run is for. `home` and `conf` are the two that decide whether a
-    # bundle is worth sending: without the WhaTap config files nothing about an
-    # upgrade or a misbehaving module can be settled remotely.
-    goal services "running whatap modules"
-    goal home     "WHATAP_HOME contents"
-    goal conf     "module configs"
-    goal logs     "log inventory"
-    # yardbase only matters on a host that runs yard. Declaring it everywhere
-    # would mark a healthy web/proxy-only host INCOMPLETE for a path it is not
-    # supposed to have.
-    _runs_yard=0
-    _i=0; while [ "$_i" -lt "${#MODS[@]}" ]; do
-        case "${MODS[$_i]}" in *yard*) _runs_yard=1 ;; esac
-        _i=$((_i + 1))
-    done
-    [ "$_runs_yard" = 1 ] && goal yardbase "yard data path"
-    # journal: only where there is a systemd unit whose journal could exist.
-    # On a host that runs the modules some other way, an absent journal is the
-    # shape of the host, not a gap, so no goal is declared at all.
-    _has_unit=0
-    if have systemctl; then
-        for _u in $WHATAP_UNITS; do unit_loaded "$_u.service" && { _has_unit=1; break; }; done
-    fi
-    [ "$_has_unit" = 1 ] && goal journal "systemd journal for whatap units"
-
+# -- Collection environment ---------------------------------------------
+_rep_env() {
     section "Collection environment"
     fact "collector: $COLLECTOR_NAME $VERSION"
     fact "bash: ${BASH_VERSION:-unknown}"
@@ -1212,8 +1186,10 @@ run_report() {
     _note_boot
     fact "tools:"
     _tool_rows ss netstat findmnt df stat systemctl journalctl timedatectl chronyc ntpq zfs zpool jstack jmap jcmd java timeout du tar ps awk
+}
 
-    # -- A. Host & platform ---------------------------------------------------
+# -- A. Host & platform ---------------------------------------------------
+_rep_a() {
     section "A. Host & platform"
     # uname's strings from /proc/sys/kernel, without a fork; hostname/uname
     # only where that file is missing or unreadable. The date and the timezone
@@ -1231,8 +1207,10 @@ run_report() {
     read_proc "cgroup v2 cpu.max" /sys/fs/cgroup/cpu.max
     read_proc "cgroup v1 memory.limit_in_bytes" /sys/fs/cgroup/memory/memory.limit_in_bytes
     probe_merged "java -version" java -version
+}
 
-    # -- B. Time & clock synchronization --------------------------------------
+# -- B. Time & clock synchronization --------------------------------------
+_rep_b() {
     # The running NTP daemon's own offset is read (no network call); an
     # external comparison is opt-in (--time-ref).
     section "B. Time & clock synchronization"
@@ -1293,8 +1271,10 @@ run_report() {
         subsection "external time reference (opt-in --time-ref; network call)"
         time_ref_probe
     fi
+}
 
-    # -- C. Storage & filesystem (infra focus) --------------------------------
+# -- C. Storage & filesystem (infra focus) --------------------------------
+_rep_c() {
     section "C. Storage & filesystem"
     # The goal exists only on a host that runs yard; elsewhere the facts are
     # printed and nothing is resolved.
@@ -1352,8 +1332,20 @@ run_report() {
             fact "$sub dir: $( [ -d "$WHOME/$sub" ] && echo present || echo absent )"
         done
     fi
+}
 
-    # -- D. Deployment layout (on-disk) ---------------------------------------
+# _home_missed GOAL [SUB] -> resolves GOAL when WHATAP_HOME (or its SUB
+# directory) could not be listed. --home or the owning account is the fix only
+# when the home itself is the problem; a SUB missing from a searchable home is not.
+_home_missed() {
+    if [ -z "$WHOME" ] && [ -z "$_ABSENCE_WHY" ]; then na "$1" "$NO_WHATAP_NA"
+    elif [ -z "$WHOME" ]; then missed "$1" "$(home_why "$2")$(home_fix); $_ABSENCE_WHY"
+    elif [ -z "$2" ] || [ -d "$WHOME/$2" ] || [ ! -x "$WHOME" ]; then missed "$1" "$(home_why "$2")$(home_fix)"
+    else missed "$1" "$(home_why "$2")"; fi
+}
+
+# -- D. Deployment layout (on-disk) ---------------------------------------
+_rep_d() {
     section "D. Deployment layout (on-disk)"
     fact "WHATAP_HOME: ${WHOME:-n/a}"
     fact "WHATAP_HOME resolved by: $WHOME_SRC"
@@ -1364,12 +1356,12 @@ run_report() {
         got home
     else
         fact "layout: n/a ($(home_why))"
-        if [ -z "$WHOME" ] && [ -z "$_ABSENCE_WHY" ]; then na home "$NO_WHATAP_NA"
-        elif [ -z "$WHOME" ]; then missed home "$(home_why)$(home_fix); $_ABSENCE_WHY"
-        else missed home "$(home_why)$(home_fix)"; fi
+        _home_missed home ""
     fi
+}
 
-    # -- E. Runtime processes (current state) ---------------------------------
+# -- E. Runtime processes (current state) ---------------------------------
+_rep_e() {
     section "E. Runtime processes (current state)"
     if [ "${#PIDS[@]}" -eq 0 ]; then
         fact "no whatap.server.* / whatap.opslake.* JVM among $((PROC_SEEN - PROC_UNREAD)) readable /proc/<pid>/cmdline ($PROC_UNREAD not readable)"
@@ -1424,8 +1416,10 @@ run_report() {
     else
         fact "systemd: n/a (command not found: systemctl — non-systemd host or container)"
     fi
+}
 
-    # -- F. Configuration (raw) -----------------------------------------------
+# -- F. Configuration (raw) -----------------------------------------------
+_rep_f() {
     section "F. Configuration"
     # conf/ must be listable before its glob means anything: an unreadable
     # directory hands back the literal pattern, not "no *.conf".
@@ -1443,105 +1437,116 @@ run_report() {
         else na conf "conf/ is readable and holds no *.conf"; fi
     else
         fact "conf/: n/a ($(home_why conf))"
-        if [ -z "$WHOME" ] && [ -z "$_ABSENCE_WHY" ]; then na conf "$NO_WHATAP_NA"
-        elif [ -z "$WHOME" ]; then missed conf "$(home_why conf)$(home_fix); $_ABSENCE_WHY"
-        elif [ -d "$WHOME/conf" ] || [ ! -x "$WHOME" ]; then missed conf "$(home_why conf)$(home_fix)"
-        else missed conf "$(home_why conf)"; fi
+        _home_missed conf conf
     fi
+}
 
-    # -- G. Logs & recent events ----------------------------------------------
+# -- G. Logs & recent events ----------------------------------------------
+_rep_g() {
     section "G. Logs & recent events"
     if [ -n "$WHOME" ] && _dir_ok "$WHOME/logs"; then
-        # Current logs are listed one by one; rotated ones (logback
-        # "<base>.<yyyyMMdd>.<i>.log", often hundreds) are summarized per base.
-        subsection "current logs (non-rotated) — name / size / mtime"
-        local _f _cur=0
-        for _f in "$WHOME"/logs/*.log "$WHOME"/logs/*/*.log; do
-            [ -f "$_f" ] || continue
-            case "$_f" in *.[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].*.log) continue ;; esac
-            _cur=1
-            fact "$(printf '%s\t%s bytes\t%s' "${_f#"$WHOME"/}" "$( { wc -c < "$_f"; } 2>/dev/null | tr -d ' ')" "$(date -u -r "$_f" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo n/a)")"
-        done
-        if [ "$_cur" = 0 ]; then
-            fact "no non-rotated *.log found under $WHOME/logs"
-            na logs "logs/ is readable and holds no non-rotated *.log"
-        else
-            got logs
-        fi
-
-        subsection "rotated logs (summary per base: count / total bytes / date span)"
-        # ls -l is metadata only (no content read) — safe with hundreds of files.
-        local _rot
-        _rot="$(ls -l "$WHOME"/logs/*.log "$WHOME"/logs/*/*.log 2>/dev/null | awk '
-            { p=$NF }
-            p ~ /\.[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]\.[0-9]+\.log$/ {
-                m=split(p,a,"/"); fn=a[m]
-                sub(/\.[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]\.[0-9]+\.log$/, "", fn)
-                match(p, /\.[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]\./); d=substr(p,RSTART+1,8)
-                c[fn]++; s[fn]+=$5
-                if (mn[fn]==""||d<mn[fn]) mn[fn]=d
-                if (d>mx[fn]) mx[fn]=d
-            }
-            END { for (b in c) printf "%s: %d files, %d bytes total, %s..%s\n", b, c[b], s[b], mn[b], mx[b] }
-        ' | sort)"
-        if [ -n "$_rot" ]; then printf '%s\n' "$_rot" | while IFS= read -r _l; do fact "$_l"; done
-        else fact "no rotated logs"; fi
-
-        # What this bundle actually carries, as opposed to what exists on the host
-        # above. Without this the reader cannot tell "no such log" from "we left
-        # it out", and the two lead to different next steps.
-        if [ "$LOGSEL_RAN" = 1 ]; then
-            subsection "logs copied into this bundle (selection)"
-            fact "policy: $LOGSEL_REASON; caps ${OPT_MAXLOG_MB}MB per file, ${OPT_MAXTOTAL_MB}MB total"
-            fact "copied: $LOGSEL_KEPT_N files, $LOGSEL_KEPT_BYTES bytes ($LOGSEL_TRUNC_N truncated to their newest end)"
-            fact "not copied: $LOGSEL_DROP_N files, $LOGSEL_DROP_BYTES bytes"
-            fact "per-file detail with the reason for each: logs/SELECTION.txt"
-        fi
-
-        subsection "recent ERROR/WARN/Exception counts (current logs only, last 2MB each)"
-        for _f in "$WHOME"/logs/*.log "$WHOME"/logs/*/*.log; do
-            [ -f "$_f" ] || continue
-            case "$_f" in *.[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].*.log) continue ;; esac
-            local c; c="$(tail -c 2097152 "$_f" 2>/dev/null | grep -cE 'ERROR|WARN|Exception' 2>/dev/null)"
-            fact "${_f#"$WHOME"/}: ${c:-0}"
-        done
-        subsection "per-service log tails (base logs, newest-first, 40 lines each)"
-        # Each base *.log, newest first, without rotated files and the
-        # _self/_api/access/checker/gc streams: 40 lines each, at most 12 logs.
-        # `ls -1t` because a glob cannot sort; read line by line from a heredoc
-        # so a name with a space survives and _lc stays in this shell.
-        local TAIL_LINES=40 LOG_TAIL_FILES=12 _lc=0 _lf _lslist
-        _lslist="$(ls -1t "$WHOME"/logs/*.log 2>/dev/null)"
-        while IFS= read -r _lf; do
-            [ -n "$_lf" ] && [ -f "$_lf" ] || continue
-            # skip secondary streams and rotated (logback ".<yyyyMMdd>.<i>.log") files
-            case "$_lf" in
-                *_self.log|*_api.log|*access*|*checker*|*/gc*.log) continue ;;
-                *.[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].*.log) continue ;;
-            esac
-            _lc=$((_lc + 1))
-            if [ "$_lc" -gt "$LOG_TAIL_FILES" ]; then
-                fact "(further base logs not tailed: at most $LOG_TAIL_FILES are tailed; all are in the inventory above)"
-                break
-            fi
-            fact "${_lf#"$WHOME"/} (mtime $(date -u -r "$_lf" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo n/a)):"
-            tail -n "$TAIL_LINES" "$_lf" 2>/dev/null | _indent '        '
-        done <<EOF
-$_lslist
-EOF
-        [ "$_lc" -eq 0 ] && fact "no base service logs found (only _self/_api/access streams, or none)"
-        subsection "self-mon / checker"
-        fact "yard_self.log: $( ls "$WHOME"/logs/*_self.log >/dev/null 2>&1 && echo present || echo 'n/a (path not found)' )"
-        local chk; chk="$(_bounded find "$WHOME/logs" -maxdepth 2 -name '*checker*.log' 2>/dev/null | head -n1)"
-        if [ -n "$chk" ]; then fact "$chk (last 20 lines):"; tail -n 20 "$chk" 2>/dev/null | while IFS= read -r _l; do printf '        %s\n' "$_l"; done
-        else fact "checker log: n/a (path not found)"; fi
+        _rep_g_inventory
+        _rep_g_tails
     else
         fact "logs/: n/a ($(home_why logs))"
-        if [ -z "$WHOME" ] && [ -z "$_ABSENCE_WHY" ]; then na logs "$NO_WHATAP_NA"
-        elif [ -z "$WHOME" ]; then missed logs "$(home_why logs)$(home_fix); $_ABSENCE_WHY"
-        elif [ -d "$WHOME/logs" ] || [ ! -x "$WHOME" ]; then missed logs "$(home_why logs)$(home_fix)"
-        else missed logs "$(home_why logs)"; fi
+        _home_missed logs logs
     fi
+    _rep_g_heap
+    _rep_g_journal
+}
+
+# _rep_g_inventory -> G: the logs on the host, and which of them this bundle carries
+_rep_g_inventory() {
+    # Current logs are listed one by one; rotated ones (logback
+    # "<base>.<yyyyMMdd>.<i>.log", often hundreds) are summarized per base.
+    subsection "current logs (non-rotated) — name / size / mtime"
+    local _f _cur=0
+    for _f in "$WHOME"/logs/*.log "$WHOME"/logs/*/*.log; do
+        [ -f "$_f" ] || continue
+        case "$_f" in *.[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].*.log) continue ;; esac
+        _cur=1
+        fact "$(printf '%s\t%s bytes\t%s' "${_f#"$WHOME"/}" "$( { wc -c < "$_f"; } 2>/dev/null | tr -d ' ')" "$(date -u -r "$_f" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo n/a)")"
+    done
+    if [ "$_cur" = 0 ]; then
+        fact "no non-rotated *.log found under $WHOME/logs"
+        na logs "logs/ is readable and holds no non-rotated *.log"
+    else
+        got logs
+    fi
+
+    subsection "rotated logs (summary per base: count / total bytes / date span)"
+    # ls -l is metadata only (no content read) — safe with hundreds of files.
+    local _rot
+    _rot="$(ls -l "$WHOME"/logs/*.log "$WHOME"/logs/*/*.log 2>/dev/null | awk '
+        { p=$NF }
+        p ~ /\.[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]\.[0-9]+\.log$/ {
+            m=split(p,a,"/"); fn=a[m]
+            sub(/\.[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]\.[0-9]+\.log$/, "", fn)
+            match(p, /\.[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]\./); d=substr(p,RSTART+1,8)
+            c[fn]++; s[fn]+=$5
+            if (mn[fn]==""||d<mn[fn]) mn[fn]=d
+            if (d>mx[fn]) mx[fn]=d
+        }
+        END { for (b in c) printf "%s: %d files, %d bytes total, %s..%s\n", b, c[b], s[b], mn[b], mx[b] }
+    ' | sort)"
+    if [ -n "$_rot" ]; then printf '%s\n' "$_rot" | while IFS= read -r _l; do fact "$_l"; done
+    else fact "no rotated logs"; fi
+
+    # What this bundle actually carries, as opposed to what exists on the host
+    # above. Without this the reader cannot tell "no such log" from "we left
+    # it out", and the two lead to different next steps.
+    if [ "$LOGSEL_RAN" = 1 ]; then
+        subsection "logs copied into this bundle (selection)"
+        fact "policy: $LOGSEL_REASON; caps ${OPT_MAXLOG_MB}MB per file, ${OPT_MAXTOTAL_MB}MB total"
+        fact "copied: $LOGSEL_KEPT_N files, $LOGSEL_KEPT_BYTES bytes ($LOGSEL_TRUNC_N truncated to their newest end)"
+        fact "not copied: $LOGSEL_DROP_N files, $LOGSEL_DROP_BYTES bytes"
+        fact "per-file detail with the reason for each: logs/SELECTION.txt"
+    fi
+}
+
+# _rep_g_tails -> G: error counts and the newest lines of each base log
+_rep_g_tails() {
+    local _f
+    subsection "recent ERROR/WARN/Exception counts (current logs only, last 2MB each)"
+    for _f in "$WHOME"/logs/*.log "$WHOME"/logs/*/*.log; do
+        [ -f "$_f" ] || continue
+        case "$_f" in *.[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].*.log) continue ;; esac
+        local c; c="$(tail -c 2097152 "$_f" 2>/dev/null | grep -cE 'ERROR|WARN|Exception' 2>/dev/null)"
+        fact "${_f#"$WHOME"/}: ${c:-0}"
+    done
+    subsection "per-service log tails (base logs, newest-first, 40 lines each)"
+    # Each base *.log, newest first, without rotated files and the
+    # _self/_api/access/checker/gc streams: 40 lines each, at most 12 logs.
+    # `ls -1t` because a glob cannot sort; read line by line from a heredoc
+    # so a name with a space survives and _lc stays in this shell.
+    local TAIL_LINES=40 LOG_TAIL_FILES=12 _lc=0 _lf _lslist
+    _lslist="$(ls -1t "$WHOME"/logs/*.log 2>/dev/null)"
+    while IFS= read -r _lf; do
+        [ -n "$_lf" ] && [ -f "$_lf" ] || continue
+        # skip secondary streams and rotated (logback ".<yyyyMMdd>.<i>.log") files
+        case "$_lf" in
+            *_self.log|*_api.log|*access*|*checker*|*/gc*.log) continue ;;
+            *.[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].*.log) continue ;;
+        esac
+        _lc=$((_lc + 1))
+        if [ "$_lc" -gt "$LOG_TAIL_FILES" ]; then
+            fact "(further base logs not tailed: at most $LOG_TAIL_FILES are tailed; all are in the inventory above)"
+            break
+        fi
+        fact "${_lf#"$WHOME"/} (mtime $(date -u -r "$_lf" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo n/a)):"
+        tail -n "$TAIL_LINES" "$_lf" 2>/dev/null | _indent '        '
+    done <<EOF
+$_lslist
+EOF
+    [ "$_lc" -eq 0 ] && fact "no base service logs found (only _self/_api/access streams, or none)"
+    subsection "self-mon / checker"
+    fact "yard_self.log: $( ls "$WHOME"/logs/*_self.log >/dev/null 2>&1 && echo present || echo 'n/a (path not found)' )"
+    local chk; chk="$(_bounded find "$WHOME/logs" -maxdepth 2 -name '*checker*.log' 2>/dev/null | head -n1)"
+    if [ -n "$chk" ]; then fact "$chk (last 20 lines):"; tail -n 20 "$chk" 2>/dev/null | while IFS= read -r _l; do printf '        %s\n' "$_l"; done
+    else fact "checker log: n/a (path not found)"; fi
+}
+
+_rep_g_heap() {
     subsection "heap dumps / GC log / restart"
     if [ -n "$WHOME" ]; then
         # "none" only when every directory searched was read. A directory is
@@ -1571,6 +1576,9 @@ EOF
         if [ -f "$WHOME/restart.out" ]; then fact "restart.out (last 20 lines):"; tail -n 20 "$WHOME/restart.out" 2>/dev/null | while IFS= read -r _l; do printf '        %s\n' "$_l"; done
         else fact "restart.out: n/a (path not found)"; fi
     fi
+}
+
+_rep_g_journal() {
     subsection "journal errors (last ${OPT_HOURS}h, bounded, installed units only)"
     _jwhy="$(journal_why)"
     _jhits=0; _jfail=""
@@ -1607,6 +1615,44 @@ EOF
         fact "journal: readable by uid $(id -u 2>/dev/null || echo '?'); no err entries for the loaded whatap units in the last ${OPT_HOURS}h"
         na journal "the system journal is readable and holds no entries for the whatap units in the last ${OPT_HOURS}h"
     fi
+}
+
+run_report() {
+    emit_header
+
+    # What this run is for. `home` and `conf` are the two that decide whether a
+    # bundle is worth sending: without the WhaTap config files nothing about an
+    # upgrade or a misbehaving module can be settled remotely.
+    goal services "running whatap modules"
+    goal home     "WHATAP_HOME contents"
+    goal conf     "module configs"
+    goal logs     "log inventory"
+    # yardbase only matters on a host that runs yard. Declaring it everywhere
+    # would mark a healthy web/proxy-only host INCOMPLETE for a path it is not
+    # supposed to have.
+    _runs_yard=0
+    _i=0; while [ "$_i" -lt "${#MODS[@]}" ]; do
+        case "${MODS[$_i]}" in *yard*) _runs_yard=1 ;; esac
+        _i=$((_i + 1))
+    done
+    [ "$_runs_yard" = 1 ] && goal yardbase "yard data path"
+    # journal: only where there is a systemd unit whose journal could exist.
+    # On a host that runs the modules some other way, an absent journal is the
+    # shape of the host, not a gap, so no goal is declared at all.
+    _has_unit=0
+    if have systemctl; then
+        for _u in $WHATAP_UNITS; do unit_loaded "$_u.service" && { _has_unit=1; break; }; done
+    fi
+    [ "$_has_unit" = 1 ] && goal journal "systemd journal for whatap units"
+
+    _rep_env
+    _rep_a
+    _rep_b
+    _rep_c
+    _rep_d
+    _rep_e
+    _rep_f
+    _rep_g
 
     emit_status
     emit_footer

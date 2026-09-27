@@ -27,7 +27,7 @@ export LC_ALL=C
 # ---- collector metadata -----------------------------------------------------
 # History: CHANGELOG.md, section collect-collmysql.sh (next to this file).
 COLLECTOR_NAME="whatap-collmysql"
-VERSION="0.10.4"
+VERSION="0.10.5"
 DOMAIN="collection-server"
 TARGET="collection-server-mysql/$(hostname 2>/dev/null || echo unknown)"
 
@@ -1058,6 +1058,18 @@ EOF
     _BL_TGT_WHY="$MYSQL_CONN, ${_BL_TGT_IPS//$_nl/ } not an address of this host"
 }
 
+# _bl_netns_owns /proc/P -> 0 when P's network namespace owns one of _BL_TGT_IPS
+_bl_netns_owns() {
+    local ip mine
+    mine="$_nl$(_local_ips "$1/net/fib_trie")$_nl"
+    while IFS= read -r ip; do
+        [ -n "$ip" ] && case "$mine" in *"$_nl$ip$_nl"*) return 0 ;; esac
+    done <<EOF
+$_BL_TGT_IPS
+EOF
+    return 1
+}
+
 # _binlog_proc -> the local mysqld/mariadbd that is the server connected to;
 # its logs are read through /proc/P/root. P qualifies when:
 # 1. @@pid_file through /proc/P/root holds P's pid in its namespace (last
@@ -1091,7 +1103,7 @@ _binlog_proc() {
     # 0. where the client connected: a TCP address that neither this host nor
     # a local mysqld's network namespace owns is a remote server
     _bl_target
-    local netns_ok ip mine owned=0
+    local owned=0
     if [ -n "$_bl_rows" ]; then
         l="${_bl_rows%"$_nl"}"; l="${l##*"$_nl"}"; set -f; set -- $l; set +f; last="${1:-}"; lsz="${2:-}"
     fi
@@ -1103,13 +1115,7 @@ _binlog_proc() {
         case "$st" in Z*|X*) continue ;; esac      # a zombie holds no files
         cand=$((cand + 1)); v=""
         if [ "$_BL_TGT" = ips ]; then
-            netns_ok=0; mine="$_nl$(_local_ips "$d/net/fib_trie")$_nl"
-            while IFS= read -r ip; do
-                [ -n "$ip" ] && case "$mine" in *"$_nl$ip$_nl"*) netns_ok=1 ;; esac
-            done <<EOF
-$_BL_TGT_IPS
-EOF
-            if [ "$netns_ok" = 0 ]; then other="$other $p(its network namespace does not own ${_BL_TGT_IPS//$_nl/ })"; continue; fi
+            _bl_netns_owns "$d" || { other="$other $p(its network namespace does not own ${_BL_TGT_IPS//$_nl/ })"; continue; }
             owned=$((owned + 1))
         fi
         # 1. the pid file
@@ -1349,21 +1355,9 @@ _window() {
     else got window; fi
 }
 
-run_report() {
-    emit_header
-
-    # This collector's sections are lettered by hand, so the roll-up carries one too.
-
-    # Nearly everything here comes from SQL, so the login is the goal that
-    # decides whether a run answers anything at all. `binlog` is declared only
-    # when it was asked for: without --binlog its absence is a choice, not a gap.
-    goal login  "mysql login"
-    goal host   "host-side facts (process, sockets, disk)"
-    [ "$OPT_BINLOG" = 1 ] && goal binlog "binary log content attribution"
-    # The samplers only add detail: with neither installed the window has no
-    # input, so no goal (J's fact lines say what is missing).
-    { have iostat || have vmstat; } && goal window "interval samples (iostat -x, vmstat) over the window"
-
+# One _rep_<x> per section, in report order.
+# -- Collection environment ---------------------------------------------
+_rep_env() {
     section "Collection environment"
     fact "bash: ${BASH_VERSION:-unknown}"
     fact "uid: $(id -u 2>/dev/null || echo unknown)"
@@ -1409,7 +1403,10 @@ run_report() {
     if have iostat || have vmstat; then
         fact "window: ${WIN_SECS}s$([ "$WIN_GIVEN" = 1 ] && echo " (--window)" || echo " (default)")"
     else fact "window: not run (no sampler installed)"; fi
+}
 
+# -- A. Server identity and version ---------------------------------------
+_rep_a() {
     section "A. Server identity and version"
     # Which account the server matched, not which one was asked for. They differ
     # when a host pattern matches something wider than the literal name, and the
@@ -1453,7 +1450,10 @@ run_report() {
     # goal: a run with no SQL at all is still worth sending if they came back.
     if have ps || have ss || have netstat; then got host
     else missed host "no ps, ss or netstat on this host"; fi
+}
 
+# -- B. HA and replication -------------------------------------------------
+_rep_b() {
     section "B. HA and replication"
     sql  "binlog_format"       "SELECT @@binlog_format"
     sql  "gtid_mode"           "SELECT @@gtid_mode"
@@ -1481,7 +1481,10 @@ run_report() {
     # MEMBER_ROLE arrived in 8.0; naming it breaks the whole row on 5.7.
     sql  "group replication"   "SELECT MEMBER_HOST, MEMBER_STATE FROM performance_schema.replication_group_members"
     sql  "semi-sync"           "SHOW STATUS LIKE 'Rpl_semi_sync%_status'"
+}
 
+# -- C. Binary log inventory and retention --------------------------------
+_rep_c() {
     section "C. Binary log inventory and retention"
     sql "log_bin"                     "SELECT @@log_bin" LOG_BIN
     sql "log_bin_basename"            "SELECT @@log_bin_basename" BINLOG_BASE
@@ -1492,6 +1495,14 @@ run_report() {
     sql "binlog_row_image"            "SHOW VARIABLES LIKE 'binlog_row_image'"
     sql "binlog_rows_query_log_events" "SHOW VARIABLES LIKE 'binlog_rows_query_log_events'"
     sql "sync_binlog"                 "SELECT @@sync_binlog"
+    _rep_c_inventory
+    sql "binlog cache use / disk use" "SHOW GLOBAL STATUS LIKE 'Binlog_cache%'"
+    sql "Binlog_bytes_written"        "SHOW GLOBAL STATUS LIKE 'Binlog%bytes%'"
+    _rep_c_dir
+}
+
+# _rep_c_inventory -> C: SHOW BINARY LOGS as totals and both ends; sets _bl_rows
+_rep_c_inventory() {
     # A host whose binary logs accumulate can hold thousands of files, and the
     # full listing would be the whole report. Report the inventory as totals
     # plus both ends; section I attributes the content.
@@ -1520,9 +1531,11 @@ run_report() {
             printf '%s\n' "$_bl_rows" | tail -20 | while IFS= read -r _l; do sub "$_l"; done
         fi
     fi
-    sql "binlog cache use / disk use" "SHOW GLOBAL STATUS LIKE 'Binlog_cache%'"
-    sql "Binlog_bytes_written"        "SHOW GLOBAL STATUS LIKE 'Binlog%bytes%'"
+}
 
+# _rep_c_dir -> C: the binlog directory as the server process sees it; sets
+# BINLOG_DIR and LDIR for section I
+_rep_c_dir() {
     # Growth comes from file mtimes (no second sample). A NULL or bare-name
     # log_bin_basename leaves no directory, not dirname's ".".
     BINLOG_DIR=""
@@ -1562,7 +1575,10 @@ run_report() {
     else
         fact "binlog directory: $BINLOG_DIR (not readable by uid $(id -u 2>/dev/null || echo '?') at $LDIR)"
     fi
+}
 
+# -- D. Storage and I/O ----------------------------------------------------
+_rep_d() {
     section "D. Storage and I/O"
     probe "df -hT" df -hT
     probe "mount points" sh -c "findmnt -o TARGET,SOURCE,FSTYPE,OPTIONS 2>/dev/null || mount"
@@ -1579,7 +1595,10 @@ run_report() {
     sql "Innodb_buffer_pool pages"    "SHOW GLOBAL STATUS LIKE 'Innodb_buffer_pool_pages_%'"
     sql "Innodb_row operations"       "SHOW GLOBAL STATUS LIKE 'Innodb_rows_%'"
     sql "Com_ counters"               "SHOW GLOBAL STATUS WHERE Variable_name IN ('Com_select','Com_insert','Com_update','Com_delete','Com_commit','Queries')"
+}
 
+# -- E. InnoDB configuration -----------------------------------------------
+_rep_e() {
     section "E. InnoDB configuration"
     sql "innodb_page_size"               "SELECT @@innodb_page_size"
     sql "innodb_buffer_pool_size"        "SELECT @@innodb_buffer_pool_size"
@@ -1590,7 +1609,10 @@ run_report() {
     sql "innodb_log_file settings"       "SHOW VARIABLES LIKE 'innodb_log_file%'"
     sql "innodb_redo_log_capacity"       "SHOW VARIABLES LIKE 'innodb_redo_log_capacity'"
     sqlv "engine status"                 "SHOW ENGINE INNODB STATUS"
+}
 
+# -- F. Schema footprint ---------------------------------------------------
+_rep_f() {
     section "F. Schema footprint"
     sql "schemas (name, tables, data MB, index MB)" \
         "SELECT table_schema, COUNT(*), ROUND(SUM(data_length)/1024/1024,1), ROUND(SUM(index_length)/1024/1024,1) FROM information_schema.tables GROUP BY table_schema ORDER BY SUM(data_length+index_length) DESC"
@@ -1604,7 +1626,10 @@ run_report() {
         "SELECT s.TABLE_SCHEMA, s.TABLE_NAME, s.INDEX_NAME, s.SEQ_IN_INDEX, s.COLUMN_NAME, s.CARDINALITY FROM information_schema.statistics s JOIN (SELECT table_schema, table_name FROM information_schema.tables WHERE table_schema NOT IN ('information_schema','performance_schema','mysql','sys') ORDER BY data_length+index_length DESC LIMIT 15) t ON t.table_schema = s.TABLE_SCHEMA AND t.table_name = s.TABLE_NAME ORDER BY s.TABLE_SCHEMA, s.TABLE_NAME, s.INDEX_NAME, s.SEQ_IN_INDEX"
     sql "columns of DeniedIPAddress and ApmRegion" \
         "SELECT table_schema, table_name, column_name, is_nullable, column_type FROM information_schema.columns WHERE table_name IN ('DeniedIPAddress','ApmRegion') ORDER BY table_schema, table_name, ordinal_position"
+}
 
+# -- G. Per-table I/O and index wait ---------------------------------------
+_rep_g() {
     section "G. Per-table I/O and index wait, from performance_schema"
     sql "performance_schema enabled" "SELECT @@performance_schema"
     sql "top 20 tables by I/O wait (schema, table, count, latency ns)" \
@@ -1617,12 +1642,18 @@ run_report() {
         "SELECT LEFT(DIGEST_TEXT,120), COUNT_STAR, SUM_ROWS_EXAMINED, SUM_ROWS_SENT FROM performance_schema.events_statements_summary_by_digest ORDER BY SUM_ROWS_EXAMINED DESC LIMIT 15"
     sql "file I/O by event (event, count read, bytes read, count write, bytes written)" \
         "SELECT EVENT_NAME, COUNT_READ, SUM_NUMBER_OF_BYTES_READ, COUNT_WRITE, SUM_NUMBER_OF_BYTES_WRITE FROM performance_schema.file_summary_by_event_name WHERE COUNT_STAR > 0 ORDER BY SUM_NUMBER_OF_BYTES_WRITE DESC LIMIT 15"
+}
 
+# -- H. Current activity ---------------------------------------------------
+_rep_h() {
     section "H. Current activity"
     sql "processlist"            "SELECT ID, USER, HOST, DB, COMMAND, TIME, STATE, LEFT(INFO,120) FROM information_schema.processlist ORDER BY TIME DESC LIMIT 30"
     sql "threads connected/running" "SHOW GLOBAL STATUS WHERE Variable_name IN ('Threads_connected','Threads_running','Max_used_connections')"
     sql "max_connections"        "SELECT @@max_connections"
+}
 
+# -- I. Binary log content attribution -------------------------------------
+_rep_i() {
     section "I. Binary log content attribution"
     # Obtained only when every selected file was decoded to its end; a failed
     # or capped decode is a gap, however many counters it printed.
@@ -1638,8 +1669,7 @@ run_report() {
         missed binlog "command not found: mysqlbinlog"
     elif [ -z "$BINLOG_DIR" ]; then
         # Splitting these two matters: an unresolved path is answered by getting
-        # a login, an unreadable one by getting a different account. The old
-        # wording covered both and answered neither (Smartfren, 2026-09-23).
+        # a login, an unreadable one by getting a different account.
         if [ "$MYSQL_OK" != 1 ]; then fact "n/a (binary log directory not resolved: @@log_bin_basename not queried: $MYSQL_WHY)"
         else fact "n/a (binary log directory not resolved: @@log_bin_basename is ${BINLOG_BASE:-empty})"; fi
         missed binlog "binary log directory not resolved (@@log_bin_basename ${BINLOG_BASE:-unavailable}; mysql connection: $MYSQL_WHY)"
@@ -1653,58 +1683,7 @@ run_report() {
         missed binlog "run as uid $(id -u 2>/dev/null || echo '?'); $LDIR is $(stat -c '%U:%G %a' "$LDIR" 2>/dev/null || echo 'not readable') and not readable by this uid$(_priv_hint)"
     else
         fact "decoding the $BINLOG_FILES newest binary logs under $BINLOG_DIR ($_BL_VIA, $LDIR)"
-        # "path<TAB>bytes", newest first. The newest files and their sizes are
-        # the last rows of SHOW BINARY LOGS (section C). Their paths come from
-        # @@log_bin_index when it is readable and lists the same names in the
-        # same order (logs in more than one directory), else BINLOG_DIR/name.
-        # A selected file that is not here, or a name listed twice with no
-        # index to tell them apart, is named and blocks the goal. Only without
-        # that list does one directory listing (by mtime) supply both.
-        _bl_list=""; _bl_gap=""
-        if [ -n "$_bl_rows" ]; then
-            _bl_idx=""
-            case "$BINLOG_INDEX" in /*) [ -f "$_BL_ROOT$BINLOG_INDEX" ] && [ -r "$_BL_ROOT$BINLOG_INDEX" ] && _bl_idx="$_BL_ROOT$BINLOG_INDEX" ;; esac
-            # index entries are the server's paths: they get the same root
-            _bl_sel="$(printf '%s\n' "$_bl_rows" | awk -v d="$LDIR" -v rt="$_BL_ROOT" -v dd="${DATADIR%/}" -v idx="$_bl_idx" -v n="$BINLOG_FILES" '
-                NF { r++; name[r] = $1; size[r] = $2; cnt[$1]++ }
-                END {
-                    use = 0
-                    if (idx != "") {
-                        k = 0
-                        while ((getline l < idx) > 0) if (l != "") p[++k] = l
-                        use = (k == r)
-                        for (i = 1; i <= k && use; i++) { b = p[i]; sub(/.*\//, "", b); if (b != name[i]) use = 0 }
-                    }
-                    for (i = r; i >= 1 && i > r - n; i--) {
-                        if (use) {
-                            q = p[i]
-                            if (q !~ /^\//) { sub(/^\.\//, "", q); q = dd "/" q }
-                            q = rt q
-                            print "F\t" q "\t" size[i] "\t" (cnt[name[i]] > 1)
-                        } else if (cnt[name[i]] > 1) print "D\t" name[i] "\t" cnt[name[i]]
-                        else print "F\t" d "/" name[i] "\t" size[i] "\t0"
-                    }
-                }')"
-            while IFS="$_tab" read -r _k _p _b _dup; do
-                case "$_k" in
-                    F) if [ -f "$_p" ]; then _bl_list="$_bl_list$_p$_tab$_b$_tab${_dup:-0}$_nl"
-                       else
-                           fact "skipped: ${_p##*/} (listed by SHOW BINARY LOGS; $_p is not a file on this host)"
-                           _bl_gap="$_bl_gap${_bl_gap:+; }${_p##*/}: not a file at $_p on this host"
-                       fi ;;
-                    D) fact "skipped: $_p (SHOW BINARY LOGS lists it $_b times and @@log_bin_index ${BINLOG_INDEX:-?} is not readable here, so which file is meant is not known)"
-                       _bl_gap="$_bl_gap${_bl_gap:+; }$_p: listed $_b times, no readable index to tell them apart" ;;
-                esac
-            done <<EOF
-$_bl_sel
-EOF
-            _bl_src="SHOW BINARY LOGS"
-        else
-            _bl_list="$(_bounded ls -ltd --time-style=+%s -- "$LDIR"/*.[0-9][0-9][0-9][0-9][0-9][0-9] 2>/dev/null \
-                | head -n "$BINLOG_FILES" \
-                | awk '{ sz = $5; for (i = 1; i <= 6; i++) sub(/^[^ ]+ +/, ""); print $0 "\t" sz }')"
-            _bl_src=""
-        fi
+        _rep_i_select
         if [ -z "$_bl_list" ] && [ -n "$_bl_src" ]; then
             fact "n/a (none of the $BINLOG_FILES newest files SHOW BINARY LOGS lists could be read on this host)"
             missed binlog "none of the $BINLOG_FILES newest files SHOW BINARY LOGS lists was decoded: $_bl_gap"
@@ -1712,83 +1691,157 @@ EOF
             fact "n/a (no binary log files matched under $LDIR)"
             na binlog "$LDIR is readable and holds no <basename>.NNNNNN file"
         else
-            _bl_ok=0
-            _sum="$(_tmp binlog.sum)"
-            while IFS= read -r _bl; do
-                [ -n "$_bl" ] || continue
-                # path<TAB>bytes[<TAB>1 when the name is listed more than once]
-                _path="${_bl%%"$_tab"*}"; _bytes="${_bl#*"$_tab"}"; _dup=0
-                case "$_bytes" in *"$_tab"*) _dup="${_bytes#*"$_tab"}"; _bytes="${_bytes%%"$_tab"*}" ;; esac
-                _bl="${_path##*/}"
-                # a name the index lists in two directories is told apart by its path
-                if [ "$_dup" = 1 ]; then fact "file: $_path ($_bytes bytes)"
-                else fact "file: $_bl ($_bytes bytes)"; fi
-                # A decoded 1 GiB log is ~1.15 GiB: stream it once through awk,
-                # never into a variable. The status read is the decoder's
-                # (PIPESTATUS), not awk's.
-                CMD_TIMEOUT="$BINLOG_TIMEOUT" _bounded mysqlbinlog --no-defaults \
-                    --base64-output=DECODE-ROWS -v "$_path" 2>"$_errfile" | awk '
-                    /^### INSERT INTO / { c["INSERT " $4]++; rows++; next }
-                    /^### UPDATE /      { c["UPDATE " $3]++; rows++; next }
-                    /^### DELETE FROM / { c["DELETE " $4]++; rows++; next }
-                    # MySQL writes BEGIN; MariaDB writes START TRANSACTION
-                    /^BEGIN/ || /^START TRANSACTION/ { begins++; next }
-                    # Only the event header line, not the SET pseudo_thread_id it
-                    # emits. MariaDB opens transactions with a GTID event instead,
-                    # so this counts statement and DDL events, not transactions.
-                    /^#[0-9]/ && /thread_id=/ { queries++ }
-                    /^#[0-9][0-9][0-9][0-9][0-9][0-9] / {
-                        if (first == "") first = $1 " " $2; last = $1 " " $2
-                    }
-                    END {
-                        for (k in c) printf "T\t%d\t%s\n", c[k], k
-                        printf "S\trows\t%d\n",    rows + 0
-                        printf "S\tbegins\t%d\n",  begins + 0
-                        printf "S\tqueries\t%d\n", queries + 0
-                        printf "S\tfirst\t%s\n",   first
-                        printf "S\tlast\t%s\n",    last
-                    }' > "$_sum" 2>/dev/null
-                _rc="${PIPESTATUS[0]}"
-                if [ "$_rc" -ne 0 ] && [ "$_rc" -ne 124 ]; then
-                    _why="$(_classify_err)"
-                    sub "n/a (mysqlbinlog exit $_rc: $_why)"
-                    case "$_why" in *permission*) _why="$_why$(_priv_hint)" ;; esac
-                    _bl_gap="$_bl_gap${_bl_gap:+; }$_bl: mysqlbinlog exit $_rc, $_why"
-                    continue
-                fi
-                if [ "$_rc" -eq 124 ]; then
-                    sub "decoding stopped at the ${BINLOG_TIMEOUT}s cap; the counts below cover the part decoded before it"
-                    _bl_gap="$_bl_gap${_bl_gap:+; }$_bl: decode stopped at the ${BINLOG_TIMEOUT}s cap (partial)"
-                else
-                    _bl_ok=$((_bl_ok + 1))
-                fi
-                _rows="$(awk -F'\t' '$2=="rows"{print $3}' "$_sum")"
-                if [ "${_rows:-0}" -eq 0 ]; then
-                    sub "events per table: none (no row events decoded)"
-                else
-                    sub "events per table (count, table):"
-                    awk -F'\t' '$1=="T"{printf "%12d %s\n", $2, $3}' "$_sum" \
-                        | sort -rn | head -30 \
-                        | _indent '            '
-                fi
-                sub "row events (count): ${_rows:-0}"
-                sub "transactions (BEGIN count): $(awk -F'\t' '$2=="begins"{print $3}' "$_sum")"
-                sub "statement and DDL events (Query, count): $(awk -F'\t' '$2=="queries"{print $3}' "$_sum")"
-                sub "first event timestamp: $(awk -F'\t' '$2=="first"{print $3}' "$_sum")"
-                sub "last event timestamp:  $(awk -F'\t' '$2=="last"{print $3}' "$_sum")"
-            done <<EOF
-$_bl_list
-EOF
-            rm -f "$_sum" 2>/dev/null
-            [ -n "${_BL_INV_WHY:-}" ] && _bl_gap="$_bl_gap${_bl_gap:+; }SHOW BINARY LOGS: $_BL_INV_WHY"
-            if [ -z "$_bl_gap" ] && [ "$_bl_ok" -gt 0 ]; then got binlog
-            else missed binlog "${_bl_gap:-no file was decoded}"; fi
+            _rep_i_decode
         fi
     fi
+}
 
+# _rep_i_select -> I: _bl_list ("path<TAB>bytes[<TAB>dup]" per file, newest
+# first) and _bl_src; each selected file that is not here is added to _bl_gap
+_rep_i_select() {
+    # "path<TAB>bytes", newest first. The newest files and their sizes are
+    # the last rows of SHOW BINARY LOGS (section C). Their paths come from
+    # @@log_bin_index when it is readable and lists the same names in the
+    # same order (logs in more than one directory), else BINLOG_DIR/name.
+    # A selected file that is not here, or a name listed twice with no
+    # index to tell them apart, is named and blocks the goal. Only without
+    # that list does one directory listing (by mtime) supply both.
+    _bl_list=""; _bl_gap=""
+    if [ -n "$_bl_rows" ]; then
+        _bl_idx=""
+        case "$BINLOG_INDEX" in /*) [ -f "$_BL_ROOT$BINLOG_INDEX" ] && [ -r "$_BL_ROOT$BINLOG_INDEX" ] && _bl_idx="$_BL_ROOT$BINLOG_INDEX" ;; esac
+        # index entries are the server's paths: they get the same root
+        _bl_sel="$(printf '%s\n' "$_bl_rows" | awk -v d="$LDIR" -v rt="$_BL_ROOT" -v dd="${DATADIR%/}" -v idx="$_bl_idx" -v n="$BINLOG_FILES" '
+            NF { r++; name[r] = $1; size[r] = $2; cnt[$1]++ }
+            END {
+                use = 0
+                if (idx != "") {
+                    k = 0
+                    while ((getline l < idx) > 0) if (l != "") p[++k] = l
+                    use = (k == r)
+                    for (i = 1; i <= k && use; i++) { b = p[i]; sub(/.*\//, "", b); if (b != name[i]) use = 0 }
+                }
+                for (i = r; i >= 1 && i > r - n; i--) {
+                    if (use) {
+                        q = p[i]
+                        if (q !~ /^\//) { sub(/^\.\//, "", q); q = dd "/" q }
+                        q = rt q
+                        print "F\t" q "\t" size[i] "\t" (cnt[name[i]] > 1)
+                    } else if (cnt[name[i]] > 1) print "D\t" name[i] "\t" cnt[name[i]]
+                    else print "F\t" d "/" name[i] "\t" size[i] "\t0"
+                }
+            }')"
+        while IFS="$_tab" read -r _k _p _b _dup; do
+            case "$_k" in
+                F) if [ -f "$_p" ]; then _bl_list="$_bl_list$_p$_tab$_b$_tab${_dup:-0}$_nl"
+                   else
+                       fact "skipped: ${_p##*/} (listed by SHOW BINARY LOGS; $_p is not a file on this host)"
+                       _bl_gap="$_bl_gap${_bl_gap:+; }${_p##*/}: not a file at $_p on this host"
+                   fi ;;
+                D) fact "skipped: $_p (SHOW BINARY LOGS lists it $_b times and @@log_bin_index ${BINLOG_INDEX:-?} is not readable here, so which file is meant is not known)"
+                   _bl_gap="$_bl_gap${_bl_gap:+; }$_p: listed $_b times, no readable index to tell them apart" ;;
+            esac
+        done <<EOF
+$_bl_sel
+EOF
+        _bl_src="SHOW BINARY LOGS"
+    else
+        _bl_list="$(_bounded ls -ltd --time-style=+%s -- "$LDIR"/*.[0-9][0-9][0-9][0-9][0-9][0-9] 2>/dev/null \
+            | head -n "$BINLOG_FILES" \
+            | awk '{ sz = $5; for (i = 1; i <= 6; i++) sub(/^[^ ]+ +/, ""); print $0 "\t" sz }')"
+        _bl_src=""
+    fi
+}
+
+# _rep_i_decode -> I: decodes every file of _bl_list and resolves the binlog goal
+_rep_i_decode() {
+    _bl_ok=0
+    _sum="$(_tmp binlog.sum)"
+    while IFS= read -r _bl; do
+        [ -n "$_bl" ] || continue
+        _rep_i_file
+    done <<EOF
+$_bl_list
+EOF
+    rm -f "$_sum" 2>/dev/null
+    [ -n "${_BL_INV_WHY:-}" ] && _bl_gap="$_bl_gap${_bl_gap:+; }SHOW BINARY LOGS: $_BL_INV_WHY"
+    if [ -z "$_bl_gap" ] && [ "$_bl_ok" -gt 0 ]; then got binlog
+    else missed binlog "${_bl_gap:-no file was decoded}"; fi
+}
+
+# _rep_i_file -> I: one line of _bl_list (in _bl): decodes that file and prints
+# its counts; a failed or capped decode is added to _bl_gap
+_rep_i_file() {
+    # path<TAB>bytes[<TAB>1 when the name is listed more than once]
+    _path="${_bl%%"$_tab"*}"; _bytes="${_bl#*"$_tab"}"; _dup=0
+    case "$_bytes" in *"$_tab"*) _dup="${_bytes#*"$_tab"}"; _bytes="${_bytes%%"$_tab"*}" ;; esac
+    _bl="${_path##*/}"
+    # a name the index lists in two directories is told apart by its path
+    if [ "$_dup" = 1 ]; then fact "file: $_path ($_bytes bytes)"
+    else fact "file: $_bl ($_bytes bytes)"; fi
+    # A decoded 1 GiB log is ~1.15 GiB: stream it once through awk,
+    # never into a variable. The status read is the decoder's
+    # (PIPESTATUS), not awk's.
+    CMD_TIMEOUT="$BINLOG_TIMEOUT" _bounded mysqlbinlog --no-defaults \
+        --base64-output=DECODE-ROWS -v "$_path" 2>"$_errfile" | awk '
+        /^### INSERT INTO / { c["INSERT " $4]++; rows++; next }
+        /^### UPDATE /      { c["UPDATE " $3]++; rows++; next }
+        /^### DELETE FROM / { c["DELETE " $4]++; rows++; next }
+        # MySQL writes BEGIN; MariaDB writes START TRANSACTION
+        /^BEGIN/ || /^START TRANSACTION/ { begins++; next }
+        # Only the event header line, not the SET pseudo_thread_id it
+        # emits. MariaDB opens transactions with a GTID event instead,
+        # so this counts statement and DDL events, not transactions.
+        /^#[0-9]/ && /thread_id=/ { queries++ }
+        /^#[0-9][0-9][0-9][0-9][0-9][0-9] / {
+            if (first == "") first = $1 " " $2; last = $1 " " $2
+        }
+        END {
+            for (k in c) printf "T\t%d\t%s\n", c[k], k
+            printf "S\trows\t%d\n",    rows + 0
+            printf "S\tbegins\t%d\n",  begins + 0
+            printf "S\tqueries\t%d\n", queries + 0
+            printf "S\tfirst\t%s\n",   first
+            printf "S\tlast\t%s\n",    last
+        }' > "$_sum" 2>/dev/null
+    _rc="${PIPESTATUS[0]}"
+    if [ "$_rc" -ne 0 ] && [ "$_rc" -ne 124 ]; then
+        _why="$(_classify_err)"
+        sub "n/a (mysqlbinlog exit $_rc: $_why)"
+        case "$_why" in *permission*) _why="$_why$(_priv_hint)" ;; esac
+        _bl_gap="$_bl_gap${_bl_gap:+; }$_bl: mysqlbinlog exit $_rc, $_why"
+        return
+    fi
+    if [ "$_rc" -eq 124 ]; then
+        sub "decoding stopped at the ${BINLOG_TIMEOUT}s cap; the counts below cover the part decoded before it"
+        _bl_gap="$_bl_gap${_bl_gap:+; }$_bl: decode stopped at the ${BINLOG_TIMEOUT}s cap (partial)"
+    else
+        _bl_ok=$((_bl_ok + 1))
+    fi
+    _rows="$(awk -F'\t' '$2=="rows"{print $3}' "$_sum")"
+    if [ "${_rows:-0}" -eq 0 ]; then
+        sub "events per table: none (no row events decoded)"
+    else
+        sub "events per table (count, table):"
+        awk -F'\t' '$1=="T"{printf "%12d %s\n", $2, $3}' "$_sum" \
+            | sort -rn | head -30 \
+            | _indent '            '
+    fi
+    sub "row events (count): ${_rows:-0}"
+    sub "transactions (BEGIN count): $(awk -F'\t' '$2=="begins"{print $3}' "$_sum")"
+    sub "statement and DDL events (Query, count): $(awk -F'\t' '$2=="queries"{print $3}' "$_sum")"
+    sub "first event timestamp: $(awk -F'\t' '$2=="first"{print $3}' "$_sum")"
+    sub "last event timestamp:  $(awk -F'\t' '$2=="last"{print $3}' "$_sum")"
+}
+
+# -- J. Interval samples ---------------------------------------------------
+_rep_j() {
     section "J. Interval samples"
     _window
+}
 
+# -- K. MySQL error log ----------------------------------------------------
+_rep_k() {
     section "K. MySQL error log"
     ERRLOG="$(mysql_val "SELECT @@log_error" 2>/dev/null)"
     if [ -n "$ERRLOG" ] && [ -r "$ERRLOG" ]; then
@@ -1799,6 +1852,35 @@ EOF
         probe "journal (mysql/mariadb, last 60)" sh -c \
             "journalctl -u mysql -u mysqld -u mariadb -n 60 --no-pager 2>/dev/null"
     fi
+}
+
+run_report() {
+    emit_header
+
+    # This collector's sections are lettered by hand, so the roll-up carries one too.
+
+    # Nearly everything here comes from SQL, so the login is the goal that
+    # decides whether a run answers anything at all. `binlog` is declared only
+    # when it was asked for: without --binlog its absence is a choice, not a gap.
+    goal login  "mysql login"
+    goal host   "host-side facts (process, sockets, disk)"
+    [ "$OPT_BINLOG" = 1 ] && goal binlog "binary log content attribution"
+    # The samplers only add detail: with neither installed the window has no
+    # input, so no goal (J's fact lines say what is missing).
+    { have iostat || have vmstat; } && goal window "interval samples (iostat -x, vmstat) over the window"
+
+    _rep_env
+    _rep_a
+    _rep_b
+    _rep_c
+    _rep_d
+    _rep_e
+    _rep_f
+    _rep_g
+    _rep_h
+    _rep_i
+    _rep_j
+    _rep_k
 
     emit_status
     emit_footer
