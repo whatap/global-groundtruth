@@ -21,6 +21,10 @@
 #     The owner file is the only list of the blocks and of their members;
 #     nothing here names them. A collector that is not a member but carries the
 #     banner is reported STRAY and left unchanged.
+#   * PowerShell group blocks: the same, owned by templates/groups/<group>.ps1,
+#     for the .ps1 collectors (members collectors/**/collect-<stem>.ps1). The
+#     skeleton blocks are shell and reach no .ps1 file; ps1.ps1 carries their
+#     port. After a change a .ps1 is parsed by pwsh when pwsh is installed.
 #
 # A block runs from its banner comment to its end line. Everything between is
 # owned by the owner file; an edit made inside a collector is overwritten, which
@@ -67,7 +71,20 @@ mode="${1:---check}"
 case "$mode" in --check|--apply) ;; *) echo "usage: $0 --check|--apply" >&2; exit 2 ;; esac
 
 ALL="$(find "$ROOT/collectors" -type f -name 'collect-*.sh' | sort)"
+ALL_PS1="$(find "$ROOT/collectors" -type f -name 'collect-*.ps1' | sort)"
 rc=0
+
+# syntax_ok FILE -> the file still parses: bash -n for a .sh, the PowerShell
+# parser for a .ps1 (when pwsh is installed; without it the check is skipped)
+syntax_ok() {
+    case "$1" in
+        *.ps1) command -v pwsh >/dev/null 2>&1 || return 0
+               PS1_FILE="$1" pwsh -NoProfile -NonInteractive -Command '$e = $null; $null = [System.Management.Automation.Language.Parser]::ParseFile($env:PS1_FILE, [ref]$null, [ref]$e); if ($e.Count) { exit 1 }' </dev/null >/dev/null 2>&1 ;;
+        *) bash -n "$1" 2>/dev/null ;;
+    esac
+}
+# replace FILE: FILE.tmp becomes FILE; a shell collector stays executable
+replace() { mv "$1.tmp" "$1" && case "$1" in *.sh) chmod +x "$1" ;; esac; }
 
 # sync_block NAME BANNER ENDRE OWNER NEXT PREV FILE... -> check, or re-copy from
 # OWNER, one block in each FILE. NEXT: regex of the later blocks' banners (a
@@ -98,8 +115,8 @@ sync_block() {
                 { sed -n "1,$((at - 1))p" "$f"; printf '%s\n\n' "$src"; sed -n "$at,\$p" "$f"; } > "$f.tmp"
             else
                 { sed -n "1,${after}p" "$f"; printf '\n%s\n' "$src"; sed -n "$((after + 1)),\$p" "$f"; } > "$f.tmp"
-            fi && mv "$f.tmp" "$f" && chmod +x "$f"
-            if bash -n "$f" 2>/dev/null; then printf 'inserted %-52s (block %s)\n' "$short" "$name"
+            fi && replace "$f"
+            if syntax_ok "$f"; then printf 'inserted %-52s (block %s)\n' "$short" "$name"
             else printf 'BROKEN   %-52s (block %s) — syntax error after insert\n' "$short" "$name"; rc=1; fi
             continue
         fi
@@ -111,8 +128,8 @@ sync_block() {
             printf 'DRIFT    %-52s (block %s)\n' "$short" "$name"; rc=1; continue
         fi
         { sed -n "1,$((${r% *} - 1))p" "$f"; printf '%s\n' "$src"; sed -n "$((${r#* } + 1)),\$p" "$f"; } > "$f.tmp" \
-            && mv "$f.tmp" "$f" && chmod +x "$f"
-        if bash -n "$f" 2>/dev/null; then
+            && replace "$f"
+        if syntax_ok "$f"; then
             printf 'synced   %-52s (block %s)\n' "$short" "$name"
         else
             printf 'BROKEN   %-52s (block %s) — syntax error after sync\n' "$short" "$name"; rc=1
@@ -132,10 +149,13 @@ EOF
     sync_block "$name" "$banner" "$endre" "$SKELETON" "$nextbanner" "" $ALL
 done
 
-# ---- group blocks: the members each block names
-for owner in "$GROUPS_DIR"/*.sh; do
+# ---- group blocks: the members each block names, among the collectors of the
+# owner's language (.sh or .ps1)
+for owner in "$GROUPS_DIR"/*.sh "$GROUPS_DIR"/*.ps1; do
     [ -f "$owner" ] || continue
-    group="$(basename "$owner" .sh)"
+    ext="${owner##*.}"
+    group="$(basename "$owner" ".$ext")"
+    pool="$ALL"; [ "$ext" = ps1 ] && pool="$ALL_PS1"
     # block names in owner order; a name is letters, digits, spaces and dashes
     names="$(sed -n "s/^# ---- $group: \([A-Za-z0-9 -]*[A-Za-z0-9]\) — DO NOT EDIT.*/\1/p" "$owner")"
     [ -n "$names" ] || { echo "FAIL  no '# ---- $group: <name> — DO NOT EDIT' banner in ${owner#"$ROOT"/}" >&2; exit 2; }
@@ -160,11 +180,11 @@ EOF
             echo "FAIL  block '$group: $name' in ${owner#"$ROOT"/}: the line after the banner is not '# members: <stem> ...'" >&2
             exit 2 ;;
         esac
-        members=() others="$ALL"
+        members=() others="$pool"
         for stem in ${mline#"# members: "}; do
-            m="$(printf '%s\n' "$ALL" | grep -E "/collect-$stem\.sh\$")"
+            m="$(printf '%s\n' "$pool" | grep -E "/collect-$stem\.$ext\$")"
             [ -n "$m" ] && [ "$(printf '%s\n' "$m" | wc -l)" -eq 1 ] || {
-                echo "FAIL  block '$group: $name': member '$stem' is not exactly one collectors/**/collect-$stem.sh" >&2; exit 2; }
+                echo "FAIL  block '$group: $name': member '$stem' is not exactly one collectors/**/collect-$stem.$ext" >&2; exit 2; }
             members+=("$m")
             others="$(printf '%s\n' "$others" | grep -vxF "$m")"
         done

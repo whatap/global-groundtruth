@@ -116,7 +116,9 @@ $COLLECTOR_NAME = "whatap-apmdotnet"
 #        "64-bit path" and "none".
 #        An event message keeps the lines that name the failure (an ASP.NET
 #        1310 event's "Exception message") when it is cut at 400 characters.
-$VERSION        = "0.5.0"
+# 0.5.1  The shared blocks (templates/groups/ps1.ps1) are synced by
+#        tools/sync-shared-block.sh; report unchanged.
+$VERSION        = "0.5.1"
 $DOMAIN         = "apm"
 $CompName = $env:COMPUTERNAME; if (-not $CompName) { $CompName = [Environment]::MachineName }
 $TARGET         = "host/$CompName"
@@ -206,7 +208,8 @@ if (-not $Stdout) {
     }
 }
 
-# ---- emit helpers -------------------------------------------------------------
+# ---- ps1: emit helpers — DO NOT EDIT -----------------------------------------
+# members: apmdotnet db-mssql
 $script:SectionN = 0
 $script:Lines = New-Object System.Collections.Generic.List[string]
 
@@ -225,8 +228,10 @@ function Section([string]$t) {
     Emit ("[{0}] {1}" -f $script:SectionN, $t)
     Progress "[$script:SectionN] $t"
 }
+# ---- end ps1: emit helpers
 
-# ---- run helpers (PowerShell port) - keep identical in every .ps1 collector --
+# ---- ps1: run helpers — DO NOT EDIT ------------------------------------------
+# members: apmdotnet db-mssql
 # The port of the shell blocks "run helpers", "privilege" and "boot time" in
 # templates/collector-skeleton/collector-skeleton.sh. Keep the two in step.
 #
@@ -601,9 +606,10 @@ function Note-Boot {
         Fact "host uptime(s): n/a (Win32_OperatingSystem not readable, no TickCount64 in this runtime)"
     }
 }
-# ---- end run helpers (PowerShell port)
+# ---- end ps1: run helpers
 
-# ---- collection completeness (PowerShell port) - keep identical in every .ps1 collector
+# ---- ps1: completeness — DO NOT EDIT -----------------------------------------
+# members: apmdotnet db-mssql
 # The port of the shell block "collection completeness". Keep the two in step:
 # the same three outcomes, the same lines, the same rules.
 #
@@ -715,8 +721,10 @@ function Emit-Status {
         foreach ($l in $gaps) { Notice ("  " + $l) }
     }
 }
-# ---- end collection completeness (PowerShell port)
+# ---- end ps1: completeness
 
+# ---- ps1: fact helpers — DO NOT EDIT -----------------------------------------
+# members: apmdotnet db-mssql
 function FactBlock([string]$label, $body) {
     $arr = @($body | Where-Object { $_ -ne $null } | ForEach-Object { "$_" })
     if ($arr.Count -eq 0 -or ($arr.Count -eq 1 -and $arr[0].Trim() -eq "")) { Fact "${label}: n/a (empty output)"; return }
@@ -739,16 +747,6 @@ function TryFact([string]$label, [scriptblock]$sb) {
         if ($m -match '^(timed out: |run deadline reached: |command not found: )') { Fact "${label}: n/a ($m)" }
         else { Fact "${label}: n/a (error: $m)" }
     }
-}
-
-# ---- reasoned-absence helpers -------------------------------------------------
-# Path-State PATH -> "present", "absent", or "denied" when the run may not look
-# (Test-Path answers $false and writes an error for a path under a directory
-# this account cannot list, which read as "path not found": 0.4.0 said that of
-# applicationHost.config for a not elevated run)
-function Path-State([string]$p) {
-    try { if (Test-Path -LiteralPath $p -ErrorAction Stop) { return "present" } return "absent" }
-    catch { if ($_.Exception -is [System.UnauthorizedAccessException] -or "$($_.Exception.Message)" -match 'denied') { return "denied" } return "absent" }
 }
 # Read-Lines PATH -> the file's lines, decoded as UTF-8 (a BOM is dropped),
 # else, when the bytes are not valid UTF-8, in the ANSI code page, with
@@ -780,6 +778,24 @@ function Read-Lines([string]$path) {
     }
     if ($txt -eq "") { return }
     return ($txt.TrimEnd("`r", "`n") -split "`r`n|`n|`r")
+}
+function ConfGet([string]$path, [string]$key) {
+    if (-not (Test-Path -LiteralPath $path)) { return $null }
+    $m = Get-Content -LiteralPath $path -Encoding UTF8 -ErrorAction SilentlyContinue |
+         Where-Object { $_ -match "^\s*$key\s*=" } | Select-Object -Last 1
+    if ($m) { return ($m -split '=', 2)[1].Trim() }
+    return $null
+}
+# ---- end ps1: fact helpers
+
+# ---- reasoned-absence helpers -------------------------------------------------
+# Path-State PATH -> "present", "absent", or "denied" when the run may not look
+# (Test-Path answers $false and writes an error for a path under a directory
+# this account cannot list, which read as "path not found": 0.4.0 said that of
+# applicationHost.config for a not elevated run)
+function Path-State([string]$p) {
+    try { if (Test-Path -LiteralPath $p -ErrorAction Stop) { return "present" } return "absent" }
+    catch { if ($_.Exception -is [System.UnauthorizedAccessException] -or "$($_.Exception.Message)" -match 'denied') { return "denied" } return "absent" }
 }
 # DumpFile: verbatim, line-capped. Framework policy: configuration is dumped
 # verbatim, never masked (see README security note).
@@ -909,13 +925,6 @@ function TcpProbe([string]$label, [string]$dsthost, [int]$port, [int]$timeoutSec
     } finally { $c.Close(); Time-Log $sw.ElapsedMilliseconds $kind "tcp-connect" }
     $script:TcpSeen[$key] = $r
     Fact "${label}: $r"
-}
-function ConfGet([string]$path, [string]$key) {
-    if (-not (Test-Path -LiteralPath $path)) { return $null }
-    $m = Get-Content -LiteralPath $path -Encoding UTF8 -ErrorAction SilentlyContinue |
-         Where-Object { $_ -match "^\s*$key\s*=" } | Select-Object -Last 1
-    if ($m) { return ($m -split '=', 2)[1].Trim() }
-    return $null
 }
 
 # ---- constants from the dotnet-apm source (installer release.iss) -------------

@@ -410,6 +410,67 @@ for g in "$ROOT"/templates/groups/*.sh; do
     done < "$g"
 done
 check "each group-block function is defined once per member" '[ -z "$gdups" ]' "$gdups"
+# PowerShell group blocks: owner templates/groups/pg.ps1, member collect-x.ps1,
+# non-member collect-y.ps1; the shell collect-x.sh shares the stem and is not
+# a member (an owner's members are collectors of its own language)
+mkdir -p "$M/collectors/px"
+cat > "$M/templates/groups/pg.ps1" <<'PS'
+# owner of the pg group blocks (test)
+# ---- pg: one — DO NOT EDIT ----
+# members: x
+function P-One { return "one" }
+# ---- end pg: one
+PS
+{ printf '\357\273\277$v = 1\n'; sed -n '2,5p' "$M/templates/groups/pg.ps1"; printf 'P-One\n'; } > "$M/collectors/px/collect-x.ps1"
+printf '$v = 2\n' > "$M/collectors/px/collect-y.ps1"
+chmod 644 "$M/collectors/px/collect-x.ps1" "$M/collectors/px/collect-y.ps1"
+# shellcheck disable=SC2034  # read inside check's eval
+xsh="$(cksum < "$M/collectors/x/collect-x.sh")" ysum="$(cksum < "$M/collectors/px/collect-y.ps1")"
+check "ps1 group block in the member passes --check" '"$M/tools/sync-shared-block.sh" --check >/dev/null' \
+    "$("$M/tools/sync-shared-block.sh" --check | grep -v '^ok')"
+sed -i 's/return "one"/return "drifted"/' "$M/collectors/px/collect-x.ps1"
+check "drift in a ps1 group block is reported" '"$M/tools/sync-shared-block.sh" --check | grep -q "^DRIFT .*collect-x.ps1 .*block pg: one"'
+"$M/tools/sync-shared-block.sh" --apply >/dev/null
+check "--apply undoes ps1 drift, keeps the BOM and the file mode" \
+    '"$M/tools/sync-shared-block.sh" --check >/dev/null && grep -qx "function P-One { return \"one\" }" "$M/collectors/px/collect-x.ps1" && [ "$(head -c3 "$M/collectors/px/collect-x.ps1" | od -An -tx1 | tr -d " ")" = efbbbf ] && [ ! -x "$M/collectors/px/collect-x.ps1" ]'
+check "--apply leaves a ps1 non-member untouched" '[ "$(cksum < "$M/collectors/px/collect-y.ps1")" = "$ysum" ] && ! "$M/tools/sync-shared-block.sh" --check | grep -q "collect-y.ps1"'
+check "a shell collector with a member's stem is not a ps1 member" \
+    '[ "$(cksum < "$M/collectors/x/collect-x.sh")" = "$xsh" ] && ! "$M/tools/sync-shared-block.sh" --check | grep -q "collect-x.sh .*block pg:"'
+sed -n '2,5p' "$M/templates/groups/pg.ps1" >> "$M/collectors/px/collect-y.ps1"
+# shellcheck disable=SC2034  # read inside check's eval
+ysum="$(cksum < "$M/collectors/px/collect-y.ps1")"
+check "a ps1 non-member carrying the block is reported STRAY" '"$M/tools/sync-shared-block.sh" --check | grep -q "^STRAY .*collect-y.ps1 .*block pg: one"'
+"$M/tools/sync-shared-block.sh" --apply >/dev/null
+check "--apply leaves a STRAY ps1 copy alone" '[ "$(cksum < "$M/collectors/px/collect-y.ps1")" = "$ysum" ]'
+if command -v pwsh >/dev/null 2>&1; then
+    sed -i 's/^function P-One { return "one" }$/function P-One { return "one"/' "$M/templates/groups/pg.ps1"
+    check "a ps1 member that no longer parses after --apply is reported BROKEN" \
+        '"$M/tools/sync-shared-block.sh" --apply | grep -q "^BROKEN .*collect-x.ps1 .*block pg: one"'
+    for g in "$ROOT"/templates/groups/*.ps1; do
+        [ -f "$g" ] || continue
+        check "$(basename "$g"): parses under pwsh" \
+            'PS1_FILE="$g" pwsh -NoProfile -NonInteractive -Command "\$e = \$null; \$null = [System.Management.Automation.Language.Parser]::ParseFile(\$env:PS1_FILE, [ref]\$null, [ref]\$e); if (\$e.Count) { exit 1 }" </dev/null'
+    done
+else
+    skip "no pwsh: the ps1 parse checks"
+fi
+# each member defines every function of its ps1 group blocks once
+pdups=""
+for g in "$ROOT"/templates/groups/*.ps1; do
+    [ -f "$g" ] || continue
+    while IFS= read -r l; do
+        case "$l" in
+            "# members: "*) mem="${l#"# members: "}" ;;
+            "function "*)
+                n="${l#function }"; n="${n%%[ ({]*}"
+                for stem in $mem; do
+                    f="$(cd "$ROOT" && git ls-files "collectors/*collect-$stem.ps1")"
+                    [ -n "$f" ] && [ "$(grep -ciE "^function[[:space:]]+${n}([[:space:]({]|\$)" "$ROOT/$f")" = 1 ] || pdups="$pdups $stem:$n"
+                done ;;
+        esac
+    done < "$g"
+done
+check "each ps1 group-block function is defined once per member" '[ -z "$pdups" ]' "$pdups"
 
 # ---- 3. validate.sh --report ------------------------------------------------
 echo "== 3. validate.sh --report =="

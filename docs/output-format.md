@@ -359,7 +359,10 @@ collectors' `probe`, `/proc` table scan, environ readers, port checks): each is
 owned by `templates/groups/<group>.sh`, runs from `# ---- <group>: <name> — DO
 NOT EDIT` to `# ---- end <group>: <name>`, and names its members on the next
 line, `# members: <stem> ...` (`collect-<stem>.sh`). The owner file is copied,
-never sourced: a collector stays one file that runs by itself.
+never sourced: a collector stays one file that runs by itself. The PowerShell
+collectors carry their port of the shared blocks the same way: owned by
+`templates/groups/ps1.ps1`, with the same banners (`# ---- ps1: <name> — DO
+NOT EDIT`) and members named by `collect-<stem>.ps1`.
 `tools/sync-shared-block.sh --check` reports drift in both kinds; `--apply`
 re-copies them. Other helpers a collector carries (`section`, `fact`, `probe`
 outside a group, the CLI) start as copies of the skeleton and may be extended;
