@@ -413,6 +413,38 @@ check "--apply keeps the trailing comment" 'grep -qx "# trailing comment" "$R/co
 before="$(cat "$R"/collectors/apm/*/collect-apm*.sh | cksum)"
 "$R/tools/sync-shared-block.sh" --apply >/dev/null
 check "a second --apply changes nothing" '[ "$(cat "$R"/collectors/apm/*/collect-apm*.sh | cksum)" = "$before" ]'
+# a member that holds only apm: main: the missing group blocks go in at line 1,
+# before it. `sed -n 1,0p` printed line 1, so each insert copied the banner and
+# the run ended with 7 banners and BROKEN (found 2026-09-27)
+f="$R/collectors/apm/php/collect-apmphp.sh"
+sed -n '/^# ---- apm: main — DO NOT EDIT/,/^# ---- end apm: main$/p' "$R/templates/groups/apm.sh" > "$f"
+out="$("$R/tools/sync-shared-block.sh" --apply | grep 'collect-apmphp.sh .*block apm: ')"
+check "a member holding only apm: main gets its group blocks, apm: main once" \
+    '[ "$(grep -c "^# ---- apm: main — DO NOT EDIT" "$f")" = 1 ] && ! printf "%s\n" "$out" | grep -qv "^\(inserted\|ok\) " && bash -n "$f"' "$out"
+check "the first group block goes in at line 1" \
+    '[ "$(head -n 1 "$f")" = "$(grep -m 1 "^# ---- apm: probe helpers — DO NOT EDIT" "$R/templates/groups/apm.sh")" ] && [ "$(tail -n 1 "$f")" = "# ---- end apm: main" ]'
+check "and --check finds only the skeleton blocks missing" \
+    '! "$R/tools/sync-shared-block.sh" --check | grep "collect-apmphp.sh" | grep -qv "^\(ok\|MISSING\) .*" && ! "$R/tools/sync-shared-block.sh" --check | grep -q "^MISSING .*collect-apmphp.sh .*block apm: "'
+# drift in a block that starts at line 1 is synced without copying line 1
+sed -i '2s/^/# drift\n/' "$f"
+"$R/tools/sync-shared-block.sh" --apply >/dev/null
+check "--apply syncs a drifted block at line 1" \
+    '[ "$(grep -c "^# ---- apm: probe helpers — DO NOT EDIT" "$f")" = 1 ] && ! grep -qx "# drift" "$f" && "$R/tools/sync-shared-block.sh" --check | grep -q "^ok .*collect-apmphp.sh .*block apm: probe helpers"'
+# shellcheck disable=SC2034  # read inside check's eval
+psum="$(cksum < "$f")"
+"$R/tools/sync-shared-block.sh" --apply >/dev/null
+check "a second --apply leaves that member unchanged" '[ "$(cksum < "$f")" = "$psum" ]'
+# a CRLF collector: every block says CRLF (not BROKEN), --apply changes nothing
+g="$R/collectors/apm/java/collect-apmjava.sh"; sed -i 's/$/\r/' "$g"
+# shellcheck disable=SC2034  # read inside check's eval
+jsum="$(cksum < "$g")"
+out="$("$R/tools/sync-shared-block.sh" --check | grep 'collect-apmjava.sh')"
+check "a CRLF collector is CRLF for every block, never BROKEN" \
+    '[ -n "$out" ] && ! printf "%s\n" "$out" | grep -qv "^CRLF .*— convert to LF first$"' "$out"
+"$R/tools/sync-shared-block.sh" --apply >/dev/null
+check "--apply leaves a CRLF collector unchanged" '[ "$(cksum < "$g")" = "$jsum" ]'
+sed -i 's/\r$//' "$g"
+check "converted to LF, it passes again" '! "$R/tools/sync-shared-block.sh" --check | grep -v "^ok" | grep -q "collect-apmjava.sh"'
 sed -i 's/^# members: apmjava apmnodejs apmphp apmpython$/# members:   /' "$R/templates/groups/apm.sh"
 check "a members line with no stem fails the run" '"$R/tools/sync-shared-block.sh" --check >/dev/null 2>&1; [ $? = 2 ]'
 # the repo's group owners parse under bash and dash (the apm members run under both)

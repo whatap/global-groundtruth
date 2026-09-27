@@ -48,6 +48,10 @@
 # new shared block reaches every collector in one run. A group block with no
 # later one in the collector goes after the last earlier one it carries, or
 # after the skeleton's last block (group helpers come after the skeleton's).
+#
+# Collectors are LF. A file with a CRLF line is reported CRLF for each block and
+# left unchanged by --apply: its end lines match no end regex, so every block
+# would otherwise read BROKEN.
 set -u
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -95,6 +99,10 @@ syntax_ok() {
 # line ending in a newline; a block put at the end then follows one blank line,
 # as the owner separates its blocks
 trim_tail() { awk '{ l[NR] = $0 } /[^[:space:]]/ { n = NR } END { for (i = 1; i <= n; i++) print l[i] }' "$@"; }
+# upto N FILE -> lines 1..N of FILE, nothing when N is 0. `sed -n 1,0p` is not
+# empty: GNU sed prints line 1 when the range end is below the start, so a block
+# inserted at, or synced from, line 1 doubled that line (found 2026-09-27)
+upto() { [ "$1" -gt 0 ] || return 0; sed -n "1,$1p" "$2"; }
 # replace FILE: FILE.tmp becomes FILE; a shell collector stays executable
 replace() { mv "$1.tmp" "$1" && case "$1" in *.sh) chmod +x "$1" ;; esac; }
 
@@ -114,6 +122,10 @@ sync_block() {
     for f in "$@"; do
         [ "$f" = "$owner" ] && continue
         short="${f#"$ROOT"/}"
+        # a CRLF file matches no end line; say so instead of BROKEN, change nothing
+        if grep -q "$(printf '\r')\$" "$f"; then
+            printf 'CRLF     %-52s (block %s) — convert to LF first\n' "$short" "$name"; rc=1; continue
+        fi
         if ! r="$(block_range "$f" "$banner" "$endre")"; then
             if grep -qE "$banner|$endre" "$f"; then
                 printf 'BROKEN   %-52s (block %s) — banner or end line missing or repeated\n' "$short" "$name"; rc=1; continue
@@ -132,9 +144,9 @@ sync_block() {
                 printf 'MISSING  %-52s (block %s)\n' "$short" "$name"; rc=1; continue
             fi
             if [ -n "$at" ]; then
-                { sed -n "1,$((at - 1))p" "$f"; printf '%s\n\n' "$src"; sed -n "$at,\$p" "$f"; } > "$f.tmp"
+                { upto $((at - 1)) "$f"; printf '%s\n\n' "$src"; sed -n "$at,\$p" "$f"; } > "$f.tmp"
             else
-                { sed -n "1,${after}p" "$f"; printf '\n%s\n' "$src"; sed -n "$((after + 1)),\$p" "$f"; } > "$f.tmp"
+                { upto "$after" "$f"; printf '\n%s\n' "$src"; sed -n "$((after + 1)),\$p" "$f"; } > "$f.tmp"
             fi && replace "$f"
             if syntax_ok "$f"; then printf 'inserted %-52s (block %s)\n' "$short" "$name"
             else printf 'BROKEN   %-52s (block %s) — syntax error after insert\n' "$short" "$name"; rc=1; fi
@@ -167,7 +179,7 @@ sync_block() {
         if [ "$mode" = --check ]; then
             printf 'DRIFT    %-52s (block %s)\n' "$short" "$name"; rc=1; continue
         fi
-        { sed -n "1,$((${r% *} - 1))p" "$f"; printf '%s\n' "$src"; sed -n "$((${r#* } + 1)),\$p" "$f"; } > "$f.tmp" \
+        { upto $((${r% *} - 1)) "$f"; printf '%s\n' "$src"; sed -n "$((${r#* } + 1)),\$p" "$f"; } > "$f.tmp" \
             && replace "$f"
         if syntax_ok "$f"; then
             printf 'synced   %-52s (block %s)\n' "$short" "$name"
