@@ -9,7 +9,6 @@ checks that the newest entry is the script's `VERSION`.
   discover) into per-section helpers; /proc/\<pid>/environ reads no longer
   print Permission denied on stderr as root without CAP_SYS_PTRACE. Report
   content unchanged.
-
 - **0.8.4** — Shared code in synced blocks (R2 refactor): the skeleton's emit
   helpers now hold _optval, _emit_labeled, _tool_rows (the [1] tool table) and
   _indent (the indent loops), and its run helpers hold probe and read_proc.

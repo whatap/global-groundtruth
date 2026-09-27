@@ -7,7 +7,6 @@ newest entry is the script's `VERSION`.
 
 - **0.7.3** — Split run_report (426 lines) into one _rep_\<letter> per section;
   the yum and apt repo loops are one loop. Report content unchanged.
-
 - **0.7.2** — Shared code in synced blocks (R2 refactor): the skeleton's emit
   helpers now hold _optval, _emit_labeled, _tool_rows (the [1] tool table) and
   _indent (the indent loops), and its run helpers hold probe and read_proc.

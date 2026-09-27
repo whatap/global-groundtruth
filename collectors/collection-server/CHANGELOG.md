@@ -10,7 +10,6 @@ one entry at the top of its section (docs/authoring-guide.md, step 2);
 - **0.11.6** — Split run_report (439 lines) into one _rep_\<x> per section;
   the WHATAP_HOME na/missed ladder of D, F and G is _home_missed. Report
   content unchanged.
-
 - **0.11.5** — Shared code in synced blocks (R2 refactor): the skeleton's emit
   helpers now hold _optval, _emit_labeled, _tool_rows (the [1] tool table) and
   _indent (the indent loops), and its run helpers hold probe and read_proc.
@@ -145,7 +144,6 @@ one entry at the top of its section (docs/authoring-guide.md, step 2);
   section I is split into select, decode and per-file parts, and
   _binlog_proc's network-namespace check is _bl_netns_owns. Report content
   unchanged.
-
 - **0.10.4** — Shared code in synced blocks (R2 refactor): the skeleton's emit
   helpers now hold _optval, _emit_labeled, _tool_rows (the [1] tool table) and
   _indent (the indent loops), and its run helpers hold probe and read_proc.
@@ -159,7 +157,6 @@ one entry at the top of its section (docs/authoring-guide.md, step 2);
   reports equal but live values.
   --help names BINLOG_TIMEOUT instead of printing its value, which is now
   checked after the options.
-
 - **0.10.3** — [1]'s privilege line says when uid 0 has no CAP_SYS_PTRACE (bit 19
   of CapEff; the default in docker and k8s): "root without
   CAP_SYS_PTRACE (other uids' /proc/\<pid>/environ, root, cwd are not
