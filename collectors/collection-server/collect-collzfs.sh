@@ -36,7 +36,7 @@ export LC_ALL=C
 # ---- collector metadata -----------------------------------------------------
 # History: CHANGELOG.md, section collect-collzfs.sh (next to this file).
 COLLECTOR_NAME="whatap-collzfs"
-VERSION="0.9.0"
+VERSION="0.10.0"
 DOMAIN="collection-server"
 TARGET="collection-server-zfs/$(hostname 2>/dev/null || echo unknown)"   # refined after pool discovery
 
@@ -1360,7 +1360,11 @@ _rep_a() {
     read_proc "spl version (/sys/module/spl/version)" /sys/module/spl/version
     probe_pipe "modinfo zfs (selected)" modinfo \
         "modinfo zfs 2>/dev/null | grep -E '^(filename|version|srcversion|license|depends|retpoline):' || true"
-    probe "kernel" uname -sr
+    # /proc, no fork; uname only where it is unreadable
+    _ko=""; _kr=""
+    { IFS= read -r _ko < /proc/sys/kernel/ostype; IFS= read -r _kr < /proc/sys/kernel/osrelease; } 2>/dev/null
+    if [ -n "$_ko" ] && [ -n "$_kr" ]; then fact "kernel: $_ko $_kr"; else probe "kernel" uname -sr; fi
+    read_proc "os-release" /etc/os-release
     read_proc "kernel tainted (/proc/sys/kernel/tainted)" /proc/sys/kernel/tainted
     subsection "packaging"
     if have dpkg-query; then

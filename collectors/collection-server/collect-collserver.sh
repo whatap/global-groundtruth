@@ -21,10 +21,20 @@
 
 export LC_ALL=C
 
+# A JVM started with these loads the agents they name (a shell inherits
+# JAVA_TOOL_OPTIONS=-javaagent:... where an agent was injected). Every JVM this
+# run starts (java -version, jstack, jmap, jcmd) runs without them; [1] names
+# the ones that were set.
+_SELF_JVMOPTS=""
+for _v in JAVA_TOOL_OPTIONS JDK_JAVA_OPTIONS _JAVA_OPTIONS; do
+    eval "[ -n \"\${$_v+x}\" ]" && _SELF_JVMOPTS="$_SELF_JVMOPTS $_v"
+done
+unset JAVA_TOOL_OPTIONS JDK_JAVA_OPTIONS _JAVA_OPTIONS _v
+
 # ---- collector metadata -----------------------------------------------------
 # History: CHANGELOG.md, section collect-collserver.sh (next to this file).
 COLLECTOR_NAME="whatap-collserver"
-VERSION="0.12.0"
+VERSION="0.13.0"
 DOMAIN="collection-server"
 TARGET="collection-server/$(hostname 2>/dev/null || echo unknown)"   # refined after WHATAP_HOME is resolved
 
@@ -1184,6 +1194,7 @@ _rep_env() {
     _note_privilege
     fact "privilege: $PRIV_WHY"
     _note_boot
+    fact "JVM option variables removed from the JVMs this run starts:${_SELF_JVMOPTS:- none were set}"
     fact "tools:"
     _tool_rows ss netstat findmnt df stat systemctl journalctl timedatectl chronyc ntpq zfs zpool jstack jmap jcmd java timeout du tar ps awk
 }
@@ -1203,10 +1214,135 @@ _rep_a() {
     if have free; then probe "memory (free -m)" free -m; else read_proc "meminfo" /proc/meminfo; fi
     read_proc "loadavg" /proc/loadavg
     subsection "cgroup limits (container-aware)"
-    read_proc "cgroup v2 memory.max" /sys/fs/cgroup/memory.max
-    read_proc "cgroup v2 cpu.max" /sys/fs/cgroup/cpu.max
-    read_proc "cgroup v1 memory.limit_in_bytes" /sys/fs/cgroup/memory/memory.limit_in_bytes
-    probe_merged "java -version" java -version
+    # The root this run sees: a container's own limits when the collector runs
+    # in the server's container (cgroup namespace); the server JVMs' own cgroup
+    # follows.
+    read_proc "this run's cgroup (/proc/self/cgroup)" /proc/self/cgroup
+    read_proc "cgroup v2 memory.max (/sys/fs/cgroup root)" /sys/fs/cgroup/memory.max
+    read_proc "cgroup v2 cpu.max (/sys/fs/cgroup root)" /sys/fs/cgroup/cpu.max
+    read_proc "cgroup v1 memory.limit_in_bytes (/sys/fs/cgroup/memory root)" /sys/fs/cgroup/memory/memory.limit_in_bytes
+    _rep_a_jvm_cgroups
+    subsection "JVM runtime of the whatap server processes (readlink /proc/<pid>/exe)"
+    _rep_a_jvm_runtime
+    probe_merged "java -version (the java on PATH${_pj:+: $_pj})" java -version
+}
+
+# _grp KEY PID -> add PID to the group of KEY in _GK[] / _GP[] (parallel
+# arrays in first-seen order; bash 3.2 has no associative arrays)
+_grp() {
+    local j=0
+    while [ "$j" -lt "${#_GK[@]}" ]; do
+        [ "${_GK[$j]}" = "$1" ] && { _GP[$j]="${_GP[$j]} $2"; return; }
+        j=$((j + 1))
+    done
+    _GK[${#_GK[@]}]="$1"; _GP[${#_GP[@]}]=" $2"
+}
+
+# _rep_a_jvm_cgroups -> per distinct /proc/<pid>/cgroup of the server JVMs:
+# its content, the pids in it, and that cgroup's memory and cpu limit files
+# (v2 memory.max / cpu.max; v1 memory.limit_in_bytes, cpu.cfs_quota_us and
+# cpu.cfs_period_us under each controller's mount)
+_rep_a_jvm_cgroups() {
+    local i pid cg j l ctl path v2
+    [ "${#PIDS[@]}" -gt 0 ] || { fact "whatap server JVM cgroup: n/a (no whatap server JVM found, section E)"; return; }
+    _GK=(); _GP=()
+    i=0
+    while [ "$i" -lt "${#PIDS[@]}" ]; do
+        pid="${PIDS[$i]}"; i=$((i + 1))
+        cg=""; [ -r "/proc/$pid/cgroup" ] && cg="$(cat "/proc/$pid/cgroup" 2>/dev/null)"
+        if [ -z "$cg" ]; then read_proc "whatap server JVM cgroup (pid $pid)" "/proc/$pid/cgroup"; continue; fi
+        _grp "$cg" "$pid"
+    done
+    v2=/sys/fs/cgroup; [ -e /sys/fs/cgroup/cgroup.controllers ] || v2=/sys/fs/cgroup/unified
+    j=0
+    while [ "$j" -lt "${#_GK[@]}" ]; do
+        _emit_labeled "whatap server JVM cgroup (pid${_GP[$j]})" "${_GK[$j]}"
+        while IFS= read -r l; do
+            ctl="${l#*:}"; path="${ctl#*:}"; ctl="${ctl%%:*}"
+            path="${path%/}"
+            case "$ctl" in
+                "")  read_proc "  memory.max ($v2$path)" "$v2$path/memory.max"
+                     read_proc "  cpu.max ($v2$path)" "$v2$path/cpu.max" ;;
+                memory|*,memory|memory,*|*,memory,*)
+                     read_proc "  memory.limit_in_bytes (/sys/fs/cgroup/$ctl$path)" "/sys/fs/cgroup/$ctl$path/memory.limit_in_bytes" ;;
+                cpu|*,cpu|cpu,*|*,cpu,*)
+                     read_proc "  cpu.cfs_quota_us (/sys/fs/cgroup/$ctl$path)" "/sys/fs/cgroup/$ctl$path/cpu.cfs_quota_us"
+                     read_proc "  cpu.cfs_period_us (/sys/fs/cgroup/$ctl$path)" "/sys/fs/cgroup/$ctl$path/cpu.cfs_period_us" ;;
+            esac
+        done <<EOF
+${_GK[$j]}
+EOF
+        j=$((j + 1))
+    done
+}
+
+# _rep_a_jvm_runtime -> per distinct executable and mount namespace of the
+# server JVMs: the pids, and the JDK's release file next to the executable
+# (<exe>/../../release), read through /proc/<pid>/root so it is the file the
+# JVM sees, not the one in this run's mount namespace. Without one, the
+# executable's own -version, run only in this run's mount namespace and only
+# for an executable that is still there. The executable is readlink
+# /proc/<pid>/exe, else an absolute argv0.
+_rep_a_jvm_runtime() {
+    local i pid exe a0 j e ns home rel rp p0 uid selfns tab via
+    tab="$(printf '\t')"
+    uid="$(id -u 2>/dev/null || echo '?')"
+    selfns="$(readlink /proc/self/ns/mnt 2>/dev/null)"
+    _pj="$(command -v java 2>/dev/null)"
+    [ -n "$_pj" ] && _pj="$_pj -> $(readlink -f "$_pj" 2>/dev/null || echo "$_pj")"
+    [ "${#PIDS[@]}" -gt 0 ] || { fact "server JVM executable: n/a (no whatap server JVM found, section E)"; return; }
+    _GK=(); _GP=()
+    i=0
+    while [ "$i" -lt "${#PIDS[@]}" ]; do
+        pid="${PIDS[$i]}"; i=$((i + 1))
+        exe="$(readlink "/proc/$pid/exe" 2>/dev/null)"
+        if [ -z "$exe" ]; then
+            cmdline_of "$pid"; a0="${_CL%% *}"
+            case "$a0" in
+                /*) exe="$a0 (argv0; /proc/$pid/exe not readable by uid $uid)" ;;
+                *)  exe="n/a (/proc/$pid/exe not readable by uid $uid, argv0 ${a0:-empty} is not a path)" ;;
+            esac
+        fi
+        ns="$(readlink "/proc/$pid/ns/mnt" 2>/dev/null)"
+        _grp "$exe$tab$ns" "$pid"
+    done
+    j=0
+    while [ "$j" -lt "${#_GK[@]}" ]; do
+        e="${_GK[$j]%%"$tab"*}"; ns="${_GK[$j]#*"$tab"}"
+        p0="${_GP[$j]# }"; p0="${p0%% *}"
+        fact "exe (pid${_GP[$j]}): $e"
+        [ "$ns" = "$selfns" ] && [ -n "$ns" ] || fact "  mount namespace: ${ns:-n/a (/proc/$p0/ns/mnt not readable by uid $uid)} (this run's: ${selfns:-n/a})"
+        j=$((j + 1))
+        case "$e" in n/a*) continue ;; esac
+        e="${e%% (argv0;*}"
+        home="${e% (deleted)}"; home="${home%/*}"; home="${home%/*}"
+        rel="$home/release"
+        # the JVM's own view of the path; this run's only in the same namespace
+        via=""
+        if [ -e "/proc/$p0/root/" ] && [ -r "/proc/$p0/root/" ] && [ -x "/proc/$p0/root/" ]; then rp="/proc/$p0/root$rel"
+        elif [ -z "$ns" ] || [ -z "$selfns" ]; then rp="$rel"; via=" (this run's path; JVM's mount namespace not readable by uid $uid)"
+        elif [ "$ns" = "$selfns" ]; then rp="$rel"
+        else
+            fact "  release ($rel): n/a (/proc/$p0/root not readable by uid $uid and the JVM is in another mount namespace$(_priv_hint))"
+            continue
+        fi
+        if [ "$e" != "${e% (deleted)}" ]; then
+            if [ -f "$rp" ]; then read_proc "  release now at $rel; the running executable was replaced$via" "$rp"
+            else fact "  release ($rel)$via: n/a (path not found)"; fi
+            fact "  -version: not run (the running executable is deleted)"
+        elif [ -f "$rp" ]; then
+            read_proc "  release ($rel)$via" "$rp"
+        elif [ "${e##*/}" != java ]; then
+            fact "  release ($rel)$via: n/a (path not found); -version not run: the executable is ${e##*/}, not java"
+        elif [ -n "$via" ]; then
+            fact "  release ($rel)$via: n/a (path not found); -version not run: the JVM's mount namespace is not known to be this run's"
+        elif [ "$ns" != "$selfns" ]; then
+            fact "  release ($rel): n/a (path not found); -version not run: the JVM is in another mount namespace than this run"
+        else
+            fact "  release ($rel): n/a (path not found)"
+            probe_merged "  $e -version" "$e" -version
+        fi
+    done
 }
 
 # -- B. Time & clock synchronization --------------------------------------
@@ -1321,11 +1457,14 @@ _rep_c() {
     fi
     subsection "data directory markers"
     if [ -n "$YARDBASE" ] && [ -d "$YARDBASE" ]; then
-        fact "YARDB_LOCK: $( [ -e "$YARDBASE/YARDB_LOCK" ] && echo "present ($(date -u -r "$YARDBASE/YARDB_LOCK" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo mtime-unknown))" || echo absent )"
+        # the lock file's name differs by version (3.1.8: .lock); both are asked
+        for _lk in YARDB_LOCK .lock; do
+            fact "$_lk: $( [ -e "$YARDBASE/$_lk" ] && echo "present ($(date -u -r "$YARDBASE/$_lk" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo mtime-unknown))" || echo absent )"
+        done
         # shallow listing only — never a deep find/du in Tier 0
         probe "pcode dirs (depth 1)" ls -1 "$YARDBASE"
     else
-        fact "YARDB_LOCK / pcode dirs: n/a (yardbase not present)"
+        fact "YARDB_LOCK / .lock / pcode dirs: n/a (yardbase not present)"
     fi
     if [ -n "$WHOME" ]; then
         for sub in keeperbase logsink; do
@@ -1413,6 +1552,14 @@ _rep_d() {
     fact "WHATAP_HOME resolved by: $WHOME_SRC"
     if [ -n "$WHOME" ] && _dir_ok "$WHOME"; then
         probe "top-level (depth 1)" ls -1 "$WHOME"
+        # a version file, where a package ships one (3.1.8 ships none; the
+        # module versions are the jar names below)
+        local _vf _vn=0
+        for _vf in "$WHOME"/[Vv][Ee][Rr][Ss][Ii][Oo][Nn]*; do
+            [ -f "$_vf" ] || continue
+            _vn=1; fact "version file ${_vf#"$WHOME"/}:"; dump_file "$_vf"
+        done
+        [ "$_vn" = 0 ] && fact "version file (VERSION*, version* at the top level): none"
         if _dir_ok "$WHOME/lib"; then probe "lib jars" ls -1 "$WHOME/lib"; else fact "lib jars: n/a ($(home_why lib))"; fi
         if _dir_ok "$WHOME/conf"; then probe "conf files" ls -1 "$WHOME/conf"; else fact "conf files: n/a ($(home_why conf))"; fi
         got home

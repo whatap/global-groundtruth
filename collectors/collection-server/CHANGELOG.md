@@ -7,6 +7,31 @@ one entry at the top of its section (docs/authoring-guide.md, step 2);
 
 ## collect-collserver.sh
 
+- **0.13.0** — A reads the cgroup of the WhaTap server JVMs, not only the
+  root the run sees: per distinct `/proc/<pid>/cgroup` of the server JVMs, its
+  content, the pids in it, and that cgroup's `memory.max` / `cpu.max` (v2) or
+  `memory.limit_in_bytes` / `cpu.cfs_quota_us` / `cpu.cfs_period_us` (v1).
+  The root reads stay, labelled `(/sys/fs/cgroup root)`, next to
+  `/proc/self/cgroup`. A prints, per distinct `readlink /proc/<pid>/exe` of
+  the server JVMs and its mount namespace, the JDK `release` file next to it
+  read through `/proc/<pid>/root` (the JVM's view, not the run's: a sidecar
+  with `--pid container:` read its own JDK 21 for a JDK 17 JVM, and the host
+  run found nothing). Without one, that executable's `-version`, run only in
+  the run's own mount namespace, for an executable that is still there and
+  named java. A deleted (replaced in place) executable's release is labelled
+  `release now at <path>; the running executable was replaced`. A mount
+  namespace other than the run's is printed; the PATH `java -version` is labelled as PATH's, with where PATH's
+  java resolves. Every JVM the run starts runs without JAVA_TOOL_OPTIONS,
+  JDK_JAVA_OPTIONS and _JAVA_OPTIONS, and `[1]` names the ones that were
+  set (as apmjava 0.13.2). C reports both yard lock names, `YARDB_LOCK` and
+  `.lock`, present with mtime or absent. D dumps a `VERSION*` / `version*`
+  file at the top of WHATAP_HOME, or says there is none. Lab
+  jjsong-ggt-collsrv (WhaTap 3.1.8, 2026-09-27): the lock is
+  `yardbase/.lock` and `YARDB_LOCK: absent` was the only lock line; the
+  eight server JVMs run in `system.slice/cron.service` while A read the
+  root; PATH's java was the only JVM version in the report; the package
+  ships no version file (the module versions are the jar names in D and E).
+
 - **0.12.0** — C reports the account H2 database: `h2.file.path` from
   `conf/account.conf` (`./db` when unset), the db path's mount point and
   whether it is yardbase's, a depth-1 listing of the db, and the SQL dumps
@@ -84,6 +109,10 @@ one entry at the top of its section (docs/authoring-guide.md, step 2);
   output is handed back under sudo. Needs bash.
 
 ## collect-collzfs.sh
+
+- **0.10.0** — A prints `/etc/os-release` raw, and the kernel from
+  `/proc/sys/kernel/{ostype,osrelease}` (`uname -sr` only where they are
+  unreadable); the line reads as before. Lab jjsong-ggt-zfs, 2026-09-27.
 
 - **0.9.0** — Views that re-summarised raw output in the same report go, and
   calls made twice are made once. No fact is lost; each is read where it
@@ -189,6 +218,14 @@ one entry at the top of its section (docs/authoring-guide.md, step 2);
   bundle, so the file count is there without a walk.
 
 ## collect-collmysql.sh
+
+- **0.11.0** — F's tables whose name contains lock/meter/event/audit are
+  matched on `LOWER(table_name)`: on MySQL 8.0 the match was case-sensitive,
+  and `MeteringDaily`, `MeteringHourly`, `AuditLog` and `ReserveEvent` were
+  missed (5.7 listed all seven; lab mysql-ha, 2026-09-27: 8.0.46 now lists
+  the same seven). A prints this host's `/etc/os-release` raw and the kernel
+  from `/proc/sys/kernel/{ostype,osrelease}` (`uname -sr` only as a
+  fallback).
 
 - **0.10.5** — Split run_report (454 lines) into one _rep_\<x> per section;
   section I is split into select, decode and per-file parts, and

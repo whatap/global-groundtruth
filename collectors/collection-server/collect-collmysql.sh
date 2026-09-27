@@ -27,7 +27,7 @@ export LC_ALL=C
 # ---- collector metadata -----------------------------------------------------
 # History: CHANGELOG.md, section collect-collmysql.sh (next to this file).
 COLLECTOR_NAME="whatap-collmysql"
-VERSION="0.10.5"
+VERSION="0.11.0"
 DOMAIN="collection-server"
 TARGET="collection-server-mysql/$(hostname 2>/dev/null || echo unknown)"
 
@@ -1446,6 +1446,12 @@ _rep_a() {
     probe "listening sockets" sh -c \
         "command -v ss >/dev/null || command -v netstat >/dev/null || { echo 'command not found: ss, netstat' >&2; exit 3; }; \
          { ss -lntp 2>/dev/null || netstat -lntp 2>/dev/null; } | grep -E ':3306|:33060'; true"
+    # This host's OS and kernel (the collector's host: the database host when
+    # it runs there, as documented). /proc, no fork; uname only as a fallback.
+    read_proc "os-release" /etc/os-release
+    _ko=""; _kr=""
+    { IFS= read -r _ko < /proc/sys/kernel/ostype; IFS= read -r _kr < /proc/sys/kernel/osrelease; } 2>/dev/null
+    if [ -n "$_ko" ] && [ -n "$_kr" ]; then fact "kernel: $_ko $_kr"; else probe "kernel" uname -sr; fi
     # These two are the part that survives a failed login, so they are their own
     # goal: a run with no SQL at all is still worth sending if they came back.
     if have ps || have ss || have netstat; then got host
@@ -1618,8 +1624,10 @@ _rep_f() {
         "SELECT table_schema, COUNT(*), ROUND(SUM(data_length)/1024/1024,1), ROUND(SUM(index_length)/1024/1024,1) FROM information_schema.tables GROUP BY table_schema ORDER BY SUM(data_length+index_length) DESC"
     sql "largest 25 tables (schema, table, rows, data MB, index MB)" \
         "SELECT table_schema, table_name, table_rows, ROUND(data_length/1024/1024,1), ROUND(index_length/1024/1024,1) FROM information_schema.tables WHERE table_schema NOT IN ('information_schema','performance_schema','mysql','sys') ORDER BY data_length+index_length DESC LIMIT 25"
-    sql "tables whose name contains lock/metering/event/audit" \
-        "SELECT table_schema, table_name, table_rows FROM information_schema.tables WHERE table_schema NOT IN ('information_schema','performance_schema','mysql','sys') AND (table_name LIKE '%lock%' OR table_name LIKE '%meter%' OR table_name LIKE '%event%' OR table_name LIKE '%audit%') ORDER BY table_rows DESC"
+    # LOWER(): on 8.0 table_name compares case-sensitively (MeteringDaily,
+    # AuditLog and ReserveEvent were missed); on 5.7 it did not.
+    sql "tables whose name contains lock/metering/event/audit (any case)" \
+        "SELECT table_schema, table_name, table_rows FROM information_schema.tables WHERE table_schema NOT IN ('information_schema','performance_schema','mysql','sys') AND (LOWER(table_name) LIKE '%lock%' OR LOWER(table_name) LIKE '%meter%' OR LOWER(table_name) LIKE '%event%' OR LOWER(table_name) LIKE '%audit%') ORDER BY table_rows DESC"
     # A reader asking "is this query scanning?" needs the index the deployed
     # schema has, not the one the entity declares.
     sql "indexes of the 15 largest tables (schema, table, index, seq, column, cardinality)" \

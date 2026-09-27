@@ -707,5 +707,15 @@ EOF
 out="$(PATH="$S17b" bash "$C" --stdout --window=10 --mysql-args "-u x" </dev/null 2>/dev/null)"
 has "every sampler present failed: the goal is blocked" "$out" "interval samples (iostat -x, vmstat) over the window — every sampler failed: vmstat: error: vmstat: broken"
 
+echo "== 18. 0.11.0: F matches table names in any case; A has the host's OS and kernel =="
+: >| "$A"
+out="$(STUBARGS="$A" PATH="$S" bash "$C" --stdout --mysql-args "-u x" </dev/null 2>/dev/null)"
+has "the name match is case-insensitive" "$(cat "$A")" "LOWER(table_name) LIKE '%meter%'"
+hasnt "and not a bare table_name LIKE" "$(cat "$A")" "(table_name LIKE '%lock%'"
+if [ -r /etc/os-release ] && [ -r /proc/sys/kernel/osrelease ]; then
+    has "os-release is dumped raw" "$out" "$(head -n1 /etc/os-release)"
+    has "kernel from /proc/sys/kernel" "$out" "kernel: $(cat /proc/sys/kernel/ostype) $(cat /proc/sys/kernel/osrelease)"
+else skip "os-release / kernel (not readable here)"; fi
+
 echo; echo "PASS=$PASS FAIL=$FAIL SKIP=$SKIP"
 [ "$FAIL" -eq 0 ]

@@ -462,7 +462,8 @@ EOF
 t0=$(date +%s)
 out="$(RUN_DEADLINE=3 PATH="$S24" "$C" --stdout </dev/null 2>/dev/null)"
 t1=$(date +%s)
-has "java -version cut by the run deadline says so" "$out" "java -version: n/a (run deadline reached: 3s)"
+has "java -version cut by the run deadline says so" "$out" "java -version (the java on PATH: $S24/java -> "
+has "with the deadline as the reason" "$out" "): n/a (run deadline reached: 3s)"
 [ $((t1 - t0)) -le 30 ] && ok "and the run ends ($((t1 - t0))s)" || bad "the run ends" "<= 30s" "$((t1 - t0))s"
 rm -f "$S24/java"
 stub_write "$S24/curl" <<'EOF'
@@ -522,6 +523,53 @@ exec sleep 30
 EOF2
 out="$(PATH="$S25" CMD_TIMEOUT=2 "$C" --home "$H25" --stdout 2>/dev/null)"
 has "a capped find is n/a, not 0" "$out" "backup files in $H25/dblink/backup: n/a (timed out: 2s)"
+
+echo "== 26. 0.13.0: both yard lock names, the server JVMs' cgroup and runtime, JAVA_TOOL_OPTIONS =="
+H26="$ROOT/h26"; mkhome "$H26"; mkdir -p "$H26/yardbase/1"; : > "$H26/yardbase/.lock"
+out="$("$C" --home "$H26" --stdout 2>/dev/null)"
+has "3.1.8's .lock is reported" "$out" ".lock: present ("
+has "and YARDB_LOCK as absent" "$out" "YARDB_LOCK: absent"
+has "no version file is said once" "$out" "version file (VERSION*, version* at the top level): none"
+printf '3.1.8-7014\n' > "$H26/VERSION"
+out="$("$C" --home "$H26" --stdout 2>/dev/null)"
+has "a version file is dumped raw" "$out" "        3.1.8-7014"
+# A JVM whose executable is a JDK's bin/java with a release file next to it,
+# and one whose executable is not java at all.
+J26="$ROOT/jdk26"; mkdir -p "$J26/bin"; cp "$(type -P sleep)" "$J26/bin/java"
+printf 'JAVA_VERSION="17.0.99"\n' > "$J26/release"
+( cd "$H26" && exec -a "java -jar whatap.server.yard.boot" "$J26/bin/java" 60 ) >/dev/null 2>&1 </dev/null &
+j1=$!
+( cd "$H26" && exec -a "java -jar whatap.server.proxy.boot.whatap.server.proxy-1.jar" sleep 60 ) >/dev/null 2>&1 </dev/null &
+j2=$!
+sleep 1
+out="$(ONLY_PIDS="$j1 $j2" JAVA_TOOL_OPTIONS=-Dggt=1 "$C" --home "$H26" --stdout 2>/dev/null)"
+has "the JVM's executable is read from /proc" "$out" "exe (pid $j1): $J26/bin/java"
+has "and its JDK's release file printed" "$out" 'JAVA_VERSION="17.0.99"'
+has "an executable not named java is not run" "$out" "-version not run: the executable is sleep, not java"
+has "the JVMs' cgroup is read from /proc/<pid>/cgroup" "$out" "whatap server JVM cgroup (pid $j1 $j2)"
+has "the run's own cgroup is labelled" "$out" "this run's cgroup (/proc/self/cgroup)"
+if [ -e /sys/fs/cgroup/cgroup.controllers ]; then
+    cg="$(sed -n 's/^0:://p' "/proc/$j1/cgroup")"; cg="${cg%/}"
+    has "and that cgroup's memory.max" "$out" "memory.max (/sys/fs/cgroup$cg)"
+else skip "the cgroup v2 limit file (no unified hierarchy here)"; fi
+has "JAVA_TOOL_OPTIONS is named as removed" "$out" "JVM option variables removed from the JVMs this run starts: JAVA_TOOL_OPTIONS"
+kill "$j1" "$j2" 2>/dev/null; wait "$j1" "$j2" 2>/dev/null
+# the JDK replaced in place under a running JVM: the release there is not its own
+( cd "$H26" && exec -a "java -jar whatap.server.yard.boot" "$J26/bin/java" 60 ) >/dev/null 2>&1 </dev/null &
+j1=$!; sleep 1
+cp "$J26/bin/java" "$J26/bin/java.new"; mv -f "$J26/bin/java.new" "$J26/bin/java"
+out="$(ONLY_PIDS="$j1" "$C" --home "$H26" --stdout 2>/dev/null)"
+has "a replaced executable's release is labelled so" "$out" "release now at $J26/release; the running executable was replaced"
+has "and no -version is run" "$out" "-version: not run (the running executable is deleted)"
+hasnt "the same namespace prints no namespace line" "$out" "mount namespace:"
+kill "$j1" 2>/dev/null; wait "$j1" 2>/dev/null
+S26="$ROOT/stub26"; stub_clone "$S" "$S26"
+stub_write "$S26/java" <<'EOF2'
+#!/bin/sh
+echo "JTO=[${JAVA_TOOL_OPTIONS:-}]" >&2
+EOF2
+out="$(PATH="$S26" JAVA_TOOL_OPTIONS=-javaagent:/x.jar "$C" --home "$H26" --stdout 2>/dev/null)"
+has "java -version runs without JAVA_TOOL_OPTIONS" "$out" "JTO=[]"
 
 echo; echo "PASS=$PASS FAIL=$FAIL SKIP=$SKIP"
 [ "$FAIL" -eq 0 ]

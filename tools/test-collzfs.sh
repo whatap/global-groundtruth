@@ -765,5 +765,14 @@ K24e="$ROOT/k24e"; mkdir -p "$K24e"
 out="$(COLLZFS_KSTAT_DIR="$K24e" PATH="$S0" "$C" --stdout </dev/null 2>/dev/null)"
 has "a kstat tree with no pool: window n/a" "$out" "time window (every txg, counters, zpool iostat -vlq, -r/-w) — no <pool>/txgs under $K24e and no pool listed by zpool"
 
+echo "== 25. 0.10.0: A has os-release and the kernel from /proc/sys/kernel =="
+# the stub zpool/zfs of case 4 make section A run on a host without ZFS
+if [ "$HAVE_ZFS" = 0 ]; then out="$(PATH="$S" "$C" --stdout </dev/null 2>/dev/null)"
+else out="$("$C" --stdout </dev/null 2>/dev/null)"; fi
+if [ -r /etc/os-release ] && [ -r /proc/sys/kernel/osrelease ]; then
+    has "os-release is dumped raw" "$out" "$(head -n1 /etc/os-release)"
+    has "kernel from /proc/sys/kernel" "$out" "kernel: $(cat /proc/sys/kernel/ostype) $(cat /proc/sys/kernel/osrelease)"
+else skip "os-release / kernel (not readable here)"; fi
+
 echo; echo "PASS=$PASS FAIL=$FAIL SKIP=$SKIP"
 [ "$FAIL" -eq 0 ]

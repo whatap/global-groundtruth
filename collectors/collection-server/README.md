@@ -46,7 +46,24 @@ One `.txt` report, organized into MECE domains (each fact in exactly one place):
 - **A. Host & platform** — hostname, kernel and arch (read from
   `/proc/sys/kernel/{hostname,ostype,osrelease,arch}`, the strings `uname`
   prints; `hostname`/`uname` run only where a file is unreadable), OS release,
-  memory, cgroup limits, load, `java -version`. The date and timezone are B's.
+  memory, load, cgroup limits, and the JVM runtime. cgroup: this run's
+  `/proc/self/cgroup` and the limit files at the `/sys/fs/cgroup` root it sees
+  (a container's own, in a cgroup namespace), then per distinct
+  `/proc/<pid>/cgroup` of the WhaTap server JVMs its pids and that cgroup's
+  `memory.max` / `cpu.max` (v2) or `memory.limit_in_bytes` /
+  `cpu.cfs_quota_us` / `cpu.cfs_period_us` (v1). JVM runtime: per distinct
+  `readlink /proc/<pid>/exe` and mount namespace of the server JVMs (an
+  absolute argv0 where exe is unreadable), its pids and the JDK `release`
+  file next to it, read through `/proc/<pid>/root` so a sidecar or host run
+  reads the JVM's file; without one, that executable's `-version`, only in
+  the run's own mount namespace and only while the executable is not
+  deleted. A deleted executable (a JDK replaced in place) gets
+  `release now at <path>; the running executable was replaced`, since that
+  file may no longer describe the running JVM; then PATH's `java -version`,
+  labelled as PATH's. Every JVM the run starts (`java -version`, `jstack`,
+  `jmap`, `jcmd`) runs without `JAVA_TOOL_OPTIONS`, `JDK_JAVA_OPTIONS` and
+  `_JAVA_OPTIONS`, so an injected `-javaagent` is not loaded; `[1]` names
+  the ones that were set. The date and timezone are B's.
 - **B. Time & clock synchronization** — a common root-cause axis: a skewed clock
   drops data into the wrong time buckets. Reports `timedatectl` (synchronized?
   NTP active? RTC/UTC/local), timezone, clocksource, virtualization, each
@@ -55,7 +72,9 @@ One `.txt` report, organized into MECE domains (each fact in exactly one place):
   against an external NTP/HTTP source (a network call; never sets the clock).
 - **C. Storage & filesystem** — yardbase path, **its filesystem type (ZFS or
   not)** and, on ZFS, pool/dataset/ARC properties; capacity via `df` (never a
-  recursive `du` in the report); `YARDB_LOCK`; partition range (shallow).
+  recursive `du` in the report); the yard lock file under both names it
+  has had, `YARDB_LOCK` and `.lock` (3.1.8), each present with its mtime or
+  absent; partition range (shallow).
   The account service's H2 database: `h2.file.path` from `conf/account.conf`
   (the package ships `./db`, taken relative to `WHATAP_HOME`), its mount point
   and whether yardbase shares it, its files, and the daily SQL dumps under
@@ -63,7 +82,9 @@ One `.txt` report, organized into MECE domains (each fact in exactly one place):
   this file, and it fills with yardbase when both are on one filesystem;
   a dump the backup could not write is left at 0 bytes (2026-09-16, MEA).
 - **D. Deployment layout** — resolved `WHATAP_HOME` (and how it was resolved),
-  directory tree, jar versions, conf file list.
+  directory tree, jar versions, conf file list, and a `VERSION*` / `version*`
+  file at the top level dumped raw when there is one (3.1.8 ships none; the
+  module versions are then the jar names here and in E).
 - **E. Runtime processes** — per service: pid, jar/version, heap & GC flags,
   RSS, start time; listening ports; systemd unit state. The port list checks
   each module's **default** port number and is labelled that way
@@ -286,7 +307,8 @@ One `.txt` report, MECE domains `[1]` + A..O:
   kstat tree and the module-parameter dir exist, pool/dataset/snapshot counts,
   which tiers this run enabled and the time window's length.
 - **A. ZFS software & kernel module** — `zfs version`, userland vs `zfs-kmod`
-  version, `modinfo`, package/DKMS state, kernel taint, ZFS systemd units,
+  version, `modinfo`, the kernel (`/proc/sys/kernel/{ostype,osrelease}`) and
+  `/etc/os-release` (raw), package/DKMS state, kernel taint, ZFS systemd units,
   `zpool.cache`. Also **asks the installed binary which subcommands and flags it
   has** (`zfs rewrite`, `zpool iostat -r/-w`, `zpool status -t`) rather than
   inferring capability from a version string.
@@ -792,7 +814,8 @@ One `.txt` report, sections `[1]` and A..K:
   connect and why not, and which opt-in tiers this run enabled.
 - **A. Server identity and version** — version, hostname, `server_id`,
   `server_uuid`, uptime, `read_only` / `super_read_only`, port, socket, datadir,
-  the local `mysqld` process and the listening sockets.
+  the local `mysqld` process and the listening sockets, and this host's
+  `/etc/os-release` (raw) and kernel (`/proc/sys/kernel/{ostype,osrelease}`).
 - **B. HA and replication** — `binlog_format`, GTID mode, `SHOW REPLICA STATUS`
   and the older `SHOW SLAVE STATUS`, `SHOW BINARY LOG STATUS` (MySQL 8.2+; on
   its syntax error, before 8.2 and on MariaDB, `SHOW MASTER STATUS` instead,
@@ -816,7 +839,9 @@ One `.txt` report, sections `[1]` and A..K:
   `innodb_flush_log_at_trx_commit`, flush method, doublewrite, I/O capacity, log
   file settings, and `SHOW ENGINE INNODB STATUS`.
 - **F. Schema footprint** — per-schema table count and size, the 25 largest
-  tables, the tables whose names contain `lock` / `meter` / `event` / `audit`,
+  tables, the tables whose names contain `lock` / `meter` / `event` / `audit`
+  in any case (`LOWER(table_name)`: on 8.0 a plain `LIKE` is case-sensitive
+  there and missed `MeteringDaily`, `AuditLog`, `ReserveEvent`),
   and the columns of `DeniedIPAddress` and `ApmRegion`.
 - **G. Per-table I/O and statement digests, from `performance_schema`** — the
   tables with the most I/O wait, the tables with the most rows written, the
