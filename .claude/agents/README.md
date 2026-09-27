@@ -17,6 +17,21 @@ Authoring follows the same grading: mechanical edits (moves, splits, CHANGELOG
 entries) can be written by a sonnet agent; design or D-tier changes are written
 by the main session or an opus agent.
 
+## Work that is not a collector change
+
+Lab, reading and survey work is graded the same way: by what a wrong answer
+costs, not by how long the task is.
+
+| Work | Agent | Model | Use for |
+|---|---|---|---|
+| Lab targets | `gg-lab-builder` | sonnet | Build or repair a permanent lab target (VM, docker image/container on `jjsong-ggt-docker`, fixture) and prove it with a collector run. |
+| Reading | `gg-reader` | sonnet | Read Slack channels, case folders or docs and return a candidate table, each candidate grepped against the current collectors. |
+| Design audit | general-purpose | opus | A survey whose answer is a trade-off (what to cut, what a rule should say), not a list of facts. |
+| Report-changing authoring | general-purpose | opus | Writing a D-tier change (see Grading). Mechanical edits: sonnet. |
+
+A grep-style coverage audit ("which collector prints X") is Reading, not a
+design audit.
+
 ## Grading a change
 
 Take the highest tier that any part of the change hits.
@@ -39,6 +54,24 @@ Take the highest tier that any part of the change hits.
 - Every fifth M verification (and any M verification of a patch over ~500
   diff lines) is also run by `gg-verify-deep`; a miss moves that kind of
   change to D. Record the outcome in the table below.
+
+## Moving up a model when quality drops
+
+The model in an agent file is the default, not a ceiling. The caller re-runs
+the same task one tier up (Agent tool `model: opus`, or `sonnet` for a haiku
+task) when any of these happens, and logs it in the table below:
+
+- the agent answers `ESCALATE: <why>`, or says it could not exercise a path it
+  was asked to cover;
+- a later step contradicts it: a verifier, a check, a collector run or the
+  user finds something the agent reported as done, present or safe;
+- its output fails the task's own acceptance (a lab target whose collector run
+  is not COMPLETE, a candidate table without the grep evidence per row);
+- the same task needed a second round with the same model.
+
+Two logged misses of one kind of task at a tier move that kind of task up for
+good: change the default here and in the agent file. Going back down needs a
+blind calibration like the ones below.
 
 ## Calibration log
 
