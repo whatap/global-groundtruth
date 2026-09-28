@@ -5,6 +5,8 @@ newest first. Every change to the script bumps its `VERSION` and adds one
 entry at the top of this list (docs/authoring-guide.md, step 2);
 `tools/validate.sh` checks that the newest entry is the script's `VERSION`.
 
+- **0.6.2** — Move TcpProbe into the shared ps1 fact-helpers block
+  (templates/groups/ps1.ps1); no behavior change.
 - **0.6.1** — Collection status (ps1 group `Emit-Time`): when a bounded call was slow, capped or not run, the per-command "where the time went" table gives way to the time log's own records, one line per such call in the order they ran (`<ms> ms  <outcome>  <command>`, the first 40, then `(N more in this run)`), as the shell collectors print; CONTRACT rule 1.
 - **0.6.0** — The runtime each process actually loaded is in the default run:
   section D lists, per w3wp and per dotnet.exe (the first 10), the loaded

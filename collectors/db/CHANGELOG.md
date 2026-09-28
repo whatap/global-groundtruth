@@ -7,6 +7,10 @@ one entry at the top of its section (docs/authoring-guide.md, step 2);
 
 ## collect-db.sh
 
+- **0.9.3** — Drop nslookup/crontab from the [1] tool row (never run on the
+  host); split _rep_tls per-instance body into _rep_tls_inst; read
+  dbms/db_ip/db_port/connect_option through one helper (_inst_conf) in each
+  section.
 - **0.9.2** — Collection status (skeleton `_emit_time`): when a bounded call was slow, capped or not run, the per-command "where the time went" table (sums largest first, time outside bounded calls) gives way to the time log's own records, one line per such call in the order they ran (`<ms> ms  <outcome>  <command>`, the first 40, then `(N more in this run)`); CONTRACT rule 1. `_run_init` sets its EXIT/INT/TERM/HUP traps before it creates the private directory: a signal in between left `ggt.*` behind.
 - **0.9.1** — `_run_init` (skeleton) also takes the script as read from stdin when `$0` is the shell's own binary (`/bin/bash -s`, `$0 -ef /proc/$$/exe`): bash 3.2 under musl otherwise faulted in a loop at full CPU after `4<&0`.
 - **0.9.0** — Derived views removed (CONTRACT rule 1, "Derived views"); every
@@ -109,6 +113,8 @@ one entry at the top of its section (docs/authoring-guide.md, step 2);
 
 ## windows/collect-db-mssql.ps1
 
+- **0.7.2** — Move TcpProbe into the shared ps1 fact-helpers block
+  (templates/groups/ps1.ps1); no behavior change.
 - **0.7.1** — Collection status (ps1 group `Emit-Time`): when a bounded call was slow, capped or not run, the per-command "where the time went" table gives way to the time log's own records, one line per such call in the order they ran (`<ms> ms  <outcome>  <command>`, the first 40, then `(N more in this run)`), as the shell collectors print; CONTRACT rule 1.
 - **0.7.0** — Derived views removed (CONTRACT rule 1): section F's WA code
   histogram becomes, per code in order of first appearance, `WA123 (M

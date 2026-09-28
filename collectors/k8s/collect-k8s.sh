@@ -36,7 +36,7 @@ export LC_ALL=C
 # ---- collector metadata -----------------------------------------------------
 COLLECTOR_NAME="whatap-k8s"
 # History: CHANGELOG.md (next to this file).
-VERSION="0.13.1"
+VERSION="0.13.2"
 DOMAIN="k8s"
 TARGET="k8s-cluster/unresolved"      # refined after CLI/context/namespace discovery
 
@@ -1313,6 +1313,13 @@ CR_WHY=""            # what was read, or why the list failed
 discover_workloads() {
     [ -n "$KCTL_BIN" ] || { CR_STATE=failed; CR_WHY="command not found: kubectl/oc"; return; }
     [ "$API_OK" = 0 ] && { CR_STATE=failed; CR_WHY="skipped: $API_WHY"; return; }
+    _disc_crs
+    _disc_ns_workloads
+    _disc_webhooks
+}
+
+# the CRD list, the WhatapAgent CR list built on it, and CR_NAMES/CR_NSS (cap 3)
+_disc_crs() {
     local out line
     # CRDs. The CR goal rests on this list and on the CR list below: an absence
     # is stated only when both calls answered, cluster-wide.
@@ -1373,6 +1380,11 @@ discover_workloads() {
 $out
 EOF
     fi
+}
+
+# namespace-scoped workloads: daemonset, operator deployment, other whatap
+# deployments, helm secrets
+_disc_ns_workloads() {
     # namespace-scoped workloads
     if [ -n "$NS" ]; then
         DS_NAME="$(kval get ds -n "$NS" -o name | grep -Ei 'whatap' | head -n1)"; DS_WHY="$(_kv_why)"
@@ -1391,6 +1403,11 @@ EOF
         run_k get secrets -n "$NS" -o name; kr_keep SECG names
         HELM_SECRETS="$(kg_kval SECG names get secrets -n "$NS" -o name | grep -E 'sh\.helm\.release\.v1\..*whatap' | sed 's#^secret/##')"; HS_WHY="$(_kv_why)"
     fi
+}
+
+# mutating/validating webhook configs (with per-hook names), clusterroles,
+# and the cluster-wide ALL_HOOKS listing section J filters per target
+_disc_webhooks() {
     WEBHOOKS="$(kval get mutatingwebhookconfigurations,validatingwebhookconfigurations -o name | grep -Ei 'whatap')"; WH_WHY="$(_kv_why)"
     # per-hook names: the API server keys its admission metrics by these, not by the
     # configuration object name, so they have to be resolved to read the counters
@@ -1832,65 +1849,73 @@ $(kg_kval "$_WHG" svc get "$wh" -o "jsonpath=$T_WH_SVC")
 EOF
     done
     [ -n "$list" ] || { fact "serving chain: n/a (no whatap webhook hook names a clientConfig.service)"; return; }
-    local i targets t kind host ca out rc saved c to=0 opt vfy
-    for i in $(printf '%s' "$list" | cut -d' ' -f1); do
-        read -r i wh hk sns sn sp <<EOF
-$(printf '%s\n' "$list" | awk -v i="$i" '$1 == i')
+    local i wh hk sns sn sp host ca out rc saved c to=0 opt vfy
+    while read -r i wh hk sns sn sp; do
+        [ -n "$i" ] || continue
+        _chain_probe_addr
+    done <<EOF
+$list
 EOF
-        host="$sn.$sns.svc"; ca="$(_tmp "chain$i.ca")"
-        opt=(-servername "$host")
-        # the caBundle's own fingerprint is in the subsection above
-        if openssl x509 -noout -in "$ca" 2>/dev/null; then
-            if [ "$vh" = 1 ]; then
-                opt=("${opt[@]}" -CAfile "$ca" -verify_hostname "$host"); vfy=" (-CAfile: caBundle of $hk; -verify_hostname $host)"
-            else
-                opt=("${opt[@]}" -CAfile "$ca"); vfy=" (-CAfile: caBundle of $hk; name not verified: this openssl's s_client has no -verify_hostname)"
-            fi
+}
+
+# one webhook/service entry of _rep_operator_chain: i/wh/hk/sns/sn/sp read
+# there, host/ca/to/opt/vfy declared there too (visible here by dynamic
+# scope; `to` latches across entries once an address times out)
+_chain_probe_addr() {
+    local targets t kind
+    host="$sn.$sns.svc"; ca="$(_tmp "chain$i.ca")"
+    opt=(-servername "$host")
+    # the caBundle's own fingerprint is in the subsection above
+    if openssl x509 -noout -in "$ca" 2>/dev/null; then
+        if [ "$vh" = 1 ]; then
+            opt=("${opt[@]}" -CAfile "$ca" -verify_hostname "$host"); vfy=" (-CAfile: caBundle of $hk; -verify_hostname $host)"
         else
-            vfy=" (no -CAfile: the caBundle of $hk is empty or not a certificate)"
+            opt=("${opt[@]}" -CAfile "$ca"); vfy=" (-CAfile: caBundle of $hk; name not verified: this openssl's s_client has no -verify_hostname)"
         fi
-        fact "service $sns/$sn port $sp (hook $hk of $wh):"
-        # the addresses: ClusterIP of the Service, the first subset of its Endpoints
-        targets=""
-        if run_k get "svc/$sn" "endpoints/$sn" -n "$sns" -o 'jsonpath={range .items[*]}{.kind}{" "}{.spec.clusterIP}{" "}{.subsets[0].ports[0].port}{" "}{.subsets[0].addresses[*].ip}{"\n"}{end}'; then
-            targets="$(printf '%s\n' "$K_OUT" | awk -v sp="$sp" '
-                $1 == "Endpoints" { for (j = 3; j <= NF && j <= 4; j++) print $j ":" $2 " endpoint" }
-                $1 == "Service" && $2 != "" && $2 != "None" && $2 !~ /^[0-9]+$/ { svc = $2 ":" sp " service" }
-                END { if (svc != "") print svc }')"
-        else
-            fact "  addresses: n/a ($(_k_reason))"
+    else
+        vfy=" (no -CAfile: the caBundle of $hk is empty or not a certificate)"
+    fi
+    fact "service $sns/$sn port $sp (hook $hk of $wh):"
+    # the addresses: ClusterIP of the Service, the first subset of its Endpoints
+    targets=""
+    if run_k get "svc/$sn" "endpoints/$sn" -n "$sns" -o 'jsonpath={range .items[*]}{.kind}{" "}{.spec.clusterIP}{" "}{.subsets[0].ports[0].port}{" "}{.subsets[0].addresses[*].ip}{"\n"}{end}' </dev/null; then
+        targets="$(printf '%s\n' "$K_OUT" | awk -v sp="$sp" '
+            $1 == "Endpoints" { for (j = 3; j <= NF && j <= 4; j++) print $j ":" $2 " endpoint" }
+            $1 == "Service" && $2 != "" && $2 != "None" && $2 !~ /^[0-9]+$/ { svc = $2 ":" sp " service" }
+            END { if (svc != "") print svc }')"
+    else
+        fact "  addresses: n/a ($(_k_reason))"
+        return
+    fi
+    [ -n "$targets" ] || { fact "  addresses: none (no ready endpoint address and no ClusterIP)"; return; }
+    while read -r t kind; do
+        [ -n "$t" ] || continue
+        if [ "$to" = 1 ]; then fact "  $t ($kind): not tried (an earlier address did not answer within ${CHAIN_TO}s)"; continue; fi
+        saved="$CMD_TIMEOUT"; CMD_TIMEOUT="$CHAIN_TO"
+        out="$(_bounded_in /dev/null openssl s_client -connect "$t" "${opt[@]}" -showcerts 2>"$(_tmp chain.err)")"; rc=$?
+        CMD_TIMEOUT="$saved"
+        if [ "$rc" = 124 ]; then
+            if _past_deadline; then fact "  $t ($kind): n/a (run deadline reached: ${RUN_DEADLINE}s)"
+            else fact "  $t ($kind): n/a (timed out: ${CHAIN_TO}s)"; fi
+            to=1; continue
+        fi
+        rm -f "$(_tmp chain)".[0-9]* 2>/dev/null
+        printf '%s\n' "$out" | awk -v d="$(_tmp chain)" '/-----BEGIN CERTIFICATE-----/ { n++; f = d "." n } f { print > f } /-----END CERTIFICATE-----/ { close(f); f = "" }'
+        if [ ! -f "$(_tmp chain).1" ]; then
+            fact "  $t ($kind): n/a (no certificate presented: exit $rc$(grep -v '^depth=\|^verify \|^CONNECTED' "$(_tmp chain.err)" 2>/dev/null | head -n1 | _cutw 160 | sed 's/^/: /'))"
             continue
         fi
-        [ -n "$targets" ] || { fact "  addresses: none (no ready endpoint address and no ClusterIP)"; continue; }
-        while read -r t kind; do
-            [ -n "$t" ] || continue
-            if [ "$to" = 1 ]; then fact "  $t ($kind): not tried (an earlier address did not answer within ${CHAIN_TO}s)"; continue; fi
-            saved="$CMD_TIMEOUT"; CMD_TIMEOUT="$CHAIN_TO"
-            out="$(_bounded_in /dev/null openssl s_client -connect "$t" "${opt[@]}" -showcerts 2>"$(_tmp chain.err)")"; rc=$?
-            CMD_TIMEOUT="$saved"
-            if [ "$rc" = 124 ]; then
-                if _past_deadline; then fact "  $t ($kind): n/a (run deadline reached: ${RUN_DEADLINE}s)"
-                else fact "  $t ($kind): n/a (timed out: ${CHAIN_TO}s)"; fi
-                to=1; continue
-            fi
-            rm -f "$(_tmp chain)".[0-9]* 2>/dev/null
-            printf '%s\n' "$out" | awk -v d="$(_tmp chain)" '/-----BEGIN CERTIFICATE-----/ { n++; f = d "." n } f { print > f } /-----END CERTIFICATE-----/ { close(f); f = "" }'
-            if [ ! -f "$(_tmp chain).1" ]; then
-                fact "  $t ($kind): n/a (no certificate presented: exit $rc$(grep -v '^depth=\|^verify \|^CONNECTED' "$(_tmp chain.err)" 2>/dev/null | head -n1 | _cutw 160 | sed 's/^/: /'))"
-                continue
-            fi
-            fact "  $t ($kind):"
-            c=1
-            while [ -f "$(_tmp chain).$c" ]; do
-                fact "    cert $((c - 1)): $(_x509_facts "$(_tmp chain).$c")"
-                c=$((c + 1))
-            done
-            c="$(printf '%s\n' "$out" | grep -m1 '^ *Verify return code' | sed 's/^ *//')"
-            fact "    ${c:-Verify return code: n/a (not printed)}$vfy"
-        done <<EOF
+        fact "  $t ($kind):"
+        c=1
+        while [ -f "$(_tmp chain).$c" ]; do
+            fact "    cert $((c - 1)): $(_x509_facts "$(_tmp chain).$c")"
+            c=$((c + 1))
+        done
+        c="$(printf '%s\n' "$out" | grep -m1 '^ *Verify return code' | sed 's/^ *//')"
+        fact "    ${c:-Verify return code: n/a (not printed)}$vfy"
+    done <<EOF
 $targets
 EOF
-    done
 }
 
 # _rep_operator_proxy -> the proxy variables of the kube-apiserver, the caller
@@ -2156,75 +2181,92 @@ _rep_logs() {
     section "G. Logs (bounded tails)"
     fact "bounds: --tail=$LOG_TAIL_LINES per container; previous instance --tail=100; up to 3 sample node-agent pods (--bundle carries fuller logs)"
     if [ -n "$NS" ]; then
-        # Merged read (why a deep tail is needed for the injection trail: README.md
-        # Design notes) reuses one --tail=4000 call for both the --tail lines and
-        # the trail. --limit-bytes cuts the NEWEST lines, so an output under
-        # 3996000 bytes (4000000 - 4000, one $(...) newline strip per line) was
-        # not cut; otherwise, or if the read failed, --tail is its own call. One
-        # read also means one pod: deploy/NAME resolves to a pod per call.
-        if [ -n "$OP_DEPLOY" ]; then
-            local dp_rc dp_out dp_why="" inj
-            run_k logs -n "$NS" "deploy/$OP_DEPLOY" --tail=4000 --limit-bytes=4000000
-            dp_rc="$K_RC" dp_out="$K_OUT"
-            [ "$dp_rc" -eq 0 ] || dp_why="$(_k_reason)"
-            if [ "$dp_rc" -eq 0 ] && [ "$LOG_TAIL_LINES" -le 4000 ] && [ "${#dp_out}" -lt 3996000 ]; then
-                K_OUT="$(printf '%s\n' "$dp_out" | tail -n "$LOG_TAIL_LINES")"; K_RC=0
-            else
-                run_k logs -n "$NS" "deploy/$OP_DEPLOY" --tail="$LOG_TAIL_LINES"
-            fi
-            if [ "$K_RC" -eq 0 ] && [ -n "$K_OUT" ]; then
-                _emit_labeled "logs deploy/$OP_DEPLOY" "$K_OUT"
-            else
-                fact "logs deploy/$OP_DEPLOY: n/a ($(_k_reason))"
-            fi
-            if [ "$dp_rc" -eq 0 ]; then
-                # includes the webhook's own skip wording (target disabled / pod labels do
-                # not match / namespace does not match / no matching targets), which is the
-                # trail for a pod that was seen by the webhook and left untouched
-                inj="$(printf '%s\n' "$dp_out" | grep -Ei 'inject|instrument|whatap-agent-init|NODE_OPTIONS|NODE_PATH|PYTHONPATH|JAVA_TOOL_OPTIONS|AGENT_PATH|mutat|admission|apm-init|target|selector|skipping' | tail -n 200)"
-                if [ -n "$inj" ]; then
-                    _emit_labeled "operator log lines matching injection markers (tail 4000 -> last 200 matches)" "$inj"
-                else
-                    fact "operator log lines matching injection markers: none in the last 4000 lines"
-                fi
-            else
-                fact "operator log injection markers: n/a ($dp_why)"
-            fi
-        fi
-        local mdep
-        mdep="$(printf '%s\n' "$WHATAP_DEPLOYS" | awk '$1 ~ /master-agent/ {print $1; exit}')"
-        if [ -n "$mdep" ]; then
-            if run_k logs -n "$NS" "deploy/$mdep" --tail="$LOG_TAIL_LINES" && [ -n "$K_OUT" ]; then
-                _emit_labeled "logs deploy/$mdep" "$K_OUT"
-            else
-                fact "logs deploy/$mdep: n/a ($(_k_reason))"
-            fi
-        else
-            fact "master-agent deployment logs: n/a (no deployment name matching master-agent)"
-        fi
-        # sample node-agent pods: top-2 by restarts + first Running pod (max 3)
-        local picked=" " count=0 i pod cont
-        i=0
-        while [ "$i" -lt "${#SP_POD[@]}" ] && [ "$count" -lt 3 ]; do
-            pod="${SP_POD[$i]}"
-            case "$i" in
-                0|1) : ;;                                  # top restarts
-                *) [ "${SP_PHASE[$i]}" = "Running" ] || { i=$((i + 1)); continue; } ;;
-            esac
-            case "$picked" in *" $pod "*) i=$((i + 1)); continue ;; esac
-            picked="$picked$pod "
-            count=$((count + 1))
-            for cont in $DS_CONTAINERS; do
-                emit_log_tail "$pod" "$cont" "$LOG_TAIL_LINES"
-                [ "${SP_RST[$i]}" -gt 0 ] 2>/dev/null && emit_log_tail "$pod" "$cont" 100 previous
-            done
-            i=$((i + 1))
-        done
-        [ "${#SP_POD[@]}" -eq 0 ] && fact "node-agent pod logs: n/a (${SP_WHY:-no node-agent pods found})"
+        _logs_operator
+        _logs_master
+        _logs_nodeagent
     else
         fact "log probes: n/a (not applicable: no whatap namespace discovered)"
     fi
+    _logs_apiserver
+}
 
+# operator deployment logs + injection-marker trail
+_logs_operator() {
+    # Merged read (why a deep tail is needed for the injection trail: README.md
+    # Design notes) reuses one --tail=4000 call for both the --tail lines and
+    # the trail. --limit-bytes cuts the NEWEST lines, so an output under
+    # 3996000 bytes (4000000 - 4000, one $(...) newline strip per line) was
+    # not cut; otherwise, or if the read failed, --tail is its own call. One
+    # read also means one pod: deploy/NAME resolves to a pod per call.
+    [ -n "$OP_DEPLOY" ] || return
+    local dp_rc dp_out dp_why="" inj
+    run_k logs -n "$NS" "deploy/$OP_DEPLOY" --tail=4000 --limit-bytes=4000000
+    dp_rc="$K_RC" dp_out="$K_OUT"
+    [ "$dp_rc" -eq 0 ] || dp_why="$(_k_reason)"
+    if [ "$dp_rc" -eq 0 ] && [ "$LOG_TAIL_LINES" -le 4000 ] && [ "${#dp_out}" -lt 3996000 ]; then
+        K_OUT="$(printf '%s\n' "$dp_out" | tail -n "$LOG_TAIL_LINES")"; K_RC=0
+    else
+        run_k logs -n "$NS" "deploy/$OP_DEPLOY" --tail="$LOG_TAIL_LINES"
+    fi
+    if [ "$K_RC" -eq 0 ] && [ -n "$K_OUT" ]; then
+        _emit_labeled "logs deploy/$OP_DEPLOY" "$K_OUT"
+    else
+        fact "logs deploy/$OP_DEPLOY: n/a ($(_k_reason))"
+    fi
+    if [ "$dp_rc" -eq 0 ]; then
+        # includes the webhook's own skip wording (target disabled / pod labels do
+        # not match / namespace does not match / no matching targets), which is the
+        # trail for a pod that was seen by the webhook and left untouched
+        inj="$(printf '%s\n' "$dp_out" | grep -Ei 'inject|instrument|whatap-agent-init|NODE_OPTIONS|NODE_PATH|PYTHONPATH|JAVA_TOOL_OPTIONS|AGENT_PATH|mutat|admission|apm-init|target|selector|skipping' | tail -n 200)"
+        if [ -n "$inj" ]; then
+            _emit_labeled "operator log lines matching injection markers (tail 4000 -> last 200 matches)" "$inj"
+        else
+            fact "operator log lines matching injection markers: none in the last 4000 lines"
+        fi
+    else
+        fact "operator log injection markers: n/a ($dp_why)"
+    fi
+}
+
+# master-agent deployment logs
+_logs_master() {
+    local mdep
+    mdep="$(printf '%s\n' "$WHATAP_DEPLOYS" | awk '$1 ~ /master-agent/ {print $1; exit}')"
+    if [ -n "$mdep" ]; then
+        if run_k logs -n "$NS" "deploy/$mdep" --tail="$LOG_TAIL_LINES" && [ -n "$K_OUT" ]; then
+            _emit_labeled "logs deploy/$mdep" "$K_OUT"
+        else
+            fact "logs deploy/$mdep: n/a ($(_k_reason))"
+        fi
+    else
+        fact "master-agent deployment logs: n/a (no deployment name matching master-agent)"
+    fi
+}
+
+# sample node-agent pods: top-2 by restarts + first Running pod (max 3)
+_logs_nodeagent() {
+    local picked=" " count=0 i pod cont
+    i=0
+    while [ "$i" -lt "${#SP_POD[@]}" ] && [ "$count" -lt 3 ]; do
+        pod="${SP_POD[$i]}"
+        case "$i" in
+            0|1) : ;;                                  # top restarts
+            *) [ "${SP_PHASE[$i]}" = "Running" ] || { i=$((i + 1)); continue; } ;;
+        esac
+        case "$picked" in *" $pod "*) i=$((i + 1)); continue ;; esac
+        picked="$picked$pod "
+        count=$((count + 1))
+        for cont in $DS_CONTAINERS; do
+            emit_log_tail "$pod" "$cont" "$LOG_TAIL_LINES"
+            [ "${SP_RST[$i]}" -gt 0 ] 2>/dev/null && emit_log_tail "$pod" "$cont" 100 previous
+        done
+        i=$((i + 1))
+    done
+    [ "${#SP_POD[@]}" -eq 0 ] && fact "node-agent pod logs: n/a (${SP_WHY:-no node-agent pods found})"
+}
+
+# kube-apiserver logs, filtered to the webhook call outcome
+_logs_apiserver() {
     subsection "kube-apiserver logs (webhook call outcome)"
     # The API server writes a warning for every admission webhook call that fails,
     # INCLUDING when failurePolicy: Ignore then lets the request through — which is
@@ -2303,40 +2345,45 @@ _rep_helm() {
 }
 
 # I. In-pod node facts (kubectl exec, best-effort)
+# the exec plan (mounts/logcont/mpaths/logdirs/rootdirs/sockdirs/mfiles/ports/
+# portcont/hport/hostpid) stays declared in _rep_inpod, visible here by
+# dynamic scope
+_inpod_plan() {
+    mounts="$(kg_kval DSG mounts get ds "$DS_NAME" -n "$NS" -o "jsonpath=$T_DS_MOUNTS")"
+    logcont="$(printf '%s\n' "$mounts" | awk -F'=' '$2 ~ /\/var\/log|\/rootfs/ {print $1; exit}')"
+    [ -z "$logcont" ] && logcont="$(printf '%s' "$DS_CONTAINERS" | awk '{print $1}')"
+    # candidate path roots derive from the chosen container's DECLARED mounts
+    # (e.g. a whole-host mount at /rootfs shifts every host path under it)
+    mpaths="$(printf '%s\n' "$mounts" | awk -F'=' -v c="$logcont" '$1 == c {print $2}' | tr ',' '\n' | grep -v '^$' | head -n 4)"
+    logdirs="/var/log/containers"; rootdirs=""; sockdirs=""
+    for m in $mpaths; do
+        case "$m" in
+            *.sock|/dev*|/sys*|/proc*|/etc*) continue ;;
+            */var/log) logdirs="$logdirs $m/containers" ;;
+            /) : ;;
+            *) logdirs="$logdirs $m/var/log/containers" ;;
+        esac
+    done
+    mfiles=""
+    for m in "" $mpaths; do
+        [ "$m" = "/" ] && m=""
+        case "$m" in *.sock|/dev*|/sys*|/proc*|/etc*|*/var/log) continue ;; esac
+        rootdirs="$rootdirs $m/var/log/pods $m/var/log/containers $m/mnt/paas/runtime/container_logs"
+        sockdirs="$sockdirs $m/run/containerd/containerd.sock $m/var/run/docker.sock $m/run/crio/crio.sock"
+        [ -n "$m" ] && mfiles="$mfiles $m/etc/kubernetes/manifests/kube-apiserver.yaml"
+    done
+    ports="$(kg_kval DSG ports get ds "$DS_NAME" -n "$NS" -o "jsonpath=$T_DS_PORTS")"
+    portcont="$(printf '%s\n' "$ports" | awk -F'=' '$2 != "" {print $1; exit}')"
+    hport="$(printf '%s\n' "$ports" | awk -F'=' '$2 != "" {print $2; exit}')"
+    hostpid="$(kg_kval DSG hostpid get ds "$DS_NAME" -n "$NS" -o "jsonpath=$T_DS_HOSTPID")"
+}
+
 _rep_inpod() {
     section "I. In-pod node facts (kubectl exec into node-agent pods)"
     if [ -n "$NS" ] && [ -n "$DS_NAME" ] && [ "${#SP_POD[@]}" -gt 0 ]; then
         # derive exec plan from the DS spec (declared mounts / ports / hostPID)
-        local mounts logcont portcont hport hostpid
-        mounts="$(kg_kval DSG mounts get ds "$DS_NAME" -n "$NS" -o "jsonpath=$T_DS_MOUNTS")"
-        logcont="$(printf '%s\n' "$mounts" | awk -F'=' '$2 ~ /\/var\/log|\/rootfs/ {print $1; exit}')"
-        [ -z "$logcont" ] && logcont="$(printf '%s' "$DS_CONTAINERS" | awk '{print $1}')"
-        # candidate path roots derive from the chosen container's DECLARED mounts
-        # (e.g. a whole-host mount at /rootfs shifts every host path under it)
-        local mpaths m logdirs rootdirs sockdirs
-        mpaths="$(printf '%s\n' "$mounts" | awk -F'=' -v c="$logcont" '$1 == c {print $2}' | tr ',' '\n' | grep -v '^$' | head -n 4)"
-        logdirs="/var/log/containers"; rootdirs=""; sockdirs=""
-        for m in $mpaths; do
-            case "$m" in
-                *.sock|/dev*|/sys*|/proc*|/etc*) continue ;;
-                */var/log) logdirs="$logdirs $m/containers" ;;
-                /) : ;;
-                *) logdirs="$logdirs $m/var/log/containers" ;;
-            esac
-        done
-        local mfiles=""
-        for m in "" $mpaths; do
-            [ "$m" = "/" ] && m=""
-            case "$m" in *.sock|/dev*|/sys*|/proc*|/etc*|*/var/log) continue ;; esac
-            rootdirs="$rootdirs $m/var/log/pods $m/var/log/containers $m/mnt/paas/runtime/container_logs"
-            sockdirs="$sockdirs $m/run/containerd/containerd.sock $m/var/run/docker.sock $m/run/crio/crio.sock"
-            [ -n "$m" ] && mfiles="$mfiles $m/etc/kubernetes/manifests/kube-apiserver.yaml"
-        done
-        local ports
-        ports="$(kg_kval DSG ports get ds "$DS_NAME" -n "$NS" -o "jsonpath=$T_DS_PORTS")"
-        portcont="$(printf '%s\n' "$ports" | awk -F'=' '$2 != "" {print $1; exit}')"
-        hport="$(printf '%s\n' "$ports" | awk -F'=' '$2 != "" {print $2; exit}')"
-        hostpid="$(kg_kval DSG hostpid get ds "$DS_NAME" -n "$NS" -o "jsonpath=$T_DS_HOSTPID")"
+        local mounts logcont portcont hport hostpid mpaths m logdirs rootdirs sockdirs mfiles ports
+        _inpod_plan
         fact "exec container for log-path probes: ${logcont:-n/a} (first container declaring a /var/log mount, else first container)"
         fact "declared container ports: $(printf '%s' "$ports" | tr '\n' ' ')"
         fact "daemonset hostPID: ${hostpid:-not set}"
@@ -2367,34 +2414,44 @@ _rep_inpod() {
             any=1
             subsection "in-pod probes: $pod"
             nd="$(_sp_node "$pod")"
+            # each of pc5/pc6/pc7 is decided once here; the pcs build below and
+            # the emit below read the same *_ok/pc7_na instead of re-testing
+            local pc5_ok=0 pc6_ok=0 pc7_ok=0 pc7_na=""
+            [ -n "$hport" ] && [ -n "$portcont" ] && pc5_ok=1
+            [ "$hostpid" = "true" ] && pc6_ok=1
+            if [ -z "$AP_NODES" ] && [ -n "$AP_WHY" ]; then
+                pc7_na="$AP_WHY"
+            elif ! _ap_on "$nd"; then
+                pc7_na="not applicable: no kube-apiserver pod on node ${nd:-?}"
+            elif [ -z "$mfiles" ]; then
+                pc7_na="not applicable: container $logcont declares no host root mount"
+            else
+                pc7_ok=1
+            fi
             pcs=("$pc1" "$pc2" "$pc3" "$pc4")
-            [ -n "$hport" ] && [ -n "$portcont" ] && pcs[${#pcs[@]}]="$pc5"
-            [ "$hostpid" = "true" ] && pcs[${#pcs[@]}]="$pc6"
-            _ap_on "$nd" && [ -n "$mfiles" ] && pcs[${#pcs[@]}]="$pc7"
+            [ "$pc5_ok" = 1 ] && pcs[${#pcs[@]}]="$pc5"
+            [ "$pc6_ok" = 1 ] && pcs[${#pcs[@]}]="$pc6"
+            [ "$pc7_ok" = 1 ] && pcs[${#pcs[@]}]="$pc7"
             _pod_probes_run "$pod" "$logcont" "${pcs[@]}"
             _pod_probe_emit 1 "container log symlink target (first entry found under: $logdirs)" "$pc1"
             _pod_probe_emit 2 "container-log roots present (candidates from declared mounts)" "$pc2"
             _pod_probe_emit 3 "container runtime sockets visible (candidates from declared mounts)" "$pc3"
             _pod_probe_emit 4 "cgroup filesystem type + v2 controllers file" "$pc4"
             pn=4
-            if [ -n "$hport" ] && [ -n "$portcont" ]; then
+            if [ "$pc5_ok" = 1 ]; then
                 pn=5; _pod_probe_emit 5 "helper endpoint http://127.0.0.1:$hport/health" "$pc5"
             else
                 fact "helper endpoint probe: n/a (not applicable: no containerPort declared in daemonset)"
             fi
-            if [ "$hostpid" = "true" ]; then
+            if [ "$pc6_ok" = 1 ]; then
                 pn=$((pn + 1)); _pod_probe_emit "$pn" "kubelet cmdline (via hostPID /proc)" "$pc6"
             else
                 fact "kubelet cmdline: n/a (not applicable: daemonset hostPID not set)"
             fi
-            if [ -z "$AP_NODES" ] && [ -n "$AP_WHY" ]; then
-                fact "kube-apiserver manifest proxy lines: n/a ($AP_WHY)"
-            elif ! _ap_on "$nd"; then
-                fact "kube-apiserver manifest proxy lines: n/a (not applicable: no kube-apiserver pod on node ${nd:-?})"
-            elif [ -z "$mfiles" ]; then
-                fact "kube-apiserver manifest proxy lines: n/a (not applicable: container $logcont declares no host root mount)"
-            else
+            if [ "$pc7_ok" = 1 ]; then
                 _pod_probe_emit $((pn + 1)) "kube-apiserver manifest proxy lines (node $nd, grep -i -A1)" "$pc7"
+            else
+                fact "kube-apiserver manifest proxy lines: n/a ($pc7_na)"
             fi
         done
         [ "$any" = 0 ] && fact "in-pod probes: n/a (not applicable: no Running node-agent pod)"
@@ -2696,7 +2753,7 @@ run_report() {
     _note_boot
     fact "run host: $(hostname 2>/dev/null || echo unknown)"
     fact "tools:"
-    _tool_rows kubectl oc helm awk grep sed sort tar gzip timeout curl
+    _tool_rows kubectl oc helm awk grep sed sort tar gzip timeout
     fact "cli in use: ${KCTL_BIN:-n/a (command not found: kubectl/oc)}"
     fact "cli global options: ${KOPTS[*]:-none}"
     fact "KUBECONFIG env: ${KUBECONFIG:-not set}"

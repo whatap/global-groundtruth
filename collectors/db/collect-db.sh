@@ -28,7 +28,7 @@ export LC_ALL=C
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-db"
 # History: CHANGELOG.md, section collect-db.sh (next to this file).
-VERSION="0.9.2"
+VERSION="0.9.3"
 DOMAIN="db"
 TARGET="db-host/$(hostname 2>/dev/null || echo unknown)"
 
@@ -1460,6 +1460,16 @@ log_lines() {
 }
 
 # ---- report body ----------------------------------------------------------------
+# _inst_conf IDIR -> sets I_DBMS/I_IP/I_PORT/I_COPT from IDIR/whatap.conf (the
+# same four keys, read once per instance instead of per section)
+_inst_conf() {
+    local cf="$1/whatap.conf"
+    conf_get I_DBMS "$cf" dbms
+    conf_get I_IP "$cf" db_ip
+    conf_get I_PORT "$cf" db_port
+    conf_get I_COPT "$cf" connect_option
+}
+
 # [1] collection environment; the tool list explains a later "command not found"
 _rep_env() {
     section "Collection environment"
@@ -1469,7 +1479,7 @@ _rep_env() {
     fact "privilege: $PRIV_WHY"
     _note_boot
     fact "tools:"
-    _tool_rows ps ss netstat ip getent nslookup java systemctl crontab timeout find readlink
+    _tool_rows ps ss netstat ip getent java systemctl timeout find readlink
     fact "/proc: ${PROC_STATE:-n/a (mountinfo not read)}"
 }
 
@@ -1714,8 +1724,7 @@ _rep_network() {
         subsection "instance: $idir"
         # the keys are in section D (verbatim); each probe line names its target
         local dbip dbport whost wport
-        conf_get dbip "$cf" db_ip
-        conf_get dbport "$cf" db_port
+        _inst_conf "$idir"; dbip="$I_IP"; dbport="$I_PORT"
         conf_get whost "$cf" 'whatap\.server\.host'
         conf_get wport "$cf" 'whatap\.server\.port'
         case "$dbip" in
@@ -1748,7 +1757,7 @@ _rep_engine() {
     while [ "$i" -lt "${#INST_DIRS[@]}" ]; do
         local idir="${INST_DIRS[$i]}" cf="${INST_DIRS[$i]}/whatap.conf"
         local dbms nlog2 ldir2=""
-        conf_get dbms "$cf" dbms
+        _inst_conf "$idir"; dbms="$I_DBMS"
         subsection "instance: $idir (dbms=${dbms:-unset})"
         spec=""
         case "$dbms" in
@@ -1877,7 +1886,7 @@ _rep_packs() {
     local said=0 packable=0
     while [ "$i" -lt "${#INST_DIRS[@]}" ]; do
         local dbms
-        conf_get dbms "${INST_DIRS[$i]}/whatap.conf" dbms
+        _inst_conf "${INST_DIRS[$i]}"; dbms="$I_DBMS"
         case "$dbms" in
             postgres*|pg)   fact "instance ${INST_DIRS[$i]}: sql/postgresql.sql"; said=1; packable=1 ;;
             mysql|mariadb)  fact "instance ${INST_DIRS[$i]}: sql/mysql.sql"; said=1; packable=1 ;;
@@ -1908,7 +1917,6 @@ X509_OPTS_OLD="-noout -subject -issuer -dates -fingerprint -sha256 -text -certop
 # it (protocol, cipher, certificate), the counterpart to the runtime policy in
 # sections A/E and the connect_option in section D
 _rep_tls() {
-    local i
     section "K. TLS handshake probe"
     if ! have openssl; then
         fact "n/a (command not found: openssl)"
@@ -1921,105 +1929,107 @@ _rep_tls() {
         local TLS_BUDGET=30 tls_t0="$SECONDS" tls_left tls_cap tls_f
         local tls_seen_body=() tls_seen_inst=()
         tls_f="$(_tmp tls.out)"
-        i=0
-        while [ "$i" -lt "${#INST_DIRS[@]}" ]; do
-            local idir="${INST_DIRS[$i]}" cf="${INST_DIRS[$i]}/whatap.conf"
-            local dbms dbip dbport dbssl copt st out
-            conf_get dbms "$cf" dbms
-            conf_get dbip "$cf" db_ip
-            conf_get dbport "$cf" db_port
-            conf_get dbssl "$cf" db_ssl
-            conf_get copt "$cf" connect_option
-            subsection "instance: $idir (dbms=${dbms:-unset}, target ${dbip:-?}:${dbport:-?})"
-            if [ -z "$dbip" ] || [ -z "$dbport" ]; then
-                fact "n/a (not applicable: db_ip/db_port not set)"
-                i=$((i + 1)); continue
-            fi
-            st=""
-            case "$dbms" in
-                mysql|mariadb)  st="-starttls mysql" ;;
-                postgres*|pg)   st="-starttls postgres" ;;
-                redis|valkey)
-                    case "$dbssl$copt" in
-                        *true*|*ssl*) st="" ;;
-                        *) fact "n/a (not applicable: db_ssl/ssl option not set)"
-                           i=$((i + 1)); continue ;;
-                    esac ;;
-                mssql)  fact "n/a (not applicable: dbms=mssql, TLS inside the TDS prelogin is not probed with openssl s_client)"
-                        i=$((i + 1)); continue ;;
-                oracle) fact "n/a (not applicable: dbms=oracle, TCPS/native negotiation not probed in this version)"
-                        i=$((i + 1)); continue ;;
-                *)      fact "n/a (not applicable: dbms=${dbms:-unset})"
-                        i=$((i + 1)); continue ;;
-            esac
-            local down
-            if down="$(tcp_down "$dbip" "$dbport")"; then
-                fact "handshake: n/a (skipped: $down)"
-                i=$((i + 1)); continue
-            fi
-            tls_left=$((TLS_BUDGET - (SECONDS - tls_t0)))
-            if [ "$tls_left" -le 0 ]; then
-                fact "handshake: n/a (not run: TLS probes stopped after ${TLS_BUDGET}s)"
-                i=$((i + 1)); continue
-            fi
-            # min(CMD_TIMEOUT, 15, what is left of the budget)
-            tls_cap=15; [ "$CMD_TIMEOUT" -lt "$tls_cap" ] && tls_cap="$CMD_TIMEOUT"
-            [ "$tls_left" -lt "$tls_cap" ] && tls_cap="$tls_left"
-            progress "sending 1 TLS handshake to $dbip:$dbport ($dbms)"
-            local trc ncert k xo xrc
-            # shellcheck disable=SC2086
-            out="$(CMD_TIMEOUT="$tls_cap" _bounded_in /dev/null openssl s_client -showcerts $st -connect "$dbip:$dbport" 2>&1)"; trc=$?
-            if [ "$trc" -eq 124 ]; then
-                fact "handshake: n/a (timed out: ${tls_cap}s)"
-                i=$((i + 1)); continue
-            fi
-            if [ -z "$out" ]; then
-                fact "openssl s_client -showcerts ${st:+$st }-connect $dbip:$dbport: n/a (empty output, exit $trc)"
-                i=$((i + 1)); continue
-            fi
-            # verbatim but for the PEM blocks, which openssl x509 gives below
-            # per chain certificate
-            printf '%s\n' "$out" >"$tls_f" 2>/dev/null
-            local body j same=""
-            # left out as well: the per-connection random values (session
-            # ticket hex dump, Session-ID, Master-Key, Resumption PSK, Start Time)
-            body="$(awk '/-----BEGIN CERTIFICATE-----/ { s = 1 }
-                /^[[:space:]]*(TLS session ticket|Session-ID|Session-ID-ctx|Master-Key|Resumption PSK|Start Time):/ { next }
-                /^[[:space:]]*[0-9a-f][0-9a-f][0-9a-f][0-9a-f] - [0-9a-f][0-9a-f][ -]/ { next }
-                !s { print } /-----END CERTIFICATE-----/ { s = 0 }' "$tls_f")"
-            # an output already printed for an instance above (openssl's
-            # usage text, say) is named instead of printed again
-            j=0
-            while [ "$j" -lt "${#tls_seen_body[@]}" ]; do
-                [ "${tls_seen_body[$j]}" = "$st|$trc|$body" ] && { same="${tls_seen_inst[$j]}"; break; }
-                j=$((j + 1))
-            done
-            if [ -n "$same" ]; then
-                fact "openssl s_client -showcerts ${st:+$st }-connect $dbip:$dbport (exit $trc): the same output as for instance $same above"
-            else
-                tls_seen_body[${#tls_seen_body[@]}]="$st|$trc|$body"; tls_seen_inst[${#tls_seen_inst[@]}]="$idir"
-                _emit_labeled "openssl s_client -showcerts ${st:+$st }-connect $dbip:$dbport (exit $trc, stdout and stderr verbatim, PEM blocks and per-connection random values left out)" "$body"
-            fi
-            rm -f "$tls_f".cert* 2>/dev/null
-            ncert="$(awk -v p="$tls_f.cert" '/-----BEGIN CERTIFICATE-----/ { n++; f = p n } f { print > f } /-----END CERTIFICATE-----/ { close(f); f = "" } END { print n + 0 }' "$tls_f" 2>/dev/null)"
-            k=1
-            while [ "$k" -le "${ncert:-0}" ]; do
-                # shellcheck disable=SC2086
-                xo="$(_bounded openssl x509 -in "$tls_f.cert$k" $X509_OPTS 2>&1)"; xrc=$?
-                if [ "$xrc" -ne 0 ] && [ "$xrc" -ne 124 ]; then
-                    # openssl without x509 -ext: every extension, from -text
-                    # shellcheck disable=SC2086
-                    xo="$(_bounded openssl x509 -in "$tls_f.cert$k" $X509_OPTS_OLD 2>&1)"; xrc=$?
-                    _emit_labeled "certificate $k of $ncert (exit $xrc; -ext not accepted, run as: openssl x509 $X509_OPTS_OLD)" "$xo"
-                else
-                    _emit_labeled "certificate $k of $ncert (exit $xrc)" "$xo"
-                fi
-                k=$((k + 1))
-            done
-            [ "${ncert:-0}" -eq 0 ] && fact "server certificate: n/a (no certificate in the s_client output)"
-            i=$((i + 1))
+        local idir
+        for idir in "${INST_DIRS[@]}"; do
+            _rep_tls_inst "$idir"
         done
     fi
+}
+
+# one instance of section K; tls_t0/tls_seen_body/tls_seen_inst/tls_f/tls_cap
+# stay in _rep_tls (visible here by dynamic scope)
+_rep_tls_inst() {
+    local idir="$1" cf="$1/whatap.conf"
+    local dbms dbip dbport dbssl copt st out
+    _inst_conf "$idir"; dbms="$I_DBMS"; dbip="$I_IP"; dbport="$I_PORT"; copt="$I_COPT"
+    conf_get dbssl "$cf" db_ssl
+    subsection "instance: $idir (dbms=${dbms:-unset}, target ${dbip:-?}:${dbport:-?})"
+    if [ -z "$dbip" ] || [ -z "$dbport" ]; then
+        fact "n/a (not applicable: db_ip/db_port not set)"
+        return
+    fi
+    st=""
+    case "$dbms" in
+        mysql|mariadb)  st="-starttls mysql" ;;
+        postgres*|pg)   st="-starttls postgres" ;;
+        redis|valkey)
+            case "$dbssl$copt" in
+                *true*|*ssl*) st="" ;;
+                *) fact "n/a (not applicable: db_ssl/ssl option not set)"
+                   return ;;
+            esac ;;
+        mssql)  fact "n/a (not applicable: dbms=mssql, TLS inside the TDS prelogin is not probed with openssl s_client)"
+                return ;;
+        oracle) fact "n/a (not applicable: dbms=oracle, TCPS/native negotiation not probed in this version)"
+                return ;;
+        *)      fact "n/a (not applicable: dbms=${dbms:-unset})"
+                return ;;
+    esac
+    local down
+    if down="$(tcp_down "$dbip" "$dbport")"; then
+        fact "handshake: n/a (skipped: $down)"
+        return
+    fi
+    tls_left=$((TLS_BUDGET - (SECONDS - tls_t0)))
+    if [ "$tls_left" -le 0 ]; then
+        fact "handshake: n/a (not run: TLS probes stopped after ${TLS_BUDGET}s)"
+        return
+    fi
+    # min(CMD_TIMEOUT, 15, what is left of the budget)
+    tls_cap=15; [ "$CMD_TIMEOUT" -lt "$tls_cap" ] && tls_cap="$CMD_TIMEOUT"
+    [ "$tls_left" -lt "$tls_cap" ] && tls_cap="$tls_left"
+    progress "sending 1 TLS handshake to $dbip:$dbport ($dbms)"
+    local trc ncert k xo xrc
+    # shellcheck disable=SC2086
+    out="$(CMD_TIMEOUT="$tls_cap" _bounded_in /dev/null openssl s_client -showcerts $st -connect "$dbip:$dbport" 2>&1)"; trc=$?
+    if [ "$trc" -eq 124 ]; then
+        fact "handshake: n/a (timed out: ${tls_cap}s)"
+        return
+    fi
+    if [ -z "$out" ]; then
+        fact "openssl s_client -showcerts ${st:+$st }-connect $dbip:$dbport: n/a (empty output, exit $trc)"
+        return
+    fi
+    # verbatim but for the PEM blocks, which openssl x509 gives below
+    # per chain certificate
+    printf '%s\n' "$out" >"$tls_f" 2>/dev/null
+    local body j same=""
+    # left out as well: the per-connection random values (session
+    # ticket hex dump, Session-ID, Master-Key, Resumption PSK, Start Time)
+    body="$(awk '/-----BEGIN CERTIFICATE-----/ { s = 1 }
+        /^[[:space:]]*(TLS session ticket|Session-ID|Session-ID-ctx|Master-Key|Resumption PSK|Start Time):/ { next }
+        /^[[:space:]]*[0-9a-f][0-9a-f][0-9a-f][0-9a-f] - [0-9a-f][0-9a-f][ -]/ { next }
+        !s { print } /-----END CERTIFICATE-----/ { s = 0 }' "$tls_f")"
+    # an output already printed for an instance above (openssl's
+    # usage text, say) is named instead of printed again
+    j=0
+    while [ "$j" -lt "${#tls_seen_body[@]}" ]; do
+        [ "${tls_seen_body[$j]}" = "$st|$trc|$body" ] && { same="${tls_seen_inst[$j]}"; break; }
+        j=$((j + 1))
+    done
+    if [ -n "$same" ]; then
+        fact "openssl s_client -showcerts ${st:+$st }-connect $dbip:$dbport (exit $trc): the same output as for instance $same above"
+    else
+        tls_seen_body[${#tls_seen_body[@]}]="$st|$trc|$body"; tls_seen_inst[${#tls_seen_inst[@]}]="$idir"
+        _emit_labeled "openssl s_client -showcerts ${st:+$st }-connect $dbip:$dbport (exit $trc, stdout and stderr verbatim, PEM blocks and per-connection random values left out)" "$body"
+    fi
+    rm -f "$tls_f".cert* 2>/dev/null
+    ncert="$(awk -v p="$tls_f.cert" '/-----BEGIN CERTIFICATE-----/ { n++; f = p n } f { print > f } /-----END CERTIFICATE-----/ { close(f); f = "" } END { print n + 0 }' "$tls_f" 2>/dev/null)"
+    k=1
+    while [ "$k" -le "${ncert:-0}" ]; do
+        # shellcheck disable=SC2086
+        xo="$(_bounded openssl x509 -in "$tls_f.cert$k" $X509_OPTS 2>&1)"; xrc=$?
+        if [ "$xrc" -ne 0 ] && [ "$xrc" -ne 124 ]; then
+            # openssl without x509 -ext: every extension, from -text
+            # shellcheck disable=SC2086
+            xo="$(_bounded openssl x509 -in "$tls_f.cert$k" $X509_OPTS_OLD 2>&1)"; xrc=$?
+            _emit_labeled "certificate $k of $ncert (exit $xrc; -ext not accepted, run as: openssl x509 $X509_OPTS_OLD)" "$xo"
+        else
+            _emit_labeled "certificate $k of $ncert (exit $xrc)" "$xo"
+        fi
+        k=$((k + 1))
+    done
+    [ "${ncert:-0}" -eq 0 ] && fact "server certificate: n/a (no certificate in the s_client output)"
 }
 
 # one instance of section L; adds to sql_ok / sql_fail / sql_na of _rep_sql
@@ -2029,12 +2039,9 @@ _rep_sql_inst() {
     # everything the agent itself uses to connect is reused from
     # whatap.conf (rule 2) — only credentials cannot come from it
     # (stored encrypted by uid.sh; this script does not decrypt)
-    conf_get dbms "$cf" dbms
-    conf_get dbip "$cf" db_ip
-    conf_get dbport "$cf" db_port
+    _inst_conf "$idir"; dbms="$I_DBMS"; dbip="$I_IP"; dbport="$I_PORT"; copt="$I_COPT"
     conf_get dbname "$cf" 'db'
     [ -z "$dbname" ] && conf_get dbname "$cf" plan_db
-    conf_get copt "$cf" connect_option
     case "$copt" in ""|\?*) ;; *) copt="?$copt" ;; esac
     subsection "instance: $idir (dbms=${dbms:-unset})"
     pack=""; jar=""; url=""; alturl=""; ping="SELECT 1"

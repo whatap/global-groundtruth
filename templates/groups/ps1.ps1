@@ -19,7 +19,7 @@
 # VERSION and add its CHANGELOG entry, and compare the members' reports before
 # and after (pwsh -NoProfile -File <member> -Stdout, then tools/validate.sh
 # --report). To add a helper: it goes in only when it is byte-identical in
-# every member; one that differs (DumpFile, TcpProbe) stays in its collector.
+# every member; one that differs (DumpFile) stays in its collector.
 #
 # What the blocks rely on the members to define: the -Quiet switch ($Quiet,
 # read by Progress) and $script:PRIV_GAP (set by the member's privilege line in
@@ -588,5 +588,36 @@ function ConfGet([string]$path, [string]$key) {
          Where-Object { $_ -match "^\s*$key\s*=" } | Select-Object -Last 1
     if ($m) { return ($m -split '=', 2)[1].Trim() }
     return $null
+}
+# TcpProbe: one TCP connect, bounded like any other call. It is timed and
+# logged as "tcp-connect", honours RUN_DEADLINE, and a connect that gets no
+# answer is logged as capped: two unanswered probes spent 10 s of a 16 s run
+# outside every other log line (0.4.0, Windows Server 2022 lab host). An
+# endpoint is probed once per run; a second conf naming it gets the first
+# answer (Windows retries a refused connect, about 2 s each).
+$script:TcpSeen = @{}
+function TcpProbe([string]$label, [string]$dsthost, [int]$port, [int]$timeoutSec = 5) {
+    if (-not $dsthost -or -not $port) { Fact "${label}: n/a (not applicable: host/port not set)"; return }
+    $key = "${dsthost}:$port".ToLowerInvariant()
+    if ($script:TcpSeen.ContainsKey($key)) { Fact "${label}: $($script:TcpSeen[$key]) (probed once above)"; return }
+    $req = $timeoutSec
+    try { $timeoutSec = Bounded-Seconds $req } catch { Time-Log 0 "not run" "tcp-connect"; Fact "${label}: tcp connect to ${dsthost}:$port n/a ($($_.Exception.Message))"; return }
+    $sw = [System.Diagnostics.Stopwatch]::StartNew(); $kind = "ran"
+    $c = New-Object System.Net.Sockets.TcpClient
+    try {
+        $t = $c.BeginConnect($dsthost, $port, $null, $null)
+        if (-not $t.AsyncWaitHandle.WaitOne($timeoutSec * 1000)) {
+            $kind = Cap-Kind $timeoutSec $req
+            $r = "tcp connect to ${dsthost}:$port did not connect within ${timeoutSec}s"
+        } else {
+            $c.EndConnect($t)
+            $r = "tcp connect to ${dsthost}:$port succeeded"
+        }
+    } catch {
+        $x = $_.Exception; while ($x.InnerException) { $x = $x.InnerException }
+        $r = "tcp connect to ${dsthost}:$port did not connect ($($x.Message.Split("`n")[0]))"
+    } finally { $c.Close(); Time-Log $sw.ElapsedMilliseconds $kind "tcp-connect" }
+    $script:TcpSeen[$key] = $r
+    Fact "${label}: $r"
 }
 # ---- end ps1: fact helpers
