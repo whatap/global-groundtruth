@@ -5,6 +5,8 @@ first. Every change to the script bumps its `VERSION` and adds one entry at
 the top of this list (docs/authoring-guide.md, step 2); `tools/validate.sh`
 checks that the newest entry is the script's `VERSION`.
 
+- **0.11.7** — The shared main no longer calls _init_probe; _run_init sets
+  _errfile, so the collector's one-line copy is gone. Report unchanged.
 - **0.11.6** — Run helpers (skeleton): `_why_124` and `_out_dir_check` move
   into the skeleton run helpers (the `--out` mkdir now runs under the command
   cap), and `_run_init` sets the probe error file and reads the uid once;

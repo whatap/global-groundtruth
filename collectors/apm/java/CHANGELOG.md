@@ -5,6 +5,15 @@ first. Every change to the script bumps its `VERSION` and adds one entry at
 the top of this list (docs/authoring-guide.md, step 2); `tools/validate.sh`
 checks that the newest entry is the script's `VERSION`.
 
+- **0.15.6** — Section B: a JVM whose exe link is marked (deleted) is listed
+  only, never run with -version, even when the path exists again (a JDK
+  upgraded in place); its VM library comes from the maps, and when that
+  library is deleted too the release file now at its path is not read. One
+  invoked under another name keeps `, invoked as NAME`. The D_JAVA_OTHER
+  header is reworded to hold for every entry. Section G's `weaving list check:
+  n/a` becomes `weaving list: n/a`. The --class-without---library warning
+  comes from run_report, right after the collecting-facts progress line (so
+  not on a --file run stopped by a bad --out).
 - **0.15.5** — Run helpers (skeleton): `_why_124` and `_out_dir_check` move
   into the skeleton run helpers (the `--out` mkdir now runs under the command
   cap), and `_run_init` sets the probe error file and reads the uid once;

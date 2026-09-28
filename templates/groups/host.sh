@@ -21,7 +21,7 @@
 # every member; one that differs stays in its collector.
 #
 # What the blocks rely on the members to define (before any call, at run time):
-#   _errfile (set by the member's _init_probe)
+#   _errfile (set by _run_init)
 # Shell: bash 3.2+ and POSIX sh/dash (nms runs under both).
 # -----------------------------------------------------------------------------
 

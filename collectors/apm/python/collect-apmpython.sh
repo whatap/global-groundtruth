@@ -25,7 +25,7 @@ export LC_ALL=C
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-apmpython"
 # History: CHANGELOG.md (next to this file).
-VERSION="0.11.6"
+VERSION="0.11.7"
 DOMAIN="apm"
 TARGET="host/$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || uname -n 2>/dev/null || echo unknown)"
 
@@ -680,10 +680,7 @@ EOF
 # ---- end collection completeness
 
 # ---- reasoned-absence helpers -------------------------------------------------
-_errfile=""
 CMD_TIMEOUT="${CMD_TIMEOUT:-15}"
-# Call after _run_init: the error file lives in the run's private directory.
-_init_probe() { _errfile="$(_tmp probe.err)"; }
 
 # ---- apm: probe helpers — DO NOT EDIT ---------------------------------------
 # members: apmjava apmnodejs apmphp apmpython
@@ -2541,7 +2538,7 @@ _rep_k8s() {
 # The run itself; the last lines of every member. fd 3 = the terminal, saved
 # before any redirection so progress() reaches the operator even in --file mode
 # (which redirects both stdout and stderr). A member's own option checks that
-# need warn go in its _init_probe, which runs before anything is collected.
+# need warn go at the start of its run_report, before anything is collected.
 exec 3>&2
 
 # No arguments -> print help and stop; a collection needs an explicit action flag.
@@ -2555,7 +2552,6 @@ if [ "$OPT_FILE" = 0 ] && [ "$OPT_STDOUT" = 0 ]; then
 fi
 
 _run_init
-_init_probe
 _out_check || exit 1
 if [ "$OPT_STDOUT" = 1 ]; then
     progress "collecting facts (read-only) -> stdout"

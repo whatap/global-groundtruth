@@ -31,7 +31,7 @@ export LC_ALL=C
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-apmphp"
 # History: CHANGELOG.md (next to this file).
-VERSION="0.8.5"
+VERSION="0.8.6"
 DOMAIN="apm"
 TARGET="host/$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || uname -n 2>/dev/null || echo unknown)"
 
@@ -664,11 +664,11 @@ EOF
 # ---- end collection completeness
 
 # ---- reasoned-absence helpers -------------------------------------------------
-_errfile=""
 _infofile=""
 CMD_TIMEOUT="${CMD_TIMEOUT:-15}"
-# Call after _run_init: the error and php -i files live in the run's private directory.
-_init_probe() { _errfile="$(_tmp probe.err)"; _infofile="$(_tmp probe.info)"; }
+# _init_probe -> the php -i file, in the run's private directory: call it after
+# _run_init, before the first php_info (run_report does, first thing)
+_init_probe() { _infofile="$(_tmp probe.info)"; }
 
 # ---- apm: probe helpers — DO NOT EDIT ---------------------------------------
 # members: apmjava apmnodejs apmphp apmpython
@@ -1736,6 +1736,7 @@ EOF
 
 # ---- report body ---------------------------------------------------------------
 run_report() {
+    _init_probe
     emit_header
 
     goal agent "whatap-php agent installation"
@@ -2380,7 +2381,7 @@ _rep_k8s() {
 # The run itself; the last lines of every member. fd 3 = the terminal, saved
 # before any redirection so progress() reaches the operator even in --file mode
 # (which redirects both stdout and stderr). A member's own option checks that
-# need warn go in its _init_probe, which runs before anything is collected.
+# need warn go at the start of its run_report, before anything is collected.
 exec 3>&2
 
 # No arguments -> print help and stop; a collection needs an explicit action flag.
@@ -2394,7 +2395,6 @@ if [ "$OPT_FILE" = 0 ] && [ "$OPT_STDOUT" = 0 ]; then
 fi
 
 _run_init
-_init_probe
 _out_check || exit 1
 if [ "$OPT_STDOUT" = 1 ]; then
     progress "collecting facts (read-only) -> stdout"

@@ -19,7 +19,7 @@
 # What the blocks rely on the members to define (before any call, at run time):
 #   from the skeleton blocks: fact, _tmp, _bounded, _cmd_kind, _past_deadline,
 #     _nl, CMD_TIMEOUT, RUN_DEADLINE
-#   probe helpers:    _errfile (set by the member's _init_probe)
+#   probe helpers:    _errfile (set by _run_init)
 #   report helpers:   read_proc, probe, _note_privilege, _note_boot and its
 #                     _priv_uid (skeleton); _proc_words,
 #                     _u8cut (text helpers)
@@ -34,7 +34,7 @@
 #   output directory: OPT_OUT, OPT_STDOUT (the CLI harness), warn, _bounded
 #   main:             ARGC, OPT_FILE, OPT_STDOUT, OPT_OUT, COLLECTOR_NAME,
 #                     TARGET (host/<name>, the name of the --file report), usage,
-#                     _init_probe, run_report (the member's), _run_init,
+#                     run_report (the member's), _run_init,
 #                     progress, _report_to_file (skeleton), _out_check (above).
 #                     It is each member's last block (`# place: end`): nothing
 #                     may follow it.
@@ -669,7 +669,7 @@ _out_check() {
 # The run itself; the last lines of every member. fd 3 = the terminal, saved
 # before any redirection so progress() reaches the operator even in --file mode
 # (which redirects both stdout and stderr). A member's own option checks that
-# need warn go in its _init_probe, which runs before anything is collected.
+# need warn go at the start of its run_report, before anything is collected.
 exec 3>&2
 
 # No arguments -> print help and stop; a collection needs an explicit action flag.
@@ -683,7 +683,6 @@ if [ "$OPT_FILE" = 0 ] && [ "$OPT_STDOUT" = 0 ]; then
 fi
 
 _run_init
-_init_probe
 _out_check || exit 1
 if [ "$OPT_STDOUT" = 1 ]; then
     progress "collecting facts (read-only) -> stdout"

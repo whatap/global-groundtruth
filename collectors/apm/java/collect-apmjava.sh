@@ -32,7 +32,7 @@ export LC_ALL=C
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-apmjava"
 # History: CHANGELOG.md (next to this file).
-VERSION="0.15.5"
+VERSION="0.15.6"
 DOMAIN="apm"
 TARGET="host/$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || uname -n 2>/dev/null || echo unknown)"
 
@@ -754,14 +754,11 @@ EOF
 # ---- end collection completeness
 
 # ---- reasoned-absence helpers -------------------------------------------------
-_errfile=""
 CMD_TIMEOUT="${CMD_TIMEOUT:-15}"
-# Call after _run_init: the error file lives in the run's private directory.
-# _init_probe -> the probe error file, and the option checks that need warn
-# (the shared main calls it before anything is collected): a combination that
-# collects nothing is named, not silently ignored
+# _init_probe -> the option checks that need warn (run_report calls it first,
+# before anything is collected): a combination that collects nothing is named,
+# not silently ignored
 _init_probe() {
-    _errfile="$(_tmp probe.err)"
     [ -n "$OPT_CLASSES" ] && [ -z "$OPT_LIBS" ] && [ "$OPT_LIBALL" = 0 ] \
         && warn "--class is not used without --library: member signatures are read from the jars --library details (--library '*' for every jar)"
     return 0
@@ -1994,16 +1991,15 @@ _add_jar() {  # _add_jar PATH PID SOURCE
 # resolves to are named java: a symlink named vshell that points at java is a
 # program invoked as vshell, and a binary named java that resolves to
 # something else is not a JDK launcher. Any other binary (jsvc, a native
-# launcher that embeds the VM), and one this run cannot execute (deleted
-# since the JVM started, or not executable by this uid), is recorded with its
-# VM library and never executed. Dedup key: the resolved target.
+# launcher that embeds the VM), and one this run cannot execute (gone, or not
+# executable by this uid), is recorded with its VM library and never executed. Dedup key: the resolved target.
 _add_java() {
     local p="$1" lib="$2" pid="$3" k
     k="$(readlink -f "$p" 2>/dev/null || echo "$p")"
     case "$D_JAVA_KEYS" in *"|$k|"*) return ;; esac
     D_JAVA_KEYS="$D_JAVA_KEYS|$k|"
     if [ ! -x "$p" ]; then
-        D_JAVA_OTHER="$D_JAVA_OTHER$_nl$p|binary of pid $pid, binary deleted or not executable|$lib|$pid"
+        D_JAVA_OTHER="$D_JAVA_OTHER$_nl$p|binary of pid $pid, binary deleted or not executable|${lib:-$(_jvm_maps_lib "$pid")}|$pid"
     elif _is_java_launcher "$k" && _is_java_launcher "$p"; then
         D_JAVA_EXES="$D_JAVA_EXES$_nl$p"
     else
@@ -2216,21 +2212,33 @@ _disc_jcmd() {
 # _disc_binaries -> the binary of every JVM into D_JAVA_* (discover); only a
 # java launcher is ever executed
 _disc_binaries() {
-    local pid exe a lib
+    local pid exe a lib del
     for pid in $D_JVM_PIDS; do
         exe="$(_link_text "/proc/$pid/exe")"
         if [ -z "$exe" ]; then
             [ -e "/proc/$pid" ] && D_JAVA_NOEXE="$D_JAVA_NOEXE $pid"
             continue
         fi
-        exe="${exe% (deleted)}"
+        # " (deleted)": the file the JVM runs is gone, even when the same path
+        # exists again (a JDK upgraded in place): that new binary's -version is
+        # not this JVM's, so it is listed with the reason and never run
+        del=""
+        case "$exe" in *" (deleted)") exe="${exe% (deleted)}"; del=1 ;; esac
         # only a confirmed JVM's binary is a Java runtime
         if ! _jvm_confirmed "$pid"; then
             D_JAVA_UNCONF="$D_JAVA_UNCONF$_nl$exe|binary of pid $pid"
             continue
         fi
         if [ "$(_ns_of "$pid")" = other ]; then
-            D_JAVA_OTHER="$D_JAVA_OTHER$_nl$exe|binary of pid $pid, under another root or mount namespace|$(_jvm_maps_lib "$pid")|$pid"
+            D_JAVA_OTHER="$D_JAVA_OTHER$_nl$exe|binary of pid $pid, under another root or mount namespace${del:+, binary deleted}|$(_jvm_maps_lib "$pid")|$pid"
+            continue
+        fi
+        if [ -n "$del" ]; then
+            case "$D_JAVA_KEYS" in *"|deleted:$exe|"*) continue ;; esac
+            D_JAVA_KEYS="$D_JAVA_KEYS|deleted:$exe|"
+            a="$(_proc_lines "/proc/$pid/cmdline" | head -n 1)"
+            if [ -n "$a" ] && ! _is_java_launcher "$a" && _is_java_launcher "$exe"; then a=", invoked as $a"; else a=""; fi
+            D_JAVA_OTHER="$D_JAVA_OTHER$_nl$exe|binary of pid $pid, binary deleted or not executable$a|$(_jvm_maps_lib "$pid")|$pid"
             continue
         fi
         lib=""
@@ -2642,11 +2650,15 @@ EOF
     done
     [ -n "$D_JAVA_NOEXE" ] && [ -z "$D_JAVA_EXES$D_JAVA_OTHER" ] && [ "$_a0res" != 1 ] && _shell_java
     if [ -n "$D_JAVA_OTHER" ]; then
-        fact "JVM binaries not run with -version (the name found or the file it resolves to is not java; listed only):"
+        fact "JVM binaries not run with -version (listed only; the reason is on each line):"
         printf '%s\n' "$D_JAVA_OTHER" | head -n 12 | while IFS='|' read -r _p _s _lib _opid; do
             [ -n "$_p" ] || continue
             printf '        -- %s   <- %s\n' "$_p" "$_s"
-            if [ -n "$_lib" ]; then
+            if [ -n "$_lib" ] && grep -qF "$_lib (deleted)" "/proc/$_opid/maps" 2>/dev/null; then
+                # the file now at that path, if any, is another runtime's
+                printf '           VM library mapped: %s (deleted)\n' "$_lib"
+                printf '           release file: not read (the VM library is deleted: what is at its path now is not this JVM'"'"'s runtime)\n'
+            elif [ -n "$_lib" ]; then
                 printf '           VM library mapped: %s\n' "$_lib"
                 # the release file of the runtime that library belongs to,
                 # looked for in the four directories above it, as the JVM
@@ -3708,7 +3720,7 @@ _rep_weaving() {
     # the weaving keys of each attached JVM: its config file is dumped verbatim
     # in section E, the modules its jar bundles are listed above
     if [ "${_nm:-0}" -eq 0 ]; then
-        fact "weaving list check: n/a (no JVM carrying a WhaTap attach marker)"
+        fact "weaving list: n/a (no JVM carrying a WhaTap attach marker)"
     fi
     for pid in $D_MARKED; do _weav_list "$pid"; done
     _weav_logs
@@ -4333,6 +4345,7 @@ _rep_goals() {
 }
 
 run_report() {
+    _init_probe
     emit_header
 
     # Without an agent on disk and a config to read, nothing downstream can be
@@ -4381,7 +4394,7 @@ run_report() {
 # The run itself; the last lines of every member. fd 3 = the terminal, saved
 # before any redirection so progress() reaches the operator even in --file mode
 # (which redirects both stdout and stderr). A member's own option checks that
-# need warn go in its _init_probe, which runs before anything is collected.
+# need warn go at the start of its run_report, before anything is collected.
 exec 3>&2
 
 # No arguments -> print help and stop; a collection needs an explicit action flag.
@@ -4395,7 +4408,6 @@ if [ "$OPT_FILE" = 0 ] && [ "$OPT_STDOUT" = 0 ]; then
 fi
 
 _run_init
-_init_probe
 _out_check || exit 1
 if [ "$OPT_STDOUT" = 1 ]; then
     progress "collecting facts (read-only) -> stdout"
