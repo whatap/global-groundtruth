@@ -776,6 +776,28 @@ _sock_list() {
     awk -v p="$pat" -v n="${4:-whatap}" '(NR <= 2 && /State|Proto|Recv-Q/) || $0 ~ n || $0 ~ p' "$(_tmp sock.out)" 2>/dev/null | head -n 50
     return "$rc"
 }
+
+# _entry_line PATH -> one `ls -l`-like line with the full mtime: stat -c where
+# it answers, else `ls -l` (minute precision)
+_entry_line() {
+    if have stat && stat -c '%A %h %U %G %s %y %N' -- "$1" 2>/dev/null; then return 0; fi
+    _head_of 1 ls -l -- "$1"
+}
+
+# _pid_file_fact LABEL FILE -> the entry line of the agent pid file FILE, the
+# pid it holds, and whether that process exists here (its comm, state and
+# ppid); an unreadable FILE is said to be one, not taken for an empty one
+_pid_file_fact() {
+    local v
+    probe "$1 entry" _entry_line "$2"
+    [ -r "$2" ] || { fact "$1: n/a (permission denied: $2)"; return; }
+    v="$(cat "$2" 2>/dev/null | tr -d ' \n')"
+    if [ -n "$v" ] && [ -d "/proc/$v" ]; then
+        fact "$1: $v (process exists; comm: $(_comm "$v"); state: $(awk '/^State:/{print $2" "$3}' "/proc/$v/status" 2>/dev/null); ppid: $(awk '/^PPid:/{print $2}' "/proc/$v/status" 2>/dev/null))"
+    else
+        fact "$1: ${v:-empty} (no process with this pid in this pid namespace)"
+    fi
+}
 # ---- end apm: file helpers
 
 # ndprobe "label" NODE_EXE [ARGS...] -> run the node binary under _bounded.
@@ -797,9 +819,10 @@ pkg_json_field() {
 # _cli_pkg_version NAME -> sets _pv to the "version" and _pj to the path of the
 # package.json of the npm package NAME whose entry script `command -v NAME`
 # resolves to (npm -> .../npm/bin/npm-cli.js, pm2 -> .../pm2/bin/pm2), read as
-# text: `NAME --version` starts node to print the same field. Looks at most
-# three directories up from the entry script and takes the first package.json
-# whose top-level "name" is NAME. Fails, with both empty, when none is readable.
+# text (_pkg_top_field): `NAME --version` starts node to print the same field.
+# Looks at most three directories up from the entry script and takes the first
+# package.json whose top-level "name" is NAME and whose top-level "version" is
+# a string. Fails, with both empty, when none is.
 _cli_pkg_version() {
     local d i=0 v
     _pv="" _pj=""
@@ -808,17 +831,9 @@ _cli_pkg_version() {
     d="$(readlink -f "$d" 2>/dev/null)" || return 1
     d="${d%/*}"
     while [ "$i" -lt 3 ] && [ -n "$d" ]; do
-        if [ -r "$d/package.json" ]; then
-            # top-level keys: the indent of the first key line; nested ones are deeper
-            v="$(_N="$1" awk 'BEGIN { n = "\"" ENVIRON["_N"] "\"" }
-                !got && match($0, /^[ \t]*"/) { ind = substr($0, 1, RLENGTH - 1); got = 1 }
-                got && substr($0, 1, length(ind) + 1) == ind "\"" {
-                    k = substr($0, length(ind) + 1)
-                    if (k ~ /^"name"[ \t]*:/)    { sub(/^"name"[ \t]*:[ \t]*/, "", k); nm = (index(k, n) == 1) }
-                    if (k ~ /^"version"[ \t]*:/ && ver == "") { sub(/^"version"[ \t]*:[ \t]*"/, "", k); sub(/".*/, "", k); ver = k }
-                }
-                END { if (nm && ver != "") print ver }' "$d/package.json" 2>/dev/null)"
-            [ -n "$v" ] && { _pv="$v" _pj="$d/package.json"; return 0; }
+        if [ -r "$d/package.json" ] && [ "$(_pkg_top_field "$d/package.json" name)" = "S$1" ]; then
+            v="$(_pkg_top_field "$d/package.json" version)"
+            case "$v" in S?*) _pv="${v#S}" _pj="$d/package.json"; return 0 ;; esac
         fi
         d="${d%/*}"; i=$((i + 1))
     done
@@ -842,20 +857,18 @@ PKG_WALK_MAX=32
 PKG_NODE_PATH_MAX=50
 PKG_JSON_BYTES=262144   # bytes of each package.json the version awk reads
 
-# _pkg_ver_line NAME PATH [NOTE] -> "NAME: <version> (PATH[, NOTE])". The value
-# is the top-level "version" of the package.json at PATH, read as text by one
-# awk that tracks brace depth and skips string contents (a nested "version",
-# as in scripts or publishConfig, is not taken; the last top-level one is, as
-# JSON.parse does). A non-string value is printed raw with that said. Only the
+# _pkg_top_field PATH KEY -> the top-level KEY of the package.json at PATH,
+# read as text by one awk that tracks brace depth and skips string contents (a
+# nested "version", as in scripts or publishConfig, is not taken; the last
+# top-level one is, as JSON.parse does): "S<value>" for a string (its first 80
+# bytes), "R<raw>" for any other value, nothing when there is none. Only the
 # first PKG_JSON_BYTES bytes are read (busybox awk took minutes on a 1 MB
-# single-line file); a file cut there says so when no version was found in it.
-# fold keeps each awk record at 512 bytes and a string keeps its first 256
-# bytes (both were quadratic in busybox awk on long lines); the parse state
-# carries across records, and a token ends only at a delimiter or at EOF.
-_pkg_ver_line() {
-    local v _t
-    if [ ! -r "$2" ]; then printf '           %s: n/a (permission denied: %s%s)\n' "$1" "$2" "${3:+; $3}"; return; fi
-    v="$(head -c "$PKG_JSON_BYTES" "$2" 2>/dev/null | fold -b -w 512 | awk '
+# single-line file). fold keeps each awk record at 512 bytes and a string
+# keeps its first 256 bytes (both were quadratic in busybox awk on long lines);
+# the parse state carries across records, and a token ends only at a
+# delimiter or at EOF.
+_pkg_top_field() {
+    head -c "$PKG_JSON_BYTES" "$1" 2>/dev/null | fold -b -w 512 | awk -v key="$2" '
         # a key written with \u00XX escapes (ver\u0073ion) is compared decoded
         function un(x,  o, i) {
             o = ""
@@ -882,13 +895,23 @@ _pkg_ver_line() {
             if (c == "{" || c == "[") { if (d == 1 && w) { r = "R" c; w = 0 } d++; continue }
             if (c == "}" || c == "]") { d--; continue }
             if (d != 1) continue
-            if (c == ":") { ac = 1; w = (k == "version" || (index(k, "\\u") && un(k) == "version")); continue }
+            if (c == ":") { ac = 1; w = (k == key || (index(k, "\\u") && un(k) == key)); continue }
             if (c == ",") { ac = 0; w = 0; k = ""; continue }
             if (w && c != " " && c != "\t" && c != "\r") tok = tok c
           }
         }
         END { if (tok != "") r = "R" tok
-              print substr(r, 1, 81) }' 2>/dev/null)"
+              print substr(r, 1, 81) }' 2>/dev/null
+}
+
+# _pkg_ver_line NAME PATH [NOTE] -> "NAME: <version> (PATH[, NOTE])", the
+# top-level "version" of the package.json at PATH (_pkg_top_field). A
+# non-string value is printed raw with that said; a file cut at
+# PKG_JSON_BYTES says so when no version was found in what was read.
+_pkg_ver_line() {
+    local v _t
+    if [ ! -r "$2" ]; then printf '           %s: n/a (permission denied: %s%s)\n' "$1" "$2" "${3:+; $3}"; return; fi
+    v="$(_pkg_top_field "$2" version)"
     case "$v" in
         S?*) printf '           %s: %s (%s%s)\n' "$1" "${v#S}" "$2" "${3:+, $3}" ;;
         R?*) printf '           %s: n/a (top-level "version" is not a string: %s; %s%s)\n' "$1" "${v#R}" "$2" "${3:+, $3}" ;;
@@ -918,14 +941,15 @@ _pkg_versions() {
         return
     fi
     eval "np=\${_np_$pid:-}"
-    # entries past the cap: counted once per process, never visited
-    more=0
-    if [ -n "$np" ]; then
-        _o="$IFS"; IFS=":$_nl$_cr"; set -f; j=0
-        for e in $np; do [ -n "$e" ] && j=$((j + 1)); done
-        set +f; IFS="$_o"
-        [ "$j" -gt "$PKG_NODE_PATH_MAX" ] && more=$((j - PKG_NODE_PATH_MAX))
-    fi
+    # NODE_PATH split once (pid and cwd are copied above); the entries past
+    # the cap are counted, never visited
+    _o="$IFS"; IFS=":$_nl$_cr"; set -f
+    # shellcheck disable=SC2086  # split on ':' by design
+    set -- $np
+    set +f; IFS="$_o"
+    more=0 j=0
+    for e in "$@"; do [ -n "$e" ] && j=$((j + 1)); done
+    [ "$j" -gt "$PKG_NODE_PATH_MAX" ] && more=$((j - PKG_NODE_PATH_MAX))
     printf '           installed packages (package.json "version"; <dir>/node_modules from cwd up to %s dirs, then NODE_PATH%s):\n' \
         "$PKG_WALK_MAX" "${pre:+; read through $pre}"
     for name in $PKG_VERSION_NAMES; do
@@ -945,19 +969,16 @@ _pkg_versions() {
             d="${d%/*}"; [ -n "$d" ] || d=/
         done
         [ -n "$found" ] && continue
-        if [ -n "$np" ]; then
-            _o="$IFS"; IFS=":$_nl$_cr"; set -f; j=0
-            for e in $np; do
-                [ -n "$e" ] || continue
-                j=$((j + 1))
-                [ "$j" -gt "$PKG_NODE_PATH_MAX" ] && break
-                case "$e" in /*) ;; *) e="${cwd%/}/${e#./}" ;; esac
-                c="${e%/}/$name/package.json"
-                if [ -e "$pre$c" ]; then _pkg_ver_line "$name" "$pre$c" "via NODE_PATH${den:+; $den}"; found=1; break; fi
-                if [ -d "$pre$e" ] && [ ! -x "$pre$e" ]; then den="${den:+$den; }permission denied: $pre$e"; fi
-            done
-            set +f; IFS="$_o"
-        fi
+        j=0
+        for e in "$@"; do
+            [ -n "$e" ] || continue
+            j=$((j + 1))
+            [ "$j" -gt "$PKG_NODE_PATH_MAX" ] && break
+            case "$e" in /*) ;; *) e="${cwd%/}/${e#./}" ;; esac
+            c="${e%/}/$name/package.json"
+            if [ -e "$pre$c" ]; then _pkg_ver_line "$name" "$pre$c" "via NODE_PATH${den:+; $den}"; found=1; break; fi
+            if [ -d "$pre$e" ] && [ ! -x "$pre$e" ]; then den="${den:+$den; }permission denied: $pre$e"; fi
+        done
         [ -n "$found" ] && continue
         [ "$more" -gt 0 ] && den="${den:+$den; }$more more NODE_PATH entries not visited (cap: $PKG_NODE_PATH_MAX)"
         if [ "$d" != / ]; then
@@ -1043,6 +1064,16 @@ _proc_table() {
                            while ((f | getline l) > 0) r = r (k++ ? " " : "") l
                            close(f); gsub(/\r/, " ", r); sub(/ \(deleted\)$/, "", r); e[p] = r }
                 print p "\037" c[p] "\037" e[p] "\037" a0[p] "\037" cl[p] } }'
+}
+
+# _note_hidepid -> sets D_HIDEPID when /proc is mounted with hidepid and this
+# uid is not root: the scan then cannot see other users' processes
+_note_hidepid() {
+    case "$(id -u 2>/dev/null)" in
+        0) ;;
+        *) grep -qE '^[^ ]+ /proc proc [^ ]*hidepid=([12]|invisible|noaccess)' /proc/mounts 2>/dev/null \
+               && D_HIDEPID="hidepid is set on /proc: other users' processes are not listed to uid $(id -u 2>/dev/null)" ;;
+    esac
 }
 # ---- end apm: process table
 
@@ -1273,6 +1304,34 @@ _scan_gaps() {
     [ -n "$D_HIDEPID" ] && g="${g:+$g; }$D_HIDEPID"
     printf '%s' "$g"
 }
+
+# _go_homes COMM -> the home candidates of the Go agent processes (D_GO_PIDS,
+# named COMM): each one's cwd, and the WHATAP_HOME in its environ; a live pid
+# whose cwd this uid cannot read goes to D_UNREAD
+_go_homes() {
+    local _gp _gc
+    for _gp in $D_GO_PIDS; do
+        _gc="$(readlink -f "/proc/$_gp/cwd" 2>/dev/null)"
+        if [ -n "$_gc" ]; then _add_home "$_gc" "cwd of $1 pid $_gp"
+        elif [ -e "/proc/$_gp" ]; then D_UNREAD="$D_UNREAD $_gp"; fi
+        if _read_proc_env "$_gp"; then
+            _env_pick WHATAP_HOME
+            [ -n "$_ev_WHATAP_HOME" ] && _home_from_pid "$_gp" "$_ev_WHATAP_HOME" "environ of $1 pid $_gp"
+        fi
+    done
+}
+
+# _agent_path_env NAME -> the collector shell's NAME (the operator's
+# WHATAP_<LANG>_AGENT_PATH) and the type of the file it names
+_agent_path_env() {
+    local v
+    eval "v=\${$1:-}"
+    if [ -z "$v" ]; then fact "env $1: not set (collector shell)"; return; fi
+    fact "env $1: $v"
+    if [ -L "$v" ]; then fact "$1 file type: symlink -> $(readlink -f "$v" 2>/dev/null)"
+    elif [ -e "$v" ]; then fact "$1 file type: regular file"
+    else fact "$1 file type: n/a (path not found)"; fi
+}
 # ---- end apm: environ readers
 
 # _np_PID: the NODE_PATH of a node PID ("" when unset or its environ was not
@@ -1303,11 +1362,7 @@ discover() {
     local pid comm exe a0 cmd cwd v _nd _mk _am="" _ar="" _ndm="" _ndr="" _d
     _env=""
 
-    case "$(id -u 2>/dev/null)" in
-        0) ;;
-        *) grep -qE '^[^ ]+ /proc proc [^ ]*hidepid=([12]|invisible|noaccess)' /proc/mounts 2>/dev/null \
-               && D_HIDEPID="hidepid is set on /proc: other users' processes are not listed to uid $(id -u 2>/dev/null)" ;;
-    esac
+    _note_hidepid
 
     # Process scan. node processes may not be named "node": pm2 and
     # next-server rename the process title, so comm, argv0 and the resolved
@@ -1351,8 +1406,7 @@ discover() {
         if _is_odd "$cwd"; then _add_home "$cwd" "cwd of node pid $pid"; eval "_cwodd_$pid=1"; cwd=""
         elif [ -z "$cwd" ] && [ -e "/proc/$pid" ]; then D_UNREAD="$D_UNREAD $pid"; fi
         eval "_cw_$pid=\$cwd"
-        if [ -z "$cwd" ]; then :
-        elif _app_root_markers "$cwd"; then
+        if [ -n "$cwd" ] && _app_root_markers "$cwd"; then
             _add_home "$cwd" "cwd of node pid $pid (whatap artifacts present)"
             _mk=1
         fi
@@ -1383,7 +1437,7 @@ EOF
 
 # _disc_homes -> the agent home candidates
 _disc_homes() {
-    local pid cwd v _l _r
+    local v _l _r
     [ -n "${WHATAP_HOME:-}" ] && _home_from_self "$WHATAP_HOME" WHATAP_HOME
     [ -n "${WHATAP_CONF_DIR:-}" ] && _home_from_self "$WHATAP_CONF_DIR" WHATAP_CONF_DIR
     [ -n "${WHATAP_CONF:-}" ] && _add_conf_name "$WHATAP_CONF"
@@ -1394,15 +1448,7 @@ _disc_homes() {
             [ -n "$v" ] && _add_home "$v" "port registry $D_LOCK_FILE"
         done < "$D_LOCK_FILE"
     fi
-    for pid in $D_GO_PIDS; do
-        cwd="$(readlink -f "/proc/$pid/cwd" 2>/dev/null)"
-        if [ -n "$cwd" ]; then _add_home "$cwd" "cwd of whatap_nodejs pid $pid"
-        elif [ -e "/proc/$pid" ]; then D_UNREAD="$D_UNREAD $pid"; fi
-        if _read_proc_env "$pid"; then
-            _env_pick WHATAP_HOME
-            [ -n "$_ev_WHATAP_HOME" ] && _home_from_pid "$pid" "$_ev_WHATAP_HOME" "environ of whatap_nodejs pid $pid"
-        fi
-    done
+    _go_homes whatap_nodejs
     D_UNREAD="$(printf '%s\n' $D_UNREAD | sort -un | tr '\n' ' ' | sed 's/ $//')"
     # operator auto-injection default mount (apm-init-nodejs seeds it)
     [ -d /whatap-agent ] && _add_home "/whatap-agent" "operator injection volume /whatap-agent"
@@ -1829,7 +1875,7 @@ EOF
             [ "$fsd" != "$d" ] && printf '           filesystem view: %s (read through a process root)\n' "$fsd"
             pj="$fsd/package.json"
             if [ -r "$pj" ]; then
-                printf '           %s\n' "$(pkg_json_field version "$pj")"
+                _pkg_ver_line version "$pj"
                 printf '           %s\n' "$(pkg_json_field releaseDate "$pj")"
                 printf '           engines: %s\n' "$(grep -A2 -m1 '"engines"' "$pj" 2>/dev/null | grep '"node"' | sed 's/^[[:space:]]*//; s/,[[:space:]]*$//')"
             else
@@ -1838,7 +1884,7 @@ EOF
             # build id of the bundled master agent binaries (2.x line only)
             if [ -r "$fsd/build.txt" ]; then
                 printf '           build.txt (first 4 lines):\n'
-                head -n 4 "$fsd/build.txt" 2>/dev/null | cut -c1-160 | _indent '             '
+                head -n 4 "$fsd/build.txt" 2>/dev/null | _u8cut 160 | _indent '             '
             fi
             if [ -d "$fsd/agent" ]; then
                 printf '           bundled master agent binaries (agent/):\n'
@@ -1972,12 +2018,7 @@ _rep_homes() {
             for pf in "$fshome"/agent-*.pid "$fshome/whatap_nodejs.pid" "$fshome/whatap_nodejs.pid.llm"; do
                 [ -f "$pf" ] || continue
                 _pidseen=1
-                _pid="$(cat "$pf" 2>/dev/null | tr -d ' \n')"
-                if [ -n "$_pid" ] && [ -d "/proc/$_pid" ]; then
-                    fact "   $(basename "$pf"): $_pid (process exists; comm: $(_comm "$_pid"))"
-                else
-                    fact "   $(basename "$pf"): ${_pid:-empty} (no process with this pid in this pid namespace)"
-                fi
+                _pid_file_fact "   $(basename "$pf")" "$pf"
             done
             [ "$_pidseen" = 0 ] && fact "   pid files (agent-*.pid, whatap_nodejs.pid*): none present"
             # startup lock files (held for seconds during agent start)
@@ -1992,7 +2033,7 @@ _rep_homes() {
                 [ "$_pp" -gt 20 ] && { fact "   more whatap_port_* files not detailed (cap: 20)"; break; }
                 _owner="${pf##*whatap_port_}"
                 if [ -d "/proc/$_owner" ]; then _alive="process exists"; else _alive="no such process"; fi
-                fact "   $(basename "$pf"): $(head -n1 "$pf" 2>/dev/null | cut -c1-80) ($_alive)"
+                fact "   $(basename "$pf"): $(head -n1 "$pf" 2>/dev/null | _u8cut 80) ($_alive)"
             done
             [ "$_pp" = 0 ] && fact "   whatap_port_<pid> files: none present"
             [ -d "$fshome/run" ] && fact "   run dir: present" || fact "   run dir: absent"
@@ -2173,18 +2214,7 @@ _rep_k8s() {
     else
         fact "/whatap-agent: n/a (path not found: /whatap-agent)"
     fi
-    if [ -n "${WHATAP_NODEJS_AGENT_PATH:-}" ]; then
-        fact "env WHATAP_NODEJS_AGENT_PATH: $WHATAP_NODEJS_AGENT_PATH"
-        if [ -L "$WHATAP_NODEJS_AGENT_PATH" ]; then
-            fact "WHATAP_NODEJS_AGENT_PATH file type: symlink -> $(readlink -f "$WHATAP_NODEJS_AGENT_PATH" 2>/dev/null)"
-        elif [ -e "$WHATAP_NODEJS_AGENT_PATH" ]; then
-            fact "WHATAP_NODEJS_AGENT_PATH file type: regular file"
-        else
-            fact "WHATAP_NODEJS_AGENT_PATH file type: n/a (path not found)"
-        fi
-    else
-        fact "env WHATAP_NODEJS_AGENT_PATH: not set (collector shell)"
-    fi
+    _agent_path_env WHATAP_NODEJS_AGENT_PATH
     for v in POD_NAME NODE_NAME NODE_IP WHATAP_OKIND WHATAP_ONODE WHATAP_MICRO_ENABLED WHATAP_LICENSE WHATAP_HOST WHATAP_PORT APP_NAME APP_PROCESS_NAME; do
         eval "_val=\${$v:-}"
         [ -n "$_val" ] && fact "env $v: $_val"

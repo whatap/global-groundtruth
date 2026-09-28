@@ -785,6 +785,28 @@ _sock_list() {
     awk -v p="$pat" -v n="${4:-whatap}" '(NR <= 2 && /State|Proto|Recv-Q/) || $0 ~ n || $0 ~ p' "$(_tmp sock.out)" 2>/dev/null | head -n 50
     return "$rc"
 }
+
+# _entry_line PATH -> one `ls -l`-like line with the full mtime: stat -c where
+# it answers, else `ls -l` (minute precision)
+_entry_line() {
+    if have stat && stat -c '%A %h %U %G %s %y %N' -- "$1" 2>/dev/null; then return 0; fi
+    _head_of 1 ls -l -- "$1"
+}
+
+# _pid_file_fact LABEL FILE -> the entry line of the agent pid file FILE, the
+# pid it holds, and whether that process exists here (its comm, state and
+# ppid); an unreadable FILE is said to be one, not taken for an empty one
+_pid_file_fact() {
+    local v
+    probe "$1 entry" _entry_line "$2"
+    [ -r "$2" ] || { fact "$1: n/a (permission denied: $2)"; return; }
+    v="$(cat "$2" 2>/dev/null | tr -d ' \n')"
+    if [ -n "$v" ] && [ -d "/proc/$v" ]; then
+        fact "$1: $v (process exists; comm: $(_comm "$v"); state: $(awk '/^State:/{print $2" "$3}' "/proc/$v/status" 2>/dev/null); ppid: $(awk '/^PPid:/{print $2}' "/proc/$v/status" 2>/dev/null))"
+    else
+        fact "$1: ${v:-empty} (no process with this pid in this pid namespace)"
+    fi
+}
 # ---- end apm: file helpers
 
 # _err_tail -> the last line of stdin; over 140 bytes, its first 60 and last 77
@@ -1200,13 +1222,24 @@ _proc_table() {
                            close(f); gsub(/\r/, " ", r); sub(/ \(deleted\)$/, "", r); e[p] = r }
                 print p "\037" c[p] "\037" e[p] "\037" a0[p] "\037" cl[p] } }'
 }
+
+# _note_hidepid -> sets D_HIDEPID when /proc is mounted with hidepid and this
+# uid is not root: the scan then cannot see other users' processes
+_note_hidepid() {
+    case "$(id -u 2>/dev/null)" in
+        0) ;;
+        *) grep -qE '^[^ ]+ /proc proc [^ ]*hidepid=([12]|invisible|noaccess)' /proc/mounts 2>/dev/null \
+               && D_HIDEPID="hidepid is set on /proc: other users' processes are not listed to uid $(id -u 2>/dev/null)" ;;
+    esac
+}
 # ---- end apm: process table
 
 # ---- discovery (internal; emits nothing) --------------------------------------
 # Populates:
 #   D_PY_EXES   distinct python interpreter paths, newline-joined; those of
 #               whatap-marked processes first (PATH + running processes)
-#   D_GO_PIDS   pids of the Go common module (comm: whatap_python)
+#   D_GO_PIDS   pids of the live Go common module processes (comm:
+#               whatap_python), from _go_rows; D_GO_RC is that read's status
 #   D_APP_PIDS  pids of python processes, whatap-marked first
 #   D_HOMES     distinct WHATAP_HOME candidates with their discovery source
 #   D_UNREAD    pids of candidate processes whose environ or cwd this uid could
@@ -1216,7 +1249,7 @@ _proc_table() {
 #               the host (a stock distro runs root python daemons)
 #   D_HIDEPID   non-empty when /proc hides other users' processes from this uid
 D_PY_EXES=""
-D_GO_PIDS=""
+D_GO_PIDS="" D_GO_RC=0
 D_APP_PIDS=""
 D_ODOO_PIDS=""      # odoo processes (setproctitle may rename comm to odoo*)
 D_HOMES=""          # newline-joined "path|source" records
@@ -1431,6 +1464,34 @@ _scan_gaps() {
     [ -n "$D_HIDEPID" ] && g="${g:+$g; }$D_HIDEPID"
     printf '%s' "$g"
 }
+
+# _go_homes COMM -> the home candidates of the Go agent processes (D_GO_PIDS,
+# named COMM): each one's cwd, and the WHATAP_HOME in its environ; a live pid
+# whose cwd this uid cannot read goes to D_UNREAD
+_go_homes() {
+    local _gp _gc
+    for _gp in $D_GO_PIDS; do
+        _gc="$(readlink -f "/proc/$_gp/cwd" 2>/dev/null)"
+        if [ -n "$_gc" ]; then _add_home "$_gc" "cwd of $1 pid $_gp"
+        elif [ -e "/proc/$_gp" ]; then D_UNREAD="$D_UNREAD $_gp"; fi
+        if _read_proc_env "$_gp"; then
+            _env_pick WHATAP_HOME
+            [ -n "$_ev_WHATAP_HOME" ] && _home_from_pid "$_gp" "$_ev_WHATAP_HOME" "environ of $1 pid $_gp"
+        fi
+    done
+}
+
+# _agent_path_env NAME -> the collector shell's NAME (the operator's
+# WHATAP_<LANG>_AGENT_PATH) and the type of the file it names
+_agent_path_env() {
+    local v
+    eval "v=\${$1:-}"
+    if [ -z "$v" ]; then fact "env $1: not set (collector shell)"; return; fi
+    fact "env $1: $v"
+    if [ -L "$v" ]; then fact "$1 file type: symlink -> $(readlink -f "$v" 2>/dev/null)"
+    elif [ -e "$v" ]; then fact "$1 file type: regular file"
+    else fact "$1 file type: n/a (path not found)"; fi
+}
 # ---- end apm: environ readers
 
 discover() {
@@ -1439,11 +1500,7 @@ discover() {
     local c p pid comm exe a0 cmd cwd envh _b _py _mk _pym="" _pyr="" _am="" _ar="" _unmk="" _d _o
     _env=""
 
-    case "$(id -u 2>/dev/null)" in
-        0) ;;
-        *) grep -qE '^[^ ]+ /proc proc [^ ]*hidepid=([12]|invisible|noaccess)' /proc/mounts 2>/dev/null \
-               && D_HIDEPID="hidepid is set on /proc: other users' processes are not listed to uid $(id -u 2>/dev/null)" ;;
-    esac
+    _note_hidepid
 
     # Process scan: matched by comm, argv0, or /proc/<pid>/exe. comm alone
     # misses a shebang-started app (gunicorn, celery, odoo-bin: the kernel
@@ -1454,7 +1511,7 @@ discover() {
     while IFS="$_us" read -r pid comm exe a0 cmd; do
         [ -n "$pid" ] || continue
         [ "$pid" = "$$" ] && continue
-        case "$comm" in whatap_python*) D_GO_PIDS="$D_GO_PIDS $pid"; continue ;; esac
+        case "$comm" in whatap_python*) continue ;; esac   # _disc_go
         _py=0
         case "$comm" in python*) _py=1 ;; esac
         _is_py "${a0##*/}" && _py=1
@@ -1522,13 +1579,28 @@ EOF
         [ -x "$p" ] && _add_py "$p"
     done
 
+    _disc_go
     _disc_homes "$_unmk"
+}
+
+# _disc_go -> D_GO_PIDS from the one list of Go module processes, _go_rows
+# (section 4 prints every row of it, zombies too). A zombie has no cwd,
+# environ or root to read, so only the rows before the first state Z (they
+# sort last) are taken; on a host with 20,000 unreaped ones that is no fork
+# per zombie.
+_disc_go() {
+    local p st _r
+    _bounded _go_rows > "$(_tmp go.rows)" 2>"$_errfile"; D_GO_RC=$?
+    while read -r p st _r; do
+        [ "$st" = Z ] && break
+        D_GO_PIDS="$D_GO_PIDS $p"
+    done < "$(_tmp go.rows)"
 }
 
 # _disc_homes UNMK -> the agent home candidates; UNMK: the unreadable python
 # processes whose command line does not name whatap
 _disc_homes() {
-    local _unmk="$1" pid p cwd _l _r _o
+    local _unmk="$1" pid p _l _r _o
     [ -n "${WHATAP_HOME:-}" ] && _home_from_self "$WHATAP_HOME" WHATAP_HOME
     [ -n "${WHATAP_HOME_BATCH:-}" ] && _home_from_self "$WHATAP_HOME_BATCH" WHATAP_HOME_BATCH
     if [ -r "$D_LOCK_FILE" ]; then
@@ -1537,15 +1609,7 @@ _disc_homes() {
             [ -n "$p" ] && _add_home "$p" "port registry $D_LOCK_FILE"
         done < "$D_LOCK_FILE"
     fi
-    for pid in $D_GO_PIDS; do
-        cwd="$(readlink -f "/proc/$pid/cwd" 2>/dev/null)"
-        if [ -n "$cwd" ]; then _add_home "$cwd" "cwd of whatap_python pid $pid"
-        elif [ -e "/proc/$pid" ]; then D_UNREAD="$D_UNREAD $pid"; fi
-        if _read_proc_env "$pid"; then
-            _env_pick WHATAP_HOME
-            [ -n "$_ev_WHATAP_HOME" ] && _home_from_pid "$pid" "$_ev_WHATAP_HOME" "environ of whatap_python pid $pid"
-        fi
-    done
+    _go_homes whatap_python
     # with no whatap_python process on the host, an unreadable python process
     # whose command line does not name whatap is not a candidate
     if [ -z "$D_GO_PIDS" ] && [ -n "$_unmk" ]; then
@@ -1826,6 +1890,7 @@ $D_HOMES
 EOF
     blocked="${blocked#; }" absent="${absent#; }"
     gaps="$(_scan_gaps)"
+    [ "$D_GO_RC" = 124 ] && gaps="${gaps:+$gaps; }whatap_python process list not read to the end (timed out reading /proc/<pid>/stat)"
     unres="${unres#; }"
     [ -n "$unres" ] && gaps="${gaps:+$gaps; }home candidate(s) not resolved: $unres"
     [ -n "$D_ODD" ] && gaps="${gaps:+$gaps; }path(s) with a newline or '|', not followed:$D_ODD"
@@ -2043,27 +2108,11 @@ _rep_pkgdirs() {
     done
 }
 
-# _entry_line PATH -> one `ls -l`-like line with the full mtime: stat -c where
-# it answers, else `ls -l` (minute precision)
-_entry_line() {
-    if have stat && stat -c '%A %h %U %G %s %y %N' -- "$1" 2>/dev/null; then return 0; fi
-    _head_of 1 ls -l -- "$1"
-}
-
-# _ls_full DIR N -> the first N entries of DIR (dot files first, as ls -a
-# sorts them; not . and ..), one stat -c line each with the full mtime, in one
-# stat call; `ls -la` (minute precision, N + 3 lines) where stat -c gives
-# nothing
+# _ls_full DIR N ENTRY... -> the ENTRY paths of DIR (its first N, from the
+# caller's glob), one stat -c line each with the full mtime, in one stat call;
+# `ls -la DIR` (minute precision, N + 3 lines) where stat -c gives nothing
 _ls_full() {
-    local d="$1" cap="$2" e c=0
-    set --
-    for e in "$d"/.[!.]* "$d"/..?* "$d"/*; do
-        case "$e" in
-            "$d/*"|"$d/.[!.]*"|"$d/..?*") [ -e "$e" ] || [ -L "$e" ] || continue ;;
-        esac
-        c=$((c + 1)); [ "$c" -gt "$cap" ] && break
-        set -- "$@" "$e"
-    done
+    local d="$1" cap="$2"; shift 2
     [ "$#" -eq 0 ] && return 0
     if have stat; then
         stat -c '%A %h %U %G %s %y %N' -- "$@" > "$(_tmp lsfull.out)" 2>/dev/null
@@ -2095,17 +2144,16 @@ _go_rows() {
 # [4] runtime processes
 _rep_procs() {
     section "Runtime processes"
-    local pid n st pp rc _gf _ng _cap=20 shown
-    _gf="$(_tmp go.rows)"
-    _bounded _go_rows > "$_gf" 2>"$_errfile"; rc=$?
+    local pid n st pp _gf _ng _cap=20 shown
+    _gf="$(_tmp go.rows)"   # read once, in discovery (_disc_go)
     _ng="$( { wc -l < "$_gf"; } 2>/dev/null | tr -d ' ')"
-    if [ "$rc" -eq 124 ]; then
+    if [ "$D_GO_RC" -eq 124 ]; then
         if _past_deadline; then fact "Go common module (whatap_python) processes: n/a (run deadline reached: ${RUN_DEADLINE}s)"
         else fact "Go common module (whatap_python) processes: n/a (timed out reading /proc/<pid>/stat: ${CMD_TIMEOUT}s)"; fi
     elif [ "${_ng:-0}" -eq 0 ]; then
         fact "Go common module (whatap_python) processes: none found in /proc"
     else
-        fact "Go common module (whatap_python) processes: $_ng (per state: $(awk '{ c[$2]++ } END { for (s in c) print s " " c[s] }' "$_gf" 2>/dev/null | sort | tr '\n' ',' | sed 's/,$//; s/,/, /g')); state Z listed last, detailing $( [ "$_ng" -gt "$_cap" ] && echo "first $_cap of $_ng" || echo "all $_ng")"
+        fact "Go common module (whatap_python) processes: $_ng; state Z listed last, detailing $( [ "$_ng" -gt "$_cap" ] && echo "first $_cap of $_ng" || echo "all $_ng")"
         shown=0
         while read -r pid st pp; do
             shown=$((shown + 1))
@@ -2174,21 +2222,6 @@ _rep_procs() {
     fi
 }
 
-# _entry_count DIR -> how many names DIR holds, dot files included, but not
-# . and .. (shell globs, no fork). An unmatched glob is skipped; in a DIR this
-# uid can read but not enter, -e fails on every entry, so only the literal
-# pattern itself is skipped.
-_entry_count() {
-    local n c=0
-    for n in "$1"/* "$1"/.[!.]* "$1"/..?*; do
-        case "$n" in
-            "$1/*"|"$1/.[!.]*"|"$1/..?*") [ -e "$n" ] || [ -L "$n" ] || continue ;;
-        esac
-        c=$((c + 1))
-    done
-    printf '%s' "$c"
-}
-
 # [5] agent homes and configuration
 _rep_homes() {
     section "Agent homes and configuration"
@@ -2219,19 +2252,7 @@ _rep_homes() {
                 fact "   whatap_python entry: n/a (path not found: $fshome/whatap_python)"
             fi
             for pf in whatap_python.pid whatap_python.pid.llm whatap_python.pid.batch; do
-                if [ -f "$fshome/$pf" ]; then
-                    probe "   $pf entry" _entry_line "$fshome/$pf"
-                    if [ ! -r "$fshome/$pf" ]; then
-                        fact "   $pf: n/a (permission denied: $fshome/$pf)"
-                        continue
-                    fi
-                    _pid="$(cat "$fshome/$pf" 2>/dev/null | tr -d ' \n')"
-                    if [ -n "$_pid" ] && [ -d "/proc/$_pid" ]; then
-                        fact "   $pf: $_pid (process exists; comm: $(_comm "$_pid"); state: $(awk '/^State:/{print $2" "$3}' "/proc/$_pid/status" 2>/dev/null); ppid: $(awk '/^PPid:/{print $2}' "/proc/$_pid/status" 2>/dev/null))"
-                    else
-                        fact "   $pf: ${_pid:-empty} (no process with this pid in this pid namespace)"
-                    fi
-                fi
+                [ -f "$fshome/$pf" ] && _pid_file_fact "   $pf" "$fshome/$pf"
             done
             for sf in security.conf paramkey.txt; do
                 if [ -e "$fshome/$sf" ]; then fact "   $sf: present, $({ wc -c < "$fshome/$sf"; } 2>/dev/null | tr -d ' ') bytes (content not collected: key material)"
@@ -2247,12 +2268,23 @@ _rep_homes() {
             elif [ ! -r "$fshome/run" ]; then
                 fact "   run dir (agent sockets): present; listing n/a (permission denied: $fshome/run)"
             else
-                _rn="$(_entry_count "$fshome/run")"
+                # the names run/ holds, dot files first as ls -a sorts them
+                # (not . and ..), counted and the first 40 kept in one glob
+                # walk, no fork. An unmatched glob is skipped; in a dir this
+                # uid can read but not enter, -e fails on every entry, so only
+                # the literal pattern itself is skipped.
+                _rn=0; set --
+                for _e in "$fshome/run"/.[!.]* "$fshome/run"/..?* "$fshome/run"/*; do
+                    case "$_e" in
+                        "$fshome/run/*"|"$fshome/run/.[!.]*"|"$fshome/run/..?*") [ -e "$_e" ] || [ -L "$_e" ] || continue ;;
+                    esac
+                    _rn=$((_rn + 1)); [ "$_rn" -le 40 ] && set -- "$@" "$_e"
+                done
                 if [ "$_rn" -eq 0 ]; then
                     fact "   run dir (agent sockets): present, 0 entries"
                 else
                     if [ "$_rn" -gt 40 ]; then _rw="first 40 of $_rn entries"; else _rw="$_rn entries"; fi
-                    probe "   run dir (agent sockets) listing ($_rw)" _ls_full "$fshome/run" 40
+                    probe "   run dir (agent sockets) listing ($_rw)" _ls_full "$fshome/run" 40 "$@"
                 fi
             fi
             [ -d "$fshome/whatap-python-llm" ] && fact "   whatap-python-llm dir (LLM Go module): present" || fact "   whatap-python-llm dir (LLM Go module): absent"
@@ -2318,7 +2350,36 @@ _rep_logs() {
 # interpreter start: the release.py lookup rides on section [3]'s.
 _rep_odoo() {
     section "Odoo application facts"
-    local opid _oc _ocands="" _rcands="" _c _l
+    _odoo_procs
+    _odoo_release
+    _odoo_conf
+
+    # listening sockets of odoo processes (default http 8069, gevent/longpolling 8072)
+    probe "odoo listening tcp sockets (odoo or ports 8069/8072)" sh -c "ss -ltnp 2>/dev/null | awk 'NR==1 || /odoo/ || /:8069 / || /:8072 /' | head -n 30"
+
+    # systemd unit facts (VM installs; absent inside containers)
+    if have systemctl; then
+        probe "systemd odoo units" _head_of 20 systemctl list-units --all 'odoo*'
+        probe "systemd odoo unit file(s)" _head_of 80 systemctl cat 'odoo*'
+    else
+        fact "systemd odoo units: n/a (command not found: systemctl)"
+    fi
+
+    # agent hook evidence for odoo, per agent home (count only; the raw lines
+    # are in the log section's whatap-hook.log head)
+    if [ -n "$D_HOMES" ]; then
+        printf '%s\n' "$D_HOMES" | cut -d'|' -f1 | sort -u | while IFS= read -r home; do
+            [ -n "$home" ] || continue
+            _fh="$(resolve_fs "$home")" || { fact "hook.log 'injected odoo' lines (home $home): n/a ($(_absent_why "$home"))"; continue; }
+            _hk="$_fh/logs/whatap-hook.log"
+            [ -r "$_hk" ] && fact "hook.log 'injected odoo' lines (first 400 lines, home $home): $(head -n 400 "$_hk" 2>/dev/null | grep -c 'injected odoo' 2>/dev/null)"
+        done
+    fi
+}
+
+# _odoo_procs -> each odoo process: ppid, comm, cmdline, cwd, uid
+_odoo_procs() {
+    local opid
     if [ -z "$D_ODOO_PIDS" ]; then
         fact "odoo processes: none found in /proc (by comm or cmdline)"
     else
@@ -2332,9 +2393,13 @@ _rep_odoo() {
             printf '           uid: %s\n' "$(awk '/^Uid:/{print $2}' "/proc/$opid/status" 2>/dev/null)"
         done
     fi
+}
 
-    # odoo package version — release.py read as text; where each interpreter
-    # would import odoo from was looked up in section [3]'s interpreter start
+# _odoo_release -> the odoo package version: release.py read as text; where
+# each interpreter would import odoo from was looked up in section [3]'s
+# interpreter start
+_odoo_release() {
+    local opid _rcands="" _c _l
     _rcands="$_odoo_rel/usr/lib/python3/dist-packages/odoo/release.py$_nl"
     for opid in $D_ODOO_PIDS; do
         _c="$(readlink -f "/proc/$opid/cwd" 2>/dev/null)"
@@ -2366,9 +2431,13 @@ EOF
     if [ "$_found_rel" = 1 ]; then :
     elif [ -n "$_odoo_miss" ]; then fact "odoo release file: n/a (no odoo/release.py found via the interpreters that answered, process cwd, dist-packages, or site-packages)"
     else fact "odoo release file: n/a (no odoo/release.py found via interpreters, process cwd, dist-packages, or site-packages)"; fi
+}
 
-    # odoo configuration — path from cmdline -c/--config, env ODOO_RC, then
-    # the packaged default locations
+# _odoo_conf -> the odoo configuration: its path from cmdline -c/--config, env
+# ODOO_RC, then the packaged default locations; each file with the password
+# lines left out, and its logfile
+_odoo_conf() {
+    local opid _oc _ocands="" _c
     for opid in $D_ODOO_PIDS; do
         _oc="$(_proc_lines "/proc/$opid/cmdline" | awk 'p==1{print;exit} $0=="-c"||$0=="--config"{p=1;next} sub(/^--config=/,""){print;exit} sub(/^-c/,"") && length($0)>0 {print;exit}')"
         [ -z "$_oc" ] && _oc="$(_proc_lines "/proc/$opid/environ" | grep '^ODOO_RC=' | head -n1 | cut -d= -f2-)"
@@ -2403,28 +2472,6 @@ EOF
             fi
         done
     fi
-
-    # listening sockets of odoo processes (default http 8069, gevent/longpolling 8072)
-    probe "odoo listening tcp sockets (odoo or ports 8069/8072)" sh -c "ss -ltnp 2>/dev/null | awk 'NR==1 || /odoo/ || /:8069 / || /:8072 /' | head -n 30"
-
-    # systemd unit facts (VM installs; absent inside containers)
-    if have systemctl; then
-        probe "systemd odoo units" _head_of 20 systemctl list-units --all 'odoo*'
-        probe "systemd odoo unit file(s)" _head_of 80 systemctl cat 'odoo*'
-    else
-        fact "systemd odoo units: n/a (command not found: systemctl)"
-    fi
-
-    # agent hook evidence for odoo, per agent home (count only; the raw lines
-    # are in the log section's whatap-hook.log head)
-    if [ -n "$D_HOMES" ]; then
-        printf '%s\n' "$D_HOMES" | cut -d'|' -f1 | sort -u | while IFS= read -r home; do
-            [ -n "$home" ] || continue
-            _fh="$(resolve_fs "$home")" || { fact "hook.log 'injected odoo' lines (home $home): n/a ($(_absent_why "$home"))"; continue; }
-            _hk="$_fh/logs/whatap-hook.log"
-            [ -r "$_hk" ] && fact "hook.log 'injected odoo' lines (first 400 lines, home $home): $(head -n 400 "$_hk" 2>/dev/null | grep -c 'injected odoo' 2>/dev/null)"
-        done
-    fi
 }
 
 # [9] kubernetes / operator injection artifacts
@@ -2435,18 +2482,7 @@ _rep_k8s() {
     else
         fact "/whatap-agent: n/a (path not found: /whatap-agent)"
     fi
-    if [ -n "${WHATAP_PYTHON_AGENT_PATH:-}" ]; then
-        fact "env WHATAP_PYTHON_AGENT_PATH: $WHATAP_PYTHON_AGENT_PATH"
-        if [ -L "$WHATAP_PYTHON_AGENT_PATH" ]; then
-            fact "WHATAP_PYTHON_AGENT_PATH file type: symlink -> $(readlink -f "$WHATAP_PYTHON_AGENT_PATH" 2>/dev/null)"
-        elif [ -e "$WHATAP_PYTHON_AGENT_PATH" ]; then
-            fact "WHATAP_PYTHON_AGENT_PATH file type: regular file"
-        else
-            fact "WHATAP_PYTHON_AGENT_PATH file type: n/a (path not found)"
-        fi
-    else
-        fact "env WHATAP_PYTHON_AGENT_PATH: not set (collector shell)"
-    fi
+    _agent_path_env WHATAP_PYTHON_AGENT_PATH
     for v in POD_NAME NODE_NAME POD_NAMESPACE OKIND ONAME ONODE; do
         eval "_val=\${$v:-}"
         [ -n "$_val" ] && fact "env $v: $_val"

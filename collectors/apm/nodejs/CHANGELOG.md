@@ -5,6 +5,13 @@ first. Every change to the script bumps its `VERSION` and adds one entry at
 the top of this list (docs/authoring-guide.md, step 2); `tools/validate.sh`
 checks that the newest entry is the script's `VERSION`.
 
+- **0.9.6** — The install block's `version` line is read by the same top-level
+  awk as section 4 (`_pkg_top_field`, `version: x (path)`; a nested "version"
+  is no longer taken), and so are npm's and pm2's name and version. Pid files
+  get an entry line (full mtime), state and ppid, and `permission denied` for
+  an unreadable one (group `_pid_file_fact`). `build.txt` and `whatap_port_*`
+  values are cut on a UTF-8 boundary. hidepid, Go-agent homes and
+  `WHATAP_NODEJS_AGENT_PATH` come from group helpers, unchanged in effect.
 - **0.9.5** — Collection status (skeleton `_emit_time`): when a bounded call was slow, capped or not run, the per-command "where the time went" table (sums largest first, time outside bounded calls) gives way to the time log's own records, one line per such call in the order they ran (`<ms> ms  <outcome>  <command>`, the first 40, then `(N more in this run)`); CONTRACT rule 1. `_run_init` sets its EXIT/INT/TERM/HUP traps before it creates the private directory: a signal in between left `ggt.*` behind.
 - **0.9.4** — `_run_init` (skeleton) also takes the script as read from stdin when `$0` is the shell's own binary (`/bin/bash -s`, `$0 -ef /proc/$$/exe`): bash 3.2 under musl otherwise faulted in a loop at full CPU after `4<&0`.
 - **0.9.3** — The host section adds `/sys/class/dmi/id/product_uuid`: its

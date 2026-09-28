@@ -770,6 +770,28 @@ _sock_list() {
     awk -v p="$pat" -v n="${4:-whatap}" '(NR <= 2 && /State|Proto|Recv-Q/) || $0 ~ n || $0 ~ p' "$(_tmp sock.out)" 2>/dev/null | head -n 50
     return "$rc"
 }
+
+# _entry_line PATH -> one `ls -l`-like line with the full mtime: stat -c where
+# it answers, else `ls -l` (minute precision)
+_entry_line() {
+    if have stat && stat -c '%A %h %U %G %s %y %N' -- "$1" 2>/dev/null; then return 0; fi
+    _head_of 1 ls -l -- "$1"
+}
+
+# _pid_file_fact LABEL FILE -> the entry line of the agent pid file FILE, the
+# pid it holds, and whether that process exists here (its comm, state and
+# ppid); an unreadable FILE is said to be one, not taken for an empty one
+_pid_file_fact() {
+    local v
+    probe "$1 entry" _entry_line "$2"
+    [ -r "$2" ] || { fact "$1: n/a (permission denied: $2)"; return; }
+    v="$(cat "$2" 2>/dev/null | tr -d ' \n')"
+    if [ -n "$v" ] && [ -d "/proc/$v" ]; then
+        fact "$1: $v (process exists; comm: $(_comm "$v"); state: $(awk '/^State:/{print $2" "$3}' "/proc/$v/status" 2>/dev/null); ppid: $(awk '/^PPid:/{print $2}' "/proc/$v/status" 2>/dev/null))"
+    else
+        fact "$1: ${v:-empty} (no process with this pid in this pid namespace)"
+    fi
+}
 # ---- end apm: file helpers
 
 # file_facts "label" PATH -> ls -l line, size, mtime and (when available) the
@@ -934,6 +956,16 @@ _proc_table() {
                            while ((f | getline l) > 0) r = r (k++ ? " " : "") l
                            close(f); gsub(/\r/, " ", r); sub(/ \(deleted\)$/, "", r); e[p] = r }
                 print p "\037" c[p] "\037" e[p] "\037" a0[p] "\037" cl[p] } }'
+}
+
+# _note_hidepid -> sets D_HIDEPID when /proc is mounted with hidepid and this
+# uid is not root: the scan then cannot see other users' processes
+_note_hidepid() {
+    case "$(id -u 2>/dev/null)" in
+        0) ;;
+        *) grep -qE '^[^ ]+ /proc proc [^ ]*hidepid=([12]|invisible|noaccess)' /proc/mounts 2>/dev/null \
+               && D_HIDEPID="hidepid is set on /proc: other users' processes are not listed to uid $(id -u 2>/dev/null)" ;;
+    esac
 }
 # ---- end apm: process table
 
@@ -1177,6 +1209,13 @@ _link_target() {
     printf '%s\n' "$t"
 }
 
+# _link_shown /proc/<pid>/{exe,cwd} -> the _link_target of it on one line for
+# the report, or why there is none
+_link_shown() {
+    local t
+    t="$(_link_target "$1")" && _oneline "$t" || echo 'n/a (unresolvable: exited, zombie, or permission denied)'
+}
+
 # _proc_start PID -> process start time, from ps when it supports lstart,
 # otherwise from the timestamp of the /proc/<pid> directory.
 _proc_start() {
@@ -1192,11 +1231,7 @@ discover() {
     D_PHP_CAP="$(_cap_or APM_INTERP_CAP "${APM_INTERP_CAP:-10}" 10)"
     local c p pid comm exe a0 cmd cwd envh d _php _alt
 
-    case "$(id -u 2>/dev/null)" in
-        0) ;;
-        *) grep -qE '^[^ ]+ /proc proc [^ ]*hidepid=([12]|invisible|noaccess)' /proc/mounts 2>/dev/null \
-               && D_HIDEPID="hidepid is set on /proc: other users' processes are not listed to uid $(id -u 2>/dev/null)" ;;
-    esac
+    _note_hidepid
 
     # Process scan over a table read once for every pid. A PHP process is
     # matched by comm, argv0 or exe: a script started from `#!/usr/bin/php`
@@ -1594,7 +1629,7 @@ _mods_count() {
         [ -d "$d" ] && printf '%s: %s files\n' "${d##*/}" "$(ls "$d" 2>/dev/null | wc -l | tr -d ' ')"
     done
 }
-_mods_names() { ls "$1"/modules/*/ 2>/dev/null | tr '\n' ' ' | cut -c1-1200; }
+_mods_names() { ls "$1"/modules/*/ 2>/dev/null | tr '\n' ' ' | _u8cut 1200; }
 
 # _resolve_goals -> resolve `agent` and `conf` once. An absence is `na` only
 # when every input behind it was read: an unreadable environ/cwd/exe or maps,
@@ -1927,7 +1962,7 @@ _rep_web() {
             "$(_comm "$pid")" \
             "$(awk '/^Uid:/{print $2}' "/proc/$pid/status" 2>/dev/null)"
         printf '           cmdline: %s\n' "$(_proc_cmd "$pid")"
-        printf '           exe: %s\n' "$(_t="$(_link_target "/proc/$pid/exe")" && _oneline "$_t" || echo 'n/a (unresolvable: exited, zombie, or permission denied)')"
+        printf '           exe: %s\n' "$(_link_shown "/proc/$pid/exe")"
     done
     if [ -z "$D_ALT_PIDS" ]; then
         fact "persistent-worker PHP runtimes (swoole/octane/roadrunner/frankenphp/workerman/php-pm): none found by executable, or by command line of a PHP executable"
@@ -1937,7 +1972,7 @@ _rep_web() {
             [ -d "/proc/$pid" ] || { printf '        -- pid %s: n/a (process exited)\n' "$pid"; continue; }
             printf '        -- pid %s comm=%s\n' "$pid" "$(_comm "$pid")"
             printf '           cmdline: %s\n' "$(_proc_cmd "$pid")"
-            printf '           cwd: %s\n' "$(_t="$(_link_target "/proc/$pid/cwd")" && _oneline "$_t" || echo 'n/a (unresolvable: exited, zombie, or permission denied)')"
+            printf '           cwd: %s\n' "$(_link_shown "/proc/$pid/cwd")"
         done
     fi
 }
@@ -2196,8 +2231,8 @@ _rep_agent() {
             printf '        -- pid %s (ppid %s)\n' "$pid" "$(awk '/^PPid:/{print $2}' "/proc/$pid/status" 2>/dev/null)"
             printf '           comm: %s\n' "$(_comm "$pid")"
             printf '           cmdline: %s\n' "$(_proc_cmd "$pid")"
-            printf '           exe: %s\n' "$(_t="$(_link_target "/proc/$pid/exe")" && _oneline "$_t" || echo 'n/a (unresolvable: exited, zombie, or permission denied)')"
-            printf '           cwd: %s\n' "$(_t="$(_link_target "/proc/$pid/cwd")" && _oneline "$_t" || echo 'n/a (unresolvable: exited, zombie, or permission denied)')"
+            printf '           exe: %s\n' "$(_link_shown "/proc/$pid/exe")"
+            printf '           cwd: %s\n' "$(_link_shown "/proc/$pid/cwd")"
             printf '           uid/state/threads: %s\n' "$(awk '/^Uid:/{u=$2} /^State:/{s=$2" "$3} /^Threads:/{t=$2} END{print u" / "s" / "t}' "/proc/$pid/status" 2>/dev/null)"
             _rss="$(awk '/^VmRSS:/{print $2" "$3}' "/proc/$pid/status" 2>/dev/null)"
             printf '           rss: %s\n' "${_rss:-n/a (no VmRSS line: zombie or permission denied)}"
@@ -2208,12 +2243,7 @@ _rep_agent() {
         [ -n "$home" ] || continue
         fshome="$(resolve_fs "$home")" || { fact "pid file $home/whatap_php.pid: n/a ($(_absent_why "$home" "$_src"))"; continue; }
         if [ -f "$fshome/whatap_php.pid" ]; then
-            _pid="$(cat "$fshome/whatap_php.pid" 2>/dev/null | tr -d ' \n')"
-            if [ -n "$_pid" ] && [ -d "/proc/$_pid" ]; then
-                fact "pid file $home/whatap_php.pid: $_pid (process exists; comm: $(_comm "$_pid"))"
-            else
-                fact "pid file $home/whatap_php.pid: ${_pid:-empty} (no process with this pid in this pid namespace)"
-            fi
+            _pid_file_fact "pid file $home/whatap_php.pid" "$fshome/whatap_php.pid"
         else
             fact "pid file $home/whatap_php.pid: n/a (path not found)"
         fi

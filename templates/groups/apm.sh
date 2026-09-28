@@ -178,6 +178,28 @@ _sock_list() {
     awk -v p="$pat" -v n="${4:-whatap}" '(NR <= 2 && /State|Proto|Recv-Q/) || $0 ~ n || $0 ~ p' "$(_tmp sock.out)" 2>/dev/null | head -n 50
     return "$rc"
 }
+
+# _entry_line PATH -> one `ls -l`-like line with the full mtime: stat -c where
+# it answers, else `ls -l` (minute precision)
+_entry_line() {
+    if have stat && stat -c '%A %h %U %G %s %y %N' -- "$1" 2>/dev/null; then return 0; fi
+    _head_of 1 ls -l -- "$1"
+}
+
+# _pid_file_fact LABEL FILE -> the entry line of the agent pid file FILE, the
+# pid it holds, and whether that process exists here (its comm, state and
+# ppid); an unreadable FILE is said to be one, not taken for an empty one
+_pid_file_fact() {
+    local v
+    probe "$1 entry" _entry_line "$2"
+    [ -r "$2" ] || { fact "$1: n/a (permission denied: $2)"; return; }
+    v="$(cat "$2" 2>/dev/null | tr -d ' \n')"
+    if [ -n "$v" ] && [ -d "/proc/$v" ]; then
+        fact "$1: $v (process exists; comm: $(_comm "$v"); state: $(awk '/^State:/{print $2" "$3}' "/proc/$v/status" 2>/dev/null); ppid: $(awk '/^PPid:/{print $2}' "/proc/$v/status" 2>/dev/null))"
+    else
+        fact "$1: ${v:-empty} (no process with this pid in this pid namespace)"
+    fi
+}
 # ---- end apm: file helpers
 
 # ---- apm: process table — DO NOT EDIT ---------------------------------------
@@ -252,6 +274,16 @@ _proc_table() {
                            while ((f | getline l) > 0) r = r (k++ ? " " : "") l
                            close(f); gsub(/\r/, " ", r); sub(/ \(deleted\)$/, "", r); e[p] = r }
                 print p "\037" c[p] "\037" e[p] "\037" a0[p] "\037" cl[p] } }'
+}
+
+# _note_hidepid -> sets D_HIDEPID when /proc is mounted with hidepid and this
+# uid is not root: the scan then cannot see other users' processes
+_note_hidepid() {
+    case "$(id -u 2>/dev/null)" in
+        0) ;;
+        *) grep -qE '^[^ ]+ /proc proc [^ ]*hidepid=([12]|invisible|noaccess)' /proc/mounts 2>/dev/null \
+               && D_HIDEPID="hidepid is set on /proc: other users' processes are not listed to uid $(id -u 2>/dev/null)" ;;
+    esac
 }
 # ---- end apm: process table
 
@@ -419,6 +451,34 @@ _scan_gaps() {
     fi
     [ -n "$D_HIDEPID" ] && g="${g:+$g; }$D_HIDEPID"
     printf '%s' "$g"
+}
+
+# _go_homes COMM -> the home candidates of the Go agent processes (D_GO_PIDS,
+# named COMM): each one's cwd, and the WHATAP_HOME in its environ; a live pid
+# whose cwd this uid cannot read goes to D_UNREAD
+_go_homes() {
+    local _gp _gc
+    for _gp in $D_GO_PIDS; do
+        _gc="$(readlink -f "/proc/$_gp/cwd" 2>/dev/null)"
+        if [ -n "$_gc" ]; then _add_home "$_gc" "cwd of $1 pid $_gp"
+        elif [ -e "/proc/$_gp" ]; then D_UNREAD="$D_UNREAD $_gp"; fi
+        if _read_proc_env "$_gp"; then
+            _env_pick WHATAP_HOME
+            [ -n "$_ev_WHATAP_HOME" ] && _home_from_pid "$_gp" "$_ev_WHATAP_HOME" "environ of $1 pid $_gp"
+        fi
+    done
+}
+
+# _agent_path_env NAME -> the collector shell's NAME (the operator's
+# WHATAP_<LANG>_AGENT_PATH) and the type of the file it names
+_agent_path_env() {
+    local v
+    eval "v=\${$1:-}"
+    if [ -z "$v" ]; then fact "env $1: not set (collector shell)"; return; fi
+    fact "env $1: $v"
+    if [ -L "$v" ]; then fact "$1 file type: symlink -> $(readlink -f "$v" 2>/dev/null)"
+    elif [ -e "$v" ]; then fact "$1 file type: regular file"
+    else fact "$1 file type: n/a (path not found)"; fi
 }
 # ---- end apm: environ readers
 
