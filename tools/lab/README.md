@@ -75,6 +75,7 @@ with a clean tree) to see the noise floor, as with capture-compare.
 | `apm-python-op` | `jjsong-ggt-apm-python-op:1` | agent from `apm-init-python` (2.1.2), `PYTHONPATH` bootstrap |
 | `apm-php-rocky` | `jjsong-ggt-apm-php-rocky:1` | Rocky 9 with systemd as PID 1, php-fpm 8.2 + nginx, whatap-php 2.14-2 rpm |
 | `apm-php-alpine` | `jjsong-ggt-apm-php-alpine:1` | Alpine (musl), php-fpm 8.3 + nginx, WhaTap PHP 2.14.2 Alpine tarball, PID 1 `sleep` |
+| `apm-payara` | `jjsong-ggt-apm-payara:1` | `payara/server-full:6.2025.10` (GlassFish lineage), Zulu 11, Java agent 2.2.77 baked into domain1's `domain.xml` `<jvm-options>` (no asadmin restart cycle needed, see the image's Dockerfile), JVM uid 1000 `payara` |
 | `java-zoo` | `jjsong-ggt-java-zoo:1` | the apmjava edge cases below |
 | `zfs` | `jjsong-ggt-zfs` (ssh) | collzfs against the real zpool `yard`; root over sudo -n |
 | `collsrv` | `jjsong-ggt-collsrv` (ssh) | collserver + collmysql against a real on-prem install; collmysql's `--binlog` argset runs as root (unix-socket auth, binlog files are mode 640 owner mysql) |
