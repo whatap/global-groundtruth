@@ -7,6 +7,10 @@ one entry at the top of its section (docs/authoring-guide.md, step 2);
 
 ## collect-db.sh
 
+- **0.9.5** — Section K leaves out the TLS 1.3 post-handshake session tickets
+  (and the "---" just before the first): they print only when a ticket lands
+  before s_client exits, one or several, so K differed run to run. "DONE"
+  after a ticket (openssl 1.1.1) is kept, and so is a last "---".
 - **0.9.4** — Run helpers (skeleton): `_why_124` and `_out_dir_check` move
   into the skeleton run helpers (the `--out` mkdir now runs under the command
   cap), and `_run_init` sets the probe error file and reads the uid once; the

@@ -35,7 +35,7 @@ export LC_ALL=C
 # ---- collector metadata -----------------------------------------------------
 # History: CHANGELOG.md, section collect-collzfs.sh (next to this file).
 COLLECTOR_NAME="whatap-collzfs"
-VERSION="0.12.3"
+VERSION="0.12.4"
 DOMAIN="collection-server"
 TARGET="collection-server-zfs/$(hostname 2>/dev/null || echo unknown)"   # refined after pool discovery
 
@@ -2664,16 +2664,6 @@ do_bundle() {
         return 1
     fi
 }
-
-# ---- collection-server: main helpers — DO NOT EDIT --------------------------
-# members: collmysql collserver collzfs
-# _need_int NAME VALUE -> exit 2 unless VALUE is a non-negative integer
-_need_int() {
-    case "$2" in
-        ''|*[!0-9]*) warn "$1 takes a non-negative integer; got '$2'"; exit 2 ;;
-    esac
-}
-# ---- end collection-server: main helpers
 
 # ---- collection-server: give back — DO NOT EDIT -----------------------------
 # members: collserver collzfs

@@ -35,7 +35,7 @@ unset JAVA_TOOL_OPTIONS JDK_JAVA_OPTIONS _JAVA_OPTIONS _v
 # ---- collector metadata -----------------------------------------------------
 # History: CHANGELOG.md, section collect-collserver.sh (next to this file).
 COLLECTOR_NAME="whatap-collserver"
-VERSION="0.15.4"
+VERSION="0.15.5"
 DOMAIN="collection-server"
 TARGET="collection-server/$(hostname 2>/dev/null || echo unknown)"   # refined after WHATAP_HOME is resolved
 
@@ -2263,7 +2263,7 @@ do_bundle() {
 }
 
 # ---- collection-server: main helpers — DO NOT EDIT --------------------------
-# members: collmysql collserver collzfs
+# members: collmysql collserver
 # _need_int NAME VALUE -> exit 2 unless VALUE is a non-negative integer
 _need_int() {
     case "$2" in

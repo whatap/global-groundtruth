@@ -7,6 +7,8 @@ one entry at the top of its section (docs/authoring-guide.md, step 2);
 
 ## collect-collserver.sh
 
+- **0.15.5** — Internal: `_need_int` lives in a group block for collmysql and
+  collserver only (collzfs never called it).
 - **0.15.4** — Run helpers (skeleton): `_why_124` and `_out_dir_check` move
   into the skeleton run helpers (the `--out` mkdir now runs under the command
   cap), and `_run_init` sets the probe error file and reads the uid once; the
@@ -157,6 +159,7 @@ one entry at the top of its section (docs/authoring-guide.md, step 2);
 
 ## collect-collzfs.sh
 
+- **0.12.4** — Internal: the unused `_need_int` helper is gone.
 - **0.12.3** — Run helpers (skeleton): `_why_124` and `_out_dir_check` move
   into the skeleton run helpers (the `--out` mkdir now runs under the command
   cap), and `_run_init` sets the probe error file and reads the uid once; no
@@ -301,6 +304,8 @@ one entry at the top of its section (docs/authoring-guide.md, step 2);
 
 ## collect-collmysql.sh
 
+- **0.12.4** — Internal: `_need_int` lives in a group block for collmysql and
+  collserver only (collzfs never called it).
 - **0.12.3** — Run helpers (skeleton): `_why_124` and `_out_dir_check` move
   into the skeleton run helpers (the `--out` mkdir now runs under the command
   cap), and `_run_init` sets the probe error file and reads the uid once; no

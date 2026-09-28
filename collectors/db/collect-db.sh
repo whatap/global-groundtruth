@@ -28,7 +28,7 @@ export LC_ALL=C
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-db"
 # History: CHANGELOG.md, section collect-db.sh (next to this file).
-VERSION="0.9.4"
+VERSION="0.9.5"
 DOMAIN="db"
 TARGET="db-host/$(hostname 2>/dev/null || echo unknown)"
 
@@ -1482,7 +1482,7 @@ log_lines() {
 
 # ---- report body ----------------------------------------------------------------
 # _inst_conf IDIR -> sets I_DBMS/I_IP/I_PORT/I_COPT from IDIR/whatap.conf (the
-# same four keys, read once per instance instead of per section)
+# four keys every section needs, in one call)
 _inst_conf() {
     local cf="$1/whatap.conf"
     conf_get I_DBMS "$cf" dbms
@@ -2016,11 +2016,22 @@ _rep_tls_inst() {
     printf '%s\n' "$out" >"$tls_f" 2>/dev/null
     local body j same=""
     # left out as well: the per-connection random values (session
-    # ticket hex dump, Session-ID, Master-Key, Resumption PSK, Start Time)
+    # ticket hex dump, Session-ID, Master-Key, Resumption PSK, Start Time),
+    # and the TLS 1.3 post-handshake tickets with the "---" just before the
+    # first: they arrive only when a ticket lands before s_client exits, one
+    # or several, so section K was not stable run to run. The handshake facts
+    # (chain, protocol, cipher, verify result) all come before the first
+    # ticket; "DONE" can come after it (openssl 1.1.1), even inside a hex
+    # dump line, and is kept.
     body="$(awk '/-----BEGIN CERTIFICATE-----/ { s = 1 }
+        /^Post-Handshake New Session Ticket arrived:/ { t = 1; hold = "" }
+        t { if ($0 ~ /DONE$/) print "DONE"; next }
+        !s && $0 == "---" { if (hold != "") print hold; hold = $0; next }
+        hold != "" { print hold; hold = "" }
         /^[[:space:]]*(TLS session ticket|Session-ID|Session-ID-ctx|Master-Key|Resumption PSK|Start Time):/ { next }
         /^[[:space:]]*[0-9a-f][0-9a-f][0-9a-f][0-9a-f] - [0-9a-f][0-9a-f][ -]/ { next }
-        !s { print } /-----END CERTIFICATE-----/ { s = 0 }' "$tls_f")"
+        !s { print } /-----END CERTIFICATE-----/ { s = 0 }
+        END { if (hold != "") print hold }' "$tls_f")"
     # an output already printed for an instance above (openssl's
     # usage text, say) is named instead of printed again
     j=0

@@ -146,7 +146,7 @@ _win_secs() {
 # ---- end collection-server: window
 
 # ---- collection-server: main helpers — DO NOT EDIT --------------------------
-# members: collmysql collserver collzfs
+# members: collmysql collserver
 # _need_int NAME VALUE -> exit 2 unless VALUE is a non-negative integer
 _need_int() {
     case "$2" in
