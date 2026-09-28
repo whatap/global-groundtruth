@@ -25,7 +25,7 @@ export LC_ALL=C
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-apmpython"
 # History: CHANGELOG.md (next to this file).
-VERSION="0.11.3"
+VERSION="0.11.4"
 DOMAIN="apm"
 TARGET="host/$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || uname -n 2>/dev/null || echo unknown)"
 
