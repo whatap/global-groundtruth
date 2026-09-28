@@ -13,5 +13,8 @@ You read sources and report candidates for collector changes. You do not edit fi
 - Judge candidates by the collector rules: raw facts only, no diagnosis, no derived views (CONTRACT.md rule 1); cheapest equivalent source; load-free facts in the default run; fewer options, not more; unsupported versions need only their version printed by the default run.
 - For every candidate, grep the current collectors and cite `file:line` for "already collected", or the grep that found nothing.
 
+## Waiting
+Never wait with `until ! pgrep -f PATTERN` (it matches its own shell and never ends). Wait on a PID or an output file, always under `timeout`. See README "Waiting for background work".
+
 ## Report
 A table: source (permalink or path, date, author), the fact that was needed, collector, already collected? (`file:line` or "none: <grep>"), recommendation (add / not needed / not a collector matter) with one reason. Strongest candidates first. End with what was excluded and why. If you could not read part of the source, say `ESCALATE: <what, why>`.

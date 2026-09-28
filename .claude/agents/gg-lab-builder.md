@@ -23,5 +23,8 @@ You build or repair one lab target that collector changes are tested against.
 
 If you cannot meet one of these, say `ESCALATE: <which, why>` instead of claiming done.
 
+## Waiting
+Never wait with `until ! pgrep -f PATTERN` (it matches its own shell and never ends). Wait on a PID or an output file, always under `timeout`. See README "Waiting for background work".
+
 ## Report
 Target facts (name, address, versions), what it reproduces, the collector run result (status line, quoted key lines), what is not covered, and every file you changed outside the target.

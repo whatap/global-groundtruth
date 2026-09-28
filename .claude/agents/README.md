@@ -73,6 +73,16 @@ Two logged misses of one kind of task at a tier move that kind of task up for
 good: change the default here and in the agent file. Going back down needs a
 blind calibration like the ones below.
 
+## Waiting for background work
+
+A wait loop must be able to end. `until ! pgrep -f "tools/lab/run.sh …"; do sleep 5; done`
+never does: the loop's own shell carries the pattern in its command line, so
+pgrep always finds it (three such loops ran for 8–12 h on 2026-09-27). Wait on
+the PID you started (`wait $pid`, or `while kill -0 $pid; do sleep 5; done`)
+or on the output file, and bound every wait (`timeout 3600 …`). If a pattern
+match is unavoidable, bracket one character so the pattern cannot match itself
+(`pgrep -f "[t]ools/lab/run.sh"`).
+
 ## Calibration log
 
 | Date | Patch | Known defect (found by opus) | Model | Caught? | Note |
