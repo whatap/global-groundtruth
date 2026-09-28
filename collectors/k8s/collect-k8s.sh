@@ -36,7 +36,7 @@ export LC_ALL=C
 # ---- collector metadata -----------------------------------------------------
 COLLECTOR_NAME="whatap-k8s"
 # History: CHANGELOG.md (next to this file).
-VERSION="0.12.2"
+VERSION="0.13.0"
 DOMAIN="k8s"
 TARGET="k8s-cluster/unresolved"      # refined after CLI/context/namespace discovery
 
@@ -118,7 +118,6 @@ OPT_QUIET=0          # suppress progress narration on stderr
 OPT_OUT="."
 OPT_NS=""            # skip namespace discovery (RBAC-scoped kubeconfigs)
 OPT_CONTEXT=""       # kubeconfig context passthrough
-OPT_KUBECONFIG=""    # kubeconfig path passthrough
 OPT_EXEC_ALL=0       # Tier 2: run in-pod probes on every node-agent pod
 OPT_APM_EXEC=0       # Tier 2: exec into --apm-target application containers
 APM_TGTS=()          # opt-in: namespaces (ns or ns/workload) to inspect for injection facts
@@ -138,7 +137,6 @@ by accident.
   collect-k8s.sh --out DIR                output directory (default: .)
   collect-k8s.sh --namespace NS (-n NS)   skip namespace discovery (RBAC-scoped access)
   collect-k8s.sh --context CTX            kubeconfig context to use (multi-cluster bastion)
-  collect-k8s.sh --kubeconfig PATH        kubeconfig file to use
   collect-k8s.sh --apm-target NS[/NAME]   inspect an application namespace for whatap APM
                                           auto-instrumentation facts (repeatable, max 5):
                                           workload template env (as declared) vs pod env
@@ -152,7 +150,8 @@ by accident.
                                           --apm-target application containers
                                           (agent home listing, conf, agent logs)
 
-Environment: LOG_TAIL_LINES=N  Tier 0 log lines per container (default: 200)
+Environment: KUBECONFIG=PATH  kubeconfig file to use (same as kubectl/oc/helm)
+             LOG_TAIL_LINES=N  Tier 0 log lines per container (default: 200)
              CMD_TIMEOUT=S / RUN_DEADLINE=S  per-call cap / whole-run budget
 
 Section J runs even with no --apm-target: it always reports the cluster-wide
@@ -179,8 +178,8 @@ while [ $# -gt 0 ]; do
         --namespace=*) _optval --namespace "${1#*=}"; OPT_NS="${1#*=}" ;;
         --context) _optval --context "${2:-}"; OPT_CONTEXT="$2"; shift ;;
         --context=*) _optval --context "${1#*=}"; OPT_CONTEXT="${1#*=}" ;;
-        --kubeconfig) _optval --kubeconfig "${2:-}"; OPT_KUBECONFIG="$2"; shift ;;
-        --kubeconfig=*) _optval --kubeconfig "${1#*=}"; OPT_KUBECONFIG="${1#*=}" ;;
+        --kubeconfig|--kubeconfig=*)
+            printf -- '--kubeconfig was removed; run KUBECONFIG=<path> collect-k8s.sh ...\n' >&2; exit 2 ;;
         --tail|--tail=*)
             printf -- '--tail is no longer an option: set LOG_TAIL_LINES=N in the environment (default 200)\n' >&2; exit 2 ;;
         --exec-per-node) OPT_EXEC_ALL=1 ;;
@@ -796,7 +795,6 @@ k8s_cli_discover() {
     KOPTS=()
     KOPTS[${#KOPTS[@]}]="--request-timeout=15s"
     [ -n "$OPT_CONTEXT" ] && KOPTS[${#KOPTS[@]}]="--context=$OPT_CONTEXT"
-    [ -n "$OPT_KUBECONFIG" ] && KOPTS[${#KOPTS[@]}]="--kubeconfig=$OPT_KUBECONFIG"
 }
 
 # run_k ARGS... -> low-level CLI call, bounded twice: kubectl's own
@@ -2274,7 +2272,6 @@ _rep_helm() {
     probe "helm version" helm version --short
     if have helm; then
         local HOPTS=()
-        [ -n "$OPT_KUBECONFIG" ] && HOPTS[${#HOPTS[@]}]="--kubeconfig=$OPT_KUBECONFIG"
         [ -n "$OPT_CONTEXT" ] && HOPTS[${#HOPTS[@]}]="--kube-context=$OPT_CONTEXT"
         local hl rel relns
         local hlrc
@@ -2941,7 +2938,6 @@ collect_bundle_helm() {
     have helm || { warn "helm: skipped (command not found: helm)"; return; }
     mkdir -p "$dest" 2>/dev/null
     local HOPTS=()
-    [ -n "$OPT_KUBECONFIG" ] && HOPTS[${#HOPTS[@]}]="--kubeconfig=$OPT_KUBECONFIG"
     [ -n "$OPT_CONTEXT" ] && HOPTS[${#HOPTS[@]}]="--kube-context=$OPT_CONTEXT"
     local hrc
     _bounded helm list -A "${HOPTS[@]}" > "$(_tmp helm.list)" 2>"$(_tmp helm.err)"; hrc=$?

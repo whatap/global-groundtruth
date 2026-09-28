@@ -221,7 +221,9 @@ and every collector must keep them.
     value exits 2) and `-h`/`--help`. The skeleton ships all of them; the
     collectors that do not have `--out` yet are getting it.
   - **Options that name the target stay** (`--home`, `--namespace`,
-    `--context`, `--kubeconfig`, a DB endpoint). Take both `--x V` and
+    `--context`, a DB endpoint), unless an environment variable the child
+    tools already read does the same: the kubeconfig file comes through
+    `KUBECONFIG` (k8s 0.13.0 removed `--kubeconfig`). Take both `--x V` and
     `--x=V`, and show short aliases in the help (`--namespace NS (-n NS)`).
   - **Everything else is an opt-in, one per feature**, and a feature is opt-in
     only when it (a) loads the target (tree walk, `zdb`, heap or thread dump,

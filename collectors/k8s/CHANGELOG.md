@@ -5,6 +5,17 @@ change to the script bumps its `VERSION` and adds one entry at the top of this
 list (docs/authoring-guide.md, step 2); `tools/validate.sh` checks that the
 newest entry is the script's `VERSION`.
 
+- **0.13.0** — Removed `--kubeconfig PATH` / `--kubeconfig=PATH`: `KUBECONFIG=<path>
+  collect-k8s.sh ...` does the same, for kubectl/oc/helm alike, so a separate
+  flag only duplicated it. The flag is stub-exit (exit 2, one stderr line)
+  rather than ignored, because silently dropping it would collect a different
+  cluster than the one the caller named. `--context` is unchanged. `usage()`
+  and the Environment block now name `KUBECONFIG=PATH` instead of the flag;
+  the `KOPTS`/`HOPTS` builders (kubectl, and helm in both the Tier 0 helm
+  section and the bundle collector) no longer append `--kubeconfig=...`
+  themselves — kubectl/oc/helm each read `$KUBECONFIG` (or `~/.kube/config`)
+  on their own, so the report's `KUBECONFIG env` and `cli global options`
+  lines still show what is in effect.
 - **0.12.2** — `_run_init` (skeleton) also takes the script as read from stdin when `$0` is the shell's own binary (`/bin/bash -s`, `$0 -ef /proc/$$/exe`): bash 3.2 under musl otherwise faulted in a loop at full CPU after `4<&0`.
 - **0.12.1** — Section D ("rbac & identity") prints the WhaTap credential
   Secrets decoded: `whatap-credentials` in the whatap namespace and the

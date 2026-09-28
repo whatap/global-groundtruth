@@ -166,6 +166,7 @@ case closes.
 ./collect-k8s.sh --bundle                 # -> whatap-k8s-<host>-<UTC>.tar.gz (report + yaml/logs)
 ./collect-k8s.sh --file --namespace <ns>  # RBAC-scoped kubeconfig: name the whatap namespace
 ./collect-k8s.sh --file --context <ctx>   # multi-cluster bastion
+KUBECONFIG=/path/to/config ./collect-k8s.sh --file  # non-default kubeconfig (kubectl/oc/helm all read it)
 ./collect-k8s.sh --file --out /var/tmp     # the .txt / .tar.gz in /var/tmp (default: current dir)
 LOG_TAIL_LINES=1000 ./collect-k8s.sh --file  # 1000 Tier 0 log lines per container (default 200)
 ./collect-k8s.sh                          # no arguments -> help only (does not collect)
