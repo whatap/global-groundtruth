@@ -1,6 +1,6 @@
 ---
 name: gg-verify-mech
-description: Verifies a behaviour-preserving global-groundtruth change (moves, splits, helper extraction, CHANGELOG/doc/comment edits) line by line. Escalates instead of guessing. Tier M in .claude/agents/README.md.
+description: Verifies a behaviour-preserving global-groundtruth change (moves, splits, helper extraction, CHANGELOG/doc/comment edits) line by line, or an A-tier change that only adds raw facts. Escalates instead of guessing. Tier M in .claude/agents/README.md.
 tools: Bash, Read, Grep, Glob
 model: sonnet
 ---
@@ -19,8 +19,11 @@ Patch path, base commit, the author's claims, and any area the caller wants look
 6. If a changed path is not exercised by any test or run, say so and build a small fixture run for it.
 7. Exhaustive, not representative: when a check applies to "each collector" or "each variable" (e.g. `--help` with odd env values, `--apply` on a member missing a block), run it on EVERY member and EVERY variable the diff touches, not on one example. A sonnet calibration on 2026-09-27 missed two defects because it picked apmjava and RUN_DEADLINE where the defect needed k8s and BINLOG_TIMEOUT.
 
+## A tier (additions only)
+When the caller grades the patch A: steps 2-4 apply to the new lines only; step 5 is `tools/lab/run.sh --base <base>` on every target that reaches the new code. Every report diff line must be an added line (`+`); a removed or changed line is `ESCALATE`. Check that each new read is bounded like its neighbours (same `_bounded`/`head -c`/cap helper) and that a missing file or command prints a clear absent line instead of an error or nothing.
+
 ## Escalate, don't guess
-If the diff touches `trap`, `kill`, `wait`, background `&`, `_bounded`, timeouts, synced skeleton blocks, the sync tool, privilege, `eval`, or changes report text, or if you find anything you cannot explain, answer `ESCALATE: <reason>` with what you checked so far, instead of a verdict.
+If the diff touches `trap`, `kill`, `wait`, background `&`, `_bounded` internals, timeouts, synced skeleton blocks, the sync tool, privilege, `eval`, or changes report text other than A-tier additions, or if you find anything you cannot explain, answer `ESCALATE: <reason>` with what you checked so far, instead of a verdict.
 
 ## Output
 Verdict (`commit` / `fix first` / `ESCALATE`), each problem with a reproduction, and the commands with results. Concise.

@@ -11,11 +11,12 @@ prompt; the shared procedure lives in the agent file.
 |---|---|---|---|
 | R (run) | `gg-check-runner` | haiku | Run a fixed list of checks and report numbers: `bash -n`, `dash -n`, shellcheck, `sync --check`, `validate.sh`, `tools/test-*.sh`, capture compare (`tools/capture-compare.sh`). No judgement beyond pass/fail and diff lines. |
 | M (mechanical) | `gg-verify-mech` | sonnet | Verify a change that should not alter behaviour and is checkable line by line: moved or split functions, CHANGELOG/doc moves, comment edits, helper extraction with identical bodies. |
+| A (additive) | `gg-verify-mech` | sonnet | Verify a change that only adds raw facts: a new `cat`/`ls`/`head`/version-file read or a raw command output inside an existing section, with no line removed from any report. Checked by the lab diff (`tools/lab/run.sh`), which must show added lines only. |
 | D (deep) | `gg-verify-deep` | opus | Verify anything where behaviour can differ subtly: signals, traps, timeouts, subshells, races; shared skeleton/group blocks (all collectors); parsing of untrusted input; report-changing logic; privilege or security paths; the sync tool itself. |
 
 Authoring follows the same grading: mechanical edits (moves, splits, CHANGELOG
-entries) can be written by a sonnet agent; design or D-tier changes are written
-by the main session or an opus agent.
+entries) and A-tier additions are written by a sonnet agent; design or D-tier
+changes are written by the main session or an opus agent.
 
 ## Work that is not a collector change
 
@@ -27,7 +28,7 @@ costs, not by how long the task is.
 | Lab targets | `gg-lab-builder` | sonnet | Build or repair a permanent lab target (VM, docker image/container on `jjsong-ggt-docker`, fixture) and prove it with a collector run. |
 | Reading | `gg-reader` | sonnet | Read Slack channels, case folders or docs and return a candidate table, each candidate grepped against the current collectors. |
 | Design audit | general-purpose | opus | A survey whose answer is a trade-off (what to cut, what a rule should say), not a list of facts. |
-| Report-changing authoring | general-purpose | opus | Writing a D-tier change (see Grading). Mechanical edits: sonnet. |
+| Report-changing authoring | general-purpose | opus | Writing a D-tier change (see Grading). Mechanical edits and A-tier additions: general-purpose with `model: sonnet`. |
 
 A grep-style coverage audit ("which collector prints X") is Reading, not a
 design audit.
@@ -40,7 +41,15 @@ Take the highest tier that any part of the change hits.
   `RUN_DEADLINE`, a synced skeleton block, the sync tool, anything under
   `privilege`, redirections of fds other than 1/2, `eval`, or a parser of
   command output whose result decides a goal outcome; or when the report is
-  meant to change.
+  meant to change in any way other than A below: a line or section removed or
+  reworded (fact-loss risk, the most frequent defect of 2026-09-27), untrusted
+  input parsed into fields (package.json, Secret data, SQL result columns),
+  or anything touching credentials that are not WhaTap's.
+- **A** if the change only adds raw facts (a file read, a version file, a raw
+  command output) inside an existing section, bounded like its neighbours,
+  and the lab diff on every target that reaches the new code shows added
+  lines only. Until five A verifications have also been run blind by
+  `gg-verify-deep` and logged below, each one is; a miss moves A back into D.
 - **M** if the change is a refactor that keeps the report byte-identical and
   the author claims it moves code without rewriting it.
 - **R** only for re-running checks on an already-verified patch (e.g. after a
@@ -92,3 +101,5 @@ match is unavoidable, bracket one character so the pattern cannot match itself
 | 2026-09-27 | fu-skel.patch (_bounded USR1 watchdog, D) | trap's `kill "$!"` (TERM) lost before exec → ~6% of bash watchdog calls +1 s | sonnet | contaminated | Verdict "fix first" for the right line, but found it by diffing against main, where the fix was already committed — not by testing. Its own latency test (best-of-5 totals over 300 calls) saw "no regression": a total/best-of hides a 6% tail. Lesson for every tier: count slow calls (≥500 ms), don't compare totals. |
 
 **Outcome (2026-09-27):** haiku = R only. sonnet = M only, with the exhaustive rule (gg-verify-mech step 7); in both D calibrations it missed the defect by sampling one representative case. opus = D. Re-run a blind calibration when a new model is considered.
+
+**A tier added (2026-09-28):** on 2026-09-27, 35 of 40 sub-agent runs were opus, because "the report is meant to change" put every collector addition in D. About half of those changes only added raw reads (nodejs framework versions, dotnet/mssql version facts, the python pid cap, apmjava version/perm facts). The lab runner now shows such a change as added lines only, which sonnet can check exhaustively; removals, parsers and shared blocks stay D.
