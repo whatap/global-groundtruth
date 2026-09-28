@@ -6,24 +6,24 @@
 >
 > | Entrypoint | Token | Scope | validated at | Status |
 > | ---------- | ----- | ----- | ------------ | ------ |
-> | [`collect-collserver.sh`](collect-collserver.sh) | `collserver` | the WhaTap backend itself | 0.15.0 | 0.15.0 run on 2026-09-28 on the lab `collsrv` VM (jjsong-ggt-collsrv, on-prem `whatap_multi` install on Ubuntu `openjdk-17-jre-headless`, `--stdout`/`--bundle`, and `--bundle --jvm` as the `whatap` user: a thread dump and a histo of each of the 8 server JVMs through `java -m jdk.jcmd`): COMPLETE, `validate.sh --report` pass — a lab VM, not a production host. 0.4.1 run against three live production backends (Smartfren, 2026-09-23); log selection re-measured against that bundle's own log tree. `--du` still unvalidated on either. |
+> | [`collect-collserver.sh`](collect-collserver.sh) | `collserver` | the WhaTap backend itself | 0.15.0 | 0.15.0 run on 2026-09-28 on the lab `collsrv` VM (jjsong-ggt-collsrv, on-prem `whatap_multi` install on Ubuntu `openjdk-17-jre-headless`, `--stdout`/`--bundle`, and `--bundle --jvm` as the `whatap` user: a thread dump and a histo of each of the 8 server JVMs through `java -m jdk.jcmd`): COMPLETE, `validate.sh --report` pass, a lab VM, not a production host. 0.4.1 run against three live production backends (Smartfren, 2026-09-23); log selection re-measured against that bundle's own log tree. `--du` still unvalidated on either. |
 > | [`collect-collzfs.sh`](collect-collzfs.sh) | `collzfs` | ZFS under the backend's data path | 0.12.0 | 0.12.0 run on 2026-09-28 as root on the lab `zfs` VM (jjsong-ggt-zfs, zpool `yard`, `--stdout`/`--bundle`): COMPLETE, `validate.sh --report` pass. 0.8.0 run as root on the same VM (Ubuntu 26.04, zfs 2.4.1, pool with a special vdev): the default run and the time window (idle, under an append load, a forced ring wrap, signals). 0.4.1 validated non-root on two live hosts (zfs 2.2.2 and 2.2.6), one of them a real collection server with `yardbase` on ZFS. `--zdb` still unvalidated. Stub tests: `tools/test-collzfs.sh` |
-> | [`collect-collmysql.sh`](collect-collmysql.sh) | `collmysql` | the MySQL that holds the backend's `account` / `notihub` metadata | 0.11.1 | 0.11.1 run on 2026-09-28 on the lab `collsrv` VM's own MySQL 8.4.11 (`--stdout`/`--binlog` as root): COMPLETE, `validate.sh --report` pass; the `mysql-ha` fixture (replicating pair, MySQL 5.6.51/5.7.32/8.4.10, MariaDB 10.11.19) was not re-run this round, so its scope note is unchanged — a replicating pair, section I on 8.4 and real `iostat` sampling are still unverified. |
+> | [`collect-collmysql.sh`](collect-collmysql.sh) | `collmysql` | the MySQL that holds the backend's `account` / `notihub` metadata | 0.11.1 | 0.11.1 run on 2026-09-28 on the lab `collsrv` VM's own MySQL 8.4.11 (`--stdout`/`--binlog` as root): COMPLETE, `validate.sh --report` pass; the `mysql-ha` fixture (replicating pair, MySQL 5.6.51/5.7.32/8.4.10, MariaDB 10.11.19) was not re-run this round, so its scope note is unchanged: a replicating pair, section I on 8.4 and real `iostat` sampling are still unverified. |
 >
 > "validated at" is the last version run on a real environment, not the current
 > `VERSION` in the script.
 >
 > Which one to run: `collect-collserver.sh` for anything about the backend
 > (services, ports, configs, logs). `collect-collzfs.sh` when the question is
-> about the ZFS filesystem under it — block sizing, allocation classes, the
+> about the ZFS filesystem under it: block sizing, allocation classes, the
 > write path, free-space fragmentation. `collect-collmysql.sh` when the question
-> is about the backend's own MySQL — replication and HA state, binary log growth
+> is about the backend's own MySQL: replication and HA state, binary log growth
 > and what is inside those logs, InnoDB I/O counters. They are each
 > self-contained; running any combination is fine and normal.
 
 The helpers two or three of them share word for word (the removed-option
 check, file dumping, the systemd helpers, the sampling-window duration
-parser, `_need_int` — collmysql and collserver only — and the `_give_back`
+parser, `_need_int` (collmysql and collserver only), and the `_give_back`
 chown-to-operator-under-sudo helper) are the group blocks
 `collection-server: <name>`, owned by
 [templates/groups/collection-server.sh](../../templates/groups/collection-server.sh):
@@ -39,16 +39,16 @@ ingress), plus `gateway` / `keeper` / `account` / `notihub` / `eureka` /
 
 ---
 
-## `collect-collserver.sh` — WhaTap backend facts
+## `collect-collserver.sh`: WhaTap backend facts
 
 ### (a) Facts it collects
 
 One `.txt` report, organized into MECE domains (each fact in exactly one place):
 
-- **`[1]` Collection environment** — bash version, uid, privilege, host boot
-  time and uptime, and which tools are present/absent — so every `n/a` below can
+- **`[1]` Collection environment**: bash version, uid, privilege, host boot
+  time and uptime, and which tools are present/absent, so every `n/a` below can
   be traced to a cause.
-- **A. Host & platform** — hostname, kernel and arch (read from
+- **A. Host & platform**: hostname, kernel and arch (read from
   `/proc/sys/kernel/{hostname,ostype,osrelease,arch}`, the strings `uname`
   prints; `hostname`/`uname` run only where a file is unreadable), OS release,
   memory, load, cgroup limits, and the JVM runtime. cgroup: this run's
@@ -72,13 +72,13 @@ One `.txt` report, organized into MECE domains (each fact in exactly one place):
   `jmap`, `jcmd`) runs without `JAVA_TOOL_OPTIONS`, `JDK_JAVA_OPTIONS` and
   `_JAVA_OPTIONS`, so an injected `-javaagent` is not loaded; `[1]` names
   the ones that were set. The date and timezone are B's.
-- **B. Time & clock synchronization** — a common root-cause axis: a skewed clock
+- **B. Time & clock synchronization**: a common root-cause axis: a skewed clock
   drops data into the wrong time buckets. Reports `timedatectl` (synchronized?
   NTP active? RTC/UTC/local), timezone, clocksource, virtualization, each
   server's JVM `-Duser.timezone`, and the **NTP daemon's own measured offset**
-  (chrony/ntpd/timesyncd — no network call; the run queries no external time
+  (chrony/ntpd/timesyncd: no network call; the run queries no external time
   source).
-- **C. Storage & filesystem** — yardbase path, **its filesystem type (ZFS or
+- **C. Storage & filesystem**: yardbase path, **its filesystem type (ZFS or
   not)** and, on ZFS, pool/dataset/ARC properties; capacity via `df` (never a
   recursive `du` in the report); the yard lock file under both names it
   has had, `YARDB_LOCK` and `.lock` (3.1.8), each present with its mtime or
@@ -89,24 +89,24 @@ One `.txt` report, organized into MECE domains (each fact in exactly one place):
   `db/backup` (count, how many are 0 bytes, newest 10). A full disk corrupts
   this file, and it fills with yardbase when both are on one filesystem;
   a dump the backup could not write is left at 0 bytes (2026-09-16, MEA).
-- **D. Deployment layout** — resolved `WHATAP_HOME` (and how it was resolved),
+- **D. Deployment layout**: resolved `WHATAP_HOME` (and how it was resolved),
   directory tree, jar versions, conf file list, and a `VERSION*` / `version*`
   file at the top level dumped raw when there is one (3.1.8 ships none; the
   module versions are then the jar names here and in E).
-- **E. Runtime processes** — per service: pid, jar/version, heap & GC flags,
+- **E. Runtime processes**: per service: pid, jar/version, heap & GC flags,
   RSS, start time; listening ports; systemd unit state. The port list checks
   each module's **default** port number and is labelled that way
   (`port 6789 (keeper default): LISTEN`); it is not read from this host's conf,
   so a LISTEN there says a socket is open on that number, not which module owns
   it. `ss -ltnp` below it names the owning process.
-- **F. Configuration** — every `conf/*.conf` dumped **raw** (see security note).
-- **G. Logs & recent events** — log inventory, bounded ERROR/WARN/Exception
+- **F. Configuration**: every `conf/*.conf` dumped **raw** (see security note).
+- **G. Logs & recent events**: log inventory, bounded ERROR/WARN/Exception
   counts, **a short tail of every base service log** (yard/proxy/gateway/keeper/
   … , newest-mtime first; rotated + `_self`/`_api`/`access` streams excluded),
   heap-dump files, journal errors.
 
 Values are **discovered, not assumed**; an absent value is reported as
-`n/a (<why>)` — `command not found`, `permission denied`, `path not found`,
+`n/a (<why>)`: `command not found`, `permission denied`, `path not found`,
 `timed out`, `not applicable`, or `empty output`.
 
 **How `WHATAP_HOME` is found, and when "not here" is an answer.** In order: a
@@ -133,7 +133,7 @@ tool's answer when it detects no hypervisor. `gc log: absent` means no
 
 ### (b) Delivery mechanism
 
-A **host shell script** the field engineer runs directly on the backend host —
+A **host shell script** the field engineer runs directly on the backend host:
 one command, hand over one file (CONTRACT rule 3):
 
 ```sh
@@ -183,7 +183,7 @@ now `LOG_TOTAL_MB=300 ./collect-collserver.sh --bundle --with-rotated=30`.
 
 While it runs, each phase is narrated on **stderr** (`>> ...`) so you can see it
 working on a slow host; the report itself stays clean. A collection needs an
-explicit action flag — running `./collect-collserver.sh` with no arguments just prints help,
+explicit action flag: running `./collect-collserver.sh` with no arguments just prints help,
 so nothing starts by accident.
 
 #### Collection-load tiers (safe on a struggling server)
@@ -206,7 +206,7 @@ so nothing starts by accident.
   candidate with its state (`kept` / `truncated` / `dropped`), its size and the
   reason; the report's G section carries the totals. A log that is missing from a
   bundle must never read as a log that did not exist on the host.
-- **Tier 2** (opt-in, may add load — announced on stderr first):
+- **Tier 2** (opt-in, may add load, announced on stderr first):
   `--jvm` writes one `jstack -l` and one `jmap -histo` (not `:live`, so no
   full GC; the first 200 lines) of each server JVM to the bundle's `jvm/`.
   Both stop the JVM at a safepoint. The tool, per JVM, is the first that
@@ -270,7 +270,7 @@ and re-validate after edits:
     was wrong, and it is what 0.4.1 fixes. The collector ran as uid 3103 on all
     three hosts and WhaTap is installed under uid 1001 (`whatap`); on
     `web02-bsd` uid 3103 could still reach `/data/whatap`, on both `web01` hosts
-    it could not. So the answer was never root — it was the owning account. The
+    it could not. So the answer was never root; it was the owning account. The
     report said "not resolved" two lines after printing the resolved path, which
     reads as a contradiction and sends the reader the wrong way.
   - **Run it as the account that owns the installation.** `--home` alone does
@@ -309,11 +309,11 @@ and re-validate after edits:
 
 ---
 
-## `collect-collzfs.sh` — ZFS facts
+## `collect-collzfs.sh`: ZFS facts
 
 For a collection-server host whose data path (`yardbase` / `logs` / `db`) sits on
 ZFS. It collects the measurements a reviewer needs in order to **verify or refute**
-a judgment about ZFS behaviour — and stops there. It prints the measured value and
+a judgment about ZFS behaviour, and stops there. It prints the measured value and
 the tunable that governs it; the threshold, the target and the "good/bad" belong to
 the reader (CONTRACT rule 1).
 
@@ -323,21 +323,21 @@ section C (fstype, `findmnt` SOURCE, `df`, `zfs get` of that dataset,
 `YARDB_LOCK`); runbooks run both, and this report's D, E and F have every
 dataset's rows, so the two join on the dataset name.
 
-### (a) Facts it collects — ZFS
+### (a) Facts it collects: ZFS
 
 One `.txt` report, MECE domains `[1]` + A..L, N, O (the WhaTap paths and
 their dataset are in collect-collserver.sh section C):
 
-- **`[1]` Collection environment** — bash, uid, privilege, boot time, tool presence, whether the
+- **`[1]` Collection environment**: bash, uid, privilege, boot time, tool presence, whether the
   kstat tree and the module-parameter dir exist, pool/dataset/snapshot counts,
   which tiers this run enabled and the time window's length.
-- **A. ZFS software & kernel module** — `zfs version`, userland vs `zfs-kmod`
+- **A. ZFS software & kernel module**: `zfs version`, userland vs `zfs-kmod`
   version, `modinfo`, the kernel (`/proc/sys/kernel/{ostype,osrelease}`) and
   `/etc/os-release` (raw), package/DKMS state, kernel taint, ZFS systemd units,
   `zpool.cache`. Also **asks the installed binary which subcommands and flags it
   has** (`zfs rewrite`, `zpool iostat -r/-w`, `zpool status -t`) rather than
   inferring capability from a version string.
-- **B. ZFS module parameters** — **every** file under
+- **B. ZFS module parameters**: **every** file under
   `/sys/module/{zfs,spl}/parameters` as `name = value` (the tunables of
   allocation-class routing, block-size limits, the txg/dirty-data write
   throttle, the metaslab allocator, the ZIL, ARC/L2ARC, prefetch, aggregation
@@ -345,32 +345,32 @@ their dataset are in collect-collserver.sh section C):
   then the **persisted** values in `/etc/modprobe.d/*zfs*` and the kernel
   cmdline. Runtime and persisted values are reported separately because they
   can differ.
-- **C. Pool topology & allocation classes** — raw `zpool list -v` (asked once:
+- **C. Pool topology & allocation classes**: raw `zpool list -v` (asked once:
   the same output is the bundle's `zpool-list-v.txt`). Its lines carry each
   top-level vdev's SIZE/ALLOC/FREE/FRAG/CAP/HEALTH, the allocation class it sits
   under (a `special` / `logs` / `cache` / `dedup` line; none means data) and its
   shape in its name (`mirror-N`, `raidzP-N`, `draid*`, `indirect-N`; a bare
   device is a single-device vdev). `zpool status -vt`, `-x`, leaf device paths,
   and the `metaslab_stats` kstat.
-- **D. Pool properties, features & capacity** — `zpool list`, `zpool get all` per
+- **D. Pool properties, features & capacity**: `zpool list`, `zpool get all` per
   pool (ashift, fragmentation, capacity, every `feature@*`), `zfs list -o space`,
   and `df -i -t zfs`, the file count of every mounted dataset. Reading `df -i`
   on ZFS: ZFS has no fixed inode table. `IUsed` is the number of
   objects in the dataset (files, directories and the like), so it is the file
   count without a walk. `Inodes` and `IFree` are derived from the free space and
-  move with it; read them as estimates, not as a limit (추정 — to be checked on a
+  move with it; read them as estimates, not as a limit (추정, to be checked on a
   real ZFS host).
-- **E. Dataset block size, compression, cache and mount** — the `zfs get` rows
+- **E. Dataset block size, compression, cache and mount**: the `zfs get` rows
   (NAME PROPERTY VALUE SOURCE) of `type`, `recordsize`, `special_small_blocks`,
   `volblocksize`, `compression`, `compressratio`, `logbias`, `sync`,
   `primarycache`, `atime`, `mounted`, `canmount`, `secondarycache`, `relatime`,
   `dedup`, `checksum`, `copies`, `reservation`, `refreservation` and `snapdir`
   for every filesystem and volume, from discovery's one `zfs get -Hp all`: exact
   values, each with its **property source** (`local`, `default`, `inherited
-  from X`) — a deliberately set value and an inherited one are different facts.
+  from X`): a deliberately set value and an inherited one are different facts.
   Then the volume list (`volblocksize` is fixed at creation), every locally-set
   property, and the `zstd` runtime kstat.
-- **F. Snapshots, clones & space accounting** — where used space sits: `used`,
+- **F. Snapshots, clones & space accounting**: where used space sits: `used`,
   `avail` and `usedby*` are D's `zfs list -o space`, and F adds the `zfs get`
   rows of `referenced`, `logicalused`, `logicalreferenced`, `written`, `quota`
   and `refquota`; `origin` is the clone-origin list. Then snapshot counts per
@@ -378,26 +378,26 @@ their dataset are in collect-collserver.sh section C):
   pinned by a clone**, and the `brtstats` block-cloning kstat. The snapshot
   summaries stay: the snapshot list itself is only in the bundle
   (`zfs-list-snapshots.tsv`).
-- **G. ARC / L2ARC / memory** — `arcstats` verbatim, `arc_summary`, a 1s `arcstat`
+- **G. ARC / L2ARC / memory**: `arcstats` verbatim, `arc_summary`, a 1s `arcstat`
   sample, `dbufstats` / `abdstats` / `zfetchstats` / `dnodestats`, and
   `/proc/meminfo` as the context those numbers are read against.
-- **H. Write path: transaction groups & ZIL** — the **`txgs` ring buffer**
-  (per-txg `ndirty`, `nwritten`, and time in each state — the per-transaction-group
+- **H. Write path: transaction groups & ZIL**: the **`txgs` ring buffer**
+  (per-txg `ndirty`, `nwritten`, and time in each state, the per-transaction-group
   ingest measurement), `dmu_tx_assign`, `zil`, `state`, `iostats`, `reads`,
   `multihost` per pool.
-- **I. Per-dataset I/O counters** — every `objset-<id>` kstat verbatim
+- **I. Per-dataset I/O counters**: every `objset-<id>` kstat verbatim
   (`dataset_name`, cumulative writes / bytes written / reads / bytes read /
   unlinks, the `zil_*` counters) **per dataset**, which is the only per-dataset
   byte counter available without instrumenting the application. Plus an
   inventory of every kstat entry not inlined.
-- **J. I/O request size & latency distribution** — `zpool iostat -v`, `-lv`,
+- **J. I/O request size & latency distribution**: `zpool iostat -v`, `-lv`,
   `-qv`, and the **`-r` request-size** and **`-w` latency histograms**,
   cumulative since boot (instant kstat reads). The same views over a span of
   time are in O.
-- **K. Underlying block devices** — `lsblk`, `/sys/block/*/queue/*`
+- **K. Underlying block devices**: `lsblk`, `/sys/block/*/queue/*`
   (rotational, scheduler, nr_requests, physical/logical block size, optimal_io_size,
   write_cache), `/dev/disk/by-id` links, `iostat -x`.
-- **L. Pool events, errors & maintenance** — a **tally of `zpool events` over the
+- **L. Pool events, errors & maintenance**: a **tally of `zpool events` over the
   whole ring buffer** (count, first date, last date per class), then the last 100
   events, both from **one read of the ring** (`zpool events` in a report run,
   `zpool events -v` in a bundle run, whose files `zfs/zpool-events-*` are the
@@ -414,7 +414,7 @@ their dataset are in collect-collserver.sh section C):
   question and is bundled only for a recent window (`EVENT_DAYS` in the
   environment, default 30),
   because the full `-v` dump of that buffer was 192MB.
-- **N. Deep block & metaslab statistics** — `zdb` is opt-in (see tiers). Each
+- **N. Deep block & metaslab statistics**: `zdb` is opt-in (see tiers). Each
   zdb call runs once: in a report run N prints its first 400-500 lines; in a
   bundle run its whole output goes to `zdb/zdb-<C|Lbbbs|mm>-<pool>.txt` and N
   names each file with its size and exit status. The
@@ -427,7 +427,7 @@ their dataset are in collect-collserver.sh section C):
   one day's directory; a PATH is required and the whole yardbase
   is not walked). A walk that hits its bound (`FILESIZES_SECS` in the
   environment, default 300) is labelled `PARTIAL`.
-- **O. Time window** — in every run, 15 s by default (`--window=DUR` sets the
+- **O. Time window**: in every run, 15 s by default (`--window=DUR` sets the
   length, 10 s to 24 h). It collects the following
   over the same span:
   - every txg of the window from the `txgs` ring (`otime` / `qtime` / `wtime` /
@@ -441,7 +441,7 @@ their dataset are in collect-collserver.sh section C):
 
 Values are **discovered, not assumed**; an absent value is reported as
 `n/a (<why>)`. A tunable that does not exist in the installed build is reported as
-`not present in this zfs build` — a version fact, not a collection failure.
+`not present in this zfs build`: a version fact, not a collection failure.
 
 #### The time window (section O)
 
@@ -560,9 +560,9 @@ test report), not txg 1.
   state). The report gives the time of that read and its newest txg, and says that
   txgs after it are not in the report. How many there were cannot be known.
 
-### (b) Delivery mechanism — ZFS
+### (b) Delivery mechanism: ZFS
 
-A **host shell script** the field engineer runs on the backend host — one command,
+A **host shell script** the field engineer runs on the backend host: one command,
 hand over one file (CONTRACT rule 3):
 
 ```sh
@@ -687,24 +687,24 @@ or the snapshot list failed, was refused or hung, or when `zfs` is absent.
   yardbase is on (its section C) are collected by `collect-collserver.sh`, not
   here.
 
-#### Collection-load tiers — ZFS
+#### Collection-load tiers: ZFS
 
 - **Tier 0** (`--file` / `--stdout`) reads kstats, properties and
   cumulative-since-boot `zpool iostat`, plus the 15 s time window (kstat file
-  reads and interval samples) — no pool traversal, no tree walk, no device
+  reads and interval samples): no pool traversal, no tree walk, no device
   wake-up. Measured at **~13 s** on a live 2.7 T pool at 0.4.1. The window adds
   about 17 s: on the 0.8.0 VM, 0.7.0 took 15.7-16.1 s and 0.8.0 took 33.2-34.9 s.
   Safe to run any time.
-- **Tier 1** — `--bundle` adds the raw artifacts (full property dumps, the whole
+- **Tier 1**: `--bundle` adds the raw artifacts (full property dumps, the whole
   kstat tree except `dbufs`, all module parameters, block-device settings, journal).
   Measured at **~34 s / 89 KB** on the same host. `--window=DUR`
   (10 s to 24 h, default 15 s) sets the length of the time window:
   read-only, it costs the window's wall-clock, not disk load.
 - **Tier 2** (opt-in, announced on stderr before running):
-  - `--zdb` — `zdb -C`, `zdb -Lbbbs` (block/psize/lsize histograms and **measured**
+  - `--zdb`: `zdb -C`, `zdb -Lbbbs` (block/psize/lsize histograms and **measured**
     compression), `zdb -mm` (metaslab free-space histograms). Traverses pool
     metadata: **minutes on a large pool, and it reads the data disks.**
-  - `--filesizes=PATH` — power-of-two file-size histogram under `PATH`, by
+  - `--filesizes=PATH`: power-of-two file-size histogram under `PATH`, by
     walking the tree. Metadata-only, `-xdev`, bounded to
     `FILESIZES_SECS` (environment, default 300 s). A walk that hits the bound, or that
     could not read part of the tree (`find` exits 1 on a denied directory), is
@@ -728,7 +728,7 @@ Under sudo the `.txt` and the `.tar.gz` are handed back to the invoking user.
 
 `dbufs` is never read, in any tier: it enumerates every dbuf in the ARC.
 
-### (c) How it was built / how to maintain — ZFS
+### (c) How it was built / how to maintain: ZFS
 
 Same harness as `collect-collserver.sh` (shared `probe` / `read_proc` / `dump_file`
 helpers, fd-3 progress, action-flag dispatch), following
@@ -749,7 +749,7 @@ Two habits worth keeping when extending it:
   `EXPANDSZ` / `DEDUP` columns over time, so a parser locates columns from the
   header row.
 
-#### Design notes — ZFS
+#### Design notes: ZFS
 
 **Question -> report section**, for a reader who knows what they want to check
 but not which section has it:
@@ -762,7 +762,7 @@ but not which section has it:
 | free-space fragmentation | C/D (FRAG, CAP per vdev and per pool), B (`metaslab_*` parameters), N (`zdb -mm`) |
 | rewrite / send-receive path | A (whether the rewrite subcommand exists), F (snapshot and clone space accounting) |
 
-#### Status notes / open items — ZFS
+#### Status notes / open items: ZFS
 
 - **0.8.0 on a ZFS VM, as root** (Ubuntu 26.04, zfs 2.4.1, TZ Asia/Jakarta, pool
   `yard` with a **special** vdev, 200k small files). Runs covered:
@@ -778,21 +778,21 @@ but not which section has it:
   The allocation-class view showed `class=special`. Every report passed
   `tools/validate.sh --report`.
 - **Validated** on two live ZFS hosts, both as a **non-root** uid:
-  - a KVM host — Ubuntu 24.04, zfs **2.2.2**, pool 2.72 T, FRAG 56 %, 19 datasets,
+  - a KVM host: Ubuntu 24.04, zfs **2.2.2**, pool 2.72 T, FRAG 56 %, 19 datasets,
     2 zvols, 2 clones, and a removed vdev leaving `indirect-0/1`. Tier 0 ~13 s,
     `--bundle` ~34 s / 89 KB, plus the removed `--home` (gone in 0.12.0), the
     pre-0.8.0 `--sample`, `--filesizes`.
-  - a **real WhaTap collection server** — Ubuntu 24.10, zfs **2.2.6**, pool
+  - a **real WhaTap collection server**: Ubuntu 24.10, zfs **2.2.6**, pool
     `yardbase` 99.5 G / FRAG 30 %, 10 running `whatap.server` JVMs. Tier 0 ~10 s.
     Section M (removed in 0.12.0) resolved `WHATAP_HOME` from a running JVM's
-    `-Dwhatap.server.home`, and correctly reported the **mixed** layout — only
+    `-Dwhatap.server.home`, and correctly reported the **mixed** layout: only
     `yardbase` on ZFS (`recordsize=64K` local, `compressratio 4.43x`), while
     `logs` / `conf` / `db` / `logsink` sit on the ext4 root. The `arcstat`
     sampling branch was exercised here (that binary is absent on the KVM host).
 - **Not yet validated**: `--zdb`, and (on a production host) the *content* of the root-only probes.
   `zdb` cannot open a pool as a non-root uid (`can't open '<pool>':
   Permission denied`), `/proc/spl/kstat/zfs/dbgmsg` is `0600 root`, and
-  `zpool history` / `zpool events` return `permission denied` — those absences
+  `zpool history` / `zpool events` return `permission denied`; those absences
   are now reported with their reason, but the success path is unexercised.
   Run once as **root** on a small pool to close this.
 - **Not yet seen**: a pool with a **logs** vdev. A special vdev was seen on the
@@ -804,7 +804,7 @@ but not which section has it:
 
 ---
 
-## `collect-collmysql.sh` — the backend's MySQL
+## `collect-collmysql.sh`: the backend's MySQL
 
 The WhaTap backend keeps `account` and `notihub` metadata in MySQL. When the
 question is about that database rather than about yard, this is the collector.
@@ -816,22 +816,22 @@ path.
 
 One `.txt` report, sections `[1]` and A..K:
 
-- **`[1]` Collection environment** — bash, uid, privilege, boot time, tool
+- **`[1]` Collection environment**: bash, uid, privilege, boot time, tool
   presence, which mysql client was resolved, what the connection was attempted
   with, where the password came from (never the password), whether it could
   connect and why not, and which opt-in tiers this run enabled.
-- **A. Server identity and version** — version, hostname, `server_id`,
+- **A. Server identity and version**: version, hostname, `server_id`,
   `server_uuid`, uptime, `read_only` / `super_read_only`, port, socket, datadir,
   the local `mysqld` process and the listening sockets, and this host's
   `/etc/os-release` (raw) and kernel (`/proc/sys/kernel/{ostype,osrelease}`).
-- **B. HA and replication** — `binlog_format`, GTID mode, `SHOW REPLICA STATUS`
+- **B. HA and replication**: `binlog_format`, GTID mode, `SHOW REPLICA STATUS`
   and the older `SHOW SLAVE STATUS`, `SHOW BINARY LOG STATUS` (MySQL 8.2+; on
   its syntax error, before 8.2 and on MariaDB, `SHOW MASTER STATUS` instead,
   labelled so), connected replicas,
   Galera `wsrep_cluster_size`, Group Replication members, semi-sync status. It
   asks for all of them and reports the reason for each one that does not answer,
   so the topology is read off the server rather than assumed.
-- **C. Binary log inventory and retention** — `log_bin`, basename and index,
+- **C. Binary log inventory and retention**: `log_bin`, basename and index,
   `max_binlog_size`, `binlog_expire_logs_seconds` and the older
   `expire_logs_days`, `binlog_row_image`, `sync_binlog`, `SHOW BINARY LOGS`,
   the binlog cache counters, and the on-disk file list with mtimes and sizes so
@@ -840,28 +840,28 @@ One `.txt` report, sections `[1]` and A..K:
   when `SHOW BINARY LOGS` gives no list (refused, timed out) does that listing
   add a `total:` line summed over the `<basename>.NNNNNN` files. There is no
   `du`: with the logs in the datadir it would walk the whole datadir.
-- **D. Storage and I/O** — `df -hT`, mounts, the datadir's filesystem,
+- **D. Storage and I/O**: `df -hT`, mounts, the datadir's filesystem,
   `/proc/diskstats`, and the `Innodb_data_*`, `Innodb_os_log*`,
   `Innodb_buffer_pool_*`, `Innodb_rows_*` and `Com_*` counters.
-- **E. InnoDB configuration** — page size, buffer pool size,
+- **E. InnoDB configuration**: page size, buffer pool size,
   `innodb_flush_log_at_trx_commit`, flush method, doublewrite, I/O capacity, log
   file settings, and `SHOW ENGINE INNODB STATUS`.
-- **F. Schema footprint** — per-schema table count and size, the 25 largest
+- **F. Schema footprint**: per-schema table count and size, the 25 largest
   tables, the tables whose names contain `lock` / `meter` / `event` / `audit`
   in any case (`LOWER(table_name)`: on 8.0 a plain `LIKE` is case-sensitive
   there and missed `MeteringDaily`, `AuditLog`, `ReserveEvent`),
   and the columns of `DeniedIPAddress` and `ApmRegion`.
-- **G. Per-table I/O and statement digests, from `performance_schema`** — the
+- **G. Per-table I/O and statement digests, from `performance_schema`**: the
   tables with the most I/O wait, the tables with the most rows written, the
   statement digests with the most latency and the most rows examined, and file
   I/O by event name. This is what attributes load to a caller.
-- **H. Current activity** — processlist, thread counters, `max_connections`.
-- **I. Binary log content attribution** — opt-in, see below.
-- **J. Interval samples** — every run: `iostat -x` and `vmstat` started
+- **H. Current activity**: processlist, thread counters, `max_connections`.
+- **I. Binary log content attribution**: opt-in, see below.
+- **J. Interval samples**: every run: `iostat -x` and `vmstat` started
   together over a 15 s window (`--window=DUR` sets it), six reports each. The
   first report of each is the average since boot, the other five cover the
   window.
-- **K. MySQL error log** — the resolved `log_error` tail, or the journal.
+- **K. MySQL error log**: the resolved `log_error` tail, or the journal.
 
 ### (b) Delivery mechanism
 
@@ -1000,7 +1000,7 @@ the process table locally, and fall back to `n/a (...)` when run from elsewhere.
 - **Tier 0** (the default `--file` / `--stdout` report) runs `SHOW` statements,
   `information_schema` and `performance_schema` queries, and near-instant local
   reads. No table scan of user data, no log decode.
-- **The window** (every run, section J) — `iostat -x` and `vmstat`, started
+- **The window** (every run, section J): `iostat -x` and `vmstat`, started
   together as bounded background jobs, six reports each at a fifth of the
   window (15 s: 3 s intervals). It puts no load on the server, only wall
   clock, so it is in the default run; `--window=DUR` sets its length. It is a
@@ -1019,7 +1019,7 @@ the process table locally, and fall back to `n/a (...)` when run from elsewhere.
   report is still written: J says `ended early: SIG... after Xs of Ys` and
   keeps what the samplers had written, and the goal is blocked with the same
   words. A second signal aborts the run.
-- **Tier 2** — `--binlog[=N]` decodes the N newest binary logs (default 2) with
+- **Tier 2**: `--binlog[=N]` decodes the N newest binary logs (default 2) with
   `mysqlbinlog --base64-output=DECODE-ROWS` and counts row events per table.
   This reads whole log files, so it costs I/O proportional to their size and is
   off by default. Start with `--binlog=1` on a host under pressure. Each file
@@ -1049,7 +1049,7 @@ the process table locally, and fall back to `n/a (...)` when run from elsewhere.
   reads. A local `mysqld`/`mariadbd` P (not a zombie) is the server
   when: the server's `@@pid_file` (relative: under `@@datadir`), read through
   `/proc/P/root`, holds P's pid in its own pid namespace (last `NSpid:` field
-  of `/proc/P/status`) — or, when this uid may not enter `/proc/P/root` (a
+  of `/proc/P/status`), or when this uid may not enter `/proc/P/root` (a
   container without `CAP_SYS_PTRACE`), the pid file as the run sees it holds
   P's pid; that pid file was written at or after the server's start (its
   mtime against now minus `Uptime`, both wall clock so a clock step does not
@@ -1144,17 +1144,17 @@ Every place a secret or sensitive value can arrive from, per collector.
 
 Nothing is masked. What can carry a secret:
 
-- **`conf/*.conf`** (section F and the bundle's `conf/`) — verbatim, including
+- **`conf/*.conf`** (section F and the bundle's `conf/`): verbatim, including
   `secure.conf` / `ksecure.conf`, the `account.conf` license and
   `admin.password`, database and eureka credentials.
-- **Process arguments** — section E prints each WhaTap JVM's `-X`/`-XX` flags;
+- **Process arguments**: section E prints each WhaTap JVM's `-X`/`-XX` flags;
   the bundle's `os/ps-aux.txt` is `ps aux`, i.e. the **full command line of
   every process on the host**, including other software that takes a password
   as an argument.
-- **Logs** — the tails in G and the copied `logs/` carry whatever the services
+- **Logs**: the tails in G and the copied `logs/` carry whatever the services
   logged (request URLs, account names, tokens a module chose to log).
-- **The journal** — unit output for the last `--hours`.
-- **Tier 2** — `--jvm`'s thread dumps carry thread names and lock owners'
+- **The journal**: unit output for the last `--hours`.
+- **Tier 2**: `--jvm`'s thread dumps carry thread names and lock owners'
   class names, and its class histogram carries class names.
 
 Move the resulting `.txt` / `.tar.gz` over a trusted channel and delete it when
@@ -1164,12 +1164,12 @@ the case is closed.
 
 It does not read WhaTap `conf/*.conf`. What can carry something sensitive:
 
-- **Host identity** — hostname, device serials and models (`lsblk`,
+- **Host identity**: hostname, device serials and models (`lsblk`,
   `/dev/disk/by-id`), dataset, pool and mount names.
-- **Process arguments** — L lists `zed` / `sanoid` / `syncoid` / `zrepl` /
+- **Process arguments**: L lists `zed` / `sanoid` / `syncoid` / `zrepl` /
   `zfs send|recv` processes with their full command lines, which for a
   replication job can include a remote host, a user and an ssh option.
-- **`zpool history`** — every administrative `zpool` / `zfs` command ever run on
+- **`zpool history`**: every administrative `zpool` / `zfs` command ever run on
   the pool, with its arguments (a `zfs set` of a key location, a `zfs create`
   with properties).
 - **Configuration files named in L** are reported as present/absent only; their
@@ -1188,15 +1188,15 @@ Treat it as internal.
 Nothing is masked, and nothing is written to the database. What can carry
 something sensitive:
 
-- **The processlist** (H) — the `INFO` column, truncated to 120 characters: a
+- **The processlist** (H): the `INFO` column, truncated to 120 characters: a
   running statement's literal values, which can include a password in a
   `CREATE USER` / `SET PASSWORD` / application query.
-- **Statement digests** (G) — normalized, so literals are replaced by `?`, but
+- **Statement digests** (G): normalized, so literals are replaced by `?`, but
   schema, table and column names are verbatim.
-- **Schema footprint** (F) — every schema and table name, row counts.
-- **The error log tail** (K) — whatever the server logged (failed logins with
+- **Schema footprint** (F): every schema and table name, row counts.
+- **The error log tail** (K): whatever the server logged (failed logins with
   account and host names).
-- **Section A/[1]** — the account name the connection was attempted with and the
+- **Section A/[1]**: the account name the connection was attempted with and the
   one the server matched, and the local `mysqld` command line from `ps`. `[1]`
   prints the whole `--mysql-args` string as the operator gave it (a password
   or a bare `-p` in it ends the run first).

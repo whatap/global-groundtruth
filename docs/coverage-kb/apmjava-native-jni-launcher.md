@@ -1,16 +1,16 @@
-# Coverage KB — JVMs started by a native JNI launcher (APM / Java)
+# Coverage KB: JVMs started by a native JNI launcher (APM / Java)
 
 **What this is:** a coverage knowledge-base entry. It records environment-specific
 **facts** a real deployment exhibits, so a collector author knows what a
-"discover, never assume" (CONTRACT rule 2) collector will surface here — and so
+"discover, never assume" (CONTRACT rule 2) collector will surface here, and so
 that no one is tempted to hardcode a product name. It is a reference, not a
 branch in any script. Like every artifact in this repo, the entries below are
-facts only — no diagnosis.
+facts only: no diagnosis.
 
 Environment: a **native launcher** that creates the JVM in its own process
 through the JNI Invocation API (`JNI_CreateJavaVM`), instead of exec'ing the
 `java` binary. Observed product: **Axway API Gateway** (`vshell`). The shape is
-not specific to it — any program that links `libjvm` and calls
+not specific to it: any program that links `libjvm` and calls
 `JNI_CreateJavaVM` presents the same way.
 
 ---
@@ -21,9 +21,9 @@ not specific to it — any program that links `libjvm` and calls
 |---|---|
 | `/proc/<pid>/comm` | the launcher's own name (`vshell`), never `java` |
 | `/proc/<pid>/exe` | the launcher binary, never a `java` / `jsvc` binary |
-| `/proc/<pid>/cmdline` | the launcher's own arguments. **No JVM option at all** — the option array was built in memory and passed to `JNI_CreateJavaVM` |
+| `/proc/<pid>/cmdline` | the launcher's own arguments. **No JVM option at all**: the option array was built in memory and passed to `JNI_CreateJavaVM` |
 | `/proc/<pid>/environ` | whatever the launcher was started with; the JVM options are not necessarily here either |
-| `/proc/<pid>/maps` | `…/libjvm.so` (HotSpot and derivatives) or `…/libj9vm<ver>.so` (OpenJ9 / IBM J9) — the one trace every JVM leaves |
+| `/proc/<pid>/maps` | `…/libjvm.so` (HotSpot and derivatives) or `…/libj9vm<ver>.so` (OpenJ9 / IBM J9): the one trace every JVM leaves |
 
 Consequence for a collector: identify a JVM by the **mapped VM shared library**,
 not by a process name or a binary path, and not by a list of known launchers.
@@ -73,6 +73,6 @@ gcc -o vshell vshell.c -I"$JAVA_HOME/include" -I"$JAVA_HOME/include/linux" \
 ```
 
 The running process then has `comm: vshell`, `exe: …/vshell`, a `cmdline` with
-no JVM option on it, and `…/libjvm.so` in its `maps` — the same shape as the
+no JVM option on it, and `…/libjvm.so` in its `maps`: the same shape as the
 field observation above. Renaming the same binary and re-running is the check
 that the collector matched the mapping and not the name.

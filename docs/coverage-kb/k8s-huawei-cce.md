@@ -1,13 +1,13 @@
-# Coverage KB — Huawei Cloud CCE (Kubernetes)
+# Coverage KB: Huawei Cloud CCE (Kubernetes)
 
 **What this is:** a coverage knowledge-base entry. It records environment-specific
 **facts** that a real cluster in this environment exhibits, so a collector author
 knows what a "discover, never assume" (CONTRACT rule 2) collector will surface
-here — and so that no one is tempted to hardcode a single environment's paths.
+here, and so that no one is tempted to hardcode a single environment's paths.
 
 It is a reference, not a branch in any script. A collector should **resolve**
 these values at runtime, not special-case "CCE". Like every artifact in this
-repo, the entries below are facts only — no diagnosis.
+repo, the entries below are facts only: no diagnosis.
 
 Environment: **Huawei Cloud CCE** (Cloud Container Engine).
 
@@ -50,4 +50,4 @@ not assume v1 or v2.
 
 Copy the structure above into a new `docs/coverage-kb/<platform>.md`: name the
 environment, then list each fact as *observed value* + *how a collector should
-discover it at runtime*. Keep it to observations — no cause, no recommendation.
+discover it at runtime*. Keep it to observations: no cause, no recommendation.

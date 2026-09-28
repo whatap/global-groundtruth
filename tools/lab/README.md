@@ -1,4 +1,4 @@
-# tools/lab — before/after collector runs in permanent lab targets
+# tools/lab: before/after collector runs in permanent lab targets
 
 One command replaces the hand-built fixtures (fake `ss`, throwaway JVMs and
 containers) and the hand comparison of `git show HEAD:<collector>` against
@@ -13,8 +13,8 @@ tools/lab/run.sh --status                       # state, uptime, memory, health 
 ```
 
 For each target, `run.sh` brings it up if it is not running (and reuses it
-when it is), runs every collector that applies — once from `--base` (default
-`HEAD`, taken with `git archive`) and once from the working tree — with the
+when it is), runs every collector that applies, once from `--base` (default
+`HEAD`, taken with `git archive`) and once from the working tree, with the
 target's argument sets, and writes masked stdout / stderr / rc, plus the
 **unmasked** stdout, to `--out DIR` (default `$TMPDIR/ggtlab-out/<UTC>/`) as
 `<target>/{base,new}/<collector>.<argset>.{out,err,rc,raw}` plus
@@ -23,8 +23,8 @@ target's argument sets, and writes masked stdout / stderr / rc, plus the
 time, so the two tools mask the same way (the diff itself only ever looks at
 the masked files, not `.raw`). Then the target's checks (facts that must
 appear) are run on both trees, and `tools/validate.sh --report` is run on
-every `.raw` file whose argument set actually produces a report — every set
-except `help` and `badarg` — on both trees; masking replaces versions and
+every `.raw` file whose argument set actually produces a report, every set
+except `help` and `badarg`, on both trees; masking replaces versions and
 timestamps with tokens that `validate.sh` does not expect, which is why it
 reads `.raw`, not `.out`. The summary per target:
 
@@ -39,7 +39,7 @@ Exit 0 when nothing differs, every check passes, and `validate.sh --report`
 passes on the working tree's own reports; 1 otherwise, 2 on usage, 3 when a
 target cannot be brought up or is not healthy. A `validate.sh --report`
 failure on the base is printed (`base n/m`) but does not affect the exit
-status — it is pre-existing, not caused by the change under test. A
+status: it is pre-existing, not caused by the change under test. A
 difference is not a verdict: live state (pids, sessions, the deadline mode
 `dl` under load) moves between two runs. Run the base twice (`--base HEAD`
 with a clean tree) to see the noise floor, as with capture-compare.
@@ -69,7 +69,7 @@ with a clean tree) to see the noise floor, as with capture-compare.
 | `local` | this host | every shell collector in the capture-compare modes (help, bad argument, `--stdout` as a file, deadline, `dash`/`dash -s`/`bash -s` for apm, `sh` for collection-server) |
 | `apm-java` | `jjsong-ggt-apm-java:1` | Temurin 21, Java agent 2.2.77 via `-javaagent`, JVM uid 1500; image without `unzip` (v.properties and weaving list are `n/a`) |
 | `apm-java-jto` | same image | the operator shape: agent only in `JAVA_TOOL_OPTIONS`, nothing on the command line |
-| `apm-java-bash52` | `jjsong-ggt-apm-java-bash52:1` | the only target on Ubuntu 24.04 noble's shells (bash 5.2.21, dash 0.5.12-6ubuntu5) — everything else here is jammy/bookworm; a JVM whose JDK copy dir is deleted after it starts (section B "binary deleted since the JVM started") and a `-javaagent` JVM whose `whatap.conf` weaving list names a real module (`spring-boot-3.0`) and a bogus one (`nonexistent-9.9`); section G lists the jar's raw `weaving/*` entries |
+| `apm-java-bash52` | `jjsong-ggt-apm-java-bash52:1` | the only target on Ubuntu 24.04 noble's shells (bash 5.2.21, dash 0.5.12-6ubuntu5): everything else here is jammy/bookworm; a JVM whose JDK copy dir is deleted after it starts (section B "binary deleted since the JVM started") and a `-javaagent` JVM whose `whatap.conf` weaving list names a real module (`spring-boot-3.0`) and a bogus one (`nonexistent-9.9`); section G lists the jar's raw `weaving/*` entries |
 | `apm-nodejs` | `jjsong-ggt-apm-nodejs:1` | Node 22, npm `whatap@2.0.6` required by the app, user `node` |
 | `apm-nodejs-op` | `jjsong-ggt-apm-nodejs-op:1` | agent from `apm-init-nodejs` in `/whatap-agent`, `NODE_OPTIONS=-r whatap` |
 | `apm-python` | `jjsong-ggt-apm-python:1` | Python 3.12 venv, PyPI `whatap-python==2.2.0`, `whatap-start-agent gunicorn` |
@@ -140,7 +140,7 @@ CHECKS=( "apmjava|app-sh|some ERE that must appear" "apmjava|app-sh|!an ERE that
   `user` is a uid or name inside a container, `-` for the login user of a
   local or ssh target, `0` for root (sudo -n over ssh). An `ssh_target` only
   runs collectors on stdin (`sh -s`/`bash -s`/`dash -s`; a bare shell name
-  errors out) — the collector itself needs bash (e.g. collzfs, collserver,
+  errors out), the collector itself needs bash (e.g. collzfs, collserver,
   collmysql), so give it `bash -s`, not `sh -s`.
 - A target that needs different sets per collector defines `argsets()`
   printing them (see `targets/local.sh`, `targets/collsrv.sh`).
