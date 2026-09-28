@@ -5,6 +5,20 @@ first. Every change to the script bumps its `VERSION` and adds one entry at
 the top of this list (docs/authoring-guide.md, step 2); `tools/validate.sh`
 checks that the newest entry is the script's `VERSION`.
 
+- **0.15.4** — Section B lists a JVM whose binary was deleted after it
+  started, or is not executable by this uid, among the binaries not run, with
+  the reason `binary deleted or not executable`; it used to be dropped, so
+  section B could say `java binaries: none` while section D listed the JVM.
+  Section G again prints each agent jar's raw `weaving/*` entry list (cap 200)
+  in place of the count, and no longer matches the config's weaving list
+  against the jar (the list stays in the section E config dump). Report-value
+  cuts go through `_u8cut`, so a cut no longer splits a UTF-8 character. The
+  section J session lists and the directory listings run as shell functions
+  instead of helper scripts written per run (checked under bash 5.2 `bash
+  -s`); a slow or capped one is named by its function in the collection status
+  instead of `sh`. Internal: helpers `_release_block`, `_conf_overflow`,
+  `_zcat` and `_fd_ls` (one fd snapshot for sections D and F); `_rep_jvms`,
+  `_rep_weaving` and `discover` are split into functions.
 - **0.15.3** — Collection status (skeleton `_emit_time`): when a bounded call was slow, capped or not run, the per-command "where the time went" table (sums largest first, time outside bounded calls) gives way to the time log's own records, one line per such call in the order they ran (`<ms> ms  <outcome>  <command>`, the first 40, then `(N more in this run)`); CONTRACT rule 1. `_run_init` sets its EXIT/INT/TERM/HUP traps before it creates the private directory: a signal in between left `ggt.*` behind.
 - **0.15.2** — `_run_init` (skeleton) also takes the script as read from stdin when `$0` is the shell's own binary (`/bin/bash -s`, `$0 -ef /proc/$$/exe`): bash 3.2 under musl otherwise faulted in a loop at full CPU after `4<&0`.
 - **0.15.1** — The host section adds `/sys/class/dmi/id/product_uuid`: its
