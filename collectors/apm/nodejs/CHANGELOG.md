@@ -5,6 +5,11 @@ first. Every change to the script bumps its `VERSION` and adds one entry at
 the top of this list (docs/authoring-guide.md, step 2); `tools/validate.sh`
 checks that the newest entry is the script's `VERSION`.
 
+- **0.9.10**: Run helpers (skeleton): `_out_dir_check` makes the `--out`
+  directory even when the run deadline is already spent (the mkdir gets the
+  command cap alone), instead of exiting 1 with a false "not writable" message
+  and no report. Main: with stderr closed, fd 3 opens on /dev/null instead of
+  `exec 3>&2` ending dash before the report.
 - **0.9.9**: Emit helpers (skeleton): `progress`, `warn` and `notice` return 0
   when their write fails, so a run whose stderr is closed or full no longer
   exits 1 after a complete report.

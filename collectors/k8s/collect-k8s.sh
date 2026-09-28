@@ -36,7 +36,7 @@ export LC_ALL=C
 # ---- collector metadata -----------------------------------------------------
 COLLECTOR_NAME="whatap-k8s"
 # History: CHANGELOG.md (next to this file).
-VERSION="0.13.4"
+VERSION="0.13.5"
 DOMAIN="k8s"
 TARGET="k8s-cluster/unresolved"      # refined after CLI/context/namespace discovery
 
@@ -569,8 +569,14 @@ _bounded_in() {
 # Called before anything is collected, so an unwritable one fails at once
 # rather than after a full run.
 _out_dir_check() {
-    local d="${OPT_OUT:-.}"
-    [ -d "$d" ] || _bounded mkdir -p -- "$d" 2>/dev/null
+    local d="${OPT_OUT:-.}" dl="$RUN_DEADLINE"
+    if [ ! -d "$d" ]; then
+        # A deadline spent before the run (a tiny RUN_DEADLINE) must not stop
+        # the report from being written: the mkdir gets the command cap alone.
+        _past_deadline && RUN_DEADLINE=$(($(_elapsed) + ${CMD_TIMEOUT:-20}))
+        _bounded mkdir -p -- "$d" 2>/dev/null
+        RUN_DEADLINE="$dl"
+    fi
     if [ ! -d "$d" ] || [ ! -w "$d" ] || [ ! -x "$d" ]; then
         warn "the report was not written: output directory $d is not writable by uid ${_priv_uid:-?}"
         return 1
@@ -3082,7 +3088,9 @@ do_bundle() {
 # =============================================================================
 # fd 3 = the terminal, saved before any stdout/stderr redirection so progress()
 # still reaches the operator even in --file mode (which redirects both).
-exec 3>&2
+# A closed stderr would make exec fail, which ends dash at once: fd 3 is then
+# /dev/null, and the run goes on (the report does not need the terminal).
+if (exec 3>&2); then exec 3>&2; else exec 3>/dev/null; fi
 
 # No arguments -> print help and stop; a collection needs an explicit action flag.
 [ "$ARGC" -eq 0 ] && { usage; exit 0; }

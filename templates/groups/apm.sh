@@ -670,7 +670,9 @@ _out_check() {
 # before any redirection so progress() reaches the operator even in --file mode
 # (which redirects both stdout and stderr). A member's own option checks that
 # need warn go at the start of its run_report, before anything is collected.
-exec 3>&2
+# A closed stderr would make exec fail, which ends dash at once: fd 3 is then
+# /dev/null, and the run goes on (the report does not need the terminal).
+if (exec 3>&2); then exec 3>&2; else exec 3>/dev/null; fi
 
 # No arguments -> print help and stop; a collection needs an explicit action flag.
 [ "$ARGC" -eq 0 ] && { usage; exit 0; }

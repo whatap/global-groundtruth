@@ -32,7 +32,7 @@ export LC_ALL=C
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-apmjava"
 # History: CHANGELOG.md (next to this file).
-VERSION="0.15.9"
+VERSION="0.15.10"
 DOMAIN="apm"
 TARGET="host/$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || uname -n 2>/dev/null || echo unknown)"
 
@@ -563,8 +563,14 @@ _bounded_in() {
 # Called before anything is collected, so an unwritable one fails at once
 # rather than after a full run.
 _out_dir_check() {
-    local d="${OPT_OUT:-.}"
-    [ -d "$d" ] || _bounded mkdir -p -- "$d" 2>/dev/null
+    local d="${OPT_OUT:-.}" dl="$RUN_DEADLINE"
+    if [ ! -d "$d" ]; then
+        # A deadline spent before the run (a tiny RUN_DEADLINE) must not stop
+        # the report from being written: the mkdir gets the command cap alone.
+        _past_deadline && RUN_DEADLINE=$(($(_elapsed) + ${CMD_TIMEOUT:-20}))
+        _bounded mkdir -p -- "$d" 2>/dev/null
+        RUN_DEADLINE="$dl"
+    fi
     if [ ! -d "$d" ] || [ ! -w "$d" ] || [ ! -x "$d" ]; then
         warn "the report was not written: output directory $d is not writable by uid ${_priv_uid:-?}"
         return 1
@@ -4401,7 +4407,9 @@ run_report() {
 # before any redirection so progress() reaches the operator even in --file mode
 # (which redirects both stdout and stderr). A member's own option checks that
 # need warn go at the start of its run_report, before anything is collected.
-exec 3>&2
+# A closed stderr would make exec fail, which ends dash at once: fd 3 is then
+# /dev/null, and the run goes on (the report does not need the terminal).
+if (exec 3>&2); then exec 3>&2; else exec 3>/dev/null; fi
 
 # No arguments -> print help and stop; a collection needs an explicit action flag.
 [ "$ARGC" -eq 0 ] && { usage; exit 0; }
