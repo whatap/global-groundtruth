@@ -1,20 +1,20 @@
-# collect-k8s.sh — changelog
+# collect-k8s.sh: changelog
 
 The version history of [`collect-k8s.sh`](collect-k8s.sh), newest first. Every
 change to the script bumps its `VERSION` and adds one entry at the top of this
 list (docs/authoring-guide.md, step 2); `tools/validate.sh` checks that the
 newest entry is the script's `VERSION`.
 
-- **0.13.3** — Run helpers (skeleton): `_why_124` and `_out_dir_check` move
+- **0.13.3**: Run helpers (skeleton): `_why_124` and `_out_dir_check` move
   into the skeleton run helpers (the `--out` mkdir now runs under the command
   cap), and `_run_init` sets the probe error file and reads the uid once; no
   report change.
-- **0.13.2** — Drop curl from the [1] tool row (only run inside the pod);
+- **0.13.2**: Drop curl from the [1] tool row (only run inside the pod);
   split discover_workloads, _rep_inpod's exec plan, _rep_operator_chain's
   webhook/service loop, and _rep_logs into smaller named helpers, with no
   report change.
-- **0.13.1** — Collection status (skeleton `_emit_time`): when a bounded call was slow, capped or not run, the per-command "where the time went" table (sums largest first, time outside bounded calls) gives way to the time log's own records, one line per such call in the order they ran (`<ms> ms  <outcome>  <command>`, the first 40, then `(N more in this run)`); CONTRACT rule 1. `_run_init` sets its EXIT/INT/TERM/HUP traps before it creates the private directory: a signal in between left `ggt.*` behind.
-- **0.13.0** — Removed `--kubeconfig PATH` / `--kubeconfig=PATH`: `KUBECONFIG=<path>
+- **0.13.1**: Collection status (skeleton `_emit_time`): when a bounded call was slow, capped or not run, the per-command "where the time went" table (sums largest first, time outside bounded calls) gives way to the time log's own records, one line per such call in the order they ran (`<ms> ms  <outcome>  <command>`, the first 40, then `(N more in this run)`); CONTRACT rule 1. `_run_init` sets its EXIT/INT/TERM/HUP traps before it creates the private directory: a signal in between left `ggt.*` behind.
+- **0.13.0**: Removed `--kubeconfig PATH` / `--kubeconfig=PATH`: `KUBECONFIG=<path>
   collect-k8s.sh ...` does the same, for kubectl/oc/helm alike, so a separate
   flag only duplicated it. The flag is stub-exit (exit 2, one stderr line)
   rather than ignored, because silently dropping it would collect a different
@@ -22,11 +22,11 @@ newest entry is the script's `VERSION`.
   and the Environment block now name `KUBECONFIG=PATH` instead of the flag;
   the `KOPTS`/`HOPTS` builders (kubectl, and helm in both the Tier 0 helm
   section and the bundle collector) no longer append `--kubeconfig=...`
-  themselves — kubectl/oc/helm each read `$KUBECONFIG` (or `~/.kube/config`)
+  themselves: kubectl/oc/helm each read `$KUBECONFIG` (or `~/.kube/config`)
   on their own, so the report's `KUBECONFIG env` and `cli global options`
   lines still show what is in effect.
-- **0.12.2** — `_run_init` (skeleton) also takes the script as read from stdin when `$0` is the shell's own binary (`/bin/bash -s`, `$0 -ef /proc/$$/exe`): bash 3.2 under musl otherwise faulted in a loop at full CPU after `4<&0`.
-- **0.12.1** — Section D ("rbac & identity") prints the WhaTap credential
+- **0.12.2**: `_run_init` (skeleton) also takes the script as read from stdin when `$0` is the shell's own binary (`/bin/bash -s`, `$0 -ef /proc/$$/exe`): bash 3.2 under musl otherwise faulted in a loop at full CPU after `4<&0`.
+- **0.12.1**: Section D ("rbac & identity") prints the WhaTap credential
   Secrets decoded: `whatap-credentials` in the whatap namespace and the
   Secrets the WhatapAgent CR spec names (a field ending in `secretName`, or
   the `name` of a field ending in `secretRef`); pod env/envFrom references
@@ -41,7 +41,7 @@ newest entry is the script's `VERSION`.
   `WhaTap version lines` (the pattern also matches operator lines such as
   `whatap-injection--v1-`). Lab: `whatap-credentials` WHATAP_HOST, LICENSE,
   PORT printed; report 1634 → 1638 lines, run 20 s.
-- **0.12.0** — Collects what confirms a root cause, and drops views that
+- **0.12.0**: Collects what confirms a root cause, and drops views that
   restated raw output already in the report (user decision 2026-09-27; no
   option added or removed; no fact lost). Removed, and where the same fact is
   now read: section C's six per-CR jsonpath extracts after the CR yaml (env
@@ -67,14 +67,14 @@ newest entry is the script's `VERSION`.
   kube-apiserver's `https_proxy` with a `no_proxy` lacking `.svc` and the
   cluster CIDRs, found only from a field screenshot, and whose serving chain
   was measured by hand (`session-probe.sh`): section D **kube-apiserver proxy
-  environment** — per kube-apiserver pod in kube-system and container, env
+  environment**: per kube-apiserver pod in kube-system and container, env
   entries named `http_proxy`/`https_proxy`/`no_proxy` in any case (verbatim),
   envFrom sources, env count, or n/a naming why (no such pod: managed control
   planes do not expose it; a refused list: its reason); section I reads the
   proxy lines of the node's `/etc/kubernetes/manifests/kube-apiserver.yaml`
   when an exec sample runs on a kube-apiserver node (the without-restarts
   sample prefers such a node; no exec added). Section D **webhook serving
-  certificate chain as presented** — `openssl s_client -showcerts` from the
+  certificate chain as presented**: `openssl s_client -showcerts` from the
   collector host to the first 2 ready endpoint addresses and the Service
   ClusterIP, SNI `<svc>.<ns>.svc`, `-CAfile` = the hook's caBundle,
   `-verify_hostname` where s_client has it (LibreSSL has not: the line says
@@ -101,31 +101,31 @@ newest entry is the script's `VERSION`.
   `CN=whatap-webhook-ca`, verify 0; the lab kube-apiserver has no env
   entries. The chain code was also run under openssl 1.0.2g and LibreSSL with
   bash 3.2.
-- **0.11.5** — Shortened long comment runs: the top-of-file block now points at
+- **0.11.5**: Shortened long comment runs: the top-of-file block now points at
   README.md for section/tier detail instead of restating it; the merged-calls
   and deep-operator-log-tail algorithm rationale moved to a new README.md
   "Design notes" section, with a short pointer left in the code; the webhook
   cert mismatch root cause and the pod-probe fallback rules were tightened in
   place. Comments only; report content unchanged.
-- **0.11.4** — The batched-call store keeps each group's segments contiguous
+- **0.11.4**: The batched-call store keeps each group's segments contiguous
   (start KM_GS, count KM_GC per group; KM_SK holds KEY only), so a lookup reads
   only that group's segments and a re-run unsets only its own range instead of
   copying every segment; _km_drop is folded into _km_reset and the pod-probe
   segments are the reserved group "" (_PX_GI). 500 pods × 10 keys: 50 small
   km_get 19.7 s → 0.3 s, _pod_probes_run + _px ×20 9.0 s → 0.03 s (0.11.2:
   0.3 s, 0.02 s). Report content unchanged.
-- **0.11.3** — Split _rep_operator and _rep_apm into per-subsection and
+- **0.11.3**: Split _rep_operator and _rep_apm into per-subsection and
   per-level functions; the batched-call store uses flat arrays keyed GROUP/KEY
   instead of 14 evals over generated names; repeated code is _seg_flush,
   _x509_fp and _ns_found. Report content unchanged.
-- **0.11.2** — Shared code in synced blocks (R2 refactor): the skeleton's emit
+- **0.11.2**: Shared code in synced blocks (R2 refactor): the skeleton's emit
   helpers now hold _optval, _emit_labeled, _tool_rows (the [1] tool table) and
   _indent (the indent loops), and its run helpers hold probe and read_proc.
   Report change: probe (helm version, helm history, helm values) prints the
   output of a command that exits non-zero under "label (exit N):" instead of
   "label: n/a (...)". No goal reads that text. Compared with 0.11.1 on this
   host: reports equal but live values (operator log lines).
-- **0.11.1** — [1]'s privilege line says when uid 0 has no CAP_SYS_PTRACE (bit 19
+- **0.11.1**: [1]'s privilege line says when uid 0 has no CAP_SYS_PTRACE (bit 19
   of CapEff; the default in docker and k8s): "root without
   CAP_SYS_PTRACE (other uids' /proc/\<pid>/environ, root, cwd are not
   readable: run as the target's uid, ...)". It read "root" while
@@ -135,27 +135,27 @@ newest entry is the script's `VERSION`.
   timer outlived each call, is not used; the watchdog caps instead.
   Under a PID 1 that does not reap (sleep infinity), one run of each
   collector left 1 zombie on debian and 41-55 on alpine; now 0 (2026-09-27).
-- **0.11.0** — The Tier 0 log lines per container come from the environment,
+- **0.11.0**: The Tier 0 log lines per container come from the environment,
   LOG_TAIL_LINES (default 200, 1..999999; another value is named in a
   !! line and 200 is used). --tail is refused, naming LOG_TAIL_LINES.
   The help shows -n for --namespace. An --out directory that cannot be
   written stops the run before it collects (2026-09-26).
   A value option given nothing, or a value starting with '-', exits 2
   ("missing value for --out"); it took the next option as its value.
-- **0.10.0** — Section [1] states the API round trip: the time of the one
+- **0.10.0**: Section [1] states the API round trip: the time of the one
   reachability call (get --raw /version) in ms, no extra call
   (2026-09-26).
-- **0.9.0** — The whatap namespace, the whatap workloads and the node-agent pods are
+- **0.9.0**: The whatap namespace, the whatap workloads and the node-agent pods are
   goals: a refused, failed or timed-out list behind them is missed and
   the run INCOMPLETE (it was COMPLETE). The operator log tail is cut from
   the 4000-line read when that read holds it (one call instead of two).
-- **0.8.6** — --apm-exec reads the runtime versions without JAVA_TOOL_OPTIONS and the
+- **0.8.6**: --apm-exec reads the runtime versions without JAVA_TOOL_OPTIONS and the
   other agent variables: the JVM loaded the WhaTap agent, which wrote a
   Start block to the app's whatap.log on every run.
-- **0.8.5** — Readability refactor; report unchanged. Fewer API calls, same
+- **0.8.5**: Readability refactor; report unchanged. Fewer API calls, same
   answers: section J reads each workload and each pod in one call
   (14 -> 1 per pod), the operator deployment and operator pod list reads
   of section D are merged, and section A counts namespaces from the list
   section J prints (3 --apm-target, lab cluster: 111 s -> 75 s).
-- **0.8.4** — A CMD_TIMEOUT from the environment is used (it was overwritten by a
+- **0.8.4**: A CMD_TIMEOUT from the environment is used (it was overwritten by a
   fixed value after _run_init had checked it) (2026-09-26).

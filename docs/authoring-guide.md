@@ -1,4 +1,4 @@
-# Authoring guide — add a collector
+# Authoring guide: add a collector
 
 This guide is for a **domain developer** adding or maintaining a collector. The
 framework owner does not have to write it for you (CONTRACT rule 4). If you can
@@ -7,7 +7,7 @@ engineer for?", you can author a collector.
 
 Read [CONTRACT.md](../CONTRACT.md) and [output-format.md](output-format.md)
 first. They are short and they are the whole spec. Then read
-[collector-engineering.md](collector-engineering.md) — the design guidelines
+[collector-engineering.md](collector-engineering.md): the design guidelines
 (MECE sections, load-safe tiers, portability, reasoned absence) that keep a
 collector from misleading readers, overloading a sick host, or breaking on an
 unfamiliar OS.
@@ -18,10 +18,10 @@ unfamiliar OS.
 
 ### 1. Decide the facts
 
-Write down the questions your agent's support cases ask over and over — "where
+Write down the questions your agent's support cases ask over and over: "where
 do the logs actually live?", "which runtime?", "what's the DB parameter X?".
 Each recurring question is a fact your collector should surface. That list is
-your section list. **Stop at facts** — "which runtime" is a fact; "is the
+your section list. **Stop at facts**: "which runtime" is a fact; "is the
 runtime misconfigured" is a judgment and does not belong here.
 
 ### 2. Copy the skeleton
@@ -47,9 +47,9 @@ markdown list item, newest first, that says what changed in the report or the
 behaviour and on what evidence:
 
 ```markdown
-- **0.2.0** — Section C reads X from /proc instead of Y (Y was absent on
+- **0.2.0**: Section C reads X from /proc instead of Y (Y was absent on
   Alpine, 2026-09-27).
-- **0.1.0** — First version.
+- **0.1.0**: First version.
 ```
 
 Where several collectors share a directory and one README with a section per
@@ -60,17 +60,17 @@ collector (`collectors/collection-server/`, `collectors/db/`), they share one
 CHANGELOG (or section) is missing, whose newest entry is not its `VERSION`, or
 that carries `# x.y.z` history lines in the script again.
 
-**Name the entrypoint `collect-<token>.sh`** — never a bare `collect.sh`. The
+**Name the entrypoint `collect-<token>.sh`**: never a bare `collect.sh`. The
 `<token>` is this collector's unique short id, the **same token that prefixes its
 output filename** (`whatap-<token>-<host>-<UTC>.txt`); the seed collector is
 `collect-collserver.sh` → `whatap-collserver-…`. Two reasons: (1) the script name
-and its deliverable share one identifier, and (2) collectors are copied around —
-into `$WHATAP_HOME/bin`, next to each other, cited by name in support chats — and
+and its deliverable share one identifier, and (2) collectors are copied around
+(into `$WHATAP_HOME/bin`, next to each other, cited by name in support chats) and
 identical `collect.sh` files would collide or be run by mistake. A domain with
 per-language collectors (apm) gives each its own token (`collect-apmjava.sh`,
 `collect-apmpython.sh`). `tools/validate.sh` enforces the `collect-*.sh` shape.
 
-### 3. Write the sections — obey the two hard rules
+### 3. Write the sections: obey the two hard rules
 
 - **Facts only** (rule 1). No line may say what a fact *means*. If you catch
   yourself writing "likely", "should", "recommend", "root cause", "fix", or any
@@ -79,12 +79,12 @@ per-language collectors (apm) gives each its own token (`collect-apmjava.sh`,
 - **Discover, never assume** (rule 2). Resolve the environment instead of
   hardcoding it: follow symlinks (`readlink -f`), read mounts (`findmnt`), parse
   process arguments (`/proc/<pid>/cmdline`), dump config as-is. A value you
-  cannot obtain is a fact too — emit `n/a` via `probe` or `read_proc`, never a
+  cannot obtain is a fact too: emit `n/a` via `probe` or `read_proc`, never a
   fabricated default. This is what lets one collector work in an environment its
   author never saw (see [coverage-kb/](coverage-kb/)).
-- **Dump configuration verbatim — do not mask, and say what that exposes.**
+- **Dump configuration verbatim: do not mask, and say what that exposes.**
   Framework policy is not to alter what the report quotes: a masked value
-  destroys the very fact a reader needs — a mistyped community string or a
+  destroys the very fact a reader needs: a mistyped community string or a
   wrong server address must be readable to be verified or refuted against the
   other side. That does **not** mean the report is free of secrets. WhaTap
   configs can hold a license key or an `admin.password`, and a collector that
@@ -114,12 +114,12 @@ your delivery mechanism and document it in `collectors/<domain>/README.md`:
 - **in-cluster (k8s)**: a Job manifest whose logs are the report.
 
 The skeleton's CLI harness already makes that "one command" explicit and visible:
-running it **bare prints usage** (a collection needs an action flag — `--file` /
+running it **bare prints usage** (a collection needs an action flag, `--file` /
 `--stdout`), and it **narrates progress on stderr** so the engineer sees it
-working on a slow host. Keep both — the exact one command goes in your README.
+working on a slow host. Keep both: the exact one command goes in your README.
 See [collector-engineering.md](collector-engineering.md) guideline 5.
 
-The skeleton ships **Tier 0 only** — the facts report. If your domain needs a
+The skeleton ships **Tier 0 only**: the facts report. If your domain needs a
 `--bundle` tier (size-capped log/config artifacts as a tar.gz), copy the
 bundle plumbing from a seeded collector
 ([collect-collserver.sh](../collectors/collection-server/collect-collserver.sh)
@@ -144,7 +144,7 @@ tools/validate.sh --report /tmp/r.txt
 That checks the header values and order, the numbering, the environment
 section, the status arithmetic and the footer of a real report. `tools/test-framework.sh` does the same for every collector at once,
 and is the check to run after changing anything shared. Fix the
-**collector** until both pass — never edit the validator to make a collector
+**collector** until both pass; never edit the validator to make a collector
 pass.
 
 ### 6. Own it
@@ -164,7 +164,7 @@ host yet.
 
 ## Checklist
 
-This is the one checklist for a collector change — steps from this guide and
+This is the one checklist for a collector change: steps from this guide and
 the design guidelines of [collector-engineering.md](collector-engineering.md)
 together. Where a line names a `tools/validate.sh` check, it is one of the
 numbered checks in that script's own header comment.
@@ -174,9 +174,9 @@ numbered checks in that script's own header comment.
 - [ ] A helper that behaves the same in sibling collectors is a group block in
       `templates/groups/<group>.sh` (its `# members:` line names this
       collector), not a hand copy; `tools/sync-shared-block.sh --check` passes.
-- [ ] Sections are MECE — each fact appears once, in one domain; domains are
+- [ ] Sections are MECE: each fact appears once, in one domain; domains are
       named (collector-engineering.md guideline 1).
-- [ ] Every section is facts only — no cause, no severity, no action; reason
+- [ ] Every section is facts only: no cause, no severity, no action; reason
       and progress strings carry no judgment words. `validate.sh` greps every
       emitted line for judgment words (check 4).
 - [ ] Default run is Tier 0: no JVM attach, no recursive `du`, no whole-log
@@ -206,7 +206,7 @@ numbered checks in that script's own header comment.
       replacement, or is named and ignored when ignoring it changes nothing
       collected.
 - [ ] Temporary files live under `_tmp`; nothing is left after Ctrl-C.
-- [ ] Everything in the script is English — code, comments, usage/help text,
+- [ ] Everything in the script is English: code, comments, usage/help text,
       progress narration, report output. Tools parse the exact strings; see
       the language policy in the root [README.md](../README.md).
 - [ ] The change bumps `VERSION` and adds a CHANGELOG entry (newest first, in

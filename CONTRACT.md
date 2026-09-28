@@ -1,6 +1,6 @@
 # CONTRACT
 
-Every collector in this repository — in every domain, now and in the future —
+Every collector in this repository (in every domain, now and in the future)
 **must** obey the four rules below. They are non-negotiable. A collector that
 breaks any of them does not belong in `global-groundtruth`.
 
@@ -20,11 +20,11 @@ No diagnosis. No "likely cause." No recommendation. No fix. No severity.
 A collector reports **what is**, never **what it means**. **No report line may
 state a conclusion.**
 
-This rule binds **the script and its report — not people**. Field engineers,
+This rule binds **the script and its report, not people**. Field engineers,
 partners, and customers can and do form judgments about a case; that is their
 normal work. The collector's purpose is to gather the logs and facts that let
 any such judgment be **verified or refuted**. Interpretation happens outside
-the report — by the people reading it (typically a remote WhaTap agent
+the report, by the people reading it (typically a remote WhaTap agent
 developer, but also the engineer on site).
 
 > If a line could start with "so you should…", "this is probably…", or
@@ -33,16 +33,16 @@ developer, but also the engineer on site).
 A fact section holds **observed values only**. Three kinds of line that are not
 judgments still do not belong there:
 
-- **Explanation** — what a field means, how the product behaves, what a
+- **Explanation**: what a field means, how the product behaves, what a
   vendor's source says ("the 0.5.x line has no master agent"). It is true of
   the product, not observed on this host, and it goes in the collector's
   README.
-- **Next steps** — "check binlog_format in section C", "rerun with --sql". The
+- **Next steps**: "check binlog_format in section C", "rerun with --sql". The
   one next step a report may carry is *how to run this collector differently to
   obtain what it did not*, and it lives only in the `Collection status` section
   and on stderr, attached to the goal it would obtain (`run again with sudo`,
   `rerun with --sql`, `run it on the DB host`).
-- **Derived views** — tallies, frequency tables, histograms, percentiles,
+- **Derived views**: tallies, frequency tables, histograms, percentiles,
   joins between sections, or a table rebuilt from output the report or bundle
   already carries. Print the raw output once; the reader, or a helper on the
   analysis side, builds the view. A count of what was read (`backup files: 3`,
@@ -73,14 +73,14 @@ The wording stays inside rule 1's vocabulary: name what was not obtained and
 why, never what it means or what to do about the system.
 
 It also does not turn a normal environment into a failure. An absence is
-marked `na` when it is itself the answer — no ZFS on a host that does not use
-ZFS, no agent where the product is not installed — and the run is still
+marked `na` when it is itself the answer (no ZFS on a host that does not use
+ZFS, no agent where the product is not installed) and the run is still
 COMPLETE. Only a **blocked** value, one a different run would obtain, makes it
 INCOMPLETE. A collector that reports an ordinary host as INCOMPLETE teaches
 the field to ignore the line; one that reports a blind run as COMPLETE sends a
 report that answers the question wrongly and nobody notices until the case has
-crossed a time zone. The precise rule for telling the two apart — the one
-authors write collectors against, with its worked examples — lives in one
+crossed a time zone. The precise rule for telling the two apart (the one
+authors write collectors against, with its worked examples) lives in one
 place: [docs/output-format.md](docs/output-format.md), "Three outcomes, not
 two". This page only needs what the distinction means for the field.
 
@@ -98,7 +98,7 @@ and the validator deliberately does not inspect runtime output.
 ## 2. Discover, never assume
 
 Prefer **resolving** the environment over **hardcoding** it. Resolve symlinks,
-read mounts, parse process arguments, and dump config — so that a new or exotic
+read mounts, parse process arguments, and dump config, so that a new or exotic
 environment produces correct facts **with no code change**.
 
 > Example of the intent: to report where container logs actually live, resolve
@@ -106,7 +106,7 @@ environment produces correct facts **with no code change**.
 > path. A standard cluster and a Huawei CCE cluster then both report correctly
 > from the same code. See [docs/coverage-kb/k8s-huawei-cce.md](docs/coverage-kb/k8s-huawei-cce.md).
 
-When a value cannot be discovered, say so as a fact (`n/a`, `not found`) — never
+When a value cannot be discovered, say so as a fact (`n/a`, `not found`); never
 substitute an assumed default silently.
 
 ## 3. One field command → paste output
@@ -121,13 +121,13 @@ the whole interaction. They are not asked to interpret, edit, or select.
 ## 4. Domain-team owned
 
 The framework owner provides the contract, the shared format, the template, and
-the validator — and, at most, a **v0** of a collector to seed a domain.
+the validator, and, at most, a **v0** of a collector to seed a domain.
 
 Until a domain team is ready to take a collector over, the framework owner is
-its **interim owner** — it manages the stub and any seeded v0. Handover then
+its **interim owner**: it manages the stub and any seeded v0. Handover then
 transfers **ongoing** ownership to the domain's developers.
 
-**Ongoing ownership of each collector belongs to that domain's developers** —
+**Ongoing ownership of each collector belongs to that domain's developers**:
 the people who know which hidden facts their agent actually needs. A new
 collector is added by copying the template and following
 [docs/authoring-guide.md](docs/authoring-guide.md); the framework owner does not

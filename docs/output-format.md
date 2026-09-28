@@ -18,7 +18,7 @@ This shape is the contract's Rule 1 ("facts only") made concrete: sections hold
 facts, and nothing else.
 
 This shape is **stdout** (or the `.txt` / the bundle's `report.txt`). A collector's
-run-progress narration is written to **stderr** and is **not** part of this shape —
+run-progress narration is written to **stderr** and is **not** part of this shape:
 stdout stays byte-for-byte the report so a reader or a script can parse it. (See
 collector-engineering.md guideline 5.)
 
@@ -108,9 +108,9 @@ The five appear in this order, and `validate.sh --report` checks each value:
   helper assigns the number; nothing else prints one. `[1]` is always the
   collection environment (see below) and the last section is always
   `Collection status`.
-- Each has a short, factual **TITLE** (a noun phrase — "Container log paths",
+- Each has a short, factual **TITLE** (a noun phrase: "Container log paths",
   not "Log path problems").
-- Section bodies contain **facts only** — observed values, resolved paths,
+- Section bodies contain **facts only**: observed values, resolved paths,
   command output. A value that could not be obtained is itself a fact: print
   `n/a` or `not found`, never a guess.
 - No line states a cause, a severity, or an action. (Rule 1.)
@@ -120,12 +120,12 @@ The five appear in this order, and `validate.sh --report` checks each value:
   differently, goes in the status section. (CONTRACT rule 1.)
 
 > **Letter labels.** Collectors commonly prefix the titles of their MECE
-> domains with stable letters — `[2] A. Host & platform`, `[3] B. Time &
-> clock` — so prose (domain READMEs, case notes) can say "section B" without
+> domains with stable letters: `[2] A. Host & platform`, `[3] B. Time &
+> clock`, so prose (domain READMEs, case notes) can say "section B" without
 > breaking when a new section is inserted and the automatic numbers shift.
 > The letter is **part of the title**, chosen by the author; the `[n]` is
 > emitted by the shared `section` helper and is purely positional. Both name
-> the same section — when cross-referencing, prefer the letter.
+> the same section: when cross-referencing, prefer the letter.
 
 ## The collection environment (`[1]`)
 
@@ -169,7 +169,7 @@ the same line with `elevated` / `not elevated (DOMAIN\user)`:
 
 The authoring side is the shared block in the skeleton. `_note_privilege` fills
 `PRIV_WHY` and `PRIV_GAP` once, before the environment section reads them, and `_priv_hint`
-appends the gap to the reason of any goal that privilege blocked — so the gap
+appends the gap to the reason of any goal that privilege blocked, so the gap
 reaches the operator's terminal on the same line as what it cost:
 
 ```
@@ -220,7 +220,7 @@ something and run again?** So an absence is split.
 
 | outcome | meaning | effect |
 |---|---|---|
-| `got` | obtained | — |
+| `got` | obtained | none |
 | `na` | legitimately absent. It IS the answer, and no re-run changes it | still COMPLETE |
 | `missed` | this run was blocked. Running it differently would obtain the value | INCOMPLETE |
 
@@ -305,12 +305,12 @@ ms where the shell or `date` can), the status section always gives
 `run time:`, and when any bounded call was slow (`SLOW_SEC`, 3s), stopped at
 its cap, or not run past the deadline, it adds:
 
-- `host load at start:` and `host load at end:` — load average, pressure stall
+- `host load at start:` and `host load at end:`: load average, pressure stall
   (PSI avg10, some/full) for cpu, io and memory, available memory, and the
   processes running and blocked on I/O. Read from `/proc` only. The example
   above reads as an I/O-starved host (io PSI 48%, 6–8 blocked), which is why
   `find` hit its cap, not a collector fault.
-- `bounded calls that were slow ..., in order:` — one line per bounded call
+- `bounded calls that were slow ..., in order:`: one line per bounded call
   that took `SLOW_SEC` or longer, was stopped at its cap or at the deadline,
   or was not run past the deadline, as the time log recorded it: its ms, its
   outcome (`ran`, `capped at Ns`, `cut at the deadline`, `not run`) and the
@@ -331,7 +331,7 @@ host. A report can be full of `n/a (...)` and still look finished to someone
 whose console only said `>> done.`.
 
 This is a fact about the run, not about the environment, so it does not cross
-CONTRACT rule 1 — see CONTRACT.md, "Saying whether the collection worked".
+CONTRACT rule 1: see CONTRACT.md, "Saying whether the collection worked".
 `validate.sh` fails a collector that declares no goals or never calls
 `emit_status` (`Emit-Status` in PowerShell), and `validate.sh --report` fails a
 report whose `goals:` line does not add up or whose status line is missing.
@@ -349,7 +349,7 @@ missed conf "uid 3103 cannot reach /data/whatap"   # blocked; INCOMPLETE
 In PowerShell the same three are `Set-Got`, `Set-Na` and `Set-Missed`.
 
 Keep the list short. A goal is something whose absence makes the report not
-worth sending — not every value the collector happens to print. Resolve goals
+worth sending, not every value the collector happens to print. Resolve goals
 where the discovery variables are final, not inside a `| while` pipeline: that
 runs in a subshell and the assignment does not survive.
 
@@ -371,7 +371,7 @@ The last line is **exactly**:
 ```
 
 It is a fixed sentinel. It marks the end of the paste and states the design
-stance in one line. Do not translate, reword, or decorate it — `validate.sh`
+stance in one line. Do not translate, reword, or decorate it: `validate.sh`
 checks for this exact string.
 
 ---

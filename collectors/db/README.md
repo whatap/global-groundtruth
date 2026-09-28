@@ -1,9 +1,9 @@
-# collectors/db — WhaTap DB-monitoring collector
+# collectors/db: WhaTap DB-monitoring collector
 
 > **Status: v0 implemented** (2026-07-16; validated at `collect-db.sh` 0.9.1
 > on 2026-09-28 against the live `jjsong-ggt-postgres` container (DB host,
 > PostgreSQL 16, no DBX agent installed there): COMPLETE, `validate.sh
-> --report` pass — the mock-tree / DBX-agent-host path was not re-run this
+> --report` pass, the mock-tree / DBX-agent-host path was not re-run this
 > round, so it is still validated only at 0.9.0 (see "Verification status");
 > the script's own `VERSION` is the current one;
 > `collect-db-mssql.ps1` validated at 0.7.0 on Windows Server 2022). Owned by the DB domain team once
@@ -14,14 +14,14 @@
 ## Why the layout looks like this
 
 The DBX agent queries the monitored database **remotely over JDBC**, so the
-facts live in three different places — and no single script can reach all of
+facts live in three different places, and no single script can reach all of
 them:
 
 | Where the facts live | What lives there | Collected by |
 |---|---|---|
 | DBX agent host | agent versions (jar names), whatap.conf, agent logs (WA codes), network reachability, dmx/prx watchdog, dbxc | `collect-db.sh` |
 | DB host (on-prem) | XOS + xos.conf, slow-query log files, DB server processes, port 3002 | `collect-db.sh` (same script, run there too) |
-| Inside the DB engine | exact version/edition, monitoring-account grants, parameters, monitoring objects (pg_stat_statements, sys views, V$ access) | `sql/<engine>.sql` via the DB client — the **only** channel for managed cloud DBs (RDS etc.) |
+| Inside the DB engine | exact version/edition, monitoring-account grants, parameters, monitoring objects (pg_stat_statements, sys views, V$ access) | `sql/<engine>.sql` via the DB client: the **only** channel for managed cloud DBs (RDS etc.) |
 
 `collect-db.sh` discovers which components are present on the host it runs on
 (dbx / dmx / prx / xos / xcub / dbxc processes, plus DB server processes) and
@@ -37,16 +37,16 @@ and run `tools/sync-shared-block.sh --apply`.
 2. **Split topology** (agent host ≠ DB host, on-prem): run the same command on
    the DB host too (XOS / DB-server facts live there).
 3. Run the **SQL pack** with the *monitoring account* and send its full output.
-   Two ways — **(a) is the primary path**:
-   - **(a) over JDBC, on the agent host — no DB client needed**:
+   Two ways: **(a) is the primary path**:
+   - **(a) over JDBC, on the agent host, no DB client needed**:
      `./collect-db.sh --file --sql`
      The product is JDBC end-to-end: installing the agent never required a DB
      client, so none can be assumed anywhere. What IS guaranteed on the agent
      host is java (a DBX prerequisite) + the proven driver in `jdbc/` + network
-     reachability — the runner reuses exactly those (jshell on JDK 9+, Nashorn
+     reachability: the runner reuses exactly those (jshell on JDK 9+, Nashorn
      jrunscript on JDK 8; UTF-8 output forced). The connection is built from
      the same `whatap.conf` the agent uses: `dbms`, `db_ip`, `db_port`,
-     `db` (falling back to `plan_db`), `connect_option` — the one thing the
+     `db` (falling back to `plan_db`), `connect_option`: the one thing the
      conf cannot supply is credentials (stored encrypted by `uid.sh`; this
      script does not decrypt them). Those are asked on the terminal, or read
      from `WHATAP_GGT_USER` / `WHATAP_GGT_PW` for non-interactive runs. The
@@ -62,7 +62,7 @@ and run `tools/sync-shared-block.sh --apply`.
      directives are skipped by the JDBC runner), so the same file serves both.
 4. **Windows (MSSQL)**: use `windows/collect-db-mssql.ps1` instead of the bash
    collector, plus `windows/mssql.sql` via sqlcmd (no JDBC runner for MSSQL in
-   this version — its pack uses GO batches):
+   this version, its pack uses GO batches):
 
    ```
    .\collect-db-mssql.ps1 -File
@@ -112,8 +112,8 @@ G. Topology & network, H. Engine-specific facts, I. XOS / DB-host side facts,
 J. SQL pack per instance, K. TLS handshake probe, then the opt-in L. SQL pack
 over JDBC (`--sql`), and Collection status.
 
-Goals: `components` (a dbx/dmx/prx/xos process — a java process whose
-arguments name the whatap.agent jar or class — or a dbxc/xcub binary; the
+Goals: `components` (a dbx/dmx/prx/xos process (a java process whose
+arguments name the whatap.agent jar or class) or a dbxc/xcub binary; the
 collector's own shell ancestry is never counted), `home` (every component
 process mapped to an install dir: its cwd or the dir of an absolute jar path;
 a cwd that is deleted, cannot be entered, or is a system root such as `/` is
@@ -215,14 +215,14 @@ out of reach of any script here and stay with the field engineer.
 ## SSL/TLS connection cases
 
 A frequent field pattern. The failure is a mismatch between four facts that
-live in four different places — the collector puts them side by side:
+live in four different places: the collector puts them side by side:
 
 | # | Fact | Where it lives | Collected by |
 |---|---|---|---|
 | 1 | what the DB requires/offers (TLS versions, cert, `require_secure_transport`/`ssl`) | DB server | section K handshake probe (openssl s_client, `-starttls mysql/postgres`: its protocol, cipher, key size, verify lines verbatim, and openssl x509 subject, issuer, dates, sha256 fingerprint, SAN and signature algorithm per chain certificate) + SQL pack server variables |
-| 2 | what the agent requests | `whatap.conf` | `connect_option` and `db_ssl` in section D verbatim (misspelled keys are silently ignored by drivers — the raw spelling IS the fact) |
+| 2 | what the agent requests | `whatap.conf` | `connect_option` and `db_ssl` in section D verbatim (misspelled keys are silently ignored by drivers: the raw spelling IS the fact) |
 | 3 | what the runtime permits | agent-host JDK + driver | `jdk.tls.disabledAlgorithms` from the runtime's `java.security` (per discovered java), JDBC driver jar name/version (defaults flip across versions) |
-| 4 | what actually gets negotiated | the live session | SQL pack `[6b]`/`[3b]`: `pg_stat_ssl` / `Ssl_version` for THIS session — and since `--sql` reuses the agent's own `connect_option`, this measures the agent's negotiation, not an approximation |
+| 4 | what actually gets negotiated | the live session | SQL pack `[6b]`/`[3b]`: `pg_stat_ssl` / `Ssl_version` for THIS session, and since `--sql` reuses the agent's own `connect_option`, this measures the agent's negotiation, not an approximation |
 
 Section K is part of every run: one handshake per instance whose section G
 connect succeeded, each capped at 15 s and all of them together at 30 s
@@ -255,7 +255,7 @@ names a protocol and a cipher (`New, TLSv1.3, Cipher is ...`); against a
 server that negotiates no TLS
 (PostgreSQL `ssl=off`, MySQL without TLS) openssl can still print
 `Verify return code: 0 (ok)` with no certificate. Not probeable this way: MSSQL (TLS inside TDS
-prelogin) and Oracle TCPS — noted as reasoned absence.
+prelogin) and Oracle TCPS, noted as reasoned absence.
 
 Collection-server-side facts (server version, metrics categories) belong to
 `collectors/collection-server`, not here.
@@ -296,12 +296,12 @@ Collection-server-side facts (server version, metrics categories) belong to
   `connect_option=?ssl=true&sslmode=require` produced
   `pg_stat_ssl: t | TLSv1.3 | TLS_AES_256_GCM_SHA384` in the report.
 - SQL packs: `postgresql.sql` ran against PostgreSQL 16 as a `pg_monitor`-only
-  user through BOTH paths — the JDBC runner (`--sql`, jshell on JDK 17, real
+  user through BOTH paths (the JDBC runner (`--sql`, jshell on JDK 17, real
   postgresql-42.7.4.jar; expected-error path verified: missing
-  pg_stat_statements surfaces as `SQL-ERROR:` in the report) and psql — and
+  pg_stat_statements surfaces as `SQL-ERROR:` in the report) and psql) and
   `mysql.sql` against MySQL 8.4 via the client (the legacy `SHOW SLAVE STATUS`
   of the dual replication syntax errors there by design, `--force` continues).
-  `oracle.sql` and `windows/mssql.sql` are syntax-reviewed only — first field
+  `oracle.sql` and `windows/mssql.sql` are syntax-reviewed only: first field
   runs double as their validation. The Nashorn (JDK 8 jrunscript) runner path
   was run on OpenJDK 1.8.0_504 (lab target `db-agent`, 2026-09-28) against
   PostgreSQL 16.15 and MySQL 8.0.46: `postgresql.sql` and `mysql.sql` returned
