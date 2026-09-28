@@ -32,7 +32,7 @@ export LC_ALL=C
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-apmjava"
 # History: CHANGELOG.md (next to this file).
-VERSION="0.15.10"
+VERSION="0.15.11"
 DOMAIN="apm"
 TARGET="host/$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || uname -n 2>/dev/null || echo unknown)"
 
@@ -567,7 +567,10 @@ _out_dir_check() {
     if [ ! -d "$d" ]; then
         # A deadline spent before the run (a tiny RUN_DEADLINE) must not stop
         # the report from being written: the mkdir gets the command cap alone.
-        _past_deadline && RUN_DEADLINE=$(($(_elapsed) + ${CMD_TIMEOUT:-20}))
+        # Always, not only when _past_deadline: _bounded reads the clock again,
+        # and a second boundary crossed in between would leave it 0 s. The +1
+        # keeps that crossing from cutting a CMD_TIMEOUT of 1.
+        RUN_DEADLINE=$(($(_elapsed) + ${CMD_TIMEOUT:-20} + 1))
         _bounded mkdir -p -- "$d" 2>/dev/null
         RUN_DEADLINE="$dl"
     fi
@@ -2010,7 +2013,12 @@ _add_java() {
     case "$D_JAVA_KEYS" in *"|$k|"*) return ;; esac
     D_JAVA_KEYS="$D_JAVA_KEYS|$k|"
     if [ ! -x "$p" ]; then
-        if [ -e "$p" ]; then _w="not executable by uid ${_priv_uid:-?}"; else _w="not found at this path"; fi
+        if [ -e "$p" ]; then _w="not executable by uid ${_priv_uid:-?}"
+        else
+            # a directory this uid cannot search hides the file: say which
+            _w="$(_path_why "$p")"
+            case "$_w" in "permission denied: "*) ;; *) _w="not found at this path" ;; esac
+        fi
         D_JAVA_OTHER="$D_JAVA_OTHER$_nl$p|binary of pid $pid, $_w|${lib:-$(_jvm_maps_lib "$pid")}|$pid"
     elif _is_java_launcher "$k" && _is_java_launcher "$p"; then
         D_JAVA_EXES="$D_JAVA_EXES$_nl$p"

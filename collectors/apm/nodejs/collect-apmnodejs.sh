@@ -29,7 +29,7 @@ export LC_ALL=C
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-apmnodejs"
 # History: CHANGELOG.md (next to this file).
-VERSION="0.9.10"
+VERSION="0.9.11"
 DOMAIN="apm"
 TARGET="host/$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || uname -n 2>/dev/null || echo unknown)"
 
@@ -484,7 +484,10 @@ _out_dir_check() {
     if [ ! -d "$d" ]; then
         # A deadline spent before the run (a tiny RUN_DEADLINE) must not stop
         # the report from being written: the mkdir gets the command cap alone.
-        _past_deadline && RUN_DEADLINE=$(($(_elapsed) + ${CMD_TIMEOUT:-20}))
+        # Always, not only when _past_deadline: _bounded reads the clock again,
+        # and a second boundary crossed in between would leave it 0 s. The +1
+        # keeps that crossing from cutting a CMD_TIMEOUT of 1.
+        RUN_DEADLINE=$(($(_elapsed) + ${CMD_TIMEOUT:-20} + 1))
         _bounded mkdir -p -- "$d" 2>/dev/null
         RUN_DEADLINE="$dl"
     fi

@@ -7,6 +7,9 @@ one entry at the top of its section (docs/authoring-guide.md, step 2);
 
 ## collect-db.sh
 
+- **0.9.8**: Run helpers (skeleton): the `--out` mkdir always gets the command
+  cap (plus 1 s), so a second boundary crossed right after the deadline check
+  no longer skips it and exits 1 with a false "not writable" message.
 - **0.9.7**: Run helpers (skeleton): `_out_dir_check` makes the `--out`
   directory even when the run deadline is already spent (the mkdir gets the
   command cap alone), instead of exiting 1 with a false "not writable" message

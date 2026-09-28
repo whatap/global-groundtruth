@@ -5,6 +5,10 @@ change to the script bumps its `VERSION` and adds one entry at the top of this
 list (docs/authoring-guide.md, step 2); `tools/validate.sh` checks that the
 newest entry is the script's `VERSION`.
 
+- **0.13.6**: Run helpers (skeleton): the `--out` mkdir always gets the
+  command cap (plus 1 s), so a second boundary crossed right after the
+  deadline check no longer skips it and exits 1 with a false "not writable"
+  message.
 - **0.13.5**: Run helpers (skeleton): `_out_dir_check` makes the `--out`
   directory even when the run deadline is already spent (the mkdir gets the
   command cap alone), instead of exiting 1 with a false "not writable" message

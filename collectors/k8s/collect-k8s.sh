@@ -36,7 +36,7 @@ export LC_ALL=C
 # ---- collector metadata -----------------------------------------------------
 COLLECTOR_NAME="whatap-k8s"
 # History: CHANGELOG.md (next to this file).
-VERSION="0.13.5"
+VERSION="0.13.6"
 DOMAIN="k8s"
 TARGET="k8s-cluster/unresolved"      # refined after CLI/context/namespace discovery
 
@@ -573,7 +573,10 @@ _out_dir_check() {
     if [ ! -d "$d" ]; then
         # A deadline spent before the run (a tiny RUN_DEADLINE) must not stop
         # the report from being written: the mkdir gets the command cap alone.
-        _past_deadline && RUN_DEADLINE=$(($(_elapsed) + ${CMD_TIMEOUT:-20}))
+        # Always, not only when _past_deadline: _bounded reads the clock again,
+        # and a second boundary crossed in between would leave it 0 s. The +1
+        # keeps that crossing from cutting a CMD_TIMEOUT of 1.
+        RUN_DEADLINE=$(($(_elapsed) + ${CMD_TIMEOUT:-20} + 1))
         _bounded mkdir -p -- "$d" 2>/dev/null
         RUN_DEADLINE="$dl"
     fi
