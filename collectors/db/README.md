@@ -300,7 +300,9 @@ Collection-server-side facts (server version, metrics categories) belong to
   of the dual replication syntax errors there by design, `--force` continues).
   `oracle.sql` and `windows/mssql.sql` are syntax-reviewed only — first field
   runs double as their validation. The Nashorn (JDK 8 jrunscript) runner path
-  is untested on a live JDK 8.
+  was run on OpenJDK 1.8.0_504 (lab target `db-agent`, 2026-09-28) against
+  PostgreSQL 16.15 and MySQL 8.0.46: `postgresql.sql` and `mysql.sql` returned
+  real rows through jrunscript, the JDBC session to PostgreSQL over TLSv1.3.
 - `collect-db-mssql.ps1`: validated at 0.7.0 (0.5.0 first) on Windows Server 2022 Standard
   Evaluation 10.0.20348 (lab VM jjsong-ggt-win) under Windows PowerShell
   5.1.20348.558 and pwsh 7.6.6, 2026-09-26: SQL Server 2022 Express
