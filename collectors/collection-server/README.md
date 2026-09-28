@@ -68,8 +68,8 @@ One `.txt` report, organized into MECE domains (each fact in exactly one place):
   drops data into the wrong time buckets. Reports `timedatectl` (synchronized?
   NTP active? RTC/UTC/local), timezone, clocksource, virtualization, each
   server's JVM `-Duser.timezone`, and the **NTP daemon's own measured offset**
-  (chrony/ntpd/timesyncd — no network call). `--time-ref` optionally compares
-  against an external NTP/HTTP source (a network call; never sets the clock).
+  (chrony/ntpd/timesyncd — no network call; the run queries no external time
+  source).
 - **C. Storage & filesystem** — yardbase path, **its filesystem type (ZFS or
   not)** and, on ZFS, pool/dataset/ARC properties; capacity via `df` (never a
   recursive `du` in the report); the yard lock file under both names it
@@ -137,9 +137,8 @@ one command, hand over one file (CONTRACT rule 3):
 ./collect-collserver.sh --help          # all options
 ```
 
-**Options** (14): `--file`, `--stdout`, `--bundle`, `--quiet`, `--home DIR`,
-`--out DIR`, `--hours N`, `--with-rotated[=DAYS]`, `--threads[=N]`, `--histo`,
-`--heap`, `--du`, `--time-ref[=SRV]`, `--help`. A value option with no value,
+**Options** (11): `--file`, `--stdout`, `--bundle`, `--quiet`, `--home DIR`,
+`--out DIR`, `--hours N`, `--with-rotated[=DAYS]`, `--jvm`, `--du`, `--help`. A value option with no value,
 or with the next option taken for it (`--out --file`), exits 2.
 
 | option | what it does |
@@ -148,13 +147,13 @@ or with the next option taken for it (`--out --file`), exits 2.
 | `--out DIR` | where `--file` / `--bundle` write (default `.`); checked before collecting, an unwritable one exits 1 |
 | `--hours N` | journal window in hours (default 24): the report's journal errors (G) and the bundle's journal |
 | `--with-rotated[=DAYS]` | bundle: also copy rotated logs from the last DAYS days (default 14) |
-| `--threads[=N]`, `--histo`, `--heap`, `--du` | Tier 2, bundle only (below) |
-| `--time-ref[=SRV]` | Tier 0 opt-in: compare the clock to an external NTP/HTTP source |
+| `--jvm` | Tier 2, bundle only: one `jstack -l` and one `jmap -histo` of each server JVM (below) |
+| `--du` | Tier 2, bundle only: recursive `du --max-depth=1` of yardbase (below) |
 
-`--threads`, `--histo`, `--heap`, `--du` and `--with-rotated` work on the
-bundle only. Given without `--bundle` they are not run, and the terminal
-names them (`!! not run: --threads --du (bundle only; add --bundle to collect
-them)`); the run deadline is not raised for them.
+`--jvm`, `--du` and `--with-rotated` work on the bundle only. Given without
+`--bundle` they are not run, and the terminal names them (`!! not run: --jvm
+--du (bundle only; add --bundle to collect them)`); the run deadline is not
+raised for them.
 
 **Environment** (whole numbers 1..999999; another value is ignored with a
 warning, and the default is used):
@@ -162,7 +161,7 @@ warning, and the default is used):
 | variable | default | what it bounds |
 |---|---|---|
 | `CMD_TIMEOUT` | 20 | each external command, seconds |
-| `RUN_DEADLINE` | 300 | the whole run, seconds; raised for the Tier 2 probes unless set |
+| `RUN_DEADLINE` | 300 | the whole run, seconds; raised by 420 for `--jvm` and 120 for `--du` unless set |
 | `LOG_FILE_MB` | 5 | bundle: each copied log, MB (a larger file is tail-copied) |
 | `LOG_TOTAL_MB` | 100 | bundle: all copied logs together, MB |
 
@@ -178,6 +177,16 @@ warning, and the default is used):
 
 A runbook line `--bundle --with-rotated --log-days 30 --max-total-mb 300` is
 now `LOG_TOTAL_MB=300 ./collect-collserver.sh --bundle --with-rotated=30`.
+
+**Options removed in 0.14.0.** Each prints one `!!` line on stderr naming
+what replaced it. The ones whose request would otherwise go unmet exit 2;
+`--time-ref`, which only added an extra probe, is ignored, and the run goes on:
+
+| removed | now |
+|---|---|
+| `--threads[=N]`, `--histo` | exit 2: use `--bundle --jvm` (one `jstack -l` and one `jmap -histo` per server JVM; the old `N` dumps were taken back to back, with no interval) |
+| `--heap` | exit 2: the collector takes no heap dump; take one by hand (`jcmd <pid> GC.heap_dump <file>`) when a case needs it |
+| `--time-ref[=SRV]` | ignored: the external NTP/HTTP query was a network call from the server; B keeps the NTP daemon's own offset (`chronyc tracking` / `ntpq -pn` / `timedatectl timesync-status`) |
 
 While it runs, each phase is narrated on **stderr** (`>> ...`) so you can see it
 working on a slow host; the report itself stays clean. A collection needs an
@@ -205,9 +214,12 @@ so nothing starts by accident.
   reason; the report's G section carries the totals. A log that is missing from a
   bundle must never read as a log that did not exist on the host.
 - **Tier 2** (opt-in, may add load — announced on stderr first):
-  `--threads[=N]` (jstack), `--histo` (`jmap -histo`, not `:live`), `--heap`
-  (full heap dump), `--du` (recursive du of yardbase), `--time-ref` (external
-  time comparison — a network call). Off by default.
+  `--jvm` writes one `jstack -l` (SIGQUIT to the JVM when jstack is absent;
+  the dump then goes to the JVM's stdout) and one `jmap -histo` (not `:live`,
+  so no full GC; the first 200 lines) of each server JVM to the bundle's
+  `jvm/`. Both stop the JVM at a safepoint. `--du` writes a recursive
+  `du --max-depth=1 -h` of yardbase (the per-pcode sizes; it reads the
+  metadata of the whole data tree) to `fs/yardbase-du.txt`. Off by default.
 
 **Cost on a busy host.** Discovery reads `/proc` with one bounded
 `grep -l` over every `cmdline` (fed through `xargs`, so tens of thousands of
@@ -220,7 +232,7 @@ reading as "none running".
 **Bounds.** Every external command runs under the shared `_bounded` cap
 (`CMD_TIMEOUT`, 20 s; `systemctl` that hangs once is not asked again) and the
 whole run under `RUN_DEADLINE` (300 s, raised for Tier 2: jstack is capped at
-60 s, `jmap -histo` at 120 s, a heap dump at 900 s, `du` at 120 s). The bundle
+60 s, `jmap -histo` at 120 s, `du` at 120 s). The bundle
 journal keeps the newest 20,000 lines per unit. The bundle is assembled in the
 run's private temp directory (removed on exit, Ctrl-C, hang-up), so an
 interrupted run leaves no copy behind. Numeric options that are not
@@ -283,8 +295,8 @@ and re-validate after edits:
 
   Only the log figures transfer; the non-log part of the replay is this
   workstation's, not a backend's.
-- Validate the **Tier 2** probes (`--threads`, `--histo`, `--heap`, `--du`) on a
-  live/staging yard. Those still have not been run against a real backend.
+- Validate `--jvm` and `--du` on a live/staging yard. They have not been run
+  against a real backend.
 - `WHATAP_HOME` auto-resolution order: see "How `WHATAP_HOME` is found" in (a).
 - Portability target: bash 3.2+, `/proc`+`/sys` first, command fallback chains;
   known to run on modern Ubuntu. Re-check on the oldest OS you must support.
@@ -1137,8 +1149,8 @@ Nothing is masked. What can carry a secret:
 - **Logs** — the tails in G and the copied `logs/` carry whatever the services
   logged (request URLs, account names, tokens a module chose to log).
 - **The journal** — unit output for the last `--hours`.
-- **Tier 2** — thread dumps carry stack locals' class names; a heap dump
-  (`--heap`) carries **everything in the JVM's memory**, credentials included.
+- **Tier 2** — `--jvm`'s thread dumps carry thread names and lock owners'
+  class names, and its class histogram carries class names.
 
 Move the resulting `.txt` / `.tar.gz` over a trusted channel and delete it when
 the case is closed.

@@ -3,8 +3,8 @@
 # (front/keeper/proxy/yard/notihub/eureka/account/gateway), the target for
 # both collection-server collectors. See ~/.claude/lab-environment.md.
 # Read-only, load-light: collserver as the login user (WHATAP_HOME is its
-# own), --stdout and a plain --bundle (no --threads/--histo/--heap/--du/
-# --with-rotated); collmysql as root over sudo -n, because the binary log
+# own), --stdout and a plain --bundle (no --jvm/--du/--with-rotated);
+# collmysql as root over sudo -n, because the binary log
 # files (/var/lib/mysql/binlog.*) are mode 640 owner mysql and unreadable by
 # the login user, while root authenticates over the unix socket with no
 # password. --bundle's tar.gz goes to /tmp on the VM, not the login home.

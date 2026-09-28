@@ -60,7 +60,7 @@ anything expensive **opt-in**:
   configs, snapshots. Sequential disk reads with caps; still no JVM pause.
   (The skeleton ships Tier 0 only — copy bundle plumbing from a seeded
   collector; see [authoring-guide.md](authoring-guide.md) step 4.)
-- **Tier 2 — intrusive, opt-in** (`--threads`, `--heap`, `--du`, …). May pause a
+- **Tier 2 — intrusive, opt-in** (`--threads`, `--jvm`, `--du`, …). May pause a
   JVM or hit the data disk. **Off by default**, and print the target and the
   expected impact to **stderr before running** so the operator consents.
 - **Every external command is bounded.** Run it through `probe` or

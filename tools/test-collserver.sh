@@ -224,14 +224,16 @@ for o in "--hours x1|--hours takes a non-negative integer" \
          "--with-rotated=1e3|--with-rotated=DAYS takes a non-negative integer" \
          "--with-rotated=0|--with-rotated=DAYS takes a whole number of days, 1..999999 without leading zeros" \
          "--with-rotated=010|--with-rotated=DAYS takes a whole number of days, 1..999999 without leading zeros" \
-         "--threads=two|--threads takes a non-negative integer" \
          "--hours -1|missing value for --hours" \
          "--out|missing value for --out" "--out=|missing value for --out" \
-         "--home --file|missing value for --home" "--threads=|missing value for --threads=" \
-         "--time-ref=|missing value for --time-ref=" "--with-rotated=|missing value for --with-rotated=" \
+         "--home --file|missing value for --home" "--with-rotated=|missing value for --with-rotated=" \
          "--max-log-mb 1|--max-log-mb is no longer an option: set LOG_FILE_MB=N in the environment" \
          "--max-total-mb=1|--max-total-mb is no longer an option: set LOG_TOTAL_MB=N in the environment" \
-         "--log-days 3|--log-days was merged into --with-rotated: use --with-rotated=DAYS"; do
+         "--log-days 3|--log-days was merged into --with-rotated: use --with-rotated=DAYS" \
+         "--threads|--threads was merged into --jvm: use --bundle --jvm" \
+         "--threads=3|--threads was merged into --jvm: use --bundle --jvm" \
+         "--histo|--histo was merged into --jvm: use --bundle --jvm" \
+         "--heap|--heap is no longer an option: the collector takes no heap dump"; do
   a="${o%%|*}"; want="${o#*|}"
   B6="$ROOT/b6"; T6="$ROOT/t6"; rm -rf "$B6" "$T6"; mkdir -p "$B6" "$T6"
   # shellcheck disable=SC2086
@@ -242,13 +244,17 @@ for o in "--hours x1|--hours takes a non-negative integer" \
   chk "$a leaves nothing behind, in --out or in TMPDIR" "" "$(find "$B6" "$T6" -mindepth 1 2>/dev/null | head -3)"
 done
 echo "== 11b. 0.11.0: a bundle-only option without --bundle is named, not ignored =="
-err="$("$C" --home "$H" --stdout --threads=2 --du --with-rotated </dev/null 2>&1 >/dev/null)"; rc=$?
+err="$("$C" --home "$H" --stdout --jvm --du --with-rotated </dev/null 2>&1 >/dev/null)"; rc=$?
 chk "the run still completes" "0" "$rc"
-has "the terminal names what was not run" "$err" "!! not run: --threads --du --with-rotated (bundle only; add --bundle to collect them)"
-out="$("$C" --home "$H" --stdout --heap </dev/null 2>/dev/null)"
+has "the terminal names what was not run" "$err" "!! not run: --jvm --du --with-rotated (bundle only; add --bundle to collect them)"
+out="$("$C" --home "$H" --stdout --jvm </dev/null 2>/dev/null)"
 has "and the deadline is not raised for it" "$out" "s of 300s allowed"
-err="$("$C" --home "$H" --stdout --time-ref=127.0.0.1 --quiet </dev/null 2>&1 >/dev/null)"
-hasnt "--time-ref is not bundle only" "$err" "not run:"
+echo "== 11c. 0.14.0: --time-ref is named and ignored =="
+err="$("$C" --home "$H" --stdout --time-ref=127.0.0.1 --quiet </dev/null 2>&1 >/dev/null)"; rc=$?
+chk "the run still completes" "0" "$rc"
+has "--time-ref=SRV is named as ignored" "$err" "!! --time-ref is no longer an option (ignored)"
+out="$("$C" --home "$H" --stdout --time-ref </dev/null 2>/dev/null)"
+hasnt "and no external time line is written" "$out" "external time"
 echo "== 12. an output directory that cannot be written =="
 if [ "$(id -u)" != 0 ]; then
   RO="$ROOT/ro"; mkdir -p "$RO"; chmod 555 "$RO"
@@ -466,22 +472,6 @@ has "java -version cut by the run deadline says so" "$out" "java -version (the j
 has "with the deadline as the reason" "$out" "): n/a (run deadline reached: 3s)"
 [ $((t1 - t0)) -le 30 ] && ok "and the run ends ($((t1 - t0))s)" || bad "the run ends" "<= 30s" "$((t1 - t0))s"
 rm -f "$S24/java"
-stub_write "$S24/curl" <<'EOF'
-#!/bin/sh
-exec sleep 30
-EOF
-rm -f "$S24/ntpdate" "$S24/sntp"
-t0=$(date +%s)
-out="$(CMD_TIMEOUT=2 PATH="$S24" "$C" --stdout --time-ref </dev/null 2>/dev/null)"
-t1=$(date +%s)
-has "a curl that never answers is capped" "$out" "external time: n/a (timed out: 2s)"
-[ $((t1 - t0)) -le 60 ] && ok "and the run ends ($((t1 - t0))s)" || bad "the curl cap binds" "<= 60s" "$((t1 - t0))s"
-stub_write "$S24/curl" <<'EOF'
-#!/bin/sh
-echo "curl: (7) Failed to connect to www.google.com port 443" >&2; exit 7
-EOF
-out="$(PATH="$S24" "$C" --stdout --time-ref </dev/null 2>/dev/null)"
-has "a failed curl names its exit status" "$out" "external time: n/a (curl exit 7: "
 
 echo "== 25. the account H2 database and its dumps =="
 H25="$ROOT/h25"; mkhome "$H25"; mkdir -p "$H25/yardbase" "$H25/data/h2/backup"
@@ -570,6 +560,26 @@ echo "JTO=[${JAVA_TOOL_OPTIONS:-}]" >&2
 EOF2
 out="$(PATH="$S26" JAVA_TOOL_OPTIONS=-javaagent:/x.jar "$C" --home "$H26" --stdout 2>/dev/null)"
 has "java -version runs without JAVA_TOOL_OPTIONS" "$out" "JTO=[]"
+
+echo "== 27. 0.14.0: --jvm writes one jstack and one histo per server JVM =="
+# jstack and jmap stubs in front of the real PATH: they print their arguments
+H27="$ROOT/h27"; mkhome "$H27"; S27="$ROOT/stub27"; mkdir -p "$S27"; B27="$ROOT/b27"; mkdir -p "$B27"
+for c in jstack jmap; do
+    stub_write "$S27/$c" <<EOF2
+#!/bin/sh
+echo "$c \$*"
+EOF2
+done
+( cd "$H27" && exec -a "java -jar whatap.server.yard.boot" sleep 60 ) >/dev/null 2>&1 </dev/null &
+j1=$!; sleep 1
+err="$(ONLY_PIDS="$j1" PATH="$S27:$PATH" "$C" --home "$H27" --bundle --jvm --out "$B27" </dev/null 2>&1 >/dev/null)"; rc=$?
+kill "$j1" 2>/dev/null; wait "$j1" 2>/dev/null
+chk "the bundle is written" "0" "$rc"
+has "the pause is announced first" "$err" "[Tier2] thread dump: pid $j1 (whatap.server.yard)"
+tb="$(ls "$B27"/*.tar.gz 2>/dev/null | head -n1)"
+chk "one jstack -l of the JVM" "jstack -l $j1" "$(tar -xzOf "$tb" "./jvm/whatap.server.yard-$j1.jstack.txt" 2>/dev/null)"
+chk "one jmap -histo of the JVM" "jmap -histo $j1" "$(tar -xzOf "$tb" "./jvm/whatap.server.yard-$j1.histo.txt" 2>/dev/null)"
+has "and the deadline is raised for them" "$(tar -xzOf "$tb" ./report.txt 2>/dev/null)" "s of 720s allowed"
 
 echo; echo "PASS=$PASS FAIL=$FAIL SKIP=$SKIP"
 [ "$FAIL" -eq 0 ]

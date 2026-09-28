@@ -8,8 +8,9 @@
 # to a single .txt file; with --bundle it also archives real logs, configs and
 # host snapshots as a tar.gz.
 #
-# Tier 0 (the default report) never pauses a JVM (jstack/jmap), walks a large
-# tree (recursive du) or reads whole rotated logs; those are opt-in.
+# Tier 0 (the default report) never pauses a JVM (jstack/jmap: opt-in --jvm),
+# walks a large tree (recursive du: opt-in --du) or reads whole rotated logs
+# (opt-in --with-rotated).
 #
 # Rules: ../../CONTRACT.md and ../../docs/collector-engineering.md. No `set -e`:
 # the report always reaches its footer.
@@ -34,7 +35,7 @@ unset JAVA_TOOL_OPTIONS JDK_JAVA_OPTIONS _JAVA_OPTIONS _v
 # ---- collector metadata -----------------------------------------------------
 # History: CHANGELOG.md, section collect-collserver.sh (next to this file).
 COLLECTOR_NAME="whatap-collserver"
-VERSION="0.13.1"
+VERSION="0.14.0"
 DOMAIN="collection-server"
 TARGET="collection-server/$(hostname 2>/dev/null || echo unknown)"   # refined after WHATAP_HOME is resolved
 
@@ -121,15 +122,11 @@ OPT_MAXLOG_MB="${LOG_FILE_MB:-5}"      # per-file log copy cap (tail keeps the n
 OPT_MAXTOTAL_MB="${LOG_TOTAL_MB:-100}" # cap on ALL copied logs together
 OPT_ROTATED=0        # bundle: copy rotated logs too (opt-in)
 OPT_LOG_DAYS=14      # bundle: with --with-rotated[=DAYS], only from the last DAYS days
-OPT_THREADS=0        # Tier 2: jstack iterations (0 = off)
-OPT_HISTO=0          # Tier 2: jmap -histo (no :live)
-OPT_HEAP=0           # Tier 2: full heap dump
+OPT_JVM=0            # Tier 2: jstack -l and jmap -histo of each server JVM
 OPT_DU=0             # Tier 2: recursive du of yardbase
-OPT_TIMEREF=0        # Tier 2: compare clock to an external time source (network call)
-TIMEREF_SERVER="pool.ntp.org"
 # RUN_DEADLINE as the caller gave it (empty when not given), read before the run
-# helpers default it: a Tier 2 heap dump or thread dump needs more than the
-# default, and an explicit value from the caller wins over that.
+# helpers default it: the Tier 2 JVM dumps need more than the default, and an
+# explicit value from the caller wins over that.
 _RUN_DEADLINE_ENV="${RUN_DEADLINE:-}"
 
 usage() {
@@ -156,19 +153,17 @@ explicit action flag (--file / --stdout / --bundle) so nothing starts by acciden
   with the reason, in logs/SELECTION.txt and summarized in the report.
 
   Tier 2 (opt-in, may add load — printed to stderr before running):
-  collect-collserver.sh --bundle --threads[=N]   jstack -l each JVM N times (default N=1)
-  collect-collserver.sh --bundle --histo         jmap -histo (NOT :live, no full GC)
-  collect-collserver.sh --bundle --heap          full heap dump (large, pauses the JVM)
+  collect-collserver.sh --bundle --jvm           jstack -l and jmap -histo (NOT :live, no
+                                                 full GC) of each server JVM; each is a
+                                                 JVM safepoint pause
   collect-collserver.sh --bundle --du            recursive du of yardbase (data-disk I/O)
-  collect-collserver.sh --file --time-ref[=SRV]  also compare the clock to an external NTP/
-                                      HTTP source (network call; clock not set)
-  --threads, --histo, --heap, --du and --with-rotated work on the bundle only;
-  given without --bundle they are named on the terminal and not run.
+  --jvm, --du and --with-rotated work on the bundle only; given without
+  --bundle they are named on the terminal and not run.
 
   Environment (whole numbers 1..999999; another value is ignored with a warning):
     CMD_TIMEOUT=N      cap on each external command, seconds (default 20)
     RUN_DEADLINE=N     cap on the whole run, seconds (default 300, raised for
-                       the Tier 2 probes unless set)
+                       --jvm and --du unless set)
     LOG_FILE_MB=N      bundle: per-file log copy cap, MB (default 5; tail kept)
     LOG_TOTAL_MB=N     bundle: cap on all copied logs together, MB (default 100)
     WHATAP_HOME=DIR    a WHATAP_HOME candidate (--home DIR wins)
@@ -204,18 +199,20 @@ while [ $# -gt 0 ]; do
         --with-rotated) OPT_ROTATED=1; _BUNDLE_ONLY="$_BUNDLE_ONLY --with-rotated" ;;
         --with-rotated=*) _optval --with-rotated= "${1#*=}"; OPT_ROTATED=1; OPT_LOG_DAYS="${1#*=}"
             _BUNDLE_ONLY="$_BUNDLE_ONLY --with-rotated" ;;
-        --threads) OPT_THREADS=1; _BUNDLE_ONLY="$_BUNDLE_ONLY --threads" ;;
-        --threads=*) _optval --threads= "${1#*=}"; OPT_THREADS="${1#*=}"; _BUNDLE_ONLY="$_BUNDLE_ONLY --threads" ;;
-        --histo) OPT_HISTO=1; _BUNDLE_ONLY="$_BUNDLE_ONLY --histo" ;;
-        --heap) OPT_HEAP=1; _BUNDLE_ONLY="$_BUNDLE_ONLY --heap" ;;
+        --jvm) OPT_JVM=1; _BUNDLE_ONLY="$_BUNDLE_ONLY --jvm" ;;
+        --threads|--threads=*|--histo)
+            _removed "${1%%=*} was merged into --jvm: use --bundle --jvm (one jstack -l and one jmap -histo per server JVM)" ;;
+        --heap)
+            _removed "--heap is no longer an option: the collector takes no heap dump; run jcmd <pid> GC.heap_dump <file> by hand if one is needed" ;;
         --du) OPT_DU=1; _BUNDLE_ONLY="$_BUNDLE_ONLY --du" ;;
-        --time-ref) OPT_TIMEREF=1 ;;
-        --time-ref=*) _optval --time-ref= "${1#*=}"; OPT_TIMEREF=1; TIMEREF_SERVER="${1#*=}" ;;
+        # removed, and nothing the run collects depends on it: named, then ignored
+        --time-ref|--time-ref=*) _TIMEREF_SEEN=1 ;;
         -h|--help) usage; exit 0 ;;
         *) printf 'unknown argument: %s\n' "$1" >&2; usage >&2; exit 2 ;;
     esac
     shift
 done
+[ -n "${_TIMEREF_SEEN:-}" ] && printf '!! %s\n' "--time-ref is no longer an option (ignored): the external time query is not made; B has the NTP daemon's own offset" >&2
 
 # ---- reasoned-absence helpers (see docs/collector-engineering.md) -----------
 _classify_err() {
@@ -1152,37 +1149,6 @@ _absence_why() {
 # _no_whatap_na -> the na reason, stating what was read
 NO_WHATAP_NA="no whatap home in any readable process, unit or install path (checked: -Dwhatap.server.home and cwd of whatap JVMs, systemd units, script dir, \$WHATAP_HOME, $WHATAP_HOME_CANDIDATES)"
 
-# time_ref_probe: opt-in external time comparison (--time-ref). Makes ONE network
-# call and NEVER sets the clock. Tries ntpdate -q, then sntp, then an HTTPS Date
-# header. Emitted as facts (raw output + numeric delta); the reader interprets.
-time_ref_probe() {
-    warn "[time-ref] querying $TIMEREF_SERVER — this makes a network call (the clock is not modified)"
-    progress "querying external time reference ($TIMEREF_SERVER) — network call"
-    if have ntpdate; then
-        probe "ntpdate -q $TIMEREF_SERVER (query only)" ntpdate -q "$TIMEREF_SERVER"
-    elif have sntp; then
-        probe "sntp $TIMEREF_SERVER" sntp "$TIMEREF_SERVER"
-    elif have curl; then
-        local hdr rt lt d rc
-        # bounded like every other call; curl's own --max-time stays the tighter cap
-        hdr="$(_bounded curl -sI --max-time 10 https://www.google.com 2>"$_errfile")"; rc=$?
-        hdr="$(printf '%s\n' "$hdr" | tr -d '\r' | grep -i '^date:' | head -n1 | cut -d' ' -f2-)"
-        if [ "$rc" -eq 124 ]; then
-            fact "external time: n/a ($(_why_124))"
-        elif [ -n "$hdr" ]; then
-            fact "HTTP Date header (https://www.google.com): $hdr"
-            rt="$(date -u -d "$hdr" +%s 2>/dev/null)"; lt="$(date -u +%s 2>/dev/null)"
-            if [ -n "$rt" ] && [ -n "$lt" ]; then d=$((lt - rt)); fact "local clock minus reference: ${d}s (1s resolution + network latency)"; fi
-        elif [ "$rc" -ne 0 ]; then
-            fact "external time: n/a (curl exit $rc: $(_classify_err))"
-        else
-            fact "external time: n/a (curl exit 0: no Date header in the response)"
-        fi
-    else
-        fact "external time: n/a (command not found: ntpdate/sntp/curl)"
-    fi
-}
-
 # =============================================================================
 # Report body: one _rep_<x> per section (Tier 0 — MECE domains A..G)
 # =============================================================================
@@ -1351,8 +1317,7 @@ _rep_a_jvm_runtime() {
 
 # -- B. Time & clock synchronization --------------------------------------
 _rep_b() {
-    # The running NTP daemon's own offset is read (no network call); an
-    # external comparison is opt-in (--time-ref).
+    # The running NTP daemon's own offset is read; no network call.
     section "B. Time & clock synchronization"
     probe "timedatectl" timedatectl
     # /etc/timezone, else the zone /etc/localtime links to, else date's abbreviation
@@ -1406,10 +1371,6 @@ _rep_b() {
         [ "$_sany" = 0 ] && fact "no chrony/ntpd/timesyncd *.service loaded"
     else
         fact "time-sync service: n/a (command not found: systemctl)"
-    fi
-    if [ "$OPT_TIMEREF" = 1 ]; then
-        subsection "external time reference (opt-in --time-ref; network call)"
-        time_ref_probe
     fi
 }
 
@@ -2124,25 +2085,20 @@ collect_journal() {
 # ---- Tier 2 (opt-in) --------------------------------------------------------
 collect_threads() {
     local dest="$1"; mkdir -p "$dest" 2>/dev/null
-    local n="$OPT_THREADS"; [ "$n" -lt 1 ] 2>/dev/null && n=1
-    local i pid mod k
+    local i pid mod
     i=0
     while [ "$i" -lt "${#PIDS[@]}" ]; do
         pid="${PIDS[$i]}"; mod="${MODS[$i]}"
-        warn "[Tier2] thread dump: pid $pid ($mod) x$n — may cause a JVM safepoint pause"
-        k=1
-        while [ "$k" -le "$n" ]; do
-            if have jstack; then
-                CMD_TIMEOUT=60 _bounded jstack -l "$pid" > "$dest/$mod-$pid.jstack.$k.txt" 2>&1
-                [ $? -eq 124 ] && printf '\n(jstack stopped at the 60s cap)\n' >> "$dest/$mod-$pid.jstack.$k.txt"
-            else
-                # kill is a shell builtin and returns at once; the dump itself is
-                # written by the JVM to its own stdout, not here.
-                kill -3 "$pid" 2>/dev/null
-                printf 'jstack absent; sent SIGQUIT to %s (output goes to the JVM stdout/journal)\n' "$pid" > "$dest/$mod-$pid.sigquit.$k.txt"
-            fi
-            k=$((k + 1))
-        done
+        warn "[Tier2] thread dump: pid $pid ($mod) — may cause a JVM safepoint pause"
+        if have jstack; then
+            CMD_TIMEOUT=60 _bounded jstack -l "$pid" > "$dest/$mod-$pid.jstack.txt" 2>&1
+            [ $? -eq 124 ] && printf '\n(jstack stopped at the 60s cap)\n' >> "$dest/$mod-$pid.jstack.txt"
+        else
+            # kill is a shell builtin and returns at once; the dump itself is
+            # written by the JVM to its own stdout, not here.
+            kill -3 "$pid" 2>/dev/null
+            printf 'jstack absent; sent SIGQUIT to %s (output goes to the JVM stdout/journal)\n' "$pid" > "$dest/$mod-$pid.sigquit.txt"
+        fi
         i=$((i + 1))
     done
 }
@@ -2156,20 +2112,6 @@ collect_histo() {
         pid="${PIDS[$i]}"; mod="${MODS[$i]}"
         warn "[Tier2] jmap -histo: pid $pid ($mod) — walks the live heap (no full GC)"
         CMD_TIMEOUT=120 _bounded jmap -histo "$pid" 2>&1 | head -n 200 > "$dest/$mod-$pid.histo.txt" 2>/dev/null
-        i=$((i + 1))
-    done
-}
-
-collect_heap() {
-    local dest="$1"; mkdir -p "$dest" 2>/dev/null
-    have jmap || { warn "[Tier2] heap: jmap absent"; return; }
-    local i pid mod
-    i=0
-    while [ "$i" -lt "${#PIDS[@]}" ]; do
-        pid="${PIDS[$i]}"; mod="${MODS[$i]}"
-        warn "[Tier2] FULL HEAP DUMP: pid $pid ($mod) — large file and a JVM pause"
-        CMD_TIMEOUT=900 _bounded jmap -dump:format=b,file="$dest/$mod-$pid.hprof" "$pid" > "$dest/$mod-$pid.heap.log" 2>&1
-        [ $? -eq 124 ] && warn "[Tier2] heap dump of pid $pid stopped at the 900s cap; the .hprof is incomplete"
         i=$((i + 1))
     done
 }
@@ -2199,9 +2141,10 @@ do_bundle() {
     collect_time    "$work/time"
     collect_os      "$work/os"
     collect_journal "$work/journal"
-    [ "$OPT_THREADS" -ge 1 ] 2>/dev/null && collect_threads "$work/jvm"
-    [ "$OPT_HISTO" = 1 ] && collect_histo "$work/jvm"
-    [ "$OPT_HEAP" = 1 ] && collect_heap "$work/jvm"
+    if [ "$OPT_JVM" = 1 ]; then
+        collect_threads "$work/jvm"
+        collect_histo "$work/jvm"
+    fi
     [ "$OPT_DU" = 1 ] && collect_du "$work/fs"
 
     tarball="$OPT_OUT/$BASENAME.tar.gz"
@@ -2278,7 +2221,6 @@ _need_int --with-rotated=DAYS "$OPT_LOG_DAYS"
 case "$OPT_LOG_DAYS" in 0*|???????*)
     warn "--with-rotated=DAYS takes a whole number of days, 1..999999 without leading zeros; got '$OPT_LOG_DAYS'"; exit 2 ;;
 esac
-_need_int --threads "$OPT_THREADS"
 # The log caps come from the environment, checked like RUN_DEADLINE and
 # CMD_TIMEOUT: a value that is not a whole number 1..999999 is named and the
 # default used.
@@ -2288,15 +2230,13 @@ OPT_MAXTOTAL_MB="$(_cap_or LOG_TOTAL_MB "$OPT_MAXTOTAL_MB" 100)"
 # than ignore them, and do not raise the deadline for work that will not run.
 if [ "$OPT_BUNDLE" != 1 ] && [ -n "$_BUNDLE_ONLY" ]; then
     warn "not run:$_BUNDLE_ONLY (bundle only; add --bundle to collect them)"
-    OPT_THREADS=0 OPT_HISTO=0 OPT_HEAP=0 OPT_DU=0 OPT_ROTATED=0
+    OPT_JVM=0 OPT_DU=0 OPT_ROTATED=0
 fi
 
-# Tier 2 JVM work is capped per call (jstack 60s, jmap -histo 120s, heap dump
-# 900s); the run deadline is raised to fit them unless the caller set one.
+# Tier 2 work is capped per call (jstack 60s, jmap -histo 120s, du 120s); the
+# run deadline is raised to fit them unless the caller set one.
 if [ -z "$_RUN_DEADLINE_ENV" ]; then
-    [ "$OPT_THREADS" -ge 1 ] && RUN_DEADLINE=$((RUN_DEADLINE + 120))
-    [ "$OPT_HISTO" = 1 ] && RUN_DEADLINE=$((RUN_DEADLINE + 300))
-    [ "$OPT_HEAP" = 1 ] && RUN_DEADLINE=$((RUN_DEADLINE + 1800))
+    [ "$OPT_JVM" = 1 ] && RUN_DEADLINE=$((RUN_DEADLINE + 420))
     [ "$OPT_DU" = 1 ] && RUN_DEADLINE=$((RUN_DEADLINE + 120))
 fi
 

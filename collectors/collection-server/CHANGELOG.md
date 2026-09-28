@@ -7,6 +7,20 @@ one entry at the top of its section (docs/authoring-guide.md, step 2);
 
 ## collect-collserver.sh
 
+- **0.14.0** — Options 14 -> 11 (10 without `--help`). `--threads[=N]` and
+  `--histo` are merged into `--jvm` (bundle only): one `jstack -l` and one
+  `jmap -histo` of each server JVM; the N dumps of `--threads=N` were taken
+  back to back, with no interval, so N added nothing a second run does not.
+  `--heap` is removed: the collector takes no heap dump. `--time-ref` (a
+  network query from the server) is removed with no default-run
+  replacement: B keeps the NTP daemon's own offset. `--threads`, `--histo`
+  and `--heap` exit 2 naming `--jvm` or the hand command; `--time-ref` is
+  named on stderr and ignored. `--du` stays as it was (an analyst asked for
+  the per-pcode sizes in a field case, and no load-free source gives them).
+  The run deadline is raised by 420 s for `--jvm` (was 120 s for
+  `--threads` plus 300 s for `--histo`). Bundle file names lose the dump
+  number: `jvm/<mod>-<pid>.jstack.txt`, `.sigquit.txt` (were `.jstack.1.txt`,
+  `.sigquit.1.txt`).
 - **0.13.1** — `_run_init` (skeleton) also takes the script as read from stdin when `$0` is the shell's own binary (`/bin/bash -s`, `$0 -ef /proc/$$/exe`): bash 3.2 under musl otherwise faulted in a loop at full CPU after `4<&0`.
 - **0.13.0** — A reads the cgroup of the WhaTap server JVMs, not only the
   root the run sees: per distinct `/proc/<pid>/cgroup` of the server JVMs, its
