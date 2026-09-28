@@ -32,7 +32,7 @@ export LC_ALL=C
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-apmjava"
 # History: CHANGELOG.md (next to this file).
-VERSION="0.15.7"
+VERSION="0.15.8"
 DOMAIN="apm"
 TARGET="host/$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || uname -n 2>/dev/null || echo unknown)"
 
@@ -1995,15 +1995,17 @@ _add_jar() {  # _add_jar PATH PID SOURCE
 # resolves to are named java: a symlink named vshell that points at java is a
 # program invoked as vshell, and a binary named java that resolves to
 # something else is not a JDK launcher. Any other binary (jsvc, a native
-# launcher that embeds the VM), and one this run cannot execute (gone, or not
-# executable by this uid), is recorded with its VM library and never executed. Dedup key: the resolved target.
+# launcher that embeds the VM), and one not executable by this uid (a deleted
+# binary is already recorded and returned before this is called), is recorded
+# with its VM library and never executed. Dedup key: the resolved target.
 _add_java() {
-    local p="$1" lib="$2" pid="$3" k
+    local p="$1" lib="$2" pid="$3" k _w
     k="$(readlink -f "$p" 2>/dev/null || echo "$p")"
     case "$D_JAVA_KEYS" in *"|$k|"*) return ;; esac
     D_JAVA_KEYS="$D_JAVA_KEYS|$k|"
     if [ ! -x "$p" ]; then
-        D_JAVA_OTHER="$D_JAVA_OTHER$_nl$p|binary of pid $pid, binary deleted or not executable|${lib:-$(_jvm_maps_lib "$pid")}|$pid"
+        if [ -e "$p" ]; then _w="not executable by uid ${_priv_uid:-?}"; else _w="not found at this path"; fi
+        D_JAVA_OTHER="$D_JAVA_OTHER$_nl$p|binary of pid $pid, $_w|${lib:-$(_jvm_maps_lib "$pid")}|$pid"
     elif _is_java_launcher "$k" && _is_java_launcher "$p"; then
         D_JAVA_EXES="$D_JAVA_EXES$_nl$p"
     else
@@ -2230,7 +2232,7 @@ _disc_binaries() {
         case "$exe" in *" (deleted)") exe="${exe% (deleted)}"; del=1 ;; esac
         # only a confirmed JVM's binary is a Java runtime
         if ! _jvm_confirmed "$pid"; then
-            D_JAVA_UNCONF="$D_JAVA_UNCONF$_nl$exe|binary of pid $pid"
+            D_JAVA_UNCONF="$D_JAVA_UNCONF$_nl$exe|binary of pid $pid${del:+, binary deleted}"
             continue
         fi
         if [ "$(_ns_of "$pid")" = other ]; then
@@ -2242,7 +2244,7 @@ _disc_binaries() {
             D_JAVA_KEYS="$D_JAVA_KEYS|deleted:$exe|"
             a="$(_proc_lines "/proc/$pid/cmdline" | head -n 1)"
             if [ -n "$a" ] && ! _is_java_launcher "$a" && _is_java_launcher "$exe"; then a=", invoked as $a"; else a=""; fi
-            D_JAVA_OTHER="$D_JAVA_OTHER$_nl$exe|binary of pid $pid, binary deleted or not executable$a|$(_jvm_maps_lib "$pid")|$pid"
+            D_JAVA_OTHER="$D_JAVA_OTHER$_nl$exe|binary of pid $pid, binary deleted since the JVM started$a|$(_jvm_maps_lib "$pid")|$pid"
             continue
         fi
         lib=""

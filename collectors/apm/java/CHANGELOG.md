@@ -5,6 +5,11 @@ first. Every change to the script bumps its `VERSION` and adds one entry at
 the top of this list (docs/authoring-guide.md, step 2); `tools/validate.sh`
 checks that the newest entry is the script's `VERSION`.
 
+- **0.15.8** — Section B names each unexecuted binary's own case: "binary
+  deleted since the JVM started" for an exe link marked (deleted), "not
+  executable by uid N" for a binary that is there but not executable, "not
+  found at this path" when it is not there; the binary of an unconfirmed
+  process keeps ", binary deleted".
 - **0.15.7** — `_jvm_maps_lib` reads the VM library path as the whole rest of
   the maps line (paths with spaces were cut at the first space) without a "
   (deleted)" suffix, and takes only a path ending in /libjvm.so or libj9vm*.so
