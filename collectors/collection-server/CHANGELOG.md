@@ -7,6 +7,9 @@ one entry at the top of its section (docs/authoring-guide.md, step 2);
 
 ## collect-collserver.sh
 
+- **0.15.1** — C adds `df -i` of the yardbase next to its `df -h`: inode
+  exhaustion on an ext4/xfs yardbase was in no default report once collzfs
+  0.12.0 dropped its per-path `df -i`.
 - **0.15.0** — `--jvm` picks the tool per JVM, first that exists: the
   JVM's own `<home>/bin/jstack` / `jmap`; its own `bin/java -m
   jdk.jcmd/sun.tools.jstack.JStack -l` / `sun.tools.jmap.JMap -histo` when

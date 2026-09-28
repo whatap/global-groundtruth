@@ -35,7 +35,7 @@ unset JAVA_TOOL_OPTIONS JDK_JAVA_OPTIONS _JAVA_OPTIONS _v
 # ---- collector metadata -----------------------------------------------------
 # History: CHANGELOG.md, section collect-collserver.sh (next to this file).
 COLLECTOR_NAME="whatap-collserver"
-VERSION="0.15.0"
+VERSION="0.15.1"
 DOMAIN="collection-server"
 TARGET="collection-server/$(hostname 2>/dev/null || echo unknown)"   # refined after WHATAP_HOME is resolved
 
@@ -1424,6 +1424,7 @@ _rep_c() {
         fact "yardbase mount source: $src"
         if have findmnt; then probe "mount (findmnt)" findmnt -no FSTYPE,SOURCE,TARGET,OPTIONS -T "$ypath"; fi
         probe "capacity (df -h)" df -h "$ypath"
+        probe "inodes (df -i)" df -i "$ypath"
     else
         fstype="n/a (not resolved)"; src="n/a"
         fact "yardbase filesystem type: n/a (neither yardbase nor WHATAP_HOME resolved)"
