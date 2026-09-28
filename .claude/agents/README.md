@@ -28,7 +28,7 @@ costs, not by how long the task is.
 | Lab targets | `gg-lab-builder` | sonnet | Build or repair a permanent lab target (VM, docker image/container on `jjsong-ggt-docker`, fixture) and prove it with a collector run. |
 | Reading | `gg-reader` | sonnet | Read Slack channels, case folders or docs and return a candidate table, each candidate grepped against the current collectors. |
 | Design audit | general-purpose | opus | A survey whose answer is a trade-off (what to cut, what a rule should say), not a list of facts. |
-| Report-changing authoring | general-purpose | opus | Writing a D-tier change (see Grading). Mechanical edits and A-tier additions: general-purpose with `model: sonnet`. |
+| Report-changing authoring | general-purpose | opus | Writing a D-tier change whose design is open (a new mechanism, signals/timeouts, parsing). Removals, stubs and changes whose design the caller has fixed in the prompt: general-purpose with `model: sonnet` (gg-verify-deep still verifies them). Mechanical edits and A-tier additions: sonnet. |
 
 A grep-style coverage audit ("which collector prints X") is Reading, not a
 design audit.
@@ -100,9 +100,18 @@ raw check output). Quality comes from what is checked, so cut reading only:
   raw reports.
 - **Point at sections.** Prompts name the CONTRACT/README section to read;
   common rules for a batch go in one file whose path every prompt gives.
+- **Authors read by function, not by file.** Find the code with
+  `grep -n`, read the function ranges with `sed -n`, and read CONTRACT/README
+  only in the sections the prompt names. A whole 100-220 KB collector is read
+  only for a change to control flow across the file.
+- **Small follow-ups go to the cheapest place.** A verifier's fix list of a
+  few lines is applied by the main session or a fresh sonnet agent given the
+  patch and the list; resuming a finished 100 k-context author re-sends that
+  context on every turn.
 - **Resume, don't restart.** An agent stopped by a usage limit or an error is
-  continued with SendMessage; a fresh agent re-reads everything (one verifier
-  was run twice on 2026-09-27, about 200 k tokens lost).
+  continued with SendMessage when it stopped mid-task; a fresh agent re-reads
+  everything (one verifier was run twice on 2026-09-27, about 200 k tokens
+  lost).
 - **Slack:** filter mechanically first (drop bot/join/emoji-only messages,
   keep threads that mention a collector, product path, error text or
   version), read only what passes, and record the last-read timestamp per
