@@ -35,7 +35,7 @@ export LC_ALL=C
 # ---- collector metadata -----------------------------------------------------
 # History: CHANGELOG.md, section collect-collzfs.sh (next to this file).
 COLLECTOR_NAME="whatap-collzfs"
-VERSION="0.12.0"
+VERSION="0.12.1"
 DOMAIN="collection-server"
 TARGET="collection-server-zfs/$(hostname 2>/dev/null || echo unknown)"   # refined after pool discovery
 
@@ -423,8 +423,15 @@ _run_init() {
     _load0="$(_host_load)"
     # 16+ digits: a date without %N prints bare seconds
     [ -z "${EPOCHREALTIME:-}" ] && case "$(date +%s%N 2>/dev/null)" in *[!0-9]*|'') ;; ????????????????*) _ms_date=1 ;; esac
-    _now_ms; _run_ms0="$_ms"
     case "$_run_t0" in ''|*[!0-9]*) _run_t0="" ;; esac
+    # The traps come before the directory: set after it, a signal in between
+    # left ggt.* behind (1 in ~300 runs of a stress test, 2026-09-28). A signal
+    # during mktemp runs the trap once the assignment is done, and
+    # _run_cleanup does nothing while _tmp_dir is still empty.
+    trap '_run_cleanup' EXIT
+    trap '_run_cleanup; exit 129' HUP
+    trap '_run_cleanup; exit 130' INT
+    trap '_run_cleanup; exit 143' TERM
     # no predictable fallback name: without mktemp, _tmp answers /dev/null
     _tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/ggt.XXXXXX" 2>/dev/null)"
     # Script read from stdin (`sh -s`)? Then fd 0 is the script: a bounded
@@ -441,10 +448,6 @@ _run_init() {
     # caps from the environment: whole numbers or unused (0 = no limit to timeout(1))
     RUN_DEADLINE="$(_cap_or RUN_DEADLINE "$RUN_DEADLINE" 300)"
     CMD_TIMEOUT="$(_cap_or CMD_TIMEOUT "${CMD_TIMEOUT:-20}" 20)"
-    trap '_run_cleanup' EXIT
-    trap '_run_cleanup; exit 129' HUP
-    trap '_run_cleanup; exit 130' INT
-    trap '_run_cleanup; exit 143' TERM
     [ -n "${_timeout_bin:-}" ] || _timeout_bin="$(command -v timeout 2>/dev/null)"
     # busybox timeout(1) runs CMD in its own pid and leaves its timer to PID 1,
     # a zombie per call under a PID 1 that does not reap: the watchdog instead
@@ -477,9 +480,8 @@ _kill_tree() {
 
 # _now_ms -> _ms, ms since the epoch, in a variable so a call does not fork.
 # EPOCHREALTIME (bash), else date +%s%N when it has %N (_ms_date=1), else
-# whole seconds. Milliseconds let many short calls add up to their real time.
+# whole seconds.
 _ms_date=0
-_run_ms0=0
 _ms=0
 # shellcheck disable=SC3028  # EPOCHREALTIME is empty outside bash
 _now_ms() {
@@ -677,8 +679,9 @@ missed() { _res="$_res$1${_tab}missed$_tab$(_flat "$2")$_nl"; }
 notice() { printf '>> %s\n' "$*" >&3 2>/dev/null; }
 
 # _emit_time -> the run time; when a call was slow (SLOW_SEC), capped or not
-# run, also the host load at start and end and where the time went (bounded
-# calls summed per command, largest first, and the time outside them).
+# run, also the host load at start and end, the counts, and each such call as
+# time.log has it (ms, outcome, command), in the order they happened. No sums
+# or sorting: the reader or an analysis tool does that (CONTRACT.md, rule 1).
 _emit_time() {
     local f="${_tmp_dir:+$_tmp_dir/time.log}" counts
     fact "run time: $(_elapsed)s of ${RUN_DEADLINE}s allowed"
@@ -692,24 +695,11 @@ _emit_time() {
     fact "host load at start: ${_load0:-n/a}"
     fact "host load at end:   $(_host_load)"
     fact "bounded calls: $1; stopped at their cap or the deadline: $2; not run past the deadline: $3"
-    fact "where the time went (every bounded call, summed per command, largest first):"
-    _now_ms
-    LC_ALL=C awk -F'\t' -v run="$((_ms - _run_ms0))" '
-        $2 == "not run" { nr[$3]++; next }
-        { ms[$3] += $1; n[$3]++; tot += $1; if ($2 != "ran") { o[$3, $2]++; if (!(($3, $2) in seen)) { seen[$3, $2] = 1; ol[$3] = ol[$3] SUBSEP $2 } } }
-        END {
-            for (k in ms) {
-                x = ""; m = split(substr(ol[k], 2), L, SUBSEP)
-                for (i = 1; i <= m; i++) x = x ", " o[k, L[i]] " " L[i]
-                printf "%d\t%6.1fs  %s%s%s\n", ms[k], ms[k] / 1000, k, (n[k] > 1 ? " x" n[k] : ""), x
-            }
-            out = run - tot
-            if (out > 0) printf "%d\t%6.1fs  (outside bounded calls: shell work and file reads)\n", out, out / 1000
-        }' "$f" | sort -t "$_tab" -k1,1nr | head -n 10 | cut -f2- \
+    fact "bounded calls that were slow (${SLOW_SEC}s+), stopped or not run, in order (ms, outcome, command):"
+    awk -F'\t' -v s="$SLOW_SEC" '
+        $2 != "ran" || $1 >= s * 1000 { if (++k <= 40) printf "%s ms  %s  %s\n", $1, $2, $3 }
+        END { if (k > 40) printf "(%d more in this run)\n", k - 40 }' "$f" \
         | while IFS= read -r l; do fact "    $l"; done
-    # every command lost to the deadline, whatever the table above kept
-    awk -F'\t' '$2 == "not run" { c[$3]++ } END { for (k in c) printf "%s x%d\n", k, c[k] }' "$f" | sort \
-        | while IFS= read -r l; do fact "         -   $l not run (deadline)"; done
 }
 
 # emit_status -> the roll-up section. Call it immediately before emit_footer.
@@ -796,59 +786,6 @@ dump_file() {
     if [ ! -s "$path" ]; then fact "(empty file)"; return; fi
     head -n "$cap" "$path" 2>/dev/null | _indent '        '
 }
-
-# fstype_of PATH / source_of PATH -> the filesystem type / the source (device
-# or dataset) of the mount PATH is on; empty when neither tool answers
-fstype_of() {
-    local p="$1"
-    if have findmnt; then _bounded findmnt -no FSTYPE -T "$p" 2>/dev/null && return; fi
-    if have stat; then _bounded stat -f -c '%T' "$p" 2>/dev/null && return; fi
-    echo ""
-}
-
-source_of() {
-    local p="$1"
-    if have findmnt; then _bounded findmnt -no SOURCE -T "$p" 2>/dev/null && return; fi
-    echo ""
-}
-
-# _dir_ok DIR -> true when this uid can list DIR (read + search)
-_dir_ok() { [ -d "$1" ] && [ -r "$1" ] && [ -x "$1" ]; }
-
-# _path_state P -> ok (listable), absent (the nearest existing ancestor was
-# searched and P is not there), notdir, dangling:TARGET, or unlistable
-_path_state() {
-    local p="$1" a t
-    _dir_ok "$p" && { printf ok; return; }
-    if [ -e "$p" ]; then [ -d "$p" ] && printf unlistable || printf notdir; return; fi
-    if [ -L "$p" ]; then
-        t="$(readlink "$p")"; a="$t"
-        case "$a" in /*) ;; *) a="$(dirname "$p")/$a" ;; esac
-        a="$(dirname "$a")"
-        if [ -d "$a" ] && [ -x "$a" ]; then printf 'dangling:%s' "$t"; else printf unlistable; fi
-        return
-    fi
-    a="$(dirname "$p")"
-    while [ ! -e "$a" ] && [ "$a" != / ] && [ "$a" != . ]; do a="$(dirname "$a")"; done
-    if [ -x "$a" ]; then printf absent; else printf unlistable; fi
-}
-
-# resolve_yardbase -> YARDBASE from WHOME: yard.conf's yardbase, else
-# WHOME/yardbase; a relative value is taken relative to WHOME
-YARDBASE=""
-resolve_yardbase() {
-    local v
-    if [ -n "$WHOME" ] && [ -f "$WHOME/conf/yard.conf" ]; then
-        v="$(grep -E '^[[:space:]]*yardbase[[:space:]]*=' "$WHOME/conf/yard.conf" 2>/dev/null | tail -n1 | cut -d= -f2- | tr -d ' \r')"
-        [ -n "$v" ] && YARDBASE="$v"
-    fi
-    if [ -z "$YARDBASE" ] && [ -n "$WHOME" ] && [ -d "$WHOME/yardbase" ]; then YARDBASE="$WHOME/yardbase"; fi
-    # resolve relative to WHATAP_HOME
-    case "$YARDBASE" in
-        ""|/*) : ;;
-        *) [ -n "$WHOME" ] && YARDBASE="$WHOME/$YARDBASE" ;;
-    esac
-}
 # ---- end collection-server: file helpers
 
 # probe (run helpers) goes through _bounded: a pool that hangs costs at most
@@ -922,80 +859,6 @@ run_bounded() {
     _hung "$1" && return 124
     CMD_TIMEOUT="$s" _bounded "$@" 2>/dev/null
 }
-
-# ---- collection-server: process scan — DO NOT EDIT --------------------------
-# members: collserver collzfs
-# cmdline_of PID -> sets _CL to the process's argv joined by spaces (the bytes
-# `tr '\0' ' '` gives), with builtins only: no fork per process.
-_CL=""
-cmdline_of() {
-    local a=""
-    _CL=""
-    while IFS= read -r -d '' a; do _CL="$_CL$a "; done 2>/dev/null < "/proc/$1/cmdline"
-    _CL="$_CL$a"
-}
-
-# _whatap_cmdlines -> /proc/<pid>/cmdline paths that name a whatap module, in
-# /proc order. One bounded grep over every entry instead of a read per process,
-# fed through xargs so a host with tens of thousands of processes does not hit
-# ARG_MAX. Its exit status is kept: grep answers 0 (match) or 1 (none), and 2
-# when a process vanished mid-scan, which xargs reports as 123; anything else
-# (a cap, a failed exec) means the table was not read, and says so.
-CMDLINE_SCAN_WHY=""
-_whatap_cmdlines() {
-    # The list goes through a file and _bounded_in, not a pipe into _bounded:
-    # with the script on stdin (bash -s), _bounded gives its command /dev/null
-    # as stdin, and a piped list would arrive empty and read as "no JVM".
-    local lst; lst="$(_tmp cmdlines.lst)"
-    if have xargs && [ "$lst" != /dev/null ] && printf '%s\0' /proc/[0-9]*/cmdline > "$lst" 2>/dev/null; then
-        _bounded_in "$lst" xargs -0 grep -lsE 'whatap\.server\.|whatap\.opslake\.|\.yard\.boot'
-    else
-        # No xargs or no private directory: the paths as arguments (bounded by ARG_MAX).
-        _bounded grep -lsE 'whatap\.server\.|whatap\.opslake\.|\.yard\.boot' /proc/[0-9]*/cmdline
-    fi
-}
-_scan_cmdlines() {
-    local rc
-    _SCAN_OUT="$(_whatap_cmdlines)"; rc=$?
-    case "$rc" in
-        0|1|2|123) CMDLINE_SCAN_WHY="" ;;
-        124) CMDLINE_SCAN_WHY="the /proc/<pid>/cmdline scan did not finish within ${CMD_TIMEOUT}s" ;;
-        *)   CMDLINE_SCAN_WHY="the /proc/<pid>/cmdline scan failed (xargs/grep exit $rc)" ;;
-    esac
-}
-
-# _is_whatap_server PID CMDLINE -> true for a java process that runs a WhaTap
-# backend module: a whatap.server.*.jar / whatap.opslake.*.jar on its command
-# line, or the yard boot class. "whatap.server." alone is not enough: the
-# WhaTap Java agent passes -Dwhatap.server.host=..., and `tail -f
-# whatap.server.log` names it too. Patterns, not [[ =~ ]], so the block parses
-# under dash; the jar test is whatap.(server|opslake). followed by a run of
-# [A-Za-z0-9._-] that holds ".jar" after its first character.
-_is_whatap_server() {
-    local hit="" pfx s tok comm="" a0="${2%% *}"
-    case "$2" in *[A-Za-z0-9_].yard.boot*) hit=1 ;; esac
-    for pfx in whatap.server. whatap.opslake.; do
-        s="$2"
-        while [ -z "$hit" ]; do
-            case "$s" in *"$pfx"*) ;; *) break ;; esac
-            s="${s#*"$pfx"}"
-            tok="${s%%[!A-Za-z0-9._-]*}"
-            case "$tok" in ?*.jar*) hit=1 ;; esac
-            # past tok: a later hit inside it is a suffix of tok, no .jar either
-            # (only when tok holds one: the strip copies the rest of the string)
-            case "$tok" in *"$pfx"*) s="${s#"$tok"}" ;; esac
-        done
-    done
-    [ -n "$hit" ] || return 1
-    { IFS= read -r comm < "/proc/$1/comm"; } 2>/dev/null
-    [ "$comm" = java ] || [ "${a0##*/}" = java ]
-}
-# ---- end collection-server: process scan
-# Since 0.12.0 collzfs calls nothing in the process scan: it stays only because
-# the block's members line, shared with collserver, still names collzfs. This
-# reference keeps shellcheck from reading the block's status variable as unused
-# until collzfs leaves the members.
-: "${CMDLINE_SCAN_WHY:-}"
 
 # ---- collection-server: systemd — DO NOT EDIT -------------------------------
 # members: collserver collzfs

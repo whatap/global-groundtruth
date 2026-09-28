@@ -91,7 +91,6 @@ function Cap-Or([string]$name, [string]$v, [int]$def) {
 $script:CMD_TIMEOUT  = Cap-Or CMD_TIMEOUT "$env:CMD_TIMEOUT" 20
 $script:RUN_DEADLINE = Cap-Or RUN_DEADLINE "$env:RUN_DEADLINE" 300
 $script:RunStart     = [DateTime]::UtcNow
-$script:RunWatch     = [System.Diagnostics.Stopwatch]::StartNew()
 $script:BoundedExit  = $null
 $script:SLOW_SEC     = 3      # a bounded call at least this long is named in the status
 $script:TimeLog      = New-Object System.Collections.Generic.List[object]   # {ms; kind; name} per call
@@ -455,11 +454,10 @@ function Set-Na([string]$key, [string]$why)     { $script:Res.Add([pscustomobjec
 function Set-Missed([string]$key, [string]$why) { $script:Res.Add([pscustomobject]@{ k = $key; o = "missed"; r = (Flat $why) }) }
 
 # Emit-Time -> the run time; when a call was slow (SLOW_SEC), capped or not
-# run, also the host load at start and end and where the time went (bounded
-# calls summed per command, largest first, and the time outside them). The
-# lines are the shell _emit_time's.
+# run, also the host load at start and end, the counts, and each such call as
+# the time log has it (ms, outcome, command), in the order they happened. No
+# sums or sorting (CONTRACT.md, rule 1). The lines are the shell _emit_time's.
 function Emit-Time {
-    $inv = [System.Globalization.CultureInfo]::InvariantCulture
     Fact ("run time: {0}s of {1}s allowed" -f [int][Math]::Floor(([DateTime]::UtcNow - $script:RunStart).TotalSeconds), $script:RUN_DEADLINE)
     $log = $script:TimeLog.ToArray()
     if ($log.Count -eq 0) { return }
@@ -470,28 +468,14 @@ function Emit-Time {
     Fact ("host load at start: " + $(if ($script:Load0) { $script:Load0 } else { "n/a" }))
     Fact ("host load at end:   " + (Host-Load))
     Fact ("bounded calls: {0}; stopped at their cap or the deadline: {1}; not run past the deadline: {2}" -f $log.Count, $capped, $notrun)
-    Fact "where the time went (every bounded call, summed per command, largest first):"
-    $rows = New-Object System.Collections.Generic.List[object]
-    $tot = [long]0
-    foreach ($g in @($log | Where-Object { $_.kind -ne "not run" } | Group-Object -Property name -CaseSensitive)) {
-        $ms = [long]0; foreach ($e in $g.Group) { $ms += [long]$e.ms }
-        $tot += $ms
-        # the outcomes other than "ran", in the order first seen
-        $x = ""; $seen = New-Object System.Collections.Generic.List[string]
-        foreach ($e in $g.Group) { if ($e.kind -ne "ran" -and -not $seen.Contains($e.kind)) { $seen.Add($e.kind) } }
-        foreach ($k in $seen) { $x += ", {0} {1}" -f @($g.Group | Where-Object { $_.kind -eq $k }).Count, $k }
-        $n = $(if ($g.Count -gt 1) { " x$($g.Count)" } else { "" })
-        $rows.Add([pscustomobject]@{ ms = $ms; line = ("{0}s  {1}{2}{3}" -f ($ms / 1000.0).ToString("0.0", $inv).PadLeft(6), $g.Name, $n, $x) })
+    Fact ("bounded calls that were slow ({0}s+), stopped or not run, in order (ms, outcome, command):" -f $script:SLOW_SEC)
+    $k = 0
+    foreach ($e in $log) {
+        if ($e.kind -eq "ran" -and $e.ms -lt $script:SLOW_SEC * 1000) { continue }
+        $k++
+        if ($k -le 40) { Fact ("    {0} ms  {1}  {2}" -f $e.ms, $e.kind, $e.name) }
     }
-    $out = [long]$script:RunWatch.ElapsedMilliseconds - $tot
-    if ($out -gt 0) { $rows.Add([pscustomobject]@{ ms = $out; line = ("{0}s  (outside bounded calls: shell work and file reads)" -f ($out / 1000.0).ToString("0.0", $inv).PadLeft(6)) }) }
-    foreach ($r in @($rows | Sort-Object -Property @{ Expression = { $_.ms }; Descending = $true }, @{ Expression = { $_.line }; Descending = $true } | Select-Object -First 10)) {
-        Fact ("    " + $r.line)
-    }
-    # every command lost to the deadline, whatever the table above kept
-    foreach ($g in @($log | Where-Object { $_.kind -eq "not run" } | Group-Object -Property name -CaseSensitive | Sort-Object -Property Name -CaseSensitive)) {
-        Fact ("         -   {0} x{1} not run (deadline)" -f $g.Name, $g.Count)
-    }
+    if ($k -gt 40) { Fact ("    ({0} more in this run)" -f ($k - 40)) }
 }
 
 function Emit-Status {

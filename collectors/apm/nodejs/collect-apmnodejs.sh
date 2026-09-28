@@ -29,7 +29,7 @@ export LC_ALL=C
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-apmnodejs"
 # History: CHANGELOG.md (next to this file).
-VERSION="0.9.4"
+VERSION="0.9.5"
 DOMAIN="apm"
 TARGET="host/$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || uname -n 2>/dev/null || echo unknown)"
 
@@ -298,8 +298,15 @@ _run_init() {
     _load0="$(_host_load)"
     # 16+ digits: a date without %N prints bare seconds
     [ -z "${EPOCHREALTIME:-}" ] && case "$(date +%s%N 2>/dev/null)" in *[!0-9]*|'') ;; ????????????????*) _ms_date=1 ;; esac
-    _now_ms; _run_ms0="$_ms"
     case "$_run_t0" in ''|*[!0-9]*) _run_t0="" ;; esac
+    # The traps come before the directory: set after it, a signal in between
+    # left ggt.* behind (1 in ~300 runs of a stress test, 2026-09-28). A signal
+    # during mktemp runs the trap once the assignment is done, and
+    # _run_cleanup does nothing while _tmp_dir is still empty.
+    trap '_run_cleanup' EXIT
+    trap '_run_cleanup; exit 129' HUP
+    trap '_run_cleanup; exit 130' INT
+    trap '_run_cleanup; exit 143' TERM
     # no predictable fallback name: without mktemp, _tmp answers /dev/null
     _tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/ggt.XXXXXX" 2>/dev/null)"
     # Script read from stdin (`sh -s`)? Then fd 0 is the script: a bounded
@@ -316,10 +323,6 @@ _run_init() {
     # caps from the environment: whole numbers or unused (0 = no limit to timeout(1))
     RUN_DEADLINE="$(_cap_or RUN_DEADLINE "$RUN_DEADLINE" 300)"
     CMD_TIMEOUT="$(_cap_or CMD_TIMEOUT "${CMD_TIMEOUT:-20}" 20)"
-    trap '_run_cleanup' EXIT
-    trap '_run_cleanup; exit 129' HUP
-    trap '_run_cleanup; exit 130' INT
-    trap '_run_cleanup; exit 143' TERM
     [ -n "${_timeout_bin:-}" ] || _timeout_bin="$(command -v timeout 2>/dev/null)"
     # busybox timeout(1) runs CMD in its own pid and leaves its timer to PID 1,
     # a zombie per call under a PID 1 that does not reap: the watchdog instead
@@ -352,9 +355,8 @@ _kill_tree() {
 
 # _now_ms -> _ms, ms since the epoch, in a variable so a call does not fork.
 # EPOCHREALTIME (bash), else date +%s%N when it has %N (_ms_date=1), else
-# whole seconds. Milliseconds let many short calls add up to their real time.
+# whole seconds.
 _ms_date=0
-_run_ms0=0
 _ms=0
 # shellcheck disable=SC3028  # EPOCHREALTIME is empty outside bash
 _now_ms() {
@@ -552,8 +554,9 @@ missed() { _res="$_res$1${_tab}missed$_tab$(_flat "$2")$_nl"; }
 notice() { printf '>> %s\n' "$*" >&3 2>/dev/null; }
 
 # _emit_time -> the run time; when a call was slow (SLOW_SEC), capped or not
-# run, also the host load at start and end and where the time went (bounded
-# calls summed per command, largest first, and the time outside them).
+# run, also the host load at start and end, the counts, and each such call as
+# time.log has it (ms, outcome, command), in the order they happened. No sums
+# or sorting: the reader or an analysis tool does that (CONTRACT.md, rule 1).
 _emit_time() {
     local f="${_tmp_dir:+$_tmp_dir/time.log}" counts
     fact "run time: $(_elapsed)s of ${RUN_DEADLINE}s allowed"
@@ -567,24 +570,11 @@ _emit_time() {
     fact "host load at start: ${_load0:-n/a}"
     fact "host load at end:   $(_host_load)"
     fact "bounded calls: $1; stopped at their cap or the deadline: $2; not run past the deadline: $3"
-    fact "where the time went (every bounded call, summed per command, largest first):"
-    _now_ms
-    LC_ALL=C awk -F'\t' -v run="$((_ms - _run_ms0))" '
-        $2 == "not run" { nr[$3]++; next }
-        { ms[$3] += $1; n[$3]++; tot += $1; if ($2 != "ran") { o[$3, $2]++; if (!(($3, $2) in seen)) { seen[$3, $2] = 1; ol[$3] = ol[$3] SUBSEP $2 } } }
-        END {
-            for (k in ms) {
-                x = ""; m = split(substr(ol[k], 2), L, SUBSEP)
-                for (i = 1; i <= m; i++) x = x ", " o[k, L[i]] " " L[i]
-                printf "%d\t%6.1fs  %s%s%s\n", ms[k], ms[k] / 1000, k, (n[k] > 1 ? " x" n[k] : ""), x
-            }
-            out = run - tot
-            if (out > 0) printf "%d\t%6.1fs  (outside bounded calls: shell work and file reads)\n", out, out / 1000
-        }' "$f" | sort -t "$_tab" -k1,1nr | head -n 10 | cut -f2- \
+    fact "bounded calls that were slow (${SLOW_SEC}s+), stopped or not run, in order (ms, outcome, command):"
+    awk -F'\t' -v s="$SLOW_SEC" '
+        $2 != "ran" || $1 >= s * 1000 { if (++k <= 40) printf "%s ms  %s  %s\n", $1, $2, $3 }
+        END { if (k > 40) printf "(%d more in this run)\n", k - 40 }' "$f" \
         | while IFS= read -r l; do fact "    $l"; done
-    # every command lost to the deadline, whatever the table above kept
-    awk -F'\t' '$2 == "not run" { c[$3]++ } END { for (k in c) printf "%s x%d\n", k, c[k] }' "$f" | sort \
-        | while IFS= read -r l; do fact "         -   $l not run (deadline)"; done
 }
 
 # emit_status -> the roll-up section. Call it immediately before emit_footer.

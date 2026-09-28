@@ -5,6 +5,7 @@ Every change to the script bumps its `VERSION` and adds one entry at the top
 of this list (docs/authoring-guide.md, step 2); `tools/validate.sh` checks
 that the newest entry is the script's `VERSION`.
 
+- **0.8.3** — Collection status (skeleton `_emit_time`): when a bounded call was slow, capped or not run, the per-command "where the time went" table (sums largest first, time outside bounded calls) gives way to the time log's own records, one line per such call in the order they ran (`<ms> ms  <outcome>  <command>`, the first 40, then `(N more in this run)`); CONTRACT rule 1. `_run_init` sets its EXIT/INT/TERM/HUP traps before it creates the private directory: a signal in between left `ggt.*` behind.
 - **0.8.2** — `_run_init` (skeleton) also takes the script as read from stdin when `$0` is the shell's own binary (`/bin/bash -s`, `$0 -ef /proc/$$/exe`): bash 3.2 under musl otherwise faulted in a loop at full CPU after `4<&0`.
 - **0.8.1** — The host section adds `/sys/class/dmi/id/product_uuid`: its
   `ls -l` line and `dmi product_uuid readable by uid N:` (yes or no, from an

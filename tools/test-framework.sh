@@ -112,14 +112,15 @@ for sh in bash dash; do
     check "the status names the deadline"                   'printf "%s" "$out" | grep -q "run deadline: reached at 1s"'
     # where the time went, and the load it ran under (2026-09-25)
     check "the status gives the run time"                   'printf "%s" "$out" | grep -Eq "run time: [0-9]+s of [0-9]+s allowed"'
-    check "a capped call is named with its cap"             'printf "%s" "$out" | grep -Eq "^ +[0-9]+\.[0-9]s  sleep, 1 capped at 2s$"'
-    check "one command's calls are summed, capped ones counted" 'printf "%s" "$out" | grep -Eq "^ +[0-9]+\.[0-9]s  sh x3, 2 capped at 2s$"' \
-          "$(printf '%s' "$out" | grep -E '^ +[0-9]+\.[0-9]s  ')"
-    check "fast calls are timed in ms, not rounded to 0"    'printf "%s" "$out" | grep -Eq "^ +0\.[0-9]s  tr$|^ +0\.[0-9]s  myfn"'
-    check "the time outside bounded calls is given"         'printf "%s" "$out" | grep -q "(outside bounded calls: shell work and file reads)"' 
-    check "calls not run past the deadline are counted"     'printf "%s" "$out" | grep -q "echo x2 not run (deadline)"'
+    # raw time-log records, not a per-command table (CONTRACT rule 1, 2026-09-28)
+    check "a capped call is its own line: ms, cap, command" 'printf "%s" "$out" | grep -Eq "^ +[0-9]+ ms  capped at 2s  sleep$"'
+    check "each capped call of one command has its own line" '[ "$(printf "%s\n" "$out" | grep -Ec "^ +[0-9]+ ms  capped at 2s  sh$")" = 2 ]' \
+          "$(printf '%s' "$out" | grep -E '^ +[0-9]+ ms  ')"
+    check "a fast call is not listed"                       '! printf "%s" "$out" | grep -Eq "^ +[0-9]+ ms  ran  (tr|myfn)$"'
+    check "no sums, no time outside bounded calls"          '! printf "%s" "$out" | grep -q "where the time went\|outside bounded calls"'
+    check "each call not run past the deadline is listed"   '[ "$(printf "%s\n" "$out" | grep -Ec "^ +0 ms  not run  echo$")" = 2 ]'
     check "the host load is given at start and end"         'printf "%s" "$out" | grep -q "host load at start: load " && printf "%s" "$out" | grep -q "host load at end:   load "'
-    check "no argument of a logged call is kept"            '! printf "%s" "$out" | grep -Eq "^ +[0-9]+\.[0-9]s  .*(30|TERM|trap)"'
+    check "no argument of a logged call is kept"            '! printf "%s" "$out" | grep -Eq "^ +[0-9]+ ms  .*(30|TERM|trap)"'
     check "the private directory is gone after exit"        '[ -n "$tmpd" ] && [ ! -e "$tmpd" ]'
     [ "$sh" = dash ] && check "no bash-only construct in the blocks" '! printf "%s" "$out" | grep -q "Bad substitution\|Syntax error"'
 done
@@ -183,7 +184,7 @@ for sh in bash dash; do
     check "$sh: a missing private directory is said"               'printf "%s" "$out" | grep -q "no private temp directory could be made" && printf "%s" "$out" | grep -q "dir=none"'
 done
 
-echo "== 1e. where the time went =="
+echo "== 1e. the time log in the status =="
 cat > "$T/tl.sh" <<'EOF'
 set -- --stdout
 . "$LIB"
@@ -195,12 +196,13 @@ while [ "$i" -lt 300 ]; do _bounded true; [ -d "$d" ] || break; i=$((i + 1)); do
 echo "dir-survived=$i"
 : > "$_tmp_dir/time.log"
 goal a "A"; got a
-for c in c01 c02 c03 c04 c05 c06 c07 c08 c09 c10 c11; do _time_log 1 ran "$c"; done
+_time_log 1 ran fastcmd
 _time_log 3000 "capped at 3s" sleep 9; _time_log 2000 "cut at the deadline" sleep 9
 _time_log 0 "not run" lostcmd x
-_time_log 10 ran echo hunter2; _time_log 10 ran kubectl --request-timeout=1s get pods
-_time_log 10 ran kubectl --token secret get
-_time_log 10 ran "$(printf 'we\nird')"
+_time_log 3000 ran echo hunter2; _time_log 3000 ran kubectl --request-timeout=1s get pods
+_time_log 3000 ran kubectl --token secret get
+_time_log 3000 ran "$(printf 'we\nird')"
+i=0; while [ "$i" -lt 40 ]; do _time_log 4000 ran "slow$i"; i=$((i + 1)); done
 emit_status
 EOF
 mkdir -p "$T/nodate-ns" && printf '#!/bin/sh\ncase "$1" in +%%s%%N) exec /bin/date +%%s ;; esac\nexec /bin/date "$@"\n' > "$T/nodate-ns/date" && chmod +x "$T/nodate-ns/date"
@@ -210,8 +212,11 @@ for sh in bash dash; do
     # the watchdog's TERM ran the inherited trap and removed the directory
     # within 1..176 calls under bash (2026-09-25)
     check "$sh: 300 bounded builtins keep the private directory" 'printf "%s" "$out" | grep -q "dir-survived=300"' "$(printf '%s' "$out" | grep dir-survived)"
-    check "$sh: not-run rows are listed past the top 10"   'printf "%s" "$out" | grep -q "lostcmd x1 not run (deadline)"'
-    check "$sh: mixed outcomes of one command are each counted" 'printf "%s" "$out" | grep -Eq "sleep x2, 1 capped at 3s, 1 cut at the deadline$"'
+    check "$sh: the records come as logged, in order"       '[ "$(printf "%s\n" "$out" | grep -E "^ +[0-9]+ ms  " | head -3 | sed "s/^ *//" | tr "\n" "|")" = "3000 ms  capped at 3s  sleep|2000 ms  cut at the deadline  sleep|0 ms  not run  lostcmd|" ]' \
+          "$(printf '%s\n' "$out" | grep -E '^ +[0-9]+ ms  ' | head -3)"
+    check "$sh: a fast ran call is not listed"             '! printf "%s" "$out" | grep -q fastcmd'
+    check "$sh: 40 records, then the rest counted"         'printf "%s" "$out" | grep -Eq "^ +\(7 more in this run\)$" && printf "%s" "$out" | grep -q "  slow32$" && ! printf "%s" "$out" | grep -q "  slow33$"'
+    check "$sh: nothing summed or sorted"                   '! printf "%s" "$out" | grep -Eq "where the time went|outside bounded calls| x[0-9]+(,|$)"'
     check "$sh: an argument of a plain command is never kept" '! printf "%s" "$out" | grep -q hunter2'
     check "$sh: a subcommand tool keeps its subcommand"     'printf "%s" "$out" | grep -Eq "  kubectl get$"' "$(printf '%s' "$out" | grep kubectl)"
     check "$sh: an option before it hides the subcommand, never the value" 'printf "%s" "$out" | grep -Eq "  kubectl$" && ! printf "%s" "$out" | grep -q secret'
@@ -288,6 +293,22 @@ for sh in bash dash; do
     d="$(cat "$T/intr.dir" 2>/dev/null)"
     check "$sh: INT ends the run at once, with 130" '[ "$irc" = 130 ] && [ "$took" -le 3 ]' "rc=$irc took=${took}s"
     check "$sh: INT removes the run's directory" '[ -n "$d" ] && [ ! -e "$d" ]' "left: $d"
+done
+
+# A TERM while mktemp makes the private directory: with the traps set after
+# it, the directory stayed behind (1 in ~300 runs of a stress test,
+# 2026-09-28). A mktemp that sleeps after creating it holds the run there.
+mkdir -p "$T/slowmk" "$T/mkt"
+printf '#!/bin/sh\n%s "$@"; rc=$?; sleep 2; exit $rc\n' "$(command -v mktemp)" > "$T/slowmk/mktemp"; chmod +x "$T/slowmk/mktemp"
+printf 'set -- --stdout\n. "$LIB"\nexec 3>&2\n_run_init\nexit 0\n' > "$T/mk.sh"
+for sh in bash dash; do
+    command -v "$sh" >/dev/null 2>&1 || continue
+    rm -rf "$T/mkt"/*
+    PATH="$T/slowmk:$PATH" TMPDIR="$T/mkt" LIB="$T/lib.sh" "$sh" "$T/mk.sh" >/dev/null 2>&1 &
+    mp=$!
+    i=0; while [ -z "$(ls "$T/mkt" 2>/dev/null)" ] && [ "$i" -lt 30 ]; do sleep 0.1; i=$((i + 1)); done
+    kill -TERM "$mp" 2>/dev/null; wait "$mp"; mrc=$?
+    check "$sh: a TERM during mktemp exits 143 and leaves no directory" '[ "$mrc" = 143 ] && [ -z "$(ls "$T/mkt")" ]' "rc=$mrc left: $(ls "$T/mkt")"
 done
 
 # ---- 2. sync-shared-block ---------------------------------------------------

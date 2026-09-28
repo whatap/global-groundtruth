@@ -128,8 +128,9 @@ redirection as UTF-16LE; `tools/validate.sh --report` rejects such a copy.
   connect, so a refused probe takes about 2 s, an unanswered one its 5 s cap.
 - `run time` and, when a call was slow, capped or cut by the deadline, the
   host load (CPU busy over a 250 ms sample, processor and disk queue, free
-  memory) and "where the time went" close the status section, as in the
-  shell collectors. `CMD_TIMEOUT` and `RUN_DEADLINE` are read from the
+  memory) and each slow, stopped or not-run call in time-log order
+  (`<ms> ms  <outcome>  <command>`, the first 40, then `(N more in this run)`)
+  close the status section, as in the shell collectors. `CMD_TIMEOUT` and `RUN_DEADLINE` are read from the
   environment.
 
 Goals: `agent` (a home or an uninstall entry; `missed` when the HKLM

@@ -62,7 +62,10 @@ dump_file() {
     if [ ! -s "$path" ]; then fact "(empty file)"; return; fi
     head -n "$cap" "$path" 2>/dev/null | _indent '        '
 }
+# ---- end collection-server: file helpers
 
+# ---- collection-server: path helpers — DO NOT EDIT --------------------------
+# members: collserver
 # fstype_of PATH / source_of PATH -> the filesystem type / the source (device
 # or dataset) of the mount PATH is on; empty when neither tool answers
 fstype_of() {
@@ -115,10 +118,10 @@ resolve_yardbase() {
         *) [ -n "$WHOME" ] && YARDBASE="$WHOME/$YARDBASE" ;;
     esac
 }
-# ---- end collection-server: file helpers
+# ---- end collection-server: path helpers
 
 # ---- collection-server: process scan — DO NOT EDIT --------------------------
-# members: collserver collzfs
+# members: collserver
 # cmdline_of PID -> sets _CL to the process's argv joined by spaces (the bytes
 # `tr '\0' ' '` gives), with builtins only: no fork per process.
 _CL=""

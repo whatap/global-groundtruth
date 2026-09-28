@@ -203,11 +203,10 @@ for and whether it got it:
     host load at start: load 7.90 6.12 5.01; psi avg10 (some/full) cpu 31.20/0.00 io 48.10/40.02 memory 0.00/0.00; mem available 812 of 7821 MiB; procs running 9, blocked 6
     host load at end:   load 9.40 6.80 5.30; psi avg10 (some/full) cpu 28.70/0.00 io 52.33/44.90 memory 0.00/0.00; mem available 790 of 7821 MiB; procs running 7, blocked 8
     bounded calls: 57; stopped at their cap or the deadline: 2; not run past the deadline: 0
-    where the time went (every bounded call, summed per command, largest first):
-          40.0s  find x2, 2 capped at 20s
-          18.2s  (outside bounded calls: shell work and file reads)
-           4.1s  du
-           1.3s  systemctl show x3
+    bounded calls that were slow (3s+), stopped or not run, in order (ms, outcome, command):
+        20004 ms  capped at 20s  find
+        4113 ms  ran  du
+        20002 ms  capped at 20s  find
     blocked (running this differently would obtain these):
         WHATAP_HOME contents — uid 3103 cannot reach /data/whatap
         module configs — uid 3103 cannot reach /data/whatap
@@ -311,11 +310,13 @@ its cap, or not run past the deadline, it adds:
   processes running and blocked on I/O. Read from `/proc` only. The example
   above reads as an I/O-starved host (io PSI 48%, 6–8 blocked), which is why
   `find` hit its cap, not a collector fault.
-- `where the time went:` — every bounded call summed per command, the ten
-  largest, each with how many were capped or cut at the deadline; the time
-  spent outside bounded calls (shell work, file reads); and every command
-  that was not run past the deadline (`<cmd> xN not run (deadline)`), however
-  many there are.
+- `bounded calls that were slow ..., in order:` — one line per bounded call
+  that took `SLOW_SEC` or longer, was stopped at its cap or at the deadline,
+  or was not run past the deadline, as the time log recorded it: its ms, its
+  outcome (`ran`, `capped at Ns`, `cut at the deadline`, `not run`) and the
+  command, in the order the calls happened. The first 40 are listed, then
+  `(N more in this run)`. No sums or sorting (Contract rule 1): which command
+  cost the most is for the reader or an analysis tool to add up.
 
 Only a command's name is kept, plus the subcommand word for tools built that
 way (`kubectl get`, `zfs list`, `systemctl show`), never an argument, which

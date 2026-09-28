@@ -19,7 +19,8 @@ mask() {
         -e 's/[0-9]{4}-?[0-9]{2}-?[0-9]{2}T?[ ]?[0-9]{2}:?[0-9]{2}:?[0-9]{2}Z?/TS/g' \
         -e 's/ggt\.[A-Za-z0-9]{6}/ggt.X/g' -e 's/rfcap\.[A-Za-z0-9]{6}/rfcap.X/g' \
         -e '/^    (run time|host load at|bounded calls|where the time went)/d' \
-        -e '/^ {8,}[0-9]+\.[0-9]s  /d' -e '/^ {8,}-   .* not run \(deadline\)$/d'
+        -e '/^ {8,}[0-9]+\.[0-9]s  /d' -e '/^ {8,}-   .* not run \(deadline\)$/d' \
+        -e '/^ {8,}[0-9]+ ms  /d' -e '/^ {8,}\([0-9]+ more in this run\)$/d'
 }
 
 capture() {
