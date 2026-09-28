@@ -1,6 +1,8 @@
 # collectors/apm/php — WhaTap PHP APM agent collector
 
-> **Status: SEEDED (v0.2; validated at `collect-apmphp.sh` 0.8.0 on
+> **Status: SEEDED (v0.2; validated at `collect-apmphp.sh` 0.8.2 on
+> 2026-09-28 on the lab targets `apm-php-rocky` / `apm-php-alpine` (same
+> setup as 0.8.0 below); COMPLETE, `validate.sh --report` pass. 0.8.0 on
 > 2026-09-27 on the lab targets `apm-php-rocky` / `apm-php-alpine` (web user
 > and root without CAP_SYS_PTRACE, `sh -s`, `bash -s`, file); 0.7.2 on
 > 2026-09-27 against the real agent: whatap-php 2.14-2 rpm on Rocky 9 (PHP 8.2

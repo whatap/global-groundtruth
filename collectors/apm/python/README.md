@@ -1,6 +1,8 @@
 # collectors/apm/python — WhaTap Python APM agent collector
 
-> **Status: SEEDED (v0; validated at `collect-apmpython.sh` 0.10.2 on
+> **Status: SEEDED (v0; validated at `collect-apmpython.sh` 0.11.2 on
+> 2026-09-28 on the lab `apm-python` / `apm-python-op` containers (same setup
+> as below); COMPLETE, `validate.sh --report` pass. 0.10.2 was run on
 > 2026-09-27 against real `whatap-python` agents: 2.2.0 from PyPI in a
 > virtualenv under `whatap-start-agent gunicorn`, and the operator's
 > `apm-init-python` copy (2.1.2, `PYTHONPATH=/whatap-agent:/whatap-agent/whatap/bootstrap`)

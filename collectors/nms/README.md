@@ -1,15 +1,19 @@
 # collectors/nms
 
-> **Status: SEEDED v0 (validated at `collect-nms.sh` 0.3.0; the script's
-> `VERSION` is the current one).** A working collector exists and
+> **Status: SEEDED v0 (validated at `collect-nms.sh` 0.7.5 on 2026-09-28; the
+> script's own `VERSION` is the current one).** A working collector exists and
 > is owned, for now, by the Global team (framework owner). Handover transfers
 > ongoing ownership to the NMS development team (CONTRACT rule 4).
-> **Live-validated on Ubuntu 24.04 with a real `whatap-nms` 1.0.2 (deb)
-> install** — including a failed-postinst scenario, where the report captured
-> the package state (`half-configured`), the `pkg-install-error.log` cause
-> line, python/venv facts, and outbound reachability in one paste. Also
+> **Live-validated on the lab `nms` target (Rocky 9 + systemd, real
+> `whatap-nms` 1.3.3 rpm, all four units — `uvicorn`/`nmscore`/
+> `icmptcphealthd`/`nmsautomationd` — running)** — a RHEL-family host with a
+> fully-running manager; COMPLETE, `validate.sh --report` pass. Earlier,
+> 0.3.0 was live-validated on Ubuntu 24.04 with a real `whatap-nms` 1.0.2
+> (deb) install — including a failed-postinst scenario, where the report
+> captured the package state (`half-configured`), the `pkg-install-error.log`
+> cause line, python/venv facts, and outbound reachability in one paste. Also
 > verified to degrade gracefully (reasoned `n/a`) on a host without the
-> package. Not yet run on a RHEL-family host or a fully-running manager.
+> package.
 
 The **WhaTap NMS Control Manager** is the on-prem network-monitoring manager
 (`whatap-nms` package — rpm on RHEL-family, deb on Debian-family): a Python

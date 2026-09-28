@@ -1,7 +1,11 @@
 # collectors/apm/java — WhaTap Java APM agent collector
 
-> **Status: SEEDED (v0; validated at `collect-apmjava.sh` 0.13.2 on
-> 2026-09-27 against real WhaTap Java agents: an operator-injected Spring Boot
+> **Status: SEEDED (v0; validated at `collect-apmjava.sh` 0.15.2 on
+> 2026-09-28 on the lab `apm-java` / `apm-java-jto` containers (Temurin
+> 21.0.12, real agent 2.2.77 attached by `-javaagent` and by
+> `JAVA_TOOL_OPTIONS`, JVM uid 1500); COMPLETE, `validate.sh --report` pass.
+> 0.13.2 was run on 2026-09-27 against real WhaTap Java agents: an
+> operator-injected Spring Boot
 > pod on the lab cluster (Temurin 17.0.18, agent 2.2.68 from
 > `apm-init-java:latest`, connected to the collection server) and Temurin
 > 21.0.12 containers with agent 2.2.77 attached by `-javaagent` and by

@@ -1,11 +1,14 @@
 # collectors/k8s — SEEDED v0
 
-> **Status: SEEDED v0** (validated at `collect-k8s.sh` 0.4.4; the script's own
-> `VERSION` is the current one). Owned by the k8s domain team
+> **Status: SEEDED v0** (validated at `collect-k8s.sh` 0.12.2 on 2026-09-28;
+> the script's own `VERSION` is the current one). Owned by the k8s domain team
 > (CONTRACT rule 4); until handover it is managed by the Global team.
-> Verified end-to-end against one live kubeadm cluster (v1.32, containerd,
-> whatap-operator 2.9.7 + node-agent DaemonSet + APM auto-instrumented app).
-> Not yet run on OpenShift / CCE / EKS / RBAC-restricted profiles.
+> Verified end-to-end against the lab `k8s-lab` kubeadm cluster (v1.32.13,
+> containerd 2.2.2, cilium, real operator-injected APM pods) and the lab
+> `k8sproxy` MEA webhook-fail-open repro (kubeadm v1.32.13), both run from a
+> bastion-shaped `KUBECONFIG` and, for `k8sproxy`, from inside the cluster
+> VM too; COMPLETE, `validate.sh --report` pass. Not yet run on
+> OpenShift / CCE / EKS / RBAC-restricted profiles.
 
 ## (a) What it collects
 

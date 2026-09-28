@@ -1,8 +1,11 @@
 # collectors/db — WhaTap DB-monitoring collector
 
-> **Status: v0 implemented** (2026-07-16; validated at `collect-db.sh` 0.9.0
-> on a mock install tree against live PostgreSQL 16 / MySQL 8.0 — see
-> "Verification status"; the script's own `VERSION` is the current one;
+> **Status: v0 implemented** (2026-07-16; validated at `collect-db.sh` 0.9.1
+> on 2026-09-28 against the live `jjsong-ggt-postgres` container (DB host,
+> PostgreSQL 16, no DBX agent installed there): COMPLETE, `validate.sh
+> --report` pass — the mock-tree / DBX-agent-host path was not re-run this
+> round, so it is still validated only at 0.9.0 (see "Verification status");
+> the script's own `VERSION` is the current one;
 > `collect-db-mssql.ps1` validated at 0.7.0 on Windows Server 2022). Owned by the DB domain team once
 > handed over (CONTRACT rule 4); until then managed by the Global team.
 > Scope grounded in a full read of #ext-db-모니터링-기술문의 (2025-04 → 2026-07,

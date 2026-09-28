@@ -1,6 +1,8 @@
 # collectors/apm/nodejs — WhaTap Node.js APM agent collector
 
-> **Status: SEEDED (v0; validated at `collect-apmnodejs.sh` 0.8.2 on
+> **Status: SEEDED (v0; validated at `collect-apmnodejs.sh` 0.9.4 on
+> 2026-09-28 on the lab `apm-nodejs` / `apm-nodejs-op` containers (same setup
+> as below); COMPLETE, `validate.sh --report` pass. 0.8.2 was run on
 > 2026-09-27 against the real `whatap` npm agent 2.0.6 (`require('whatap')` in
 > the app, master `whatap_nodejs` in a Node 22 container) and the operator's
 > `apm-init-nodejs` copy (`NODE_OPTIONS=-r whatap`, `/whatap-agent`); as root,
