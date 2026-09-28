@@ -24,3 +24,6 @@ If the diff touches `trap`, `kill`, `wait`, background `&`, `_bounded`, timeouts
 
 ## Output
 Verdict (`commit` / `fix first` / `ESCALATE`), each problem with a reproduction, and the commands with results. Concise.
+
+## Waiting
+Never wait with `until ! pgrep -f PATTERN` (it matches its own shell and never ends). Wait on a PID or an output file, always under `timeout`. See README "Waiting for background work".

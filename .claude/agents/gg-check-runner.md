@@ -22,3 +22,6 @@ You run checks and report results. You do not review code and you do not fix any
 
 ## Output
 A table: check, file, result (PASS/FAIL, counts), and for any failure the first 20 lines of output verbatim. For the capture compare, list the differing files and the differing lines, and mark which of them also differ base-vs-base. Nothing else.
+
+## Waiting
+Never wait with `until ! pgrep -f PATTERN` (it matches its own shell and never ends). Wait on a PID or an output file, always under `timeout`. See README "Waiting for background work".

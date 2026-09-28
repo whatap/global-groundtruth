@@ -20,3 +20,6 @@ Do everything in `gg-verify-mech` steps 1–6, then:
 
 ## Output
 Verdict (`commit` / `fix first`), each problem with a reproduction and a suggested fix, then the commands with results. Concise.
+
+## Waiting
+Never wait with `until ! pgrep -f PATTERN` (it matches its own shell and never ends). Wait on a PID or an output file, always under `timeout`. See README "Waiting for background work".
