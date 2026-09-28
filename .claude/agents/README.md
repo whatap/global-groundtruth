@@ -82,6 +82,32 @@ Two logged misses of one kind of task at a tier move that kind of task up for
 good: change the default here and in the agent file. Going back down needs a
 blind calibration like the ones below.
 
+## Reading (token budget)
+
+Sub-agent cost is mostly what they read, not what they write. On 2026-09-27,
+58 runs used about 10.4 M tokens: Slack reading 27 %, verification 17 %
+(120-200 k per verifier in 1-5 tool calls, i.e. whole 100-220 KB collectors and
+raw check output). Quality comes from what is checked, so cut reading only:
+
+- **Excerpt, not the whole file.** Verifiers and re-checkers start from
+  `tools/excerpt.sh -C <tree> <base>` (diff, full body of every touched
+  function, same-file callers). Read the whole collector only when the change
+  needs it: synced blocks, traps/signals/timeouts, control flow across
+  functions, or when the excerpt leaves a question open. Say which in the
+  report.
+- **Summaries for checks.** Run `tools/check-all.sh -C <tree> <base>` and read
+  a full log only for a FAIL. Lab runs: read `run.sh` report diffs, not the
+  raw reports.
+- **Point at sections.** Prompts name the CONTRACT/README section to read;
+  common rules for a batch go in one file whose path every prompt gives.
+- **Resume, don't restart.** An agent stopped by a usage limit or an error is
+  continued with SendMessage; a fresh agent re-reads everything (one verifier
+  was run twice on 2026-09-27, about 200 k tokens lost).
+- **Slack:** filter mechanically first (drop bot/join/emoji-only messages,
+  keep threads that mention a collector, product path, error text or
+  version), read only what passes, and record the last-read timestamp per
+  channel so the next pass reads only newer threads.
+
 ## Waiting for background work
 
 A wait loop must be able to end. `until ! pgrep -f "tools/lab/run.sh …"; do sleep 5; done`

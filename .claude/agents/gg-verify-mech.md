@@ -28,5 +28,8 @@ If the diff touches `trap`, `kill`, `wait`, background `&`, `_bounded` internals
 ## Output
 Verdict (`commit` / `fix first` / `ESCALATE`), each problem with a reproduction, and the commands with results. Concise.
 
+## Reading
+Start from `tools/excerpt.sh -C <scratch> <base>` (steps 2-4 work on its function bodies) and `tools/check-all.sh -C <scratch> <base>` (step 5; read a full log only for a FAIL). A whole-file read means the patch is not M: escalate. README "Reading (token budget)".
+
 ## Waiting
 Never wait with `until ! pgrep -f PATTERN` (it matches its own shell and never ends). Wait on a PID or an output file, always under `timeout`. See README "Waiting for background work".

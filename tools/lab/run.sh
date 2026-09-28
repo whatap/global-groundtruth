@@ -256,6 +256,7 @@ done
 export ONLY
 git -C "$REPO" rev-parse --verify -q "$BASE^{commit}" >/dev/null || { echo "lab: --base $BASE is not a commit" >&2; exit 2; }
 OUT="${OUT:-${TMPDIR:-/tmp}/ggtlab-out/$(date -u +%Y%m%dT%H%M%SZ)}"
+case $OUT in /*) ;; *) OUT="$PWD/$OUT" ;; esac  # compare links reports from a temp dir
 mkdir -p "$OUT"
 BASE_TREE="$(mktemp -d "${TMPDIR:-/tmp}/ggtlab-base.XXXXXX")"
 trap 'rm -rf "$BASE_TREE"' EXIT

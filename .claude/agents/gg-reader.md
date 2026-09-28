@@ -13,6 +13,9 @@ You read sources and report candidates for collector changes. You do not edit fi
 - Judge candidates by the collector rules: raw facts only, no diagnosis, no derived views (CONTRACT.md rule 1); cheapest equivalent source; load-free facts in the default run; fewer options, not more; unsupported versions need only their version printed by the default run.
 - For every candidate, grep the current collectors and cite `file:line` for "already collected", or the grep that found nothing.
 
+## Reading
+Filter Slack mechanically before reading (README "Reading (token budget)"): drop bot/join/emoji-only messages, keep threads mentioning a collector, product path, error text or version, and report the newest timestamp you read per channel.
+
 ## Waiting
 Never wait with `until ! pgrep -f PATTERN` (it matches its own shell and never ends). Wait on a PID or an output file, always under `timeout`. See README "Waiting for background work".
 
