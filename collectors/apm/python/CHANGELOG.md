@@ -5,6 +5,11 @@ first. Every change to the script bumps its `VERSION` and adds one entry at
 the top of this list (docs/authoring-guide.md, step 2); `tools/validate.sh`
 checks that the newest entry is the script's `VERSION`.
 
+- **0.11.5** — `_disc_go`'s Go-process read (`_go_rows`) is kept in a
+  variable, not a file under `_tmp`: with no private temp directory it lost
+  every Go-module pid (homes, `D_UNREAD` split, `resolve_fs` order). A timeout
+  of that read records its reason (deadline vs command timeout) once, at read
+  time, so section 4 and the goal-gap text agree.
 - **0.11.4** — Discovery takes the Go module pids from the same
   `/proc/\<pid>/stat` read as section 4 (`_disc_go`; zombies are listed but
   not followed, and a timeout of that read is a goal gap). The section 4 line

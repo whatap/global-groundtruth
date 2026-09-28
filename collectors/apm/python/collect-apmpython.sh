@@ -25,7 +25,7 @@ export LC_ALL=C
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-apmpython"
 # History: CHANGELOG.md (next to this file).
-VERSION="0.11.4"
+VERSION="0.11.5"
 DOMAIN="apm"
 TARGET="host/$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || uname -n 2>/dev/null || echo unknown)"
 
@@ -1239,7 +1239,11 @@ _note_hidepid() {
 #   D_PY_EXES   distinct python interpreter paths, newline-joined; those of
 #               whatap-marked processes first (PATH + running processes)
 #   D_GO_PIDS   pids of the live Go common module processes (comm:
-#               whatap_python), from _go_rows; D_GO_RC is that read's status
+#               whatap_python), from _go_rows; D_GO_RC is that read's status,
+#               D_GO_ROWS its raw output (kept in a variable, not a file: it
+#               must survive when no private temp directory could be made),
+#               D_GO_WHY why rc is 124 ("deadline" or "timeout"), fixed at
+#               read time so both report sites give the same reason
 #   D_APP_PIDS  pids of python processes, whatap-marked first
 #   D_HOMES     distinct WHATAP_HOME candidates with their discovery source
 #   D_UNREAD    pids of candidate processes whose environ or cwd this uid could
@@ -1249,7 +1253,7 @@ _note_hidepid() {
 #               the host (a stock distro runs root python daemons)
 #   D_HIDEPID   non-empty when /proc hides other users' processes from this uid
 D_PY_EXES=""
-D_GO_PIDS="" D_GO_RC=0
+D_GO_PIDS="" D_GO_RC=0 D_GO_ROWS="" D_GO_WHY=""
 D_APP_PIDS=""
 D_ODOO_PIDS=""      # odoo processes (setproctitle may rename comm to odoo*)
 D_HOMES=""          # newline-joined "path|source" records
@@ -1583,18 +1587,26 @@ EOF
     _disc_homes "$_unmk"
 }
 
-# _disc_go -> D_GO_PIDS from the one list of Go module processes, _go_rows
+# _disc_go -> D_GO_PIDS from the one list of Go module processes, D_GO_ROWS
 # (section 4 prints every row of it, zombies too). A zombie has no cwd,
 # environ or root to read, so only the rows before the first state Z (they
 # sort last) are taken; on a host with 20,000 unreaped ones that is no fork
-# per zombie.
+# per zombie. Kept in a variable, not a file under _tmp: with no private temp
+# directory (_tmp answers /dev/null) a file would lose every row read here.
 _disc_go() {
     local p st _r
-    _bounded _go_rows > "$(_tmp go.rows)" 2>"$_errfile"; D_GO_RC=$?
+    D_GO_ROWS="$(_bounded _go_rows 2>"$_errfile")"; D_GO_RC=$?
+    D_GO_WHY=""
+    if [ "$D_GO_RC" -eq 124 ]; then
+        if _past_deadline; then D_GO_WHY=deadline; else D_GO_WHY=timeout; fi
+    fi
     while read -r p st _r; do
+        [ -n "$p" ] || continue
         [ "$st" = Z ] && break
         D_GO_PIDS="$D_GO_PIDS $p"
-    done < "$(_tmp go.rows)"
+    done <<EOF
+$D_GO_ROWS
+EOF
 }
 
 # _disc_homes UNMK -> the agent home candidates; UNMK: the unreadable python
@@ -1890,7 +1902,10 @@ $D_HOMES
 EOF
     blocked="${blocked#; }" absent="${absent#; }"
     gaps="$(_scan_gaps)"
-    [ "$D_GO_RC" = 124 ] && gaps="${gaps:+$gaps; }whatap_python process list not read to the end (timed out reading /proc/<pid>/stat)"
+    if [ "$D_GO_RC" = 124 ]; then
+        if [ "$D_GO_WHY" = deadline ]; then gaps="${gaps:+$gaps; }whatap_python process list not read to the end (run deadline reached: ${RUN_DEADLINE}s)"
+        else gaps="${gaps:+$gaps; }whatap_python process list not read to the end (timed out reading /proc/<pid>/stat)"; fi
+    fi
     unres="${unres#; }"
     [ -n "$unres" ] && gaps="${gaps:+$gaps; }home candidate(s) not resolved: $unres"
     [ -n "$D_ODD" ] && gaps="${gaps:+$gaps; }path(s) with a newline or '|', not followed:$D_ODD"
@@ -2144,11 +2159,11 @@ _go_rows() {
 # [4] runtime processes
 _rep_procs() {
     section "Runtime processes"
-    local pid n st pp _gf _ng _cap=20 shown
-    _gf="$(_tmp go.rows)"   # read once, in discovery (_disc_go)
-    _ng="$( { wc -l < "$_gf"; } 2>/dev/null | tr -d ' ')"
+    local pid n st pp _ng _cap=20 shown
+    _ng=0
+    [ -n "$D_GO_ROWS" ] && _ng="$(printf '%s\n' "$D_GO_ROWS" | wc -l | tr -d ' ')"
     if [ "$D_GO_RC" -eq 124 ]; then
-        if _past_deadline; then fact "Go common module (whatap_python) processes: n/a (run deadline reached: ${RUN_DEADLINE}s)"
+        if [ "$D_GO_WHY" = deadline ]; then fact "Go common module (whatap_python) processes: n/a (run deadline reached: ${RUN_DEADLINE}s)"
         else fact "Go common module (whatap_python) processes: n/a (timed out reading /proc/<pid>/stat: ${CMD_TIMEOUT}s)"; fi
     elif [ "${_ng:-0}" -eq 0 ]; then
         fact "Go common module (whatap_python) processes: none found in /proc"
@@ -2172,7 +2187,9 @@ _rep_procs() {
             else
                 printf '           env: n/a (permission denied: /proc/%s/environ)\n' "$pid"
             fi
-        done < "$_gf"
+        done <<EOF
+$D_GO_ROWS
+EOF
         [ "$_ng" -gt "$_cap" ] && fact "-- remaining $((_ng - _cap)) whatap_python processes not detailed (cap: $_cap)"
     fi
     n="$(echo $D_APP_PIDS | wc -w | tr -d ' ')"
