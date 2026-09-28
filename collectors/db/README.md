@@ -228,7 +228,11 @@ Section K is part of every run (0.8.0; it was the opt-in `--tls`, which is now
 refused with that message): one handshake per instance whose section G
 connect succeeded, each capped at 15 s and all of them together at 30 s
 (instances left after that say `n/a (not run: TLS probes stopped after 30s)`). It sends no credentials and nothing after
-the handshake. Measured 2026-09-26 against PostgreSQL 16.15 (ssl on, and
+the handshake. Since 0.9.5 the TLS 1.3 post-handshake session tickets are
+also left out (and the "---" line right before the first one): they arrive
+only when a ticket lands before s_client exits, one or several, so section K
+differed run to run; "DONE" after a ticket (openssl 1.1.1) is kept, and so is
+a trailing "---". Measured 2026-09-26 against PostgreSQL 16.15 (ssl on, and
 ssl off) and MySQL 8.4.10 containers, the handshake leaves the same server
 trace as the section G connect probe that every run already sent: nothing in
 the default logs; with `log_connections=on` one `connection received` line

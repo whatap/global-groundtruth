@@ -79,7 +79,7 @@ per-language collectors (apm) gives each its own token (`collect-apmjava.sh`,
 - **Discover, never assume** (rule 2). Resolve the environment instead of
   hardcoding it: follow symlinks (`readlink -f`), read mounts (`findmnt`), parse
   process arguments (`/proc/<pid>/cmdline`), dump config as-is. A value you
-  cannot obtain is a fact too — emit `n/a` via the `try` helper, never a
+  cannot obtain is a fact too — emit `n/a` via `probe` or `read_proc`, never a
   fabricated default. This is what lets one collector work in an environment its
   author never saw (see [coverage-kb/](coverage-kb/)).
 - **Dump configuration verbatim — do not mask, and say what that exposes.**
@@ -101,7 +101,7 @@ per-language collectors (apm) gives each its own token (`collect-apmjava.sh`,
   whole run). Pass it through the environment of the one child that needs it,
   or a mode-600 file under `_tmp`.
 
-Use `section`, `fact`, and `try`; do not hand-format the header or footer.
+Use `section`, `fact`, `probe`, and `read_proc`; do not hand-format the header or footer.
 
 ### 4. Make it one command → paste (rule 3)
 

@@ -22,10 +22,15 @@
 > self-contained; running any combination is fine and normal.
 
 The helpers two or three of them share word for word (the removed-option
-check, the `/proc` cmdline scan, the systemd helpers, the `--out` check, ...)
-are the group blocks `collection-server: <name>`, owned by
+check, file dumping, the systemd helpers, the sampling-window duration
+parser, `_need_int` — collmysql and collserver only — and the `_give_back`
+chown-to-operator-under-sudo helper) are the group blocks
+`collection-server: <name>`, owned by
 [templates/groups/collection-server.sh](../../templates/groups/collection-server.sh):
-edit them there and run `tools/sync-shared-block.sh --apply`.
+edit them there and run `tools/sync-shared-block.sh --apply`. The path
+helpers, process scan and probe helpers are collserver's own code, not group
+blocks: collserver is the only one that uses them (the probe helpers came from
+the skeleton's run helpers instead).
 
 The **collection server** is the WhaTap backend that receives agent data and
 stores/aggregates it: `yard` (core store/aggregate), `proxy` (agent TCP
