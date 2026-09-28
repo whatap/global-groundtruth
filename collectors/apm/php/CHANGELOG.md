@@ -5,6 +5,10 @@ Every change to the script bumps its `VERSION` and adds one entry at the top
 of this list (docs/authoring-guide.md, step 2); `tools/validate.sh` checks
 that the newest entry is the script's `VERSION`.
 
+- **0.8.10**: Pid file line (apm group): a comm, state or ppid that cannot be
+  read (/proc/\<pid> hidden by hidepid) says `n/a (not readable: ...)` instead
+  of an empty value, and the state keeps its whole text (`D (disk sleep)`, not
+  `D (disk`).
 - **0.8.9**: Run helpers (skeleton): the `--out` mkdir always gets the command
   cap (plus 1 s), so a second boundary crossed right after the deadline check
   no longer skips it and exits 1 with a false "not writable" message.

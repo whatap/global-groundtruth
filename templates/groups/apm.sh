@@ -190,12 +190,15 @@ _entry_line() {
 # pid it holds, and whether that process exists here (its comm, state and
 # ppid); an unreadable FILE is said to be one, not taken for an empty one
 _pid_file_fact() {
-    local v
+    local v c st
     probe "$1 entry" _entry_line "$2"
     [ -r "$2" ] || { fact "$1: n/a (permission denied: $2)"; return; }
     v="$(cat "$2" 2>/dev/null | tr -d ' \n')"
     if [ -n "$v" ] && [ -d "/proc/$v" ]; then
-        fact "$1: $v (process exists; comm: $(_comm "$v"); state: $(awk '/^State:/{print $2" "$3}' "/proc/$v/status" 2>/dev/null); ppid: $(awk '/^PPid:/{print $2}' "/proc/$v/status" 2>/dev/null))"
+        # /proc/<pid> of another uid can exist but not be readable (hidepid)
+        c="$(_comm "$v")"
+        st="$(awk '/^State:/{s=$0; sub(/^State:[ \t]*/, "", s)} /^PPid:/{p=$2} END{if (s != "") print "state: " s "; ppid: " p}' "/proc/$v/status" 2>/dev/null)"
+        fact "$1: $v (process exists; comm: ${c:-n/a (not readable: /proc/$v/comm)}; ${st:-state, ppid: n/a (not readable: /proc/$v/status)})"
     else
         fact "$1: ${v:-empty} (no process with this pid in this pid namespace)"
     fi
