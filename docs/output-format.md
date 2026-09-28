@@ -353,24 +353,10 @@ worth sending — not every value the collector happens to print. Resolve goals
 where the discovery variables are final, not inside a `| while` pipeline: that
 runs in a subshell and the assignment does not survive.
 
-The shared blocks (emit helpers, privilege, boot time, run helpers, completeness) are
-identical in every shell collector and owned by the skeleton. Each runs from
-its `# ---- <name> — DO NOT EDIT` banner to its `# ---- end <name>` line.
-Group blocks do the same for helpers a few sibling collectors share (the apm
-collectors' `probe`, `/proc` table scan, environ readers, port checks, and
-their `main`, the run's last lines): each is
-owned by `templates/groups/<group>.sh`, runs from `# ---- <group>: <name> — DO
-NOT EDIT` to `# ---- end <group>: <name>`, and names its members on the next
-line, `# members: <stem> ...` (`collect-<stem>.sh`). The owner file is copied,
-never sourced: a collector stays one file that runs by itself. The PowerShell
-collectors carry their port of the shared blocks the same way: owned by
-`templates/groups/ps1.ps1`, with the same banners (`# ---- ps1: <name> — DO
-NOT EDIT`) and members named by `collect-<stem>.ps1`.
-`tools/sync-shared-block.sh --check` reports drift in both kinds; `--apply`
-re-copies them. Other helpers a collector carries (`section`, `fact`, `probe`
-outside a group, the CLI) start as copies of the skeleton and may be extended;
-the synced blocks may not. A helper goes into a group block only when it
-behaves the same in every member; one that differs stays in its collector.
+For what a shared block is, who owns it, and which helpers are synced versus
+just copied, see
+[templates/collector-skeleton/README.md](../templates/collector-skeleton/README.md)
+and [tools/sync-shared-block.sh](../tools/sync-shared-block.sh).
 
 A `na` reason says what the run read, not what the environment is: "no whatap
 home in any readable process, unit or install path" rather than "WhaTap is not

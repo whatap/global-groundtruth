@@ -103,9 +103,9 @@ Notes:
   (`./collect-collzfs.sh --file`) as well. It is a separate report; send both.
 - When the question is about the backend's **MySQL**, run
   `./collect-collmysql.sh --file` on the MySQL host. If the database needs a
-  login, give it with `--defaults-file <my.cnf>` or let the collector ask for
-  the password on the terminal. Never type a password into the command line:
-  other users of the host can read it there.
+  login, give it with `--defaults-extra-file <my.cnf>` (or `MYSQL_PWD`). Never
+  type a password into the command line: other users of the host can read it
+  there.
 
 ### 4.2 Kubernetes (bastion / workstation)
 

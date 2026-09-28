@@ -91,8 +91,9 @@ collected. Add your collector's own options to it by the option conventions of
 guideline 5 (one opt-in per feature, caps through the environment).
 
 `probe` and `read_proc` are in the synced run helpers; the `_init_probe` and
-`_classify_err` they rely on are the collector's own (the reasoned-absence
-helpers below them): keep, trim, or extend them for your domain. See
+`_classify_err` they rely on are the collector's own, or its group's (the
+reasoned-absence helpers below them): keep, trim, or extend them for your
+domain. See
 guideline 4. The emit helpers come before the CLI harness, because the option
 loop calls `_optval`: in every collector the emit block must end before the
 first `ARGC=$#` line, where option parsing starts. `sync-shared-block.sh

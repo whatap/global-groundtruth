@@ -21,9 +21,9 @@
 > and what is inside those logs, InnoDB I/O counters. They are each
 > self-contained; running any combination is fine and normal.
 
-The helpers the three share word for word (the removed-option check, the
-`/proc` cmdline scan, the systemd helpers, the `--out` check, ...) are the group
-blocks `collection-server: <name>`, owned by
+The helpers two or three of them share word for word (the removed-option
+check, the `/proc` cmdline scan, the systemd helpers, the `--out` check, ...)
+are the group blocks `collection-server: <name>`, owned by
 [templates/groups/collection-server.sh](../../templates/groups/collection-server.sh):
 edit them there and run `tools/sync-shared-block.sh --apply`.
 
@@ -170,26 +170,11 @@ warning, and the default is used):
 
 `WHATAP_HOME` in the environment is one of the candidates `--home` overrides.
 
-**Options removed in 0.11.0.** Each exits 2 with a message naming its replacement:
-
-| removed | use instead |
-|---|---|
-| `--max-log-mb M` | `LOG_FILE_MB=M` in the environment (default 5) |
-| `--max-total-mb M` | `LOG_TOTAL_MB=M` in the environment (default 100) |
-| `--log-days N` | `--with-rotated=N` (it only ever applied with `--with-rotated`) |
+**Options removed in 0.11.0 and 0.14.0.** A removed option exits 2, or (`--time-ref`
+only) is named and ignored, with its replacement; the list is in CHANGELOG.md.
 
 A runbook line `--bundle --with-rotated --log-days 30 --max-total-mb 300` is
 now `LOG_TOTAL_MB=300 ./collect-collserver.sh --bundle --with-rotated=30`.
-
-**Options removed in 0.14.0.** Each prints one `!!` line on stderr naming
-what replaced it. The ones whose request would otherwise go unmet exit 2;
-`--time-ref`, which only added an extra probe, is ignored, and the run goes on:
-
-| removed | now |
-|---|---|
-| `--threads[=N]`, `--histo` | exit 2: use `--bundle --jvm` (one `jstack -l` and one `jmap -histo` per server JVM; the old `N` dumps were taken back to back, with no interval) |
-| `--heap` | exit 2: the collector takes no heap dump; take one by hand (`jcmd <pid> GC.heap_dump <file>`) when a case needs it |
-| `--time-ref[=SRV]` | ignored: the external NTP/HTTP query was a network call from the server; B keeps the NTP daemon's own offset (`chronyc tracking` / `ntpq -pn` / `timedatectl timesync-status`) |
 
 While it runs, each phase is narrated on **stderr** (`>> ...`) so you can see it
 working on a slow host; the report itself stays clean. A collection needs an
@@ -651,40 +636,20 @@ default is used):
   does not block the goal (docs/output-format.md, "A tool that only adds
   detail").
 
-**Options removed in 0.8.0.** Each exits 2 with a message naming its replacement:
+**Options removed in 0.8.0, 0.11.0 and 0.12.0.** A removed option exits 2, or
+(`--home` only) is named and ignored, with its replacement; the list is in
+CHANGELOG.md.
 
-| removed | use instead |
-|---|---|
-| `--sample[=SEC]` | nothing for 15 s (every run has a window); `--window=30s` or any `--window=DUR` for longer |
-| `--window-start=TIME` | start the run at that time (`at`, `cron`) with `--window=DUR` (until 0.11.0 the message named `--window=DUR@START`) |
-| `--no-filesizes` | nothing: the walk runs only when `--filesizes` is given |
-| `--filesizes-secs N` | `FILESIZES_SECS=N` in the environment (default 300). The walk also stays under `RUN_DEADLINE`, which grows by `FILESIZES_SECS` unless the caller set it. |
-| `--event-days N` | `EVENT_DAYS=N` in the environment (default 30; 0 keeps the detail of every event) |
-| `--hours N` | `JOURNAL_HOURS=N` in the environment (default 24) |
-
-The environment values are checked like `CMD_TIMEOUT` and `RUN_DEADLINE`: a
-value that is not a whole number is ignored with a warning, and the default is
-used. `--help` lists the five in an Environment block. That leaves 9 options
-(since 0.12.0, without `--home`):
+The environment values (`FILESIZES_SECS`, `EVENT_DAYS`, `JOURNAL_HOURS`,
+`CMD_TIMEOUT`, `RUN_DEADLINE`) are checked the same way: a value that is not a
+whole number is ignored with a warning, and the default is used. `--help`
+lists the five in an Environment block. That leaves 9 options (since 0.12.0,
+without `--home`):
 `--file --stdout --bundle --quiet --out --window --filesizes --zdb --help`.
 
-**Removed in 0.11.0.** Each exits 2 with one line naming its replacement:
-collecting from now, or skipping the walk, is not what the runbook asked for.
-
-| removed | use instead |
-|---|---|
-| `--window=DUR@START` | start the run at `START` (`at`, `cron`) with `--window=DUR` |
-| `--filesizes` with no PATH (walked the whole yardbase) | `--filesizes=PATH`, a narrow sample such as one day's directory |
-
-**Removed in 0.12.0, and ignored.** `--home DIR` (or `--home=DIR`) prints one
-`!!` line, `--home is no longer used: collzfs reports ZFS only; the WhaTap
-paths and their dataset are in collect-collserver.sh section C`, and the run
-goes on: no ZFS fact depended on it. With it went section M (WhaTap paths →
-filesystem → dataset, those datasets' `zfs get` rows again, `df -h` / `df -i`
-of each path, `YARDB_LOCK` and the yardbase listing), the `paths` goal, and the
-bundle's `whatap/` directory (`paths.txt`, `path-dataset-map.txt`); the
-bundle's whole-host `df-h.txt` / `df-i.txt` moved to `host/`. The file count
-is now D's `df -i -t zfs`.
+Since 0.12.0 `--home` is ignored: collzfs reports ZFS only, and the WhaTap
+paths and their dataset are in collect-collserver.sh section C instead. The
+file count is D's `df -i -t zfs`.
 
 The report changed where `--sample` was: section J has no "interval sample
 (--sample)" subsection, and `[1]`'s tiers line is
@@ -815,10 +780,11 @@ but not which section has it:
 - **Validated** on two live ZFS hosts, both as a **non-root** uid:
   - a KVM host — Ubuntu 24.04, zfs **2.2.2**, pool 2.72 T, FRAG 56 %, 19 datasets,
     2 zvols, 2 clones, and a removed vdev leaving `indirect-0/1`. Tier 0 ~13 s,
-    `--bundle` ~34 s / 89 KB, plus `--home`, the pre-0.8.0 `--sample`, `--filesizes`.
+    `--bundle` ~34 s / 89 KB, plus the removed `--home` (gone in 0.12.0), the
+    pre-0.8.0 `--sample`, `--filesizes`.
   - a **real WhaTap collection server** — Ubuntu 24.10, zfs **2.2.6**, pool
     `yardbase` 99.5 G / FRAG 30 %, 10 running `whatap.server` JVMs. Tier 0 ~10 s.
-    Section M resolved `WHATAP_HOME` from a running JVM's
+    Section M (removed in 0.12.0) resolved `WHATAP_HOME` from a running JVM's
     `-Dwhatap.server.home`, and correctly reported the **mixed** layout — only
     `yardbase` on ZFS (`recordsize=64K` local, `compressratio 4.43x`), while
     `logs` / `conf` / `db` / `logsink` sit on the ext4 root. The `arcstat`
@@ -940,12 +906,8 @@ warning, and the default is used):
 
 `MYSQL_PWD` is a password source (below), not a cap.
 
-**Options removed in 0.10.0.** Each exits 2 with a message naming its replacement:
-
-| removed | use instead |
-|---|---|
-| `--no-sudo` | nothing: the collector never elevates itself (since 0.8.0 the flag did nothing); run it with `sudo` when root is needed |
-| `--sample[=SEC]` | nothing for 15 s (every run has a window); `--window=DUR` for longer (`--sample` took about 50 s: `iostat` then `vmstat`, 5 s x 6 each) |
+**Options removed in 0.10.0.** A removed option exits 2 with its replacement
+named; the list is in CHANGELOG.md.
 
 **Removed in 0.12.0: the password prompt.** A bare `-p` in `--mysql-args`
 (or `--password`, or a cluster ending in `p` such as `-Bp`) no longer asks for

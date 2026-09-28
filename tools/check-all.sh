@@ -7,7 +7,7 @@
 #   --framework  also run tools/test-framework.sh (about 10 minutes)
 #   --log DIR    where full outputs go (default: a mktemp dir, printed)
 #
-# Checks: bash -n; dash -n (#!/bin/sh files and templates/groups/*.sh);
+# Checks: bash -n; dash -n (collectors/apm/*.sh and templates/*.sh);
 # `shellcheck -S warning`; tools/sync-shared-block.sh --check;
 # tools/validate.sh per changed collector; tools/test-<token>.sh matching a
 # changed collector.
@@ -50,7 +50,7 @@ printf 'tree %s, base %s, %d changed script(s), logs %s\n' "$PWD" "$BASE" "${#FI
 for f in "${FILES[@]}"; do
   case $f in *.sh) ;; *) continue ;; esac
   run "bash -n $f" bash -n "$f"
-  if head -1 "$f" | grep -q '^#! */bin/sh' || case $f in templates/groups/*) true ;; *) false ;; esac; then
+  if case $f in collectors/apm/*|templates/*) true ;; *) false ;; esac; then
     run "dash -n $f" dash -n "$f"
   fi
   run "shellcheck $f" shellcheck -S warning "$f"

@@ -26,7 +26,14 @@
 #       non-comment line — a label that lives only in a comment is never
 #       actually emitted
 #   (2) it is missing the exact footer sentinel line (same non-comment rule)
-#   (2b) a PowerShell collector does not parse (see below)
+#   (2b) a PowerShell collector does not parse. `bash -n` has no counterpart
+#        for .ps1, so this runs the PowerShell parser when `pwsh` is present.
+#        When it is not, the line "~ not checked" is printed instead: a check
+#        that could not run is not a check that passed. On Linux, pwsh
+#        installs without root:
+#          curl -sSL <PowerShell release>/powershell-<ver>-linux-x64.tar.gz | \
+#            tar -xz -C ~/.local/share/powershell-dist
+#          ln -s ~/.local/share/powershell-dist/pwsh ~/.local/bin/pwsh
 #   (3) it declares no goal, never calls emit_status, states no privilege,
 #       never calls _note_boot, or (shell) never calls _run_init
 #   (4) an EMITTED line contains a judgment word (case-insensitive):
@@ -40,13 +47,6 @@
 #       (collect-* only) it has no `# History: <CHANGELOG.md>[, section <s>]`
 #       pointer line, the CHANGELOG or section it names is not there, or the
 #       newest entry there (the first `- **x.y.z**` item) is not its VERSION.
-#   (2b) a PowerShell collector does not parse. `bash -n` has no counterpart for
-#        .ps1, so this runs the PowerShell parser when `pwsh` is present. When it
-#        is not, the line "~ not checked" is printed instead: a check that could
-#        not run is not a check that passed. On Linux, pwsh installs without root:
-#          curl -sSL <PowerShell release>/powershell-<ver>-linux-x64.tar.gz | \
-#            tar -xz -C ~/.local/share/powershell-dist
-#          ln -s ~/.local/share/powershell-dist/pwsh ~/.local/bin/pwsh
 #
 # Rule (4) is a keyword list. It catches the common slip, not every judgment:
 # "probably" or "the problem is" pass it. Review catches the rest (CONTRACT.md).
@@ -291,16 +291,18 @@ for f in "${targets[@]}"; do
     #     say whether it got it (CONTRACT, "Saying whether the collection worked").
     #     Shell only — the PowerShell collectors carry their own port of the block
     #     and are checked by the Emit-Status name instead.
-    #     Section 0 states the privilege the run had. What a collection can read
-    #     is decided by it, and a report that omits it leaves the reader unable
-    #     to tell an absent value from an unreadable one. Shell collectors carry
-    #     the shared block; the PowerShell pair ports the same line by hand.
-    #     Section 0 also states the host boot time, because nearly everything a
-    #     collector reports is cumulative since boot and without it those are sums
-    #     with no denominator. This looks for the _note_boot CALL, not the label:
-    #     the label is printed from inside the shared block, so sync-shared-block
-    #     sees a collector that carries the block and never calls it as "ok".
-    #     Shell only. The PowerShell pair has no port of that block yet.
+    #     Section [1] states the privilege the run had. What a collection can
+    #     read is decided by it, and a report that omits it leaves the reader
+    #     unable to tell an absent value from an unreadable one. Shell
+    #     collectors carry the shared block; the PowerShell pair ports the
+    #     same line by hand.
+    #     Section [1] also states the host boot time, because nearly everything
+    #     a collector reports is cumulative since boot and without it those are
+    #     sums with no denominator. This looks for the _note_boot CALL, not the
+    #     label: the label is printed from inside the shared block, so
+    #     sync-shared-block sees a collector that carries the block and never
+    #     calls it as "ok". Shell only — the PowerShell pair carries the boot
+    #     time by hand and is checked below by the `host boot(UTC):` fact.
     case "$bn" in
         *.ps1)
             grep -v '^[[:space:]]*#' "$f" | grep -qF 'Emit-Status' \

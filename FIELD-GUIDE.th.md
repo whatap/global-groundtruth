@@ -101,8 +101,8 @@ cd global-groundtruth/collectors/collection-server
   collector คู่กันในไดเรกทอรีเดียวกัน (`./collect-collzfs.sh --file`) ด้วย
   เป็นรายงานคนละฉบับ กรุณาส่งทั้งสองไฟล์
 - หากคำถามเกี่ยวกับ **MySQL** ของ backend ให้รัน `./collect-collmysql.sh --file`
-  บนโฮสต์ MySQL หากฐานข้อมูลต้องล็อกอิน ให้ระบุผ่าน `--defaults-file <my.cnf>`
-  หรือปล่อยให้ collector ถามรหัสผ่านบนเทอร์มินัล ห้ามพิมพ์รหัสผ่านลงในบรรทัดคำสั่ง
+  บนโฮสต์ MySQL หากฐานข้อมูลต้องล็อกอิน ให้ระบุผ่าน `--defaults-extra-file <my.cnf>`
+  (หรือ `MYSQL_PWD`) ห้ามพิมพ์รหัสผ่านลงในบรรทัดคำสั่ง
   เพราะผู้ใช้อื่นบนโฮสต์นั้นอ่านได้
 
 ### 4.2 Kubernetes (bastion / เครื่องทำงาน)

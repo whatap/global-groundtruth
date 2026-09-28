@@ -191,7 +191,8 @@ numbered checks in that script's own header comment.
 - [ ] `/proc`/`/sys` used where possible; external commands have fallbacks and
       run through `probe` / `_bounded`, so the run reaches its footer even on a
       host where every command hangs (guideline 3).
-- [ ] bash 3.2+ only; no `set -e`/`set -u`; counter loops increment.
+- [ ] POSIX sh in the synced blocks and apm; bash 3.2+ elsewhere; no
+      `set -e`/`set -u`; counter loops increment.
 - [ ] One command produces the whole paste: no-args prints usage and exits 0,
       a run needs an explicit action flag (`--file` / `--stdout` / `--bundle`);
       progress is narrated on stderr (fd 3, `--quiet` suppresses it), never
@@ -201,7 +202,8 @@ numbered checks in that script's own header comment.
 - [ ] Options follow guideline 5: action flags plus `--quiet`/`--out`/`--help`,
       target options, one opt-in per loading/long/sensitive/touching feature;
       caps via environment; no `--no-X`; a removed option exits 2 naming its
-      replacement.
+      replacement, or is named and ignored when ignoring it changes nothing
+      collected.
 - [ ] Temporary files live under `_tmp`; nothing is left after Ctrl-C.
 - [ ] Everything in the script is English — code, comments, usage/help text,
       progress narration, report output. Tools parse the exact strings; see

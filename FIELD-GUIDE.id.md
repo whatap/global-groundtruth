@@ -108,9 +108,9 @@ Catatan:
   (`./collect-collzfs.sh --file`). Itu laporan terpisah; kirim keduanya.
 - Bila pertanyaannya tentang **MySQL** milik backend, jalankan
   `./collect-collmysql.sh --file` di host MySQL. Jika database memerlukan login,
-  berikan lewat `--defaults-file <my.cnf>` atau biarkan collector menanyakan
-  password di terminal. Jangan pernah mengetik password di baris perintah:
-  pengguna lain di host itu dapat membacanya.
+  berikan lewat `--defaults-extra-file <my.cnf>` (atau `MYSQL_PWD`). Jangan
+  pernah mengetik password di baris perintah: pengguna lain di host itu dapat
+  membacanya.
 
 ### 4.2 Kubernetes (bastion / workstation)
 

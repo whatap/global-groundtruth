@@ -101,8 +101,8 @@ cd global-groundtruth/collectors/collection-server
   (`./collect-collzfs.sh --file`)도 함께 요청됩니다. 별도 리포트이므로 둘 다
   보내주십시오.
 - 백엔드의 **MySQL**이 쟁점이면 MySQL 호스트에서 `./collect-collmysql.sh --file`을
-  실행하십시오. 로그인이 필요하면 `--defaults-file <my.cnf>`로 주거나, collector가
-  터미널에서 암호를 묻게 두십시오. 암호를 명령행에 직접 입력하지 마십시오.
+  실행하십시오. 로그인이 필요하면 `--defaults-extra-file <my.cnf>`로 주거나
+  `MYSQL_PWD`를 쓰십시오. 암호를 명령행에 직접 입력하지 마십시오.
   명령행은 그 호스트의 다른 사용자도 읽을 수 있습니다.
 
 ### 4.2 Kubernetes (bastion / 워크스테이션)
