@@ -6,7 +6,7 @@
 >
 > | Entrypoint | Token | Scope | validated at | Status |
 > | ---------- | ----- | ----- | ------------ | ------ |
-> | [`collect-collserver.sh`](collect-collserver.sh) | `collserver` | the WhaTap backend itself | 0.13.1 | 0.13.1 run on 2026-09-28 on the lab `collsrv` VM (jjsong-ggt-collsrv, on-prem `whatap_multi` install, `--stdout`/`--bundle`): COMPLETE, `validate.sh --report` pass — a lab VM, not a production host. 0.4.1 run against three live production backends (Smartfren, 2026-09-23); log selection re-measured against that bundle's own log tree. Tier 2 probes still unvalidated on either. |
+> | [`collect-collserver.sh`](collect-collserver.sh) | `collserver` | the WhaTap backend itself | 0.15.0 | 0.15.0 run on 2026-09-28 on the lab `collsrv` VM (jjsong-ggt-collsrv, on-prem `whatap_multi` install on Ubuntu `openjdk-17-jre-headless`, `--stdout`/`--bundle`, and `--bundle --jvm` as the `whatap` user: a thread dump and a histo of each of the 8 server JVMs through `java -m jdk.jcmd`): COMPLETE, `validate.sh --report` pass — a lab VM, not a production host. 0.4.1 run against three live production backends (Smartfren, 2026-09-23); log selection re-measured against that bundle's own log tree. `--du` still unvalidated on either. |
 > | [`collect-collzfs.sh`](collect-collzfs.sh) | `collzfs` | ZFS under the backend's data path | 0.10.1 | 0.10.1 run on 2026-09-28 as root on the lab `zfs` VM (jjsong-ggt-zfs, zpool `yard`, `--stdout`/`--bundle`): COMPLETE, `validate.sh --report` pass. 0.8.0 run as root on the same VM (Ubuntu 26.04, zfs 2.4.1, pool with a special vdev): the default run and the time window (idle, under an append load, a forced ring wrap, signals). 0.4.1 validated non-root on two live hosts (zfs 2.2.2 and 2.2.6), one of them a real collection server with `yardbase` on ZFS. `--zdb` still unvalidated. Stub tests: `tools/test-collzfs.sh` |
 > | [`collect-collmysql.sh`](collect-collmysql.sh) | `collmysql` | the MySQL that holds the backend's `account` / `notihub` metadata | 0.11.1 | 0.11.1 run on 2026-09-28 on the lab `collsrv` VM's own MySQL 8.4.11 (`--stdout`/`--binlog` as root): COMPLETE, `validate.sh --report` pass; the `mysql-ha` fixture (replicating pair, MySQL 5.6.51/5.7.32/8.4.10, MariaDB 10.11.19) was not re-run this round, so its scope note is unchanged — a replicating pair, section I on 8.4 and real `iostat` sampling are still unverified. |
 >
@@ -54,8 +54,11 @@ One `.txt` report, organized into MECE domains (each fact in exactly one place):
   `cpu.cfs_quota_us` / `cpu.cfs_period_us` (v1). JVM runtime: per distinct
   `readlink /proc/<pid>/exe` and mount namespace of the server JVMs (an
   absolute argv0 where exe is unreadable), its pids and the JDK `release`
-  file next to it, read through `/proc/<pid>/root` so a sidecar or host run
-  reads the JVM's file; without one, that executable's `-version`, only in
+  file next to it and `ls -A <home>/bin` (a JRE has no jstack or jmap; at
+  most 60 entries, then `(N more)`; only for a home from `/proc/<pid>/exe`
+  named java, never one from argv0), both
+  read through `/proc/<pid>/root` so a sidecar or host run reads the JVM's
+  file; without a release file, that executable's `-version`, only in
   the run's own mount namespace and only while the executable is not
   deleted. A deleted executable (a JDK replaced in place) gets
   `release now at <path>; the running executable was replaced`, since that
@@ -214,10 +217,23 @@ so nothing starts by accident.
   reason; the report's G section carries the totals. A log that is missing from a
   bundle must never read as a log that did not exist on the host.
 - **Tier 2** (opt-in, may add load — announced on stderr first):
-  `--jvm` writes one `jstack -l` (SIGQUIT to the JVM when jstack is absent;
-  the dump then goes to the JVM's stdout) and one `jmap -histo` (not `:live`,
-  so no full GC; the first 200 lines) of each server JVM to the bundle's
-  `jvm/`. Both stop the JVM at a safepoint. `--du` writes a recursive
+  `--jvm` writes one `jstack -l` and one `jmap -histo` (not `:live`, so no
+  full GC; the first 200 lines) of each server JVM to the bundle's `jvm/`.
+  Both stop the JVM at a safepoint. The tool, per JVM, is the first that
+  exists: the JVM's own `<home>/bin/jstack` / `jmap`; its own `bin/java -m
+  jdk.jcmd/sun.tools.jstack.JStack` / `sun.tools.jmap.JMap` when
+  `<home>/release` lists `jdk.jcmd` (a JRE such as Ubuntu's
+  `openjdk-17-jre-headless`, whose `bin/` holds no jstack); both only for a
+  JVM in the run's mount namespace; then `jstack` / `jmap` in `PATH`. With
+  none, jstack becomes SIGQUIT to the JVM (`.sigquit.txt`): the JVM writes
+  the dump to its own fd 1, which the note gives raw (`readlink
+  /proc/<pid>/fd/1`; WhaTap's `bin/control.sh` starts modules with
+  `>> /dev/null 2>&1`, so there it is `/dev/null` and the dump is lost); a
+  refused signal (another uid) is written `kill -3: exit N: <stderr> (not
+  sent)` instead. A tool that exits non-zero ends its file with `(exit N)`.
+  Each file's first line is `command: <the command run>`; a cut dump ends
+  with `(stopped at the 60s cap)`, `(stopped at the run deadline, Ns)` or
+  `(not run: ...)`. `--du` writes a recursive
   `du --max-depth=1 -h` of yardbase (the per-pcode sizes; it reads the
   metadata of the whole data tree) to `fs/yardbase-du.txt`. Off by default.
 

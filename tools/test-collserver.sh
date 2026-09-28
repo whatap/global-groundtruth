@@ -577,9 +577,109 @@ kill "$j1" 2>/dev/null; wait "$j1" 2>/dev/null
 chk "the bundle is written" "0" "$rc"
 has "the pause is announced first" "$err" "[Tier2] thread dump: pid $j1 (whatap.server.yard)"
 tb="$(ls "$B27"/*.tar.gz 2>/dev/null | head -n1)"
-chk "one jstack -l of the JVM" "jstack -l $j1" "$(tar -xzOf "$tb" "./jvm/whatap.server.yard-$j1.jstack.txt" 2>/dev/null)"
-chk "one jmap -histo of the JVM" "jmap -histo $j1" "$(tar -xzOf "$tb" "./jvm/whatap.server.yard-$j1.histo.txt" 2>/dev/null)"
+# the JVM's executable is sleep, not a java with a home: PATH's tools
+chk "one jstack -l of the JVM, PATH's" "command: $S27/jstack -l $j1
+jstack -l $j1" "$(tar -xzOf "$tb" "./jvm/whatap.server.yard-$j1.jstack.txt" 2>/dev/null)"
+chk "one jmap -histo of the JVM, PATH's" "command: $S27/jmap -histo $j1
+jmap -histo $j1" "$(tar -xzOf "$tb" "./jvm/whatap.server.yard-$j1.histo.txt" 2>/dev/null)"
 has "and the deadline is raised for them" "$(tar -xzOf "$tb" ./report.txt 2>/dev/null)" "s of 720s allowed"
+
+echo "== 28. 0.15.0: --jvm uses the JVM's own home (bin/jstack, or java -m jdk.jcmd on a JRE), else SIGQUIT with fd 1 =="
+H28="$ROOT/h28"; mkhome "$H28"; B28="$ROOT/b28"; mkdir -p "$B28"
+S28="$ROOT/stub28"; mkdir -p "$S28"
+for c in jstack jmap; do
+    stub_write "$S28/$c" <<EOF2
+#!/bin/sh
+echo "PATH $c \$*"
+EOF2
+done
+# A JRE: bin/ holds only java, a copy of bash. The running JVM is that bash;
+# the collector's "java -m jdk.jcmd/<class> ARGS" becomes bash in monitor mode
+# running the script jdk.jcmd/<class> relative to its cwd, which prints ARGS.
+JRE="$ROOT/jre28"; mkdir -p "$JRE/bin"; cp "$(type -P bash)" "$JRE/bin/java"
+printf 'JAVA_VERSION="17.0.99"\nMODULES="java.base jdk.attach jdk.jcmd jdk.jdi"\n' > "$JRE/release"
+W28="$ROOT/w28"; mkdir -p "$W28/jdk.jcmd"
+for c in sun.tools.jstack.JStack sun.tools.jmap.JMap; do
+    stub_write "$W28/jdk.jcmd/$c" <<EOF2
+echo "$c \$*"
+EOF2
+done
+# A JDK: bin/ holds java (a copy of sleep) and jstack; no jmap, so jmap is PATH's
+JDK="$ROOT/jdk28"; mkdir -p "$JDK/bin"; cp "$(type -P sleep)" "$JDK/bin/java"
+stub_write "$JDK/bin/jstack" <<'EOF2'
+#!/bin/sh
+echo "JDK jstack $*"
+EOF2
+# A JDK whose jstack and jmap exit 3 with no output, and 70 files in its bin
+JDKc="$ROOT/jdk28c"; mkdir -p "$JDKc/bin"; cp "$(type -P sleep)" "$JDKc/bin/java"
+for c in jstack jmap; do printf '#!/bin/sh\nexit 3\n' | stub_write "$JDKc/bin/$c"; done
+for n in $(seq 1 67); do : > "$JDKc/bin/x$n"; done
+( cd "$H28" && exec -a "java -jar whatap.server.yard.boot" "$JRE/bin/java" -c 'sleep 60; :' ) >/dev/null 2>&1 </dev/null &
+j1=$!
+( cd "$H28" && exec -a "java -jar whatap.server.proxy.boot.whatap.server.proxy-1.jar" "$JDK/bin/java" 60 ) >/dev/null 2>&1 </dev/null &
+j2=$!
+( cd "$H28" && exec -a "java -jar whatap.server.gateway.boot.whatap.server.gateway-1.jar" "$JDKc/bin/java" 60 ) >/dev/null 2>&1 </dev/null &
+j4=$!
+( cd "$H28" && exec -a "java -jar whatap.server.front.boot.whatap.server.front-1.jar" sleep 60 ) >/dev/null 2>&1 </dev/null &
+j5=$!; sleep 1
+out="$(ONLY_PIDS="$j1 $j2 $j4 $j5" "$C" --home "$H28" --stdout 2>/dev/null)"
+has "A lists the JRE's bin" "$out" "ls -A $JRE/bin: java"
+has "and the JDK's bin" "$out" "ls -A $JDK/bin: java jstack"
+has "a bin of 70 files: the first 60 and a count" "$out" "(10 more)"
+hasnt "and not the 61st" "$out" " x9 "
+sl="$(readlink -f "$(type -P sleep)")"; sl="${sl%/*}"; sl="${sl%/*}"
+has "an executable not named java: no ls" "$out" "ls -A $sl/bin: not run (the executable is sleep, not java)"
+kill "$j5" 2>/dev/null; wait "$j5" 2>/dev/null
+err="$(cd "$W28" && ONLY_PIDS="$j1 $j2 $j4" PATH="$S28:$PATH" "$C" --home "$H28" --bundle --jvm --out "$B28" </dev/null 2>&1 >/dev/null)"; rc=$?
+chk "the bundle is written" "0" "$rc"
+tb="$(ls "$B28"/*.tar.gz 2>/dev/null | head -n1)"
+# (bash in monitor mode adds "no job control" lines on stderr: first line and
+# the class's output are checked)
+a="$(tar -xzOf "$tb" "./jvm/whatap.server.yard-$j1.jstack.txt" 2>/dev/null)"
+chk "the JRE's JVM: its own java -m jdk.jcmd jstack" "command: $JRE/bin/java -m jdk.jcmd/sun.tools.jstack.JStack -l $j1" "$(printf '%s\n' "$a" | head -n1)"
+has "and that ran" "$a" "sun.tools.jstack.JStack -l $j1"
+a="$(tar -xzOf "$tb" "./jvm/whatap.server.yard-$j1.histo.txt" 2>/dev/null)"
+chk "and its own java -m jdk.jcmd jmap -histo" "command: $JRE/bin/java -m jdk.jcmd/sun.tools.jmap.JMap -histo $j1" "$(printf '%s\n' "$a" | head -n1)"
+has "and that ran" "$a" "sun.tools.jmap.JMap -histo $j1"
+chk "the JDK's JVM: its own bin/jstack" "command: $JDK/bin/jstack -l $j2
+JDK jstack -l $j2" "$(tar -xzOf "$tb" "./jvm/whatap.server.proxy-$j2.jstack.txt" 2>/dev/null)"
+chk "and PATH's jmap, the home having none" "command: $S28/jmap -histo $j2
+PATH jmap -histo $j2" "$(tar -xzOf "$tb" "./jvm/whatap.server.proxy-$j2.histo.txt" 2>/dev/null)"
+kill "$j1" "$j2" 2>/dev/null; wait "$j1" "$j2" 2>/dev/null
+chk "a tool that exits 3 with no output says so" "command: $JDKc/bin/jstack -l $j4
+
+(exit 3)" "$(tar -xzOf "$tb" "./jvm/whatap.server.gateway-$j4.jstack.txt" 2>/dev/null)"
+chk "and so does its jmap" "command: $JDKc/bin/jmap -histo $j4
+
+(exit 3)" "$(tar -xzOf "$tb" "./jvm/whatap.server.gateway-$j4.histo.txt" 2>/dev/null)"
+kill "$j4" 2>/dev/null; wait "$j4" 2>/dev/null
+# no tool anywhere (the executable is sleep, no jstack in PATH): SIGQUIT, and
+# the note gives the JVM's fd 1 raw
+S28b="$ROOT/stub28b"; stub_clone "$S" "$S28b"; rm -f "$S28b/jstack" "$S28b/jmap"; ln -sf "$(type -P gzip)" "$S28b/gzip"
+B28b="$ROOT/b28b"; mkdir -p "$B28b"
+( cd "$H28" && exec -a "java -jar whatap.server.yard.boot" sleep 60 ) >/dev/null 2>&1 </dev/null &
+j3=$!; sleep 1
+err="$(ONLY_PIDS="$j3" PATH="$S28b" "$C" --home "$H28" --bundle --jvm --out "$B28b" </dev/null 2>&1 >/dev/null)"
+kill "$j3" 2>/dev/null; wait "$j3" 2>/dev/null
+tb="$(ls "$B28b"/*.tar.gz 2>/dev/null | head -n1)"
+sq="$(tar -xzOf "$tb" "./jvm/whatap.server.yard-$j3.sigquit.txt" 2>/dev/null)"
+has "no jstack: SIGQUIT is the command" "$sq" "command: kill -3 $j3"
+has "and the note names the JVM's fd 1 raw" "$sq" "the JVM writes the dump to its fd 1: /dev/null"
+has "no jmap: the histo file says so" "$(tar -xzOf "$tb" "./jvm/whatap.server.yard-$j3.histo.txt" 2>/dev/null)" "no jmap in PATH)"
+# a refused SIGQUIT (another uid: EPERM) is written as not sent, with no fd 1
+# line; an exported kill function stands in for the refusal
+( cd "$H28" && exec -a "java -jar whatap.server.yard.boot" sleep 60 ) >/dev/null 2>&1 </dev/null &
+j3=$!; sleep 1
+B28c="$ROOT/b28c"; mkdir -p "$B28c"
+# (passed the way bash exports a function, so this shell keeps its own kill)
+# shellcheck disable=SC2016
+err="$(env 'BASH_FUNC_kill%%=() { if [ "$1" = -3 ]; then echo "kill: ($2) - Operation not permitted" >&2; return 1; fi; builtin kill "$@"; }' \
+    ONLY_PIDS="$j3" PATH="$S28b" "$C" --home "$H28" --bundle --jvm --out "$B28c" </dev/null 2>&1 >/dev/null)"
+kill "$j3" 2>/dev/null; wait "$j3" 2>/dev/null
+tb="$(ls "$B28c"/*.tar.gz 2>/dev/null | head -n1)"
+sq="$(tar -xzOf "$tb" "./jvm/whatap.server.yard-$j3.sigquit.txt" 2>/dev/null)"
+has "a refused SIGQUIT is written as not sent" "$sq" "kill -3: exit 1: kill: ($j3) - Operation not permitted (not sent)"
+hasnt "and no fd 1 line" "$sq" "fd 1"
 
 echo; echo "PASS=$PASS FAIL=$FAIL SKIP=$SKIP"
 [ "$FAIL" -eq 0 ]

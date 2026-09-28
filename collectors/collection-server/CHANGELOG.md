@@ -7,6 +7,24 @@ one entry at the top of its section (docs/authoring-guide.md, step 2);
 
 ## collect-collserver.sh
 
+- **0.15.0** — `--jvm` picks the tool per JVM, first that exists: the
+  JVM's own `<home>/bin/jstack` / `jmap`; its own `bin/java -m
+  jdk.jcmd/sun.tools.jstack.JStack -l` / `sun.tools.jmap.JMap -histo` when
+  `<home>/release` lists `jdk.jcmd` (both only in the run's mount
+  namespace, the rule A keeps for `-version`); `PATH`'s jstack / jmap; for
+  jstack, SIGQUIT. On a JRE (Ubuntu `openjdk-17-jre-headless`: `bin/` is
+  java, jpackage, keytool, rmiregistry) the SIGQUIT went to fd 1, which
+  WhaTap's `control.sh` sends to `/dev/null`; the `.sigquit.txt` now gives
+  `readlink /proc/<pid>/fd/1` raw. Every `jvm/` file starts with `command:
+  <what ran>`. Fixed: a `jmap -histo` stopped at its cap left an empty file
+  with no mark (`| head` hid exit 124); a dump cut by `RUN_DEADLINE` was
+  labelled as the 60 s cap. Both now say which (`stopped at the Ns cap`,
+  `stopped at the run deadline, Ns`, `not run: ...`); a tool that exits
+  non-zero ends its file with `(exit N)`. A refused SIGQUIT (another uid)
+  is written `kill -3: exit N: <stderr> (not sent)`, with no fd 1 line. A
+  adds `ls -A <home>/bin` per server JVM, read through `/proc/<pid>/root`
+  like the release file, at most 60 entries then `(N more)`; not run for
+  a home taken from argv0 or an executable not named java.
 - **0.14.0** — Options 14 -> 11 (10 without `--help`). `--threads[=N]` and
   `--histo` are merged into `--jvm` (bundle only): one `jstack -l` and one
   `jmap -histo` of each server JVM; the N dumps of `--threads=N` were taken

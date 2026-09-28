@@ -35,7 +35,7 @@ unset JAVA_TOOL_OPTIONS JDK_JAVA_OPTIONS _JAVA_OPTIONS _v
 # ---- collector metadata -----------------------------------------------------
 # History: CHANGELOG.md, section collect-collserver.sh (next to this file).
 COLLECTOR_NAME="whatap-collserver"
-VERSION="0.14.0"
+VERSION="0.15.0"
 DOMAIN="collection-server"
 TARGET="collection-server/$(hostname 2>/dev/null || echo unknown)"   # refined after WHATAP_HOME is resolved
 
@@ -155,7 +155,10 @@ explicit action flag (--file / --stdout / --bundle) so nothing starts by acciden
   Tier 2 (opt-in, may add load — printed to stderr before running):
   collect-collserver.sh --bundle --jvm           jstack -l and jmap -histo (NOT :live, no
                                                  full GC) of each server JVM; each is a
-                                                 JVM safepoint pause
+                                                 JVM safepoint pause. Tool per JVM: its
+                                                 home's bin/jstack|jmap, else its java
+                                                 -m jdk.jcmd (a JRE), else PATH's, else
+                                                 (jstack) SIGQUIT to the JVM
   collect-collserver.sh --bundle --du            recursive du of yardbase (data-disk I/O)
   --jvm, --du and --with-rotated work on the bundle only; given without
   --bundle they are named on the terminal and not run.
@@ -1254,7 +1257,7 @@ EOF
 # for an executable that is still there. The executable is readlink
 # /proc/<pid>/exe, else an absolute argv0.
 _rep_a_jvm_runtime() {
-    local i pid exe a0 j e ns home rel rp p0 uid selfns tab via
+    local i pid exe a0 j e ns home rel rp p0 uid selfns tab via _o _rc _a0 _e _n
     tab="$(printf '\t')"
     uid="$(id -u 2>/dev/null || echo '?')"
     selfns="$(readlink /proc/self/ns/mnt 2>/dev/null)"
@@ -1284,6 +1287,7 @@ _rep_a_jvm_runtime() {
         [ "$ns" = "$selfns" ] && [ -n "$ns" ] || fact "  mount namespace: ${ns:-n/a (/proc/$p0/ns/mnt not readable by uid $uid)} (this run's: ${selfns:-n/a})"
         j=$((j + 1))
         case "$e" in n/a*) continue ;; esac
+        _a0=0; [ "$e" != "${e%% (argv0;*}" ] && _a0=1
         e="${e%% (argv0;*}"
         home="${e% (deleted)}"; home="${home%/*}"; home="${home%/*}"
         rel="$home/release"
@@ -1295,6 +1299,25 @@ _rep_a_jvm_runtime() {
         else
             fact "  release ($rel): n/a (/proc/$p0/root not readable by uid $uid and the JVM is in another mount namespace$(_priv_hint))"
             continue
+        fi
+        # what the home's bin holds (a JRE has no jstack/jmap), one line of at
+        # most 60 entries; only for a home from /proc/<pid>/exe named java (an
+        # argv0 /usr/bin/java would list all of /usr/bin)
+        _e="${e% (deleted)}"
+        if [ "$_a0" = 1 ]; then fact "  ls -A $home/bin: not run (exe not readable; home from argv0)"
+        elif [ "${_e##*/}" != java ]; then fact "  ls -A $home/bin: not run (the executable is ${_e##*/}, not java)"
+        else
+        _o="$(_bounded ls -A "${rp%/release}/bin" 2>&1)"; _rc=$?
+        if [ "$_rc" -eq 0 ]; then
+            _n="$(printf '%s\n' "$_o" | wc -l | tr -d ' ')"
+            [ "${_n:-0}" -gt 60 ] && _o="$(printf '%s\n' "$_o" | head -n 60)
+($((_n - 60)) more)"
+        fi
+        if [ "$_rc" -eq 124 ]; then
+            if _past_deadline; then fact "  ls -A $home/bin$via: n/a (run deadline reached: ${RUN_DEADLINE}s)"
+            else fact "  ls -A $home/bin$via: n/a (timed out: ${CMD_TIMEOUT:-20}s)"; fi
+        elif [ "$_rc" -ne 0 ]; then fact "  ls -A $home/bin$via: n/a (exit $_rc: ${_o//$'\n'/ })"
+        else fact "  ls -A $home/bin$via: ${_o//$'\n'/ }"; fi
         fi
         if [ "$e" != "${e% (deleted)}" ]; then
             if [ -f "$rp" ]; then read_proc "  release now at $rel; the running executable was replaced$via" "$rp"
@@ -2083,36 +2106,90 @@ collect_journal() {
 }
 
 # ---- Tier 2 (opt-in) --------------------------------------------------------
+# _jvm_cmd PID jstack|jmap -> _JC=(command words, without the tool's own
+# arguments and PID) for the first that exists: (a) the JVM's own
+# <home>/bin/TOOL; (b) its own bin/java -m jdk.jcmd/<class>, when its
+# <home>/release lists jdk.jcmd in MODULES (a JRE); (c) TOOL in PATH. (a) and
+# (b) only for a JVM whose executable is a java that is not deleted, in this
+# run's mount namespace (the rule _rep_a_jvm_runtime keeps for -version). None: _JC=() and
+# _JCN names what was looked for.
+_jvm_cmd() {
+    local pid="$1" t="$2" exe ns home cls m=""
+    _JC=(); _JCN=""
+    exe="$(readlink "/proc/$pid/exe" 2>/dev/null)"
+    ns="$(readlink "/proc/$pid/ns/mnt" 2>/dev/null)"
+    if [ "${exe##*/}" = java ] && [ -n "$ns" ] && [ "$ns" = "$(readlink /proc/self/ns/mnt 2>/dev/null)" ]; then
+        home="${exe%/*}"; home="${home%/*}"
+        [ -f "$home/release" ] && m="$(grep '^MODULES=' "$home/release" 2>/dev/null)"
+        case "$t" in jstack) cls=sun.tools.jstack.JStack ;; *) cls=sun.tools.jmap.JMap ;; esac
+        if [ -x "$home/bin/$t" ]; then _JC=("$home/bin/$t"); return; fi
+        case " ${m#MODULES=} " in
+            *[\ \"]jdk.jcmd[\ \"]*) [ -x "$exe" ] && { _JC=("$exe" -m "jdk.jcmd/$cls"); return; } ;;
+        esac
+        _JCN="no $home/bin/$t, no jdk.jcmd in $home/release MODULES, "
+    else
+        _JCN="own home not used (exe ${exe:-n/a: /proc/$pid/exe not readable}; mount namespace ${ns:-n/a}, this run's $(readlink /proc/self/ns/mnt 2>/dev/null)), "
+    fi
+    if have "$t"; then _JC=("$(command -v "$t")"); return; fi
+    _JCN="${_JCN}no $t in PATH"
+}
+
+# _jvm_run FILE CAP ARGS... -> "command: <_JC> ARGS" as FILE's first line, then
+# the command's output (its first _JHEAD lines when _JHEAD is set), then why it stopped
+# when it hit CAP or the run deadline.
+_jvm_run() {
+    local f="$1" cap="$2" rc; shift 2
+    printf 'command: %s\n' "${_JC[*]} $*" > "$f"
+    if _past_deadline; then printf '(not run: run deadline reached at %ss)\n' "$RUN_DEADLINE" >> "$f"; return; fi
+    if [ -n "${_JHEAD:-}" ]; then
+        # keep the first lines and drain the rest: a bare `| head` would end the
+        # tool with SIGPIPE, and a temp file of the whole output has no size cap
+        CMD_TIMEOUT="$cap" _bounded "${_JC[@]}" "$@" 2>&1 | { head -n "$_JHEAD"; cat >/dev/null; } >> "$f"; rc=${PIPESTATUS[0]}
+    else
+        CMD_TIMEOUT="$cap" _bounded "${_JC[@]}" "$@" >> "$f" 2>&1; rc=$?
+    fi
+    [ "$rc" -eq 0 ] && return
+    [ "$rc" -eq 124 ] || { printf '\n(exit %s)\n' "$rc" >> "$f"; return; }
+    if _past_deadline; then printf '\n(stopped at the run deadline, %ss)\n' "$RUN_DEADLINE" >> "$f"
+    else printf '\n(stopped at the %ss cap)\n' "$cap" >> "$f"; fi
+}
+
 collect_threads() {
     local dest="$1"; mkdir -p "$dest" 2>/dev/null
-    local i pid mod
+    local i pid mod fd1 kerr krc
     i=0
     while [ "$i" -lt "${#PIDS[@]}" ]; do
-        pid="${PIDS[$i]}"; mod="${MODS[$i]}"
+        pid="${PIDS[$i]}"; mod="${MODS[$i]}"; i=$((i + 1))
         warn "[Tier2] thread dump: pid $pid ($mod) — may cause a JVM safepoint pause"
-        if have jstack; then
-            CMD_TIMEOUT=60 _bounded jstack -l "$pid" > "$dest/$mod-$pid.jstack.txt" 2>&1
-            [ $? -eq 124 ] && printf '\n(jstack stopped at the 60s cap)\n' >> "$dest/$mod-$pid.jstack.txt"
-        else
-            # kill is a shell builtin and returns at once; the dump itself is
-            # written by the JVM to its own stdout, not here.
-            kill -3 "$pid" 2>/dev/null
-            printf 'jstack absent; sent SIGQUIT to %s (output goes to the JVM stdout/journal)\n' "$pid" > "$dest/$mod-$pid.sigquit.txt"
+        _jvm_cmd "$pid" jstack
+        if [ "${#_JC[@]}" -gt 0 ]; then
+            _jvm_run "$dest/$mod-$pid.jstack.txt" 60 -l "$pid"
+            continue
         fi
-        i=$((i + 1))
+        # kill is a shell builtin and returns at once; the dump itself is
+        # written by the JVM to its own fd 1, not here.
+        fd1="$(readlink "/proc/$pid/fd/1" 2>/dev/null)" || fd1="n/a (/proc/$pid/fd/1 not readable by uid $(id -u 2>/dev/null))"
+        printf 'command: kill -3 %s\njstack: %s\n' "$pid" "$_JCN" > "$dest/$mod-$pid.sigquit.txt"
+        kerr="$(kill -3 "$pid" 2>&1)"; krc=$?
+        if [ "$krc" -eq 0 ]; then printf 'the JVM writes the dump to its fd 1: %s\n' "$fd1" >> "$dest/$mod-$pid.sigquit.txt"
+        else printf 'kill -3: exit %s: %s (not sent)\n' "$krc" "${kerr//$'\n'/ }" >> "$dest/$mod-$pid.sigquit.txt"; fi
     done
 }
 
 collect_histo() {
     local dest="$1"; mkdir -p "$dest" 2>/dev/null
-    have jmap || { warn "[Tier2] histo: jmap absent"; return; }
     local i pid mod
     i=0
     while [ "$i" -lt "${#PIDS[@]}" ]; do
-        pid="${PIDS[$i]}"; mod="${MODS[$i]}"
+        pid="${PIDS[$i]}"; mod="${MODS[$i]}"; i=$((i + 1))
+        _jvm_cmd "$pid" jmap
+        if [ "${#_JC[@]}" -eq 0 ]; then
+            warn "[Tier2] histo: pid $pid ($mod): $_JCN"
+            printf 'command: none (%s)\n' "$_JCN" > "$dest/$mod-$pid.histo.txt"
+            continue
+        fi
         warn "[Tier2] jmap -histo: pid $pid ($mod) — walks the live heap (no full GC)"
-        CMD_TIMEOUT=120 _bounded jmap -histo "$pid" 2>&1 | head -n 200 > "$dest/$mod-$pid.histo.txt" 2>/dev/null
-        i=$((i + 1))
+        _JHEAD=200 _jvm_run "$dest/$mod-$pid.histo.txt" 120 -histo "$pid"
     done
 }
 
