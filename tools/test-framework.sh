@@ -41,14 +41,14 @@ skip() { SKIP=$((SKIP + 1)); printf '  SKIP  %s\n' "$1"; }
 check() { if eval "$2"; then ok "$1"; else no "$1" "${3:-}"; fi; }
 
 # The skeleton's helpers without its main, sourced by the group 1 scripts.
-sed '/^# ---- main — DO NOT EDIT/,$d' "$SK" > "$T/lib.sh"
+sed '/^# ---- main -/,$d' "$SK" > "$T/lib.sh"
 
 # ---- 1. shared helpers ------------------------------------------------------
 cat > "$T/helpers.sh" <<'EOF'
 set -- --stdout
 . "$LIB"
 exec 3>&2
-_run_init; _init_probe
+_run_init
 myfn() { echo from-fn; }
 slowfn() { sleep 30; echo never; }
 CMD_TIMEOUT=2
@@ -132,7 +132,7 @@ done
 # the rest of the script.
 cat > "$T/stdin-tail.sh" <<'EOF'
 exec 3>&2
-_run_init; _init_probe
+_run_init
 myfn() { echo from-fn; }
 CMD_TIMEOUT=2
 probe "fn" myfn
@@ -189,7 +189,7 @@ cat > "$T/tl.sh" <<'EOF'
 set -- --stdout
 . "$LIB"
 exec 3>&2
-_run_init; _init_probe
+_run_init
 echo "ms_date=$_ms_date"
 d=$_tmp_dir; i=0
 while [ "$i" -lt 300 ]; do _bounded true; [ -d "$d" ] || break; i=$((i + 1)); done

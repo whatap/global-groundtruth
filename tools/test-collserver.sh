@@ -30,20 +30,7 @@
 
 set -u
 set -o noclobber
-# Stubs are written only through stub_write, and stub dirs are copied only
-# through stub_clone. A stub dir is a farm of symlinks to the real tools, and a
-# `>` onto one of them writes the real tool (as root, /usr/bin/xargs itself).
-# noclobber makes any other `>` onto an existing file an error; `>|` is used
-# only on files this suite created as regular files.
-stub_write() { rm -f "$1" && cat > "$1" && chmod +x "$1"; }   # content on stdin
-stub_clone() {                                                # SRC DST: links stay links
-    local f; mkdir -p "$2"
-    for f in "$1"/*; do
-        [ -e "$f" ] || [ -L "$f" ] || continue
-        if [ -L "$f" ]; then ln -s "$(readlink "$f")" "$2/${f##*/}"
-        else rm -f "$2/${f##*/}"; cp "$f" "$2/${f##*/}"; fi
-    done
-}
+. "$(dirname "$0")/test-lib.sh"
 # Default to the collector beside this checkout. Resolve whatever we end up
 # with to an absolute path: the tests cd into throwaway directories, so a
 # relative path would stop resolving after the first one.
@@ -52,12 +39,6 @@ C="${1:-$(cd "$(dirname "$0")/.." && pwd)/collectors/collection-server/collect-c
 C="$(cd "$(dirname "$C")" && pwd)/$(basename "$C")"
 ROOT="$(mktemp -d)"; PASS=0; FAIL=0; SKIP=0
 trap 'chmod -R u+rwX "$ROOT" 2>/dev/null; rm -rf "$ROOT"' EXIT
-ok()   { PASS=$((PASS+1)); printf '  PASS  %s\n' "$1"; }
-bad()  { FAIL=$((FAIL+1)); printf '  FAIL  %s\n        expected: %s\n        actual:   %s\n' "$1" "$2" "$3"; }
-skip() { SKIP=$((SKIP+1)); printf '  ~ not checked: %s\n' "$1"; }
-chk()  { [ "$2" = "$3" ] && ok "$1" || bad "$1" "$2" "$3"; }
-has()  { printf '%s' "$2" | grep -qF -- "$3" && ok "$1" || bad "$1" "contains: $3" "absent"; }
-hasnt(){ printf '%s' "$2" | grep -qF -- "$3" && bad "$1" "absent: $3" "present" || ok "$1"; }
 # The collector finds whatap JVMs with one `xargs grep` over /proc/*/cmdline.
 # This xargs, first on PATH, passes on only the PIDs in ONLY_PIDS (empty: none),
 # so a whatap-looking process elsewhere on the host (a parallel suite's fake
@@ -93,16 +74,6 @@ case "$*" in *"-p LoadState"*yard*) echo "LoadState=loaded"; exit 0 ;; esac
 exit 0
 EOF
   chmod +x "$s/systemctl"; printf '%s' "$s"
-}
-status_adds_up() {
-  local line d g n b
-  line="$(printf '%s' "$1" | grep -o 'goals: .*')"
-  [ -n "$line" ] || { bad "$2" "a goals: line" "none"; return; }
-  d="$(echo "$line" | sed 's/goals: \([0-9]*\).*/\1/')"
-  g="$(echo "$line" | sed 's/.*declared, \([0-9]*\) obtained.*/\1/')"
-  n="$(echo "$line" | sed 's/.*obtained, \([0-9]*\) not applicable.*/\1/')"
-  b="$(echo "$line" | sed 's/.*here, \([0-9]*\) blocked.*/\1/')"
-  chk "$2 ($line)" "$d" "$((g + n + b))"
 }
 echo "== 1. a host with no WhaTap: COMPLETE, every goal n/a =="
 out="$("$C" --stdout 2>/dev/null)"

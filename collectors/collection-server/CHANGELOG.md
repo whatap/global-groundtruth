@@ -7,6 +7,12 @@ one entry at the top of its section (docs/authoring-guide.md, step 2);
 
 ## collect-collserver.sh
 
+- **0.15.4** — Run helpers (skeleton): `_why_124` and `_out_dir_check` move
+  into the skeleton run helpers (the `--out` mkdir now runs under the command
+  cap), and `_run_init` sets the probe error file and reads the uid once; the
+  local `probe_merged` goes, so a failed `-version` prints `(exit N)` with its
+  output, or `n/a (empty output, exit N)`. The path helpers and process scan
+  are plain collserver code, no longer group blocks.
 - **0.15.3** — Split collect_logs and _rep_a_jvm_runtime into smaller helpers
   (_logsel_candidates/_logsel_drop/_logsel_summary, _jvm_bin_ls); a removed
   option that is ignored (`--time-ref`) prints its `!!` note when it is read
@@ -151,6 +157,10 @@ one entry at the top of its section (docs/authoring-guide.md, step 2);
 
 ## collect-collzfs.sh
 
+- **0.12.3** — Run helpers (skeleton): `_why_124` and `_out_dir_check` move
+  into the skeleton run helpers (the `--out` mkdir now runs under the command
+  cap), and `_run_init` sets the probe error file and reads the uid once; no
+  report change.
 - **0.12.2** — Split window_run's planning into _win_plan; define the zfs-*
   unit lists once (ZFS_UNITS/ZFS_JOURNAL_UNITS); drop the stat/nproc/free
   rows, never run, from the [1] tools list; `--home` prints its `!!` ignored
@@ -291,6 +301,10 @@ one entry at the top of its section (docs/authoring-guide.md, step 2);
 
 ## collect-collmysql.sh
 
+- **0.12.3** — Run helpers (skeleton): `_why_124` and `_out_dir_check` move
+  into the skeleton run helpers (the `--out` mkdir now runs under the command
+  cap), and `_run_init` sets the probe error file and reads the uid once; no
+  report change.
 - **0.12.2** — Split _binlog_proc's identity checks into _bl_check, and
   _window's sampler start/wait/trap-restore into _win_run_samplers; drop the
   lsblk row, never run, from the [1] tools list.

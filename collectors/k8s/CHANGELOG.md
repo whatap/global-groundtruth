@@ -5,6 +5,10 @@ change to the script bumps its `VERSION` and adds one entry at the top of this
 list (docs/authoring-guide.md, step 2); `tools/validate.sh` checks that the
 newest entry is the script's `VERSION`.
 
+- **0.13.3** — Run helpers (skeleton): `_why_124` and `_out_dir_check` move
+  into the skeleton run helpers (the `--out` mkdir now runs under the command
+  cap), and `_run_init` sets the probe error file and reads the uid once; no
+  report change.
 - **0.13.2** — Drop curl from the [1] tool row (only run inside the pod);
   split discover_workloads, _rep_inpod's exec plan, _rep_operator_chain's
   webhook/service loop, and _rep_logs into smaller named helpers, with no

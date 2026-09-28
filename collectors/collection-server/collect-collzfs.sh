@@ -35,7 +35,7 @@ export LC_ALL=C
 # ---- collector metadata -----------------------------------------------------
 # History: CHANGELOG.md, section collect-collzfs.sh (next to this file).
 COLLECTOR_NAME="whatap-collzfs"
-VERSION="0.12.2"
+VERSION="0.12.3"
 DOMAIN="collection-server"
 TARGET="collection-server-zfs/$(hostname 2>/dev/null || echo unknown)"   # refined after pool discovery
 
@@ -300,7 +300,8 @@ _priv_hint() { [ -n "$PRIV_GAP" ] && printf ' (not elevated: %s)' "$PRIV_GAP"; r
 # before the environment section prints PRIV_WHY.
 _note_privilege() {
     # No uid is not uid 0. A run that cannot tell says so, and claims no root.
-    _priv_uid="$(id -u 2>/dev/null)"
+    # _run_init has usually read it already.
+    [ -n "${_priv_uid:-}" ] || _priv_uid="$(id -u 2>/dev/null)"
     [ -n "$_priv_uid" ] || _priv_uid="$(awk '/^Uid:/{print $2; exit}' /proc/self/status 2>/dev/null)"
     if [ -z "$_priv_uid" ]; then
         PRIV_WHY="n/a (id -u failed and /proc/self/status is not readable)"
@@ -348,9 +349,12 @@ _note_boot() {
 #                 not silenced by --quiet and not lost in --file mode.
 # _bounded CMD... every external command under CMD_TIMEOUT and RUN_DEADLINE.
 # _tmp NAME       a path in this run's private directory, removed on exit.
+# _out_dir_check  the output directory exists and is writable, before a run.
 # _report_to_file --file mode's write; fails when the file is not written whole.
-# probe, read_proc  a command's output or a file's content as facts, or n/a with
-#                 the reason (guideline 4).
+# probe, probe_merged, read_proc  a command's output (probe_merged: with its
+#                 stderr) or a file's content as facts, or n/a with the reason
+#                 (guideline 4).
+# _why_124        the reason for a bounded call's 124: run deadline or its cap.
 # Constraints:
 # - POSIX sh only (apm collectors run under `sh -s`, often dash or busybox):
 #   no SECONDS, no `type -t`, no ${v//x/y} outside a BASH_VERSION guard.
@@ -366,6 +370,7 @@ RUN_DEADLINE="${RUN_DEADLINE:-300}"
 _tmp_dir=""
 _timeout_bin=""   # timeout(1), found in _run_init; empty = watchdog only
 _run_t0=""
+_errfile=""       # a probe's stderr (_run_init)
 _timeout_k=""     # 5 when timeout(1) takes -k (_run_init)
 _load0=""         # _host_load at _run_init
 SLOW_SEC=3        # a bounded call at least this long is named in the status
@@ -419,8 +424,9 @@ _cap_or() {
     printf '%s' "$3"
 }
 
-# _run_init -> the private temp directory, the traps, and timeout(1). Call it
-# once in main, before anything creates a temp file.
+# _run_init -> the private temp directory, the traps, timeout(1), and _errfile
+# (the file a probe's stderr goes to, which _classify_err reads). Call it once
+# in main, before anything creates a temp file.
 _run_init() {
     _run_t0="$(date +%s 2>/dev/null)"
     _owner_pid="$$"
@@ -449,6 +455,9 @@ _run_init() {
         *)        _stdin_script=1 ;;
     esac
     [ -n "$_tmp_dir" ] || warn "no private temp directory could be made under ${TMPDIR:-/tmp}; values that need one are reported as n/a"
+    _errfile="$(_tmp probe.err)"
+    # the uid, read once: reasons name it (${_priv_uid:-?}), _note_privilege judges it
+    _priv_uid="$(id -u 2>/dev/null)"
     # caps from the environment: whole numbers or unused (0 = no limit to timeout(1))
     RUN_DEADLINE="$(_cap_or RUN_DEADLINE "$RUN_DEADLINE" 300)"
     CMD_TIMEOUT="$(_cap_or CMD_TIMEOUT "${CMD_TIMEOUT:-20}" 20)"
@@ -594,10 +603,24 @@ _bounded_in() {
     return "$rc"
 }
 
+# _out_dir_check -> the output directory OPT_OUT (empty: the working directory)
+# exists, made when missing, and this uid can write into it; else false, saying
+# so on the operator stream.
+# Called before anything is collected, so an unwritable one fails at once
+# rather than after a full run.
+_out_dir_check() {
+    local d="${OPT_OUT:-.}"
+    [ -d "$d" ] || _bounded mkdir -p -- "$d" 2>/dev/null
+    if [ ! -d "$d" ] || [ ! -w "$d" ] || [ ! -x "$d" ]; then
+        warn "the report was not written: output directory $d is not writable by uid ${_priv_uid:-?}"
+        return 1
+    fi
+}
+
 _report_to_file() {
     # `true`, not `:`. A failed redirect on a special builtin exits dash.
     if ! { true > "$1"; } 2>/dev/null; then
-        warn "the report was not written: $1 cannot be created by uid $(id -u 2>/dev/null || echo '?')"
+        warn "the report was not written: $1 cannot be created by uid ${_priv_uid:-?}"
         return 1
     fi
     run_report > "$1" 2>/dev/null
@@ -605,6 +628,12 @@ _report_to_file() {
         warn "the report was not written whole: $1 does not end with the footer"
         return 1
     fi
+}
+
+# _why_124 -> why a bounded call returned 124: the run deadline, or its own cap
+_why_124() {
+    if _past_deadline; then printf 'run deadline reached: %ss' "$RUN_DEADLINE"
+    else printf 'timed out: %ss' "$CMD_TIMEOUT"; fi
 }
 
 # probe "label" CMD [ARGS...] -> output as facts, or "label: n/a (<why>)".
@@ -615,22 +644,29 @@ _report_to_file() {
 # _classify_err, reading _errfile. PROBE_OUT / PROBE_RC: the last probe's stdout
 # and exit status (127 when nothing ran), so a caller that also parses the
 # output runs the command once.
+# probe_merged "label" CMD [ARGS...] -> the same with stderr folded into stdout,
+# for tools that answer on stderr (java -version). With no stderr to classify,
+# a failed run with no output says its exit status.
 PROBE_OUT=""; PROBE_RC=127
+probe()        { _probe_run 2 "$@"; }
+probe_merged() { _probe_run 1 "$@"; }
 # shellcheck disable=SC2034  # PROBE_OUT / PROBE_RC are read by the caller
-probe() {
-    local label="$1" out rc; shift
+_probe_run() {
+    local _pr_m="$1" label="$2" out rc; shift 2
     PROBE_OUT=""; PROBE_RC=127
     [ -n "$(_cmd_kind "$1")" ] || { fact "$label: n/a (command not found: $1)"; return; }
-    out="$(_bounded "$@" 2>"$_errfile")"; rc=$?
+    if [ "$_pr_m" = 1 ]; then out="$(_bounded "$@" 2>&1)"; rc=$?
+    else out="$(_bounded "$@" 2>"$_errfile")"; rc=$?; fi
     PROBE_OUT="$out"; PROBE_RC="$rc"
     if [ "$rc" -eq 124 ]; then
-        if _past_deadline; then fact "$label: n/a (run deadline reached: ${RUN_DEADLINE}s)"
-        else fact "$label: n/a (timed out: ${CMD_TIMEOUT}s)"; fi
+        fact "$label: n/a ($(_why_124))"
         return
     fi
     if [ "$rc" -ne 0 ]; then
         [ -n "$out" ] && { _emit_labeled "$label (exit $rc)" "$out"; return; }
-        fact "$label: n/a ($(_classify_err))"; return
+        if [ "$_pr_m" = 1 ]; then fact "$label: n/a (empty output, exit $rc)"
+        else fact "$label: n/a ($(_classify_err))"; fi
+        return
     fi
     [ -z "$out" ] && { fact "$label: n/a (empty output)"; return; }
     _emit_labeled "$label" "$out"
@@ -762,22 +798,6 @@ EOF
     fi
 }
 # ---- end collection completeness
-
-# ---- collection-server: probe helpers — DO NOT EDIT -------------------------
-# members: collmysql collserver collzfs
-# _init_probe -> _errfile, the private file (after _run_init) a probe's stderr
-# goes to; the member's _classify_err reads it.
-_errfile=""
-_init_probe() { _errfile="$(_tmp probe.err)"; }
-
-# _why_124 -> why a bounded call returned 124: the run deadline, or its own cap
-# (the same two wordings as probe)
-_why_124() {
-    if _past_deadline; then printf 'run deadline reached: %ss' "$RUN_DEADLINE"
-    else printf 'timed out: %ss' "$CMD_TIMEOUT"; fi
-}
-
-# ---- end collection-server: probe helpers
 
 # ---- collection-server: file helpers — DO NOT EDIT --------------------------
 # members: collserver collzfs
@@ -1093,7 +1113,7 @@ filesize_histogram() {
         # find exits 1 when it could not descend into part of the tree. The
         # buckets then leave those subtrees out, and must say so.
         nerr="$(grep -c . "$err" 2>/dev/null)"
-        printf '(PARTIAL: find exited %s; %s directories or files could not be read by uid %s,\n' "$rc" "${nerr:-0}" "$(id -u 2>/dev/null || echo '?')"
+        printf '(PARTIAL: find exited %s; %s directories or files could not be read by uid %s,\n' "$rc" "${nerr:-0}" "${_priv_uid:-?}"
         printf ' so the buckets below leave those subtrees out. First message: %s)\n' "$(head -n1 "$err" 2>/dev/null | cut -c1-160)"
         warn "file-size histogram is partial: ${nerr:-0} paths under $p were not readable$(_priv_hint)"
     fi
@@ -1689,7 +1709,7 @@ _module_absent_msg() {
 # was refused or timed out has not shown that there is no pool, and a missing
 # zpool binary next to a loaded kernel module has not asked.
 _resolve_pools() {
-    local uid; uid="$(id -u 2>/dev/null || echo '?')"
+    local uid; uid="${_priv_uid:-?}"
     if [ -z "$ZPOOL_RC" ]; then
         missed pools "command not found: zpool (while $( [ -d "$KSTAT_DIR" ] && echo "$KSTAT_DIR exists" || echo "zfs is installed" ))"
     elif [ "$ZPOOL_RC" -eq 0 ] && [ "$ZPOOL_COUNT" -gt 0 ] 2>/dev/null; then
@@ -2653,18 +2673,6 @@ _need_int() {
         ''|*[!0-9]*) warn "$1 takes a non-negative integer; got '$2'"; exit 2 ;;
     esac
 }
-
-# _out_dir_check -> creates the output directory OPT_OUT when missing and fails,
-# saying so on the operator stream, when this uid cannot write into it. Called
-# before anything is collected, so an unwritable one fails at once rather than
-# after a full run.
-_out_dir_check() {
-    mkdir -p "$OPT_OUT" 2>/dev/null
-    if [ ! -d "$OPT_OUT" ] || [ ! -w "$OPT_OUT" ] || [ ! -x "$OPT_OUT" ]; then
-        warn "the report was not written: output directory $OPT_OUT is not writable by uid $(id -u 2>/dev/null || echo '?')"
-        return 1
-    fi
-}
 # ---- end collection-server: main helpers
 
 # ---- collection-server: give back — DO NOT EDIT -----------------------------
@@ -2720,7 +2728,6 @@ if [ -z "$_RUN_DEADLINE_ENV" ]; then
 fi
 
 _run_init
-_init_probe
 # A caller's RUN_DEADLINE is not raised: say at once when it cuts a requested
 # window, and refuse one that would leave it under 10s. The default window is
 # cut, or not run, and says so in section O.

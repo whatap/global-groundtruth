@@ -5,6 +5,11 @@ Every change to the script bumps its `VERSION` and adds one entry at the top
 of this list (docs/authoring-guide.md, step 2); `tools/validate.sh` checks
 that the newest entry is the script's `VERSION`.
 
+- **0.8.5** — Run helpers (skeleton): `_why_124` and `_out_dir_check` move
+  into the skeleton run helpers (the `--out` mkdir now runs under the command
+  cap), and `_run_init` sets the probe error file and reads the uid once;
+  `probe_merged` comes from the skeleton; the CLI harness banner loses "DO NOT
+  EDIT"; no report change.
 - **0.8.4** — The whatap_php.pid line gets an entry line (full mtime), state
   and ppid, and `permission denied` for an unreadable file (group
   `_pid_file_fact`). The module-name list is cut on a UTF-8 boundary. hidepid

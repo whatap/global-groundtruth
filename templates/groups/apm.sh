@@ -447,7 +447,7 @@ _scan_gaps() {
     local n g=""
     if [ -n "$D_UNREAD" ]; then
         n="$(echo $D_UNREAD | wc -w | tr -d ' ')"
-        g="environ/cwd of $n candidate process(es) not readable by uid $(id -u 2>/dev/null || echo '?') (pids: $(echo $D_UNREAD | cut -d' ' -f1-10))"
+        g="environ/cwd of $n candidate process(es) not readable by uid ${_priv_uid:-?} (pids: $(echo $D_UNREAD | cut -d' ' -f1-10))"
     fi
     [ -n "$D_HIDEPID" ] && g="${g:+$g; }$D_HIDEPID"
     printf '%s' "$g"
@@ -622,8 +622,7 @@ _kernel_arch() {
         0:*" "*) fact "machine arch: ${PROBE_OUT##* }" ;;
         *:*" "*) fact "machine arch (exit $PROBE_RC): ${PROBE_OUT##* }" ;;
         127:)    fact "machine arch: n/a (command not found: uname)" ;;
-        124:)    if _past_deadline; then fact "machine arch: n/a (run deadline reached: ${RUN_DEADLINE}s)"
-                 else fact "machine arch: n/a (timed out: ${CMD_TIMEOUT}s)"; fi ;;
+        124:)    fact "machine arch: n/a ($(_why_124))" ;;
         0:)      fact "machine arch: n/a (empty output)" ;;
         *:)      fact "machine arch: n/a ($(_classify_err))" ;;
         *)       fact "machine arch: n/a (no machine field in the uname -srm output)" ;;
@@ -654,19 +653,13 @@ conf_bytes() {
 # is collected: an unwritable directory fails at once, not after a full run.
 # With --stdout the report goes to stdout, and an --out given is named as not
 # used. Fails (the reason on the operator stream) when the report cannot be
-# written; the message is the one collserver gives.
+# written (the skeleton's _out_dir_check).
 _out_check() {
-    local d="${OPT_OUT:-.}"
     if [ "$OPT_STDOUT" = 1 ]; then
         [ -n "$OPT_OUT" ] && warn "--out $OPT_OUT is not used: the report goes to stdout (--out is for --file)"
         return 0
     fi
-    [ -d "$d" ] || _bounded mkdir -p -- "$d" 2>/dev/null
-    if [ ! -d "$d" ] || [ ! -w "$d" ] || [ ! -x "$d" ]; then
-        warn "the report was not written: output directory $d is not writable by uid $(id -u 2>/dev/null || echo '?')"
-        return 1
-    fi
-    return 0
+    _out_dir_check
 }
 # ---- end apm: output directory
 

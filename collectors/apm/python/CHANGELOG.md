@@ -5,6 +5,11 @@ first. Every change to the script bumps its `VERSION` and adds one entry at
 the top of this list (docs/authoring-guide.md, step 2); `tools/validate.sh`
 checks that the newest entry is the script's `VERSION`.
 
+- **0.11.6** — Run helpers (skeleton): `_why_124` and `_out_dir_check` move
+  into the skeleton run helpers (the `--out` mkdir now runs under the command
+  cap), and `_run_init` sets the probe error file and reads the uid once;
+  `probe_merged` comes from the skeleton; the CLI harness banner loses "DO NOT
+  EDIT"; no report change.
 - **0.11.5** — `_disc_go`'s Go-process read (`_go_rows`) is kept in a
   variable, not a file under `_tmp`: with no private temp directory it lost
   every Go-module pid (homes, `D_UNREAD` split, `resolve_fs` order). A timeout

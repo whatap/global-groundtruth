@@ -5,6 +5,11 @@ first. Every change to the script bumps its `VERSION` and adds one entry at
 the top of this list (docs/authoring-guide.md, step 2); `tools/validate.sh`
 checks that the newest entry is the script's `VERSION`.
 
+- **0.9.7** — Run helpers (skeleton): `_why_124` and `_out_dir_check` move
+  into the skeleton run helpers (the `--out` mkdir now runs under the command
+  cap), and `_run_init` sets the probe error file and reads the uid once;
+  `probe_merged` comes from the skeleton; the CLI harness banner loses "DO NOT
+  EDIT"; no report change.
 - **0.9.6** — The install block's `version` line is read by the same top-level
   awk as section 4 (`_pkg_top_field`, `version: x (path)`; a nested "version"
   is no longer taken), and so are npm's and pm2's name and version. Pid files

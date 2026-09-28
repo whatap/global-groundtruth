@@ -7,6 +7,12 @@ one entry at the top of its section (docs/authoring-guide.md, step 2);
 
 ## collect-db.sh
 
+- **0.9.4** — Run helpers (skeleton): `_why_124` and `_out_dir_check` move
+  into the skeleton run helpers (the `--out` mkdir now runs under the command
+  cap), and `_run_init` sets the probe error file and reads the uid once; the
+  local `probe_merged` is replaced by the skeleton's, so a failed
+  `-version`/`--version` prints `(exit N)` with its output, or `n/a (empty
+  output, exit N)`.
 - **0.9.3** — Drop nslookup/crontab from the [1] tool row (never run on the
   host); split _rep_tls per-instance body into _rep_tls_inst; read
   dbms/db_ip/db_port/connect_option through one helper (_inst_conf) in each

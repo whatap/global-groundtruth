@@ -105,7 +105,7 @@ _optval() {
 }
 # ---- end emit helpers
 
-# ---- CLI harness — DO NOT EDIT ----------------------------------------------
+# ---- CLI harness ------------------------------------------------------------
 # Guideline 5 (../../docs/collector-engineering.md): no-args prints usage — a run
 # needs an explicit action flag (--file / --stdout) so nothing starts by accident;
 # and progress is narrated on stderr (fd 3, see main) so the operator sees it
@@ -147,18 +147,6 @@ while [ $# -gt 0 ]; do
     shift
 done
 
-# try CMD [ARGS...]  -> prints the command's output as fact lines; prints "n/a"
-# if the command fails or produces nothing. Simplest form; prefer `probe`
-# (run helpers) when you want the reason an output is missing (Contract rule 2 + guideline 4).
-try() {
-    local out
-    if out="$("$@" 2>/dev/null)" && [ -n "$out" ]; then
-        printf '%s\n' "$out" | while IFS= read -r line; do fact "$line"; done
-    else
-        fact "n/a"
-    fi
-}
-
 # ---- privilege — DO NOT EDIT ------------------------------------------------
 # What a run can read depends on the privilege it was given: a fact about this
 # run (CONTRACT rule 1), stated in the environment section ([1]). Each goal that
@@ -177,7 +165,8 @@ _priv_hint() { [ -n "$PRIV_GAP" ] && printf ' (not elevated: %s)' "$PRIV_GAP"; r
 # before the environment section prints PRIV_WHY.
 _note_privilege() {
     # No uid is not uid 0. A run that cannot tell says so, and claims no root.
-    _priv_uid="$(id -u 2>/dev/null)"
+    # _run_init has usually read it already.
+    [ -n "${_priv_uid:-}" ] || _priv_uid="$(id -u 2>/dev/null)"
     [ -n "$_priv_uid" ] || _priv_uid="$(awk '/^Uid:/{print $2; exit}' /proc/self/status 2>/dev/null)"
     if [ -z "$_priv_uid" ]; then
         PRIV_WHY="n/a (id -u failed and /proc/self/status is not readable)"
@@ -225,9 +214,12 @@ _note_boot() {
 #                 not silenced by --quiet and not lost in --file mode.
 # _bounded CMD... every external command under CMD_TIMEOUT and RUN_DEADLINE.
 # _tmp NAME       a path in this run's private directory, removed on exit.
+# _out_dir_check  the output directory exists and is writable, before a run.
 # _report_to_file --file mode's write; fails when the file is not written whole.
-# probe, read_proc  a command's output or a file's content as facts, or n/a with
-#                 the reason (guideline 4).
+# probe, probe_merged, read_proc  a command's output (probe_merged: with its
+#                 stderr) or a file's content as facts, or n/a with the reason
+#                 (guideline 4).
+# _why_124        the reason for a bounded call's 124: run deadline or its cap.
 # Constraints:
 # - POSIX sh only (apm collectors run under `sh -s`, often dash or busybox):
 #   no SECONDS, no `type -t`, no ${v//x/y} outside a BASH_VERSION guard.
@@ -243,6 +235,7 @@ RUN_DEADLINE="${RUN_DEADLINE:-300}"
 _tmp_dir=""
 _timeout_bin=""   # timeout(1), found in _run_init; empty = watchdog only
 _run_t0=""
+_errfile=""       # a probe's stderr (_run_init)
 _timeout_k=""     # 5 when timeout(1) takes -k (_run_init)
 _load0=""         # _host_load at _run_init
 SLOW_SEC=3        # a bounded call at least this long is named in the status
@@ -296,8 +289,9 @@ _cap_or() {
     printf '%s' "$3"
 }
 
-# _run_init -> the private temp directory, the traps, and timeout(1). Call it
-# once in main, before anything creates a temp file.
+# _run_init -> the private temp directory, the traps, timeout(1), and _errfile
+# (the file a probe's stderr goes to, which _classify_err reads). Call it once
+# in main, before anything creates a temp file.
 _run_init() {
     _run_t0="$(date +%s 2>/dev/null)"
     _owner_pid="$$"
@@ -326,6 +320,9 @@ _run_init() {
         *)        _stdin_script=1 ;;
     esac
     [ -n "$_tmp_dir" ] || warn "no private temp directory could be made under ${TMPDIR:-/tmp}; values that need one are reported as n/a"
+    _errfile="$(_tmp probe.err)"
+    # the uid, read once: reasons name it (${_priv_uid:-?}), _note_privilege judges it
+    _priv_uid="$(id -u 2>/dev/null)"
     # caps from the environment: whole numbers or unused (0 = no limit to timeout(1))
     RUN_DEADLINE="$(_cap_or RUN_DEADLINE "$RUN_DEADLINE" 300)"
     CMD_TIMEOUT="$(_cap_or CMD_TIMEOUT "${CMD_TIMEOUT:-20}" 20)"
@@ -471,10 +468,24 @@ _bounded_in() {
     return "$rc"
 }
 
+# _out_dir_check -> the output directory OPT_OUT (empty: the working directory)
+# exists, made when missing, and this uid can write into it; else false, saying
+# so on the operator stream.
+# Called before anything is collected, so an unwritable one fails at once
+# rather than after a full run.
+_out_dir_check() {
+    local d="${OPT_OUT:-.}"
+    [ -d "$d" ] || _bounded mkdir -p -- "$d" 2>/dev/null
+    if [ ! -d "$d" ] || [ ! -w "$d" ] || [ ! -x "$d" ]; then
+        warn "the report was not written: output directory $d is not writable by uid ${_priv_uid:-?}"
+        return 1
+    fi
+}
+
 _report_to_file() {
     # `true`, not `:`. A failed redirect on a special builtin exits dash.
     if ! { true > "$1"; } 2>/dev/null; then
-        warn "the report was not written: $1 cannot be created by uid $(id -u 2>/dev/null || echo '?')"
+        warn "the report was not written: $1 cannot be created by uid ${_priv_uid:-?}"
         return 1
     fi
     run_report > "$1" 2>/dev/null
@@ -482,6 +493,12 @@ _report_to_file() {
         warn "the report was not written whole: $1 does not end with the footer"
         return 1
     fi
+}
+
+# _why_124 -> why a bounded call returned 124: the run deadline, or its own cap
+_why_124() {
+    if _past_deadline; then printf 'run deadline reached: %ss' "$RUN_DEADLINE"
+    else printf 'timed out: %ss' "$CMD_TIMEOUT"; fi
 }
 
 # probe "label" CMD [ARGS...] -> output as facts, or "label: n/a (<why>)".
@@ -492,22 +509,29 @@ _report_to_file() {
 # _classify_err, reading _errfile. PROBE_OUT / PROBE_RC: the last probe's stdout
 # and exit status (127 when nothing ran), so a caller that also parses the
 # output runs the command once.
+# probe_merged "label" CMD [ARGS...] -> the same with stderr folded into stdout,
+# for tools that answer on stderr (java -version). With no stderr to classify,
+# a failed run with no output says its exit status.
 PROBE_OUT=""; PROBE_RC=127
+probe()        { _probe_run 2 "$@"; }
+probe_merged() { _probe_run 1 "$@"; }
 # shellcheck disable=SC2034  # PROBE_OUT / PROBE_RC are read by the caller
-probe() {
-    local label="$1" out rc; shift
+_probe_run() {
+    local _pr_m="$1" label="$2" out rc; shift 2
     PROBE_OUT=""; PROBE_RC=127
     [ -n "$(_cmd_kind "$1")" ] || { fact "$label: n/a (command not found: $1)"; return; }
-    out="$(_bounded "$@" 2>"$_errfile")"; rc=$?
+    if [ "$_pr_m" = 1 ]; then out="$(_bounded "$@" 2>&1)"; rc=$?
+    else out="$(_bounded "$@" 2>"$_errfile")"; rc=$?; fi
     PROBE_OUT="$out"; PROBE_RC="$rc"
     if [ "$rc" -eq 124 ]; then
-        if _past_deadline; then fact "$label: n/a (run deadline reached: ${RUN_DEADLINE}s)"
-        else fact "$label: n/a (timed out: ${CMD_TIMEOUT}s)"; fi
+        fact "$label: n/a ($(_why_124))"
         return
     fi
     if [ "$rc" -ne 0 ]; then
         [ -n "$out" ] && { _emit_labeled "$label (exit $rc)" "$out"; return; }
-        fact "$label: n/a ($(_classify_err))"; return
+        if [ "$_pr_m" = 1 ]; then fact "$label: n/a (empty output, exit $rc)"
+        else fact "$label: n/a ($(_classify_err))"; fi
+        return
     fi
     [ -z "$out" ] && { fact "$label: n/a (empty output)"; return; }
     _emit_labeled "$label" "$out"
@@ -645,13 +669,10 @@ EOF
 # cannot obtain is reported WITH a classified reason, so the reader can tell
 # "not installed" from "no permission" from "timed out". Reason strings stay
 # free of judgment words so validate.sh keeps passing. probe and read_proc are
-# in the run helpers; _init_probe and _classify_err are the collector's, since
-# the errors worth naming differ per domain.
-_errfile=""
+# in the run helpers; _classify_err is the collector's, since the errors worth
+# naming differ per domain. It reads _errfile, which _run_init sets.
 # Per-command cap (s); with many network probes, lower it or probe reachability once.
 CMD_TIMEOUT="${CMD_TIMEOUT:-20}"
-# Call after _run_init: the error file lives in the run's private directory.
-_init_probe() { _errfile="$(_tmp probe.err)"; }
 
 _classify_err() {
     local txt=""
@@ -665,8 +686,9 @@ _classify_err() {
 }
 
 # ---- report body — EDIT HERE ------------------------------------------------
-# Add your fact sections inside run_report(); leave the CLI harness, the helpers,
-# and the header/footer shape alone. Each `section` also narrates itself to the
+# Add your fact sections inside run_report(); the CLI harness and main are
+# copies you extend, the DO NOT EDIT blocks are synced from here and the
+# header/footer shape stays. Each `section` also narrates itself to the
 # terminal (guideline 5), so you get progress for free.
 run_report() {
     emit_header
@@ -709,7 +731,7 @@ run_report() {
     emit_footer
 }
 
-# ---- main — DO NOT EDIT -----------------------------------------------------
+# ---- main -------------------------------------------------------------------
 # fd 3 = the terminal, saved before any redirection so progress() reaches the
 # operator even in --file mode (which redirects both stdout and stderr).
 exec 3>&2
@@ -725,16 +747,11 @@ if [ "$OPT_FILE" = 0 ] && [ "$OPT_STDOUT" = 0 ]; then
 fi
 
 _run_init
-_init_probe
 
 # The output directory is checked before collecting, so an unwritable one
 # fails at once rather than after a full run.
 if [ "$OPT_STDOUT" != 1 ]; then
-    mkdir -p "$OPT_OUT" 2>/dev/null
-    if [ ! -d "$OPT_OUT" ] || [ ! -w "$OPT_OUT" ] || [ ! -x "$OPT_OUT" ]; then
-        warn "the report was not written: output directory $OPT_OUT is not writable by uid $(id -u 2>/dev/null || echo '?')"
-        exit 1
-    fi
+    _out_dir_check || exit 1
 fi
 
 if [ "$OPT_STDOUT" = 1 ]; then

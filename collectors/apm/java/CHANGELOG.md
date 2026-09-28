@@ -5,6 +5,11 @@ first. Every change to the script bumps its `VERSION` and adds one entry at
 the top of this list (docs/authoring-guide.md, step 2); `tools/validate.sh`
 checks that the newest entry is the script's `VERSION`.
 
+- **0.15.5** — Run helpers (skeleton): `_why_124` and `_out_dir_check` move
+  into the skeleton run helpers (the `--out` mkdir now runs under the command
+  cap), and `_run_init` sets the probe error file and reads the uid once;
+  `probe_merged` comes from the skeleton; the CLI harness banner loses "DO NOT
+  EDIT"; no report change.
 - **0.15.4** — Section B lists a JVM whose binary was deleted after it
   started, or is not executable by this uid, among the binaries not run, with
   the reason `binary deleted or not executable`; it used to be dropped, so
