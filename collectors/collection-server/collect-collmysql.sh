@@ -27,7 +27,7 @@ export LC_ALL=C
 # ---- collector metadata -----------------------------------------------------
 # History: CHANGELOG.md, section collect-collmysql.sh (next to this file).
 COLLECTOR_NAME="whatap-collmysql"
-VERSION="0.11.1"
+VERSION="0.12.0"
 DOMAIN="collection-server"
 TARGET="collection-server-mysql/$(hostname 2>/dev/null || echo unknown)"
 
@@ -124,9 +124,6 @@ PROC_ROOT="${COLLMYSQL_PROC:-/proc}"
 # raised to fit a binlog decode and the window.
 _RUN_DEADLINE_ENV="${RUN_DEADLINE:-}"
 BINLOG_TIMEOUT="${BINLOG_TIMEOUT:-300}"   # per-file cap for the mysqlbinlog decode
-# The most the -p prompt may wait, so an unanswered prompt does not spend the
-# whole deadline and leave every later fact "deadline reached".
-PROMPT_TIMEOUT="${PROMPT_TIMEOUT:-60}"
 MYSQL_ARGS=""         # extra arguments handed to the mysql client
 DEFAULTS_FILE=""
 EXTRA_FILE=""
@@ -144,13 +141,13 @@ explicit action flag so nothing starts by accident.
 
   --defaults-file PATH        option file handed to the mysql client (credentials)
   --defaults-extra-file PATH  option file read in addition to the client's own
-  --mysql-args "ARGS"         extra arguments for the mysql client, e.g. "-h 10.0.0.5 -P 3306 -u whatap -p"
+  --mysql-args "ARGS"         extra arguments for the mysql client, e.g. "-h 10.0.0.5 -P 3306 -u whatap"
                               (one quoted word; it may start with '-', but may not
                               be empty or one of this collector's own options)
-                              A bare -p asks for the password once, on the terminal.
-                              A password on the command line (-pSECRET,
-                              --password=SECRET, ...) is refused (exit 2): use -p,
-                              MYSQL_PWD or an option file.
+                              A password in it (-pSECRET, --password=SECRET, ...)
+                              or a bare -p is refused (exit 2): there is no prompt,
+                              and no password goes on a command line. Use an
+                              option file (Password, below).
   --binlog[=N]                decode the N newest binary logs and count events per
                               table (default N=$BINLOG_FILES). Reads log files; off by default.
                               Each file is streamed once and capped at BINLOG_TIMEOUT seconds (below)
@@ -159,6 +156,15 @@ explicit action flag so nothing starts by accident.
                               each). DUR is N (seconds), Ns, Nm or Nh, 10s .. 24h;
                               default ${WIN_DEFAULT}s. No load on the server, only wall clock.
   --quiet                     silence progress on stderr
+
+Password: write these three lines with an editor into a file only you can read
+(not with echo: the password would stay in the shell history),
+    [client]
+    user=whatap
+    password="SECRET"
+save it as ~/ggt-mysql.cnf, then
+    chmod 600 ~/ggt-mysql.cnf
+    ./$(basename "$0") --file --defaults-extra-file ~/ggt-mysql.cnf --mysql-args "-h 10.0.0.5"
 
 Privilege: the collector runs at the privilege it was started with and never
 elevates itself. A packaged MySQL often admits root over the unix socket with
@@ -175,7 +181,6 @@ Environment (whole numbers 1..999999; another value is ignored with a warning):
   RUN_DEADLINE=N    cap on the whole run, seconds (default 300, raised for
                     the window and --binlog unless set)
   BINLOG_TIMEOUT=N  cap on the --binlog decode of one file, seconds (default 300)
-  PROMPT_TIMEOUT=N  the most the -p prompt waits, seconds (default 60)
   MYSQL_PWD         the password (read, then unset before any child starts)
 EOF
 }
@@ -767,10 +772,10 @@ MYSQL_WHY="not attempted"
 
 # ---- credentials (this collector only) ---------------------------------------
 # No credential in a child's argv (world-readable) or environment: the client
-# reads the password from a mode-600 option file in the private directory. It
-# comes from a bare -p (asked once on the terminal), MYSQL_PWD (unset before any
-# child starts) or the operator's option files; one written into --mysql-args is
-# refused.
+# reads the password from the operator's option files or, for MYSQL_PWD (unset
+# before any child starts), from a mode-600 option file in the private
+# directory. One written into --mysql-args is refused, and so is a bare -p:
+# there is no prompt (removed in 0.12.0).
 _PW=""; _PW_SRC=""; _PW_WHY=""; CNF=""
 
 # _pw_opt NAME -> what the mysql client (measured: 5.6, 5.7.32, 8.0.46, 8.4.10)
@@ -804,16 +809,9 @@ _pw_opt() {
     return 1
 }
 
-# _tty_restore -> the terminal settings saved before the password prompt
-_STTY_SAVED=""
-_tty_restore() {
-    if [ -n "$_STTY_SAVED" ]; then { stty "$_STTY_SAVED" </dev/tty; } 2>/dev/null
-    else { stty echo </dev/tty; } 2>/dev/null; fi
-}
-
 # _short_pw WORD -> true when a short-option cluster holds -p. Sets _SP_KEPT
 # (the cluster without p and what follows it) and _SP_PW (the rest after p,
-# empty for "ask").
+# empty for a bare p).
 _SP_KEPT=""; _SP_PW=""
 _short_pw() {
     local w="${1#-}" i=0 c pre=""
@@ -829,41 +827,32 @@ _short_pw() {
 }
 
 
-# _prompt_budget -> seconds the prompt may wait: PROMPT_TIMEOUT or what is left
-# of the run, whichever is less
-_prompt_budget() {
-    local left=$((RUN_DEADLINE - $(_elapsed)))
-    [ "$left" -gt "$PROMPT_TIMEOUT" ] && left="$PROMPT_TIMEOUT"
-    printf '%s' "$left"
-}
-
 _take_password() {
-    local w out="" prompt=0 inargs="" afterp=0
+    local w out="" bare="" inargs=""
     set -f
     for w in $MYSQL_ARGS; do
-        # A word after a bare -p is the database name to the client, not the
-        # password; if it was meant as one it now sits on every command line.
-        # Warned about (never repeated), not changed: it is the operator's call.
-        if [ "$afterp" = 1 ]; then
-            case "$w" in -*) ;; *) warn "the word after a bare -p / --password in --mysql-args is taken as a database name by the client; if it is a password, use the prompt" ;; esac
-            afterp=0
-        fi
         case "$w" in
             --*=*) [ -n "$(_pw_opt "${w%%=*}")" ] && { inargs="${w%%=*}=..."; continue; } ;;
-            --*)   case "$(_pw_opt "$w")" in pw) prompt=1; afterp=1; continue ;; drop) continue ;; esac ;;
+            --*)   case "$(_pw_opt "$w")" in pw) bare="$w"; continue ;; drop) continue ;; esac ;;
             -?*)   # A cluster of short options (-BpX, -Np): p takes the rest of
                    # the word as the password, unless an option that takes an
                    # argument (-u, -h, -P, -D, -S, -e, -R, -#) came first.
                    if _short_pw "$w"; then
                        if [ -n "$_SP_PW" ]; then inargs="${_SP_KEPT:--}p..."; continue; fi
-                       prompt=1; afterp=1; [ -n "$_SP_KEPT" ] && out="$out${out:+ }$_SP_KEPT"; continue
+                       bare="$w"; continue
                    fi ;;
         esac
         out="$out${out:+ }$w"
     done
     set +f
     if [ -n "$inargs" ]; then
-        warn "a password in --mysql-args ($inargs) is refused: no credential goes on a command line; use a bare -p (asked on the terminal), MYSQL_PWD or --defaults-file"
+        warn "a password in --mysql-args ($inargs) is refused: no credential goes on a command line; put it in a mode-600 option file and pass --defaults-extra-file PATH (see --help)"
+        exit 2
+    fi
+    # The run would go on without the password the operator meant to give;
+    # stop before anything is collected.
+    if [ -n "$bare" ]; then
+        warn "a bare $bare in --mysql-args no longer asks for the password (removed in 0.12.0): put it in a mode-600 option file and pass --defaults-extra-file PATH (see --help)"
         exit 2
     fi
     MYSQL_ARGS="$out"
@@ -873,37 +862,9 @@ _take_password() {
         case "$MYSQL_PWD" in
             *"$_nl"*) warn "MYSQL_PWD holds a newline, which the mysql option file cannot carry; use --defaults-file"; exit 2 ;;
         esac
-        [ "$prompt" = 1 ] || { _PW="$MYSQL_PWD"; _PW_SRC=MYSQL_PWD; }
+        _PW="$MYSQL_PWD"; _PW_SRC=MYSQL_PWD
     fi
     unset MYSQL_PWD
-    [ -z "$_PW" ] && [ "$prompt" = 1 ] || return 0
-    if ! { : </dev/tty; } 2>/dev/null; then
-        _PW_WHY="-p given and this run has no terminal to ask for the password on"; return 0
-    fi
-    # Echo off before the prompt, so a password typed ahead is not shown, and
-    # back on however the read ends: a Ctrl-C at the prompt used to leave the
-    # operator's terminal without echo.
-    local left prc=0; left="$(_prompt_budget)"
-    [ "$left" -lt 1 ] && left=1
-    _STTY_SAVED="$( { stty -g </dev/tty; } 2>/dev/null)"
-    trap '_tty_restore; _run_cleanup; exit 129' HUP
-    trap '_tty_restore; _run_cleanup; exit 130' INT
-    trap '_tty_restore; _run_cleanup; exit 143' TERM
-    { stty -echo </dev/tty; } 2>/dev/null
-    printf 'MySQL password (asked once, for every query of this run): ' >/dev/tty
-    IFS= read -r -t "$left" _PW </dev/tty || prc=$?
-    _tty_restore
-    # the run helpers' traps again
-    trap '_run_cleanup; exit 129' HUP
-    trap '_run_cleanup; exit 130' INT
-    trap '_run_cleanup; exit 143' TERM
-    printf '\n' >/dev/tty
-    if [ "$prc" -gt 128 ]; then
-        _PW=""; _PW_WHY="password prompt not answered within ${left}s"
-        warn "$_PW_WHY; continuing without a password"
-    elif [ -n "$_PW" ]; then _PW_SRC="terminal prompt"
-    elif [ "$prc" = 0 ]; then _PW_WHY="prompt answered with an empty line"
-    else _PW_WHY="prompt answered with end of input"; fi
 }
 
 # _load_password -> write the client option file for the password this run holds
@@ -1399,8 +1360,8 @@ _rep_env() {
         # connection arguments is therefore a run that asked nowhere, not an
         # answer: --mysql-args would obtain it.
         missed login "no local mysqld found and no --mysql-args given (client without arguments: $MYSQL_WHY)$(_priv_hint)"
-    # The prompt's outcome and the shared privilege hint both belong to the
-    # reason. The hint says only that the run was not elevated, as in every
+    # Why no password was handed over and the shared privilege hint both
+    # belong to the reason. The hint says only that the run was not elevated, as in every
     # collector; it does not claim that sudo would fix this login.
     else missed login "$MYSQL_WHY${_PW_WHY:+; $_PW_WHY}$(_priv_hint)"; fi
     fact "binlog decode tier: $([ "$OPT_BINLOG" = 1 ] && echo "on (newest $BINLOG_FILES files)" || echo "off")"
@@ -1924,7 +1885,6 @@ _out_dir_check() {
 exec 3>&2
 # the caps (_run_init checks CMD_TIMEOUT); an ignored RUN_DEADLINE is not the caller's
 BINLOG_TIMEOUT="$(_cap_or BINLOG_TIMEOUT "$BINLOG_TIMEOUT" 300)"
-PROMPT_TIMEOUT="$(_cap_or PROMPT_TIMEOUT "$PROMPT_TIMEOUT" 60)"
 if [ -n "$_RUN_DEADLINE_ENV" ]; then
     RUN_DEADLINE="$(_cap_or RUN_DEADLINE "$RUN_DEADLINE" 300)"
     [ "$RUN_DEADLINE" = "$_RUN_DEADLINE_ENV" ] || _RUN_DEADLINE_ENV=""

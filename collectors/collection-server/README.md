@@ -875,7 +875,7 @@ One `.txt` report, sections `[1]` and A..K:
 ./collect-collmysql.sh --file                       # -> whatap-collmysql-<host>-<UTC>.txt
 sudo ./collect-collmysql.sh --stdout                # root over the unix socket; root-only files
 ./collect-collmysql.sh --file --defaults-file ~/.my.cnf
-./collect-collmysql.sh --file --mysql-args "-h 10.0.0.5 -u whatap -p"
+./collect-collmysql.sh --file --defaults-extra-file ~/ggt-mysql.cnf --mysql-args "-h 10.0.0.5"
 ./collect-collmysql.sh --file --binlog --window=60s # the binlog decode, a 60 s window
 ./collect-collmysql.sh --file --out /tmp/case       # write the report under /tmp/case
 ./collect-collmysql.sh                              # no arguments -> prints help
@@ -889,7 +889,7 @@ sudo ./collect-collmysql.sh --stdout                # root over the unix socket;
 |---|---|
 | `--out DIR` | where `--file` writes (default `.`); made if missing, checked before collecting, an unwritable one exits 1 |
 | `--defaults-file PATH`, `--defaults-extra-file PATH` | option files for the mysql client (credentials) |
-| `--mysql-args "ARGS"` | the client's own arguments (`-h`, `-P`, `-u`, a bare `-p`) |
+| `--mysql-args "ARGS"` | the client's own arguments (`-h`, `-P`, `-u`); no password, not even a bare `-p` (below) |
 | `--binlog[=N]` | Tier 2: decode the N newest binary logs (default 2) |
 | `--window=DUR` | the length of section J's window: `N` (seconds), `Ns`, `Nm` or `Nh`, 10 s .. 24 h (default 15 s) |
 
@@ -909,7 +909,6 @@ warning, and the default is used):
 | `CMD_TIMEOUT` | 20 | each external command, seconds |
 | `RUN_DEADLINE` | 300 | the whole run, seconds; raised by the window + 30 s and by the `--binlog` decode unless set |
 | `BINLOG_TIMEOUT` | 300 | the `--binlog` decode of one file, seconds |
-| `PROMPT_TIMEOUT` | 60 | the `-p` prompt, seconds |
 
 `MYSQL_PWD` is a password source (below), not a cap.
 
@@ -919,6 +918,12 @@ warning, and the default is used):
 |---|---|
 | `--no-sudo` | nothing: the collector never elevates itself (since 0.8.0 the flag did nothing); run it with `sudo` when root is needed |
 | `--sample[=SEC]` | nothing for 15 s (every run has a window); `--window=DUR` for longer (`--sample` took about 50 s: `iostat` then `vmstat`, 5 s x 6 each) |
+
+**Removed in 0.12.0: the password prompt.** A bare `-p` in `--mysql-args`
+(or `--password`, or a cluster ending in `p` such as `-Bp`) no longer asks for
+the password on the terminal. It exits 2 before any child starts, with one line
+naming `--defaults-extra-file`: a run that went on would log in without the
+password the operator meant to give. `PROMPT_TIMEOUT` is no longer read.
 
 A 0.6/0.7 runbook line `./collect-collmysql.sh --file --no-sudo --sample` is
 now `./collect-collmysql.sh --file` (or `--file --window=60s`).
@@ -949,13 +954,28 @@ account in `ps` and `/proc/<pid>/cmdline`. So the collector hands the password
 to the `mysql` client only through a mode-600 option file inside the run's
 private temp directory (`--defaults-extra-file`, or `--defaults-file` with
 `!include` of yours when you gave one), never on a child's argv or in its
-environment. Three sources:
+environment. There is no prompt. Two sources: an option file (preferred), or
+`MYSQL_PWD`.
+
+Write the option file with an editor, not with `echo` or `printf` (the
+password would stay in the shell history), make it readable by you only, and
+pass it:
+
+```ini
+[client]
+user=whatap
+password="SECRET"
+```
 
 ```sh
-./collect-collmysql.sh --file --defaults-file ~/.my.cnf          # or --defaults-extra-file
-./collect-collmysql.sh --file --mysql-args "-h 10.0.0.5 -u whatap -p"    # asked once, on the terminal
+chmod 600 ~/ggt-mysql.cnf
+./collect-collmysql.sh --file --defaults-extra-file ~/ggt-mysql.cnf --mysql-args "-h 10.0.0.5"
+./collect-collmysql.sh --file --defaults-file ~/.my.cnf                   # instead of the client's own files
 MYSQL_PWD='...' ./collect-collmysql.sh --file --mysql-args "-u whatap"   # read, then unset
 ```
+
+`--defaults-extra-file` is read after the client's own option files
+(`/etc/my.cnf`, `~/.my.cnf`); `--defaults-file` replaces them.
 
 `MYSQL_PWD` is unset before any child starts, but it stays in the collector's
 own `/proc/<pid>/environ` for the run, readable by the same uid and by root,
@@ -971,18 +991,12 @@ the real clients, measured against the 5.6, 5.7.32, 8.0.46 and 8.4.10 clients
 prefixes `loose-`, `maximum-`, `skip-`, `enable-`, `disable-` before them, with
 `_` and `-` interchangeable (`--loose_password=X`), and any other option name
 that spells password. A bare `-p` (or `--password`, or a cluster ending in `p`
-such as `-Bp`) asks once. `-p X` with a space is not a password: the client
-reads it as "ask", and `X` as a database name.
+such as `-Bp`, or `-p X` with a space) exits 2 too, since 0.12.0 (the prompt
+was removed; see the removed options above).
 
-**Every wait ends within `RUN_DEADLINE`.** The `-p` prompt waits at most
-`PROMPT_TIMEOUT` (60 s) or what is left of the run, whichever is less, so an
-unanswered prompt does not spend the whole deadline; it restores the terminal
-on every path, Ctrl-C included, and an unanswered one leaves the run without a
-password with that reason in `[1]`. A bare `-p` with no terminal (`ssh host
-'cmd'`, cron) is not passed to the client and the report says so. The caps
-come from the environment only (`CMD_TIMEOUT`, `RUN_DEADLINE`, `BINLOG_TIMEOUT`,
-`PROMPT_TIMEOUT`, whole numbers 1..999999); a bad value is dropped with a
-warning. The window raises the deadline by its length plus 30 s (its two
+**Every wait ends within `RUN_DEADLINE`.** The caps come from the environment
+only (`CMD_TIMEOUT`, `RUN_DEADLINE`, `BINLOG_TIMEOUT`, whole numbers
+1..999999); a bad value is dropped with a warning. The window raises the deadline by its length plus 30 s (its two
 samplers run at the same time); `[1]` prints the deadline the run used.
 
 The script needs bash and says so, exit 2, under `sh`. It runs from stdin
@@ -1196,8 +1210,7 @@ something sensitive:
 - **Section A/[1]** — the account name the connection was attempted with and the
   one the server matched, and the local `mysqld` command line from `ps`. `[1]`
   prints the whole `--mysql-args` string as the operator gave it (a password
-  in it ends the run first; a word after a bare `-p` is printed, since the
-  client takes it as a database name).
+  or a bare `-p` in it ends the run first).
 - **Section I** prints table names and event counts, not the decoded rows.
 - **Section J** prints the block device names `iostat -x` lists.
 

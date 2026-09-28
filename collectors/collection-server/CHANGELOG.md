@@ -243,6 +243,14 @@ one entry at the top of its section (docs/authoring-guide.md, step 2);
 
 ## collect-collmysql.sh
 
+- **0.12.0** — The password prompt is removed. A bare `-p` in
+  `--mysql-args` (`--password`, `-Bp`, `-p X`) exits 2 before any child
+  starts, with one line naming `--defaults-extra-file`; the password comes
+  from an option file (`--defaults-extra-file` / `--defaults-file`, the
+  client's own files) or `MYSQL_PWD`. `PROMPT_TIMEOUT` is no longer read. A
+  password written into `--mysql-args` still exits 2, and its message now
+  names `--defaults-extra-file`. `--help` and the README show the three-line
+  option file with `chmod 600`. A run without `-p` reports as before.
 - **0.11.1** — `_run_init` (skeleton) also takes the script as read from stdin when `$0` is the shell's own binary (`/bin/bash -s`, `$0 -ef /proc/$$/exe`): bash 3.2 under musl otherwise faulted in a loop at full CPU after `4<&0`.
 - **0.11.0** — F's tables whose name contains lock/meter/event/audit are
   matched on `LOWER(table_name)`: on MySQL 8.0 the match was case-sensitive,

@@ -48,7 +48,7 @@ hasnt(){ printf '%s' "$2" | grep -qF -- "$3" && bad "$1" "absent: $3" "present" 
 S="$ROOT/stub"; mkdir -p "$S"
 for c in cat ls date wc tail head sed awk grep tr id hostname find sort mktemp cp rm mkdir chmod \
          uname stat df free ps sh bash dirname basename sleep cut uniq expr touch env timeout rmdir \
-         readlink kill stty; do
+         readlink kill; do
     p="$(type -P "$c" 2>/dev/null)" && [ -n "$p" ] && ln -sf "$p" "$S/$c"
 done
 # A sudo that must never run: it logs, and the log must stay empty.
@@ -155,8 +155,6 @@ export COLLMYSQL_PROC="$FP" PIDFILE_ANS="$ROOT/run/mysqld.pid" SRV_START
 # this host's addresses: loopback and 10.9.9.9
 mkdir -p "$FP/net"; printf 'Local:\n  +-- 0.0.0.0/0 3 0 5\n     |-- 127.0.0.1\n        /32 host LOCAL\n     |-- 10.9.9.9\n        /32 host LOCAL\n     |-- 10.9.9.255\n        /32 link BROADCAST\n' >| "$FP/net/fib_trie"
 UID_NOW="$(id -u)"
-SETSID="$(type -P setsid 2>/dev/null)"
-PY="$(type -P python3 2>/dev/null)"
 PW="S3cr3t-$$-pw"; A="$ROOT/args.log"; : >| "$A"; printf '%s\n' "$PW" > "$ROOT/pw.pat"
 
 echo "== 1. the collector never elevates or re-runs itself =="
@@ -256,9 +254,9 @@ echo "== 7. no credential on a child's command line or in its environment =="
 for spell in "-p$PW" "-Bp$PW" "--password=$PW" "--loose_password=$PW" "--skip-loose-password=$PW" "--skip-password=$PW" "--pass=$PW"; do
     : >| "$A"
     err="$(STUBARGS="$A" PATH="$S" bash "$C" --stdout --mysql-args "-u x $spell" </dev/null 2>&1 >/dev/null)"; rc=$?
-    if [ "$rc" = 2 ] && printf '%s' "$err" | grep -qF "is refused: no credential goes on a command line" && [ ! -s "$A" ] \
+    if [ "$rc" = 2 ] && printf '%s' "$err" | grep -qF "is refused: no credential goes on a command line; put it in a mode-600 option file and pass --defaults-extra-file PATH" && [ ! -s "$A" ] \
        && ! printf '%s' "$err" | grep -qF -f "$ROOT/pw.pat"; then
-        ok "${spell%%"$PW"*}SECRET in --mysql-args: exit 2, no child ever started, the value not repeated"
+        ok "${spell%%"$PW"*}SECRET in --mysql-args: exit 2 naming --defaults-extra-file, no child ever started, the value not repeated"
     else bad "${spell%%"$PW"*}SECRET in --mysql-args: exit 2 before any child" "rc 2, no stub call" "rc $rc, $(wc -l < "$A") stub lines"; fi
 done
 : >| "$A"
@@ -276,13 +274,17 @@ MYSQL_PWD="$PW" STUBARGS="$A" STUB_PWFILE="$ROOT/pw.pat" PATH="$S" bash "$C" --s
 if grep -qx pwseen "$A" && grep -q -- '--defaults-extra-file=' "$A" && ! grep -qxF -- "--defaults-extra-file=$DX" "$A"; then
     ok "--defaults-extra-file is included from the private option file that carries the password"
 else bad "--defaults-extra-file with MYSQL_PWD" "the private file, pwseen" "$(grep -- '--defaults' "$A" | head -2 | tr '\n' ' ')"; fi
-if [ -n "$SETSID" ]; then
+# 0.12.0: no prompt. A bare -p (any spelling) is a removed way to give the
+# password: one line naming the option file, exit 2, before any child.
+for spell in "-p" "-Bp" "--password" "--loose-password" "-p $PW"; do
     : >| "$A"
-    out="$(STUBARGS="$A" PATH="$S" "$SETSID" bash "$C" --stdout --mysql-args "-u x -Bp" </dev/null 2>/dev/null)"
-    has "a bare -p with no terminal says so" "$out" "password: n/a (-p given and this run has no terminal to ask for the password on)"
-    if grep -qx -- '-B' "$A" && ! grep -qx -- '-Bp' "$A" && ! grep -qx -- '-p' "$A"; then ok "-Bp is -B plus a prompt, and the client never gets p"
-    else bad "-Bp is -B plus a prompt" "-B kept, p gone" "$(grep -x -- '-B.*\|-p' "$A" | head -2 | tr '\n' ' ')"; fi
-else skip "the no-terminal -p case (setsid absent)"; fi
+    err="$(STUBARGS="$A" PATH="$S" bash "$C" --stdout --mysql-args "-u x $spell" 2>&1 >/dev/null)"; rc=$?
+    if [ "$rc" = 2 ] && [ ! -s "$A" ] && [ "$(printf '%s\n' "$err" | wc -l | tr -d ' ')" = 1 ] \
+       && printf '%s' "$err" | grep -qF "in --mysql-args no longer asks for the password (removed in 0.12.0): put it in a mode-600 option file and pass --defaults-extra-file PATH" \
+       && ! printf '%s' "$err" | grep -qF -f "$ROOT/pw.pat"; then
+        ok "a bare '${spell%% *}' in --mysql-args: one line naming --defaults-extra-file, exit 2, no child"
+    else bad "a bare '${spell%% *}' in --mysql-args: stub exit 2" "rc 2, one line, no stub call" "rc $rc, $(wc -l < "$A") stub lines: $(printf '%s' "$err" | head -2 | tr '\n' ' ')"; fi
+done
 
 echo "== 8. read from stdin (bash -s) and under sh =="
 err="$(PATH="$S" bash -s -- --stdout --mysql-args "-u x -p$PW" < "$C" 2>&1 >/dev/null)"; rc=$?
@@ -310,60 +312,6 @@ if printf '%s' "$out" | grep -qF "binary logs: n/a (SHOW BINARY LOGS: access den
    && printf '%s' "$out" | grep -qF "binary log content attribution — SHOW BINARY LOGS: access denied"; then
     ok "ERROR 1227 on SHOW BINARY LOGS is n/a with the error, and blocks the binlog goal"
 else bad "ERROR 1227 on SHOW BINARY LOGS is n/a and blocks the goal" "n/a + blocked" "$(printf '%s' "$out" | grep -m2 'binary logs\|binary log content')"; fi
-if [ -n "$SETSID" ] && [ -n "$PY" ]; then
-    cat > "$ROOT/ptydrive.py" <<'EOF'
-import os, sys, subprocess, termios, time, fcntl, select
-# ptydrive LIMIT KEY CMD... : run CMD on a new pty with nobody typing; with
-# KEY=ctrlc, send ^C once the prompt is up. Prints elapsed, whether it ended,
-# whether the footer came, and whether the terminal still echoes.
-m, s = os.openpty()
-def ctty():
-    os.setsid(); fcntl.ioctl(0, termios.TIOCSCTTY, 0)
-t0 = time.time()
-p = subprocess.Popen(sys.argv[3:], stdin=s, stdout=s, stderr=s, preexec_fn=ctty)
-limit = float(sys.argv[1]); key = sys.argv[2]; buf = b""; sent = False
-while time.time() - t0 < limit:
-    r, _, _ = select.select([m], [], [], 0.3)
-    if r:
-        try: buf += os.read(m, 65536)
-        except OSError: break
-    if key in ("ctrlc", "enter", "eof") and not sent and b"MySQL password" in buf:
-        time.sleep(0.5); os.write(m, {"ctrlc": b"\x03", "enter": b"\n", "eof": b"\x04"}[key]); sent = True
-    if p.poll() is not None:
-        time.sleep(0.3)
-        try:
-            while select.select([m], [], [], 0.2)[0]: buf += os.read(m, 65536)
-        except OSError: pass
-        break
-done = p.poll() is not None
-if not done: p.kill(); p.wait()
-echo = bool(termios.tcgetattr(s)[3] & termios.ECHO)
-print("elapsed=%d done=%s footer=%s echo=%s" % (time.time() - t0, done, b"END OF COLLECTION" in buf, echo))
-sys.stdout.write(buf.decode("utf-8", "replace"))
-EOF
-    T11="$ROOT/tmp11"; mkdir -p "$T11"
-    res="$(TMPDIR="$T11" PROMPT_TIMEOUT=3 RUN_DEADLINE=40 PATH="$S" "$PY" "$ROOT/ptydrive.py" 30 none bash "$C" --stdout --mysql-args "-u x -p" 2>&1)"
-    e="$(printf '%s' "$res" | head -1 | sed 's/elapsed=\([0-9]*\).*/\1/')"
-    if [ "${e:-99}" -le 15 ] && printf '%s' "$res" | head -1 | grep -q 'footer=True echo=True' \
-       && printf '%s' "$res" | grep -qF "password: n/a (password prompt not answered within 3s)" && ! printf '%s' "$res" | grep -qF "run deadline reached"; then
-        ok "an unanswered -p prompt waits PROMPT_TIMEOUT, echo is back, the rest is collected (${e}s)"
-    else bad "an unanswered -p prompt waits PROMPT_TIMEOUT only" "<= 15s, footer, echo, no deadline" "$(printf '%s' "$res" | head -1)"; fi
-    res="$(TMPDIR="$T11" RUN_DEADLINE=6 PATH="$S" "$PY" "$ROOT/ptydrive.py" 30 none bash "$C" --stdout --mysql-args "-u x -p" 2>&1)"
-    e="$(printf '%s' "$res" | head -1 | sed 's/elapsed=\([0-9]*\).*/\1/')"
-    [ "${e:-99}" -le 12 ] && printf '%s' "$res" | head -1 | grep -q 'done=True footer=True' \
-        && ok "and within RUN_DEADLINE=6 when that is less (${e}s)" || bad "the prompt ends within RUN_DEADLINE" "<= 12s, footer" "$(printf '%s' "$res" | head -1)"
-    res="$(TMPDIR="$T11" PATH="$S" "$PY" "$ROOT/ptydrive.py" 30 ctrlc bash "$C" --stdout --mysql-args "-u x -p" 2>&1)"
-    if printf '%s' "$res" | grep -q 'MySQL password'; then
-        chk "Ctrl-C at the password prompt leaves the terminal echoing" "echo=True" "$(printf '%s' "$res" | head -1 | grep -o 'echo=[A-Za-z]*')"
-    else skip "the Ctrl-C-at-the-prompt case (no prompt appeared on the pty)"; fi
-    res="$(TMPDIR="$T11" PATH="$S" "$PY" "$ROOT/ptydrive.py" 30 enter bash "$C" --stdout --mysql-args "-u x -p" 2>&1)"
-    has "an empty line at the prompt is said as such" "$res" "password: n/a (prompt answered with an empty line)"
-    res="$(MYSQL_FAIL=1 MYSQL_ERRMSG="ERROR 1698 (28000): Access denied for user 'root'@'localhost'" TMPDIR="$T11" PATH="$S" "$PY" "$ROOT/ptydrive.py" 30 enter bash "$C" --stdout --mysql-args "-u x -p" 2>&1)"
-    has "a socket login after an empty answer: the reason carries both" "$res" "mysql login — access denied; prompt answered with an empty line (not elevated: run again with sudo)"
-    res="$(TMPDIR="$T11" PATH="$S" "$PY" "$ROOT/ptydrive.py" 30 eof bash "$C" --stdout --mysql-args "-u x -p" 2>&1)"
-    has "Ctrl-D at the prompt is said as such" "$res" "password: n/a (prompt answered with end of input)"
-    chk "the prompt runs leave no ggt.* directory" "" "$(ls -A "$T11")"
-else skip "the prompt cases (setsid or python3 absent)"; fi
 chk "and no sudo was run by any case above" "" "$(cat "$STUBLOG")"
 
 echo "== 10. client arguments are words, not a string to re-split =="
@@ -382,7 +330,7 @@ if ! ps -eo args 2>/dev/null | grep -qE '[m]ysqld|[m]ariadbd'; then
 else skip "the no-local-mysqld case (a mysqld runs on this machine)"; fi
 chk "a bad --binlog count exits 2" "2" "$(PATH="$S" bash "$C" --stdout --binlog=two </dev/null >/dev/null 2>&1; echo $?)"
 
-echo "== 12. round 7: a no-value flag, TCP logins, a word after -p =="
+echo "== 12. round 7: a no-value flag, TCP logins =="
 : >| "$A"
 STUBARGS="$A" PATH="$S" bash "$C" --stdout --mysql-args "-u x --connect-expired-password" </dev/null >/dev/null 2>&1
 grep -qx -- "--connect-expired-password" "$A" && ok "--connect-expired-password reaches the client unchanged" || bad "--connect-expired-password passes through" "in the client argv" "absent"
@@ -392,11 +340,6 @@ STUBARGS="$A" PATH="$S" bash "$C" --stdout --mysql-args "-u x --connect-expired-
 err="$(MYSQL_FAIL=1 PATH="$S" bash "$C" --stdout --mysql-args "-h 10.0.0.5 -u x" </dev/null 2>&1 >/dev/null)"
 has "a TCP login refused: blocked with the server's words" "$err" "mysql login — access denied"
 has "and the shared hint that the run was not elevated" "$err" "mysql login — access denied (not elevated: run again with sudo)"
-if [ -n "$SETSID" ]; then
-    err="$(PATH="$S" "$SETSID" bash "$C" --stdout --mysql-args "-u x -p $PW" </dev/null 2>&1 >/dev/null)"
-    has "a word after a bare -p is warned about as a database name" "$err" "is taken as a database name by the client; if it is a password, use the prompt"
-    hasnt "and the warning does not repeat it" "$(printf '%s' "$err" | grep 'database name')" "$PW"
-else skip "the word-after--p case (setsid absent)"; fi
 
 echo "== 13. round 10: the shared privilege hint, whatever the error =="
 for e in "ERROR 1045 (28000): Access denied for user 'op'@'localhost' (using password: NO)" \
