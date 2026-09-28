@@ -36,7 +36,7 @@ export LC_ALL=C
 # ---- collector metadata -----------------------------------------------------
 # History: CHANGELOG.md, section collect-collzfs.sh (next to this file).
 COLLECTOR_NAME="whatap-collzfs"
-VERSION="0.10.1"
+VERSION="0.11.0"
 DOMAIN="collection-server"
 TARGET="collection-server-zfs/$(hostname 2>/dev/null || echo unknown)"   # refined after pool discovery
 
@@ -122,7 +122,8 @@ OPT_HOURS="${JOURNAL_HOURS:-24}"
 OPT_ZDB=0            # Tier 2: zdb -C / -Lbbbs / -mm
 # File-size histogram: Tier 2. A metadata walk of a yard with ~10^8 files loads
 # the special vdev and the ARC and does not finish in the bound; df -i gives the
-# file count and --zdb the block sizes. --filesizes=PATH walks a narrow sample.
+# file count and --zdb the block sizes. --filesizes=PATH walks a narrow sample;
+# there is no whole-yardbase walk.
 OPT_FILESIZES=0
 FILESIZES_PATH=""
 # bound on the tree walk, from the environment like RUN_DEADLINE and
@@ -135,10 +136,9 @@ FILESIZES_SECS="${FILESIZES_SECS:-300}"
 OPT_EVENT_DAYS="${EVENT_DAYS:-30}"
 # The time window (section O) runs in every run: kstat file reads and interval
 # samples, no pool load, only wall-clock. WIN_DEFAULT seconds unless
-# --window=DUR[@START] sets it. WIN_SPEC is DUR, WIN_START_SPEC is START.
+# --window=DUR sets it. WIN_SPEC is DUR.
 WIN_DEFAULT=15
 WIN_SPEC=""
-WIN_START_SPEC=""
 WIN_GIVEN=0          # 1 when --window was on the command line, even empty
 WIN_SECS=0
 # RUN_DEADLINE as the caller gave it (empty when not given), read before the run
@@ -175,8 +175,8 @@ explicit action flag (--file / --stdout / --bundle) so nothing starts by acciden
   holds the metadata (a special vdev) and on the ARC, and does not finish in the
   bound. The file count comes from df -i in every run; the block-size
   distribution from --zdb. A walk that hits its bound is labelled PARTIAL.
-  collect-collzfs.sh --filesizes            walk yardbase
-  collect-collzfs.sh --filesizes=PATH       walk PATH instead (a narrow sample)
+  collect-collzfs.sh --filesizes=PATH       walk PATH (a narrow sample, such as
+                                            one day's directory); a PATH is required
                                             bound: FILESIZES_SECS in the
                                             environment (default 300 seconds)
 
@@ -195,13 +195,9 @@ explicit action flag (--file / --stdout / --bundle) so nothing starts by acciden
   collected after it. Ctrl-C ends the window early; the report keeps what
   was collected.
   collect-collzfs.sh --file --window=DUR    a window of DUR instead of 15s:
-                                            N (seconds), Ns, Nm or Nh, 10s .. 24h
-  collect-collzfs.sh --file --window=DUR@START
-                                            wait until START, then collect for DUR.
-                                            START is local time on this host:
-                                            HH:MM[:SS] (the next one) or
-                                            YYYY-MM-DDTHH:MM[:SS] (within 24h).
-                                            Keep the session open (nohup, tmux).
+                                            N (seconds), Ns, Nm or Nh, 10s .. 24h.
+                                            To cover a later time, start the run
+                                            then (at, cron); keep the session open.
 
   Tier 2 (opt-in, adds pool or disk load — announced on stderr before running):
   collect-collzfs.sh --file --zdb           zdb -C, -Lbbbs, -mm per pool: block/psize
@@ -241,7 +237,8 @@ while [ $# -gt 0 ]; do
         --sample|--sample=*)
             _removed "--sample was merged into --window: use --window=30s (or --window=DUR for a longer span)" ;;
         --zdb) OPT_ZDB=1 ;;
-        --filesizes) OPT_FILESIZES=1 ;;
+        --filesizes)
+            _removed "--filesizes needs a path since 0.11.0: use --filesizes=PATH (a narrow sample such as one day's directory); the whole yardbase is not walked" ;;
         --filesizes=*) _optval --filesizes= "${1#*=}"; OPT_FILESIZES=1; FILESIZES_PATH="${1#*=}" ;;
         --no-filesizes)
             _removed "--no-filesizes was removed: the file-size walk runs only when --filesizes is given" ;;
@@ -252,7 +249,7 @@ while [ $# -gt 0 ]; do
         --window) _optval --window "${2:-}"; WIN_GIVEN=1; WIN_SPEC="$2"; shift ;;
         --window=*) _optval --window "${1#*=}"; WIN_GIVEN=1; WIN_SPEC="${1#*=}" ;;
         --window-start|--window-start=*)
-            _removed "--window-start was merged into --window: use --window=DUR@HH:MM or --window=DUR@YYYY-MM-DDTHH:MM" ;;
+            _removed "--window-start was removed: start the run at that time (at, cron) with --window=DUR" ;;
         -h|--help) usage; exit 0 ;;
         *) printf 'unknown argument: %s\n' "$1" >&2; usage >&2; exit 2 ;;
     esac
@@ -1348,12 +1345,12 @@ _rep_env() {
     fact "tiers in this run: Tier0=always zdb=$( [ "$OPT_ZDB" = 1 ] && echo on || echo off ) filesizes=$( [ "$OPT_FILESIZES" = 1 ] && echo on || echo off ) window=$(_win_tier)"
 }
 
-# _win_tier -> the window's part of the tiers line: its length and start, or
+# _win_tier -> the window's part of the tiers line: its length, or
 # why it did not run (it runs only where ZFS is present, before the report)
 _win_tier() {
     if [ "$ZFS_ON_HOST" != 1 ]; then printf 'n/a (no ZFS on this host)'
     elif [ "$WIN_RAN" != 1 ] && [ -n "$WIN_SKIP" ]; then printf 'not run (see section O)'
-    else printf '%ss%s%s' "$WIN_SECS" "$( [ "$WIN_GIVEN" = 1 ] || echo ' (default)' )" "${WIN_START_SPEC:+ from $WIN_START_SPEC}"; fi
+    else printf '%ss%s' "$WIN_SECS" "$( [ "$WIN_GIVEN" = 1 ] || echo ' (default)' )"; fi
 }
 
 # -- A. ZFS software & kernel module --------------------------------------
@@ -1785,10 +1782,7 @@ _rep_n() {
     subsection "file-size histogram (--filesizes)"
     if [ "$OPT_FILESIZES" = 1 ]; then
         local fp="$FILESIZES_PATH"
-        [ -z "$fp" ] && fp="$YARDBASE"
-        if [ -z "$fp" ]; then
-            fact "n/a (no --filesizes=PATH given and yardbase not resolved)"
-        elif [ ! -d "$fp" ]; then
+        if [ ! -d "$fp" ]; then
             fact "n/a (path not found: $fp)"
         elif ! find /dev/null -maxdepth 0 -printf '' 2>/dev/null; then
             fact "n/a (find -printf not supported by this build; GNU find is needed)"
@@ -2098,10 +2092,9 @@ WIN_IV_MAX=300
 WIN_ROW_CAP=20000       # merged rows kept per pool
 WIN_RESERVE=120         # seconds of the run deadline left for the report
 WIN_IOSTAT_LINES=6000   # zpool iostat -v lines printed in the report
-WIN_START_EPOCH=""
 WIN_DIR=""
 WIN_RAN=0               # 1 once the window started
-WIN_SIG=""              # INT / TERM / HUP that ended the wait or the window
+WIN_SIG=""              # INT / TERM / HUP that ended the window
 WIN_T0="" WIN_T1=""     # epoch at start and end of the window
 WIN_CUT=""              # set when the run deadline ended the window early
 WIN_SKIP=""             # why no window ran
@@ -2271,41 +2264,6 @@ _win_hms() {
     else printf '%ds' "$s"; fi
 }
 
-# _win_start_epoch -> WIN_START_EPOCH from WIN_START_SPEC, local time: HH:MM[:SS]
-# is its next occurrence, YYYY-MM-DDTHH:MM[:SS] must lie within the next 24h.
-# 1 (with a warn) when it cannot be read or is out of range.
-_win_start_epoch() {
-    local s="$WIN_START_SPEC" now t t2
-    now="$(date +%s 2>/dev/null)"
-    case "$s" in
-        [0-2][0-9]:[0-5][0-9]|[0-2][0-9]:[0-5][0-9]:[0-5][0-9])
-            t="$(date -d "$(date +%Y-%m-%d) $s" +%s 2>/dev/null)"
-            case "$t" in
-                ''|*[!0-9]*) ;;
-                *) if [ "$t" -le "$now" ]; then
-                       # tomorrow's calendar date, so a DST change tonight is
-                       # resolved by date(1); +86400 only where date has no -d tomorrow
-                       t2="$(date -d "$(date -d tomorrow +%Y-%m-%d 2>/dev/null) $s" +%s 2>/dev/null)"
-                       case "$t2" in ''|*[!0-9]*) t=$((t + 86400)) ;; *) t="$t2" ;; esac
-                   fi ;;
-            esac ;;
-        [0-9][0-9][0-9][0-9]-[0-1][0-9]-[0-3][0-9]T[0-2][0-9]:[0-5][0-9]|[0-9][0-9][0-9][0-9]-[0-1][0-9]-[0-3][0-9]T[0-2][0-9]:[0-5][0-9]:[0-5][0-9])
-            t="$(date -d "$(printf '%s' "$s" | tr 'T' ' ')" +%s 2>/dev/null)" ;;
-        *)  warn "--window=DUR@START: START is HH:MM[:SS] or YYYY-MM-DDTHH:MM[:SS] (local time); got '$s'"
-            return 1 ;;
-    esac
-    case "$t" in
-        ''|*[!0-9]*) warn "--window=DUR@$s: date cannot convert '$s' on this host"; return 1 ;;
-    esac
-    if [ "$t" -le "$now" ]; then
-        warn "--window=DUR@$s: $s is in the past ($(_win_local "$t"))"; return 1
-    fi
-    if [ $((t - now)) -gt 86400 ]; then
-        warn "--window=DUR@$s: $s is more than 24h away ($(_win_local "$t"))"; return 1
-    fi
-    WIN_START_EPOCH="$t"
-}
-
 # _win_cat SRC DST -> one bounded read of SRC into DST; its exit status
 _win_cat() { CMD_TIMEOUT=10 _bounded cat "$1" > "$2" 2>/dev/null; }
 
@@ -2317,7 +2275,7 @@ _win_param() {
     else printf 'n/a (not readable: %s)' "$f"; fi
 }
 
-# _win_on_sig SIG -> the first INT / TERM / HUP ends the wait or the window;
+# _win_on_sig SIG -> the first INT / TERM / HUP ends the window;
 # the loop sees WIN_SIG and the report is still written
 _win_on_sig() {
     if [ -n "$WIN_SIG" ]; then
@@ -2478,11 +2436,11 @@ _win_iv() {
     printf '%s' "$iv"
 }
 
-# window_run -> the window, before the report: waits for its START, then
-# reads counters, every pool's txgs until the end, and counters again. Its
+# window_run -> the window, before the report: reads counters, every pool's
+# txgs until the end, and counters again. Its
 # files are in WIN_DIR; section O prints them and the bundle copies them.
 window_run() {
-    local e0 end left iv pn lastp=0 io_cap k n
+    local e0 end left iv pn io_cap k n
     WIN_DIR="$(_tmp win)"
     case "$WIN_DIR" in /dev/null) WIN_SKIP="no private temp directory could be made under ${TMPDIR:-/tmp}"; return ;; esac
     [ -d "$KSTAT_DIR" ] || { WIN_SKIP="path not found: $KSTAT_DIR"; return; }
@@ -2490,7 +2448,6 @@ window_run() {
     [ -n "$k" ] || { WIN_SKIP=nopool; return; }
     # a caller's RUN_DEADLINE that leaves the (default) window no time
     left=$((RUN_DEADLINE - WIN_RESERVE - $(_elapsed)))
-    [ -n "$WIN_START_EPOCH" ] && left=$((left - WIN_START_EPOCH + $(date +%s)))
     if [ "$left" -lt 1 ]; then
         WIN_SKIP="RUN_DEADLINE=$RUN_DEADLINE leaves no time for the ${WIN_SECS}s window (${WIN_RESERVE}s are kept for the report)"
         warn "window: not run: $WIN_SKIP"
@@ -2500,20 +2457,6 @@ window_run() {
     trap '_win_on_sig INT' INT
     trap '_win_on_sig TERM' TERM
     trap '_win_on_sig HUP' HUP
-    if [ -n "$WIN_START_EPOCH" ]; then
-        warn "--window: waiting until $(_win_local "$WIN_START_EPOCH"), in $(_win_hms $((WIN_START_EPOCH - $(date +%s)))), then collecting for $(_win_hms "$WIN_SECS"); keep this session open"
-        while [ -z "$WIN_SIG" ]; do
-            left=$((WIN_START_EPOCH - $(date +%s)))
-            [ "$left" -le 0 ] && break
-            if [ $(( $(_elapsed) - lastp )) -ge 600 ]; then progress "window: starts in $(_win_hms "$left")"; lastp="$(_elapsed)"; fi
-            [ "$left" -gt 60 ] && left=60
-            _win_sleep "$left"
-        done
-        if [ -n "$WIN_SIG" ]; then
-            warn "window: SIG$WIN_SIG while waiting for the start; the report is written without it"
-            _win_restore_traps; return
-        fi
-    fi
     WIN_RAN=1
     WIN_T0="$(date +%s)"
     e0="$(_elapsed)"; end=$((e0 + WIN_SECS))
@@ -2615,14 +2558,11 @@ WIN_GOAL="time window (every txg, counters, zpool iostat -vlq, -r/-w)"
 _O_WHY="" _O_NOPOOL=0
 _o_why() { _O_WHY="${_O_WHY:+$_O_WHY; }$1"; }
 _rep_o() {
-    section "O. Time window (every run; --window sets its length and start)"
+    section "O. Time window (every run; --window sets its length)"
     goal window "$WIN_GOAL"
-    fact "length: $(_win_hms "$WIN_SECS")$( [ "$WIN_GIVEN" = 1 ] && echo ' (--window)' || echo " (default; --window=DUR sets it)")${WIN_START_EPOCH:+, from $(_win_local "$WIN_START_EPOCH")}"
+    fact "length: $(_win_hms "$WIN_SECS")$( [ "$WIN_GIVEN" = 1 ] && echo ' (--window)' || echo " (default; --window=DUR sets it)")"
     if [ "$WIN_RAN" != 1 ]; then
-        if [ -n "$WIN_SIG" ]; then
-            fact "window: not started (SIG$WIN_SIG while waiting for the start)"
-            missed window "not started: SIG$WIN_SIG while waiting for $(_win_local "$WIN_START_EPOCH")"
-        elif [ ! -d "$KSTAT_DIR" ]; then
+        if [ ! -d "$KSTAT_DIR" ]; then
             fact "window: not run (path not found: $KSTAT_DIR)"
             if [ "${ZPOOL_COUNT:-0}" -gt 0 ] 2>/dev/null; then missed window "zpool list listed $ZPOOLS but $KSTAT_DIR is not there"
             else na window "no kstat tree ($KSTAT_DIR not found) and no pool listed by zpool"; fi
@@ -3029,12 +2969,10 @@ FILESIZES_SECS="$(_cap_or FILESIZES_SECS "$FILESIZES_SECS" 300)"
 OPT_HOURS="$(_cap_or JOURNAL_HOURS "$OPT_HOURS" 24)"
 [ "$OPT_EVENT_DAYS" = 0 ] || OPT_EVENT_DAYS="$(_cap_or EVENT_DAYS "$OPT_EVENT_DAYS" 30)"
 if [ "$WIN_GIVEN" = 1 ]; then
-    # DUR[@START]
-    case "$WIN_SPEC" in *@*) WIN_START_SPEC="${WIN_SPEC#*@}"; WIN_SPEC="${WIN_SPEC%%@*}"
-        [ -n "$WIN_START_SPEC" ] || { warn "--window=DUR@START: START is empty"; exit 2; } ;;
-    esac
-    WIN_SECS="$(_win_secs "$WIN_SPEC")" || { warn "--window takes DUR[@START], DUR from 10s to 24h: N (seconds), Ns, Nm or Nh; got '$WIN_SPEC'"; exit 2; }
-    [ -n "$WIN_START_SPEC" ] && { _win_start_epoch || exit 2; }
+    # the start time form is gone: collecting DUR from now would cover
+    # another span than the one asked for, so it stops
+    case "$WIN_SPEC" in *@*) _removed "--window=DUR@START was removed in 0.11.0: start the run at START (at, cron) with --window=DUR" ;; esac
+    WIN_SECS="$(_win_secs "$WIN_SPEC")" || { warn "--window takes DUR from 10s to 24h: N (seconds), Ns, Nm or Nh; got '$WIN_SPEC'"; exit 2; }
 else
     WIN_SECS="$WIN_DEFAULT"
 fi
@@ -3045,21 +2983,19 @@ fi
 if [ -z "$_RUN_DEADLINE_ENV" ]; then
     [ "$OPT_FILESIZES" = 1 ] && RUN_DEADLINE=$((RUN_DEADLINE + FILESIZES_SECS))
     [ "$OPT_BUNDLE" = 1 ] && RUN_DEADLINE=$((RUN_DEADLINE + 900))
-    # the wait for the window's START, the window, and its last reads
+    # the window and its last reads
     RUN_DEADLINE=$((RUN_DEADLINE + WIN_SECS + 60))
-    [ -n "$WIN_START_EPOCH" ] && RUN_DEADLINE=$((RUN_DEADLINE + WIN_START_EPOCH - $(date +%s)))
 fi
 
 _run_init
 _init_probe
 # A caller's RUN_DEADLINE is not raised: say at once when it cuts a requested
-# window, and refuse one that would leave it under 10s (or end it before the
-# start). The default window is cut, or not run, and says so in section O.
+# window, and refuse one that would leave it under 10s. The default window is
+# cut, or not run, and says so in section O.
 if [ "$WIN_GIVEN" = 1 ] && [ -n "$_RUN_DEADLINE_ENV" ]; then
-    _ww=0; [ -n "$WIN_START_EPOCH" ] && _ww=$((WIN_START_EPOCH - $(date +%s)))
-    _wl=$((RUN_DEADLINE - WIN_RESERVE - _ww))
+    _wl=$((RUN_DEADLINE - WIN_RESERVE))
     if [ "$_wl" -lt 10 ]; then
-        warn "RUN_DEADLINE=$RUN_DEADLINE leaves the window ${_wl}s (after ${_ww}s of waiting, and ${WIN_RESERVE}s kept for the report); a window needs at least 10s"
+        warn "RUN_DEADLINE=$RUN_DEADLINE leaves the window ${_wl}s (${WIN_RESERVE}s are kept for the report); a window needs at least 10s"
         exit 2
     elif [ "$_wl" -lt "$WIN_SECS" ]; then
         warn "RUN_DEADLINE=$RUN_DEADLINE cuts the window to about ${_wl}s of ${WIN_SECS}s"
@@ -3094,8 +3030,8 @@ _zp="$(printf '%s' "$ZPOOLS" | tr -s ' ' ',' | sed 's/^,//; s/,$//')"
 TARGET="collection-server-zfs/$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || echo unknown)${_zp:+@pools=$_zp}"
 progress "pools: ${ZPOOLS:-none}; datasets: ${DS_COUNT:-0}; snapshots: ${SNAP_COUNT:-0}; WHATAP_HOME: ${WHOME:-n/a}"
 
-# The window runs before the report, so its START is met on time and
-# the report's snapshot is taken at the window's end.
+# The window runs before the report, so the report's snapshot is taken at
+# the window's end.
 [ "$ZFS_ON_HOST" = 1 ] && window_run
 
 TS="$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null || echo unknown)"

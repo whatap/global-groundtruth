@@ -535,7 +535,7 @@ sleep 2
 t0=$(date +%s)
 out="$(COLLZFS_KSTAT_DIR="$K16" PATH="$S16" "$C" --stdout --window=12 </dev/null 2>/dev/null)"
 t1=$(date +%s)
-has "section O is there" "$out" "O. Time window (every run; --window sets its length and start)"
+has "section O is there" "$out" "O. Time window (every run; --window sets its length)"
 has "[1] names the window" "$out" "filesizes=off window=12s"
 has "a ring that outlasts the interval: no txg unseen" "$out" "txgs never seen (left the ring between two reads): 0"
 has "the reads are more than start and end" "$out" "pool tank: "
@@ -595,18 +595,8 @@ if type -P perl >/dev/null 2>&1; then
 else skip "the SIGINT case (needs perl to undo the background job's ignored SIGINT)"; fi
 kill "$g18" 2>/dev/null; wait "$g18" 2>/dev/null
 
-echo "== 19. 0.8.0: --window=DUR@START waits, and the options are checked before anything runs =="
-K19="$ROOT/k19"; txgs_gen "$K19" 2 20 30 & g19=$!
-sleep 1
-st19="$(date -d "@$(( $(date +%s) + 4 ))" +%H:%M:%S)"
-t0=$(date +%s)
-err="$(COLLZFS_KSTAT_DIR="$K19" PATH="$S16" "$C" --stdout --window="10@$st19" </dev/null 2>&1 >/dev/null)"
-t1=$(date +%s)
-kill "$g19" 2>/dev/null; wait "$g19" 2>/dev/null
-has "the wait is announced on the terminal" "$err" "--window: waiting until"
-[ $((t1 - t0)) -ge 14 ] && ok "the window starts after the wait ($((t1 - t0))s)" || bad "starts after the wait" ">= 14s" "$((t1 - t0))s"
-for a in "--window=5" "--window=25h" "--window=1x" "--window=10@25:00" "--window=10@2020-01-01T00:00" \
-         "--window" "--window=" "--window=10@" "--window=@10:00" "--window=10@10.00"; do
+echo "== 19. 0.8.0: the options are checked before anything runs =="
+for a in "--window=5" "--window=25h" "--window=1x" "--window" "--window="; do
   # shellcheck disable=SC2086
   err="$("$C" --stdout $a </dev/null 2>&1 >/dev/null)"; rc=$?
   chk "$a exits 2" "2" "$rc"
@@ -618,9 +608,6 @@ for a in "--out" "--out=" "--home=" "--filesizes=" "--home --file" "--window --f
   chk "$a exits 2" "2" "$rc"
   has "$a names the option" "$err" "missing value for ${a%%[ =]*}"
 done
-err="$("$C" --stdout "--window=10@$(date -d '+2 days' '+%Y-%m-%dT%H:%M')" </dev/null 2>&1 >/dev/null)"; rc=$?
-chk "a start more than 24h away exits 2" "2" "$rc"
-has "and says so" "$err" "is more than 24h away"
 out="$(PATH="$S" "$C" --stdout </dev/null 2>/dev/null)"
 has "without --window: the default length" "$out" "length: 15s (default; --window=DUR sets it)"
 # a zpool but no kstat tree: the window did not run, and [1] does not claim it
@@ -715,8 +702,8 @@ sleep 1
 chk "and leaves no stub job running" "" "$(pgrep -f "$S16/(zpool|iostat)" 2>/dev/null | head -1)"
 
 echo "== 23. 0.8.0: one window option; the removed ones name their replacement =="
-for pair in "--sample|use --window=30s" "--sample=10|use --window=30s" "--window-start=02:00|use --window=DUR@HH:MM" \
-            "--window-start 02:00|use --window=DUR@HH:MM" "--no-filesizes|runs only when --filesizes is given" \
+for pair in "--sample|use --window=30s" "--sample=10|use --window=30s" "--window-start=02:00|start the run at that time (at, cron) with --window=DUR" \
+            "--window-start 02:00|start the run at that time (at, cron) with --window=DUR" "--no-filesizes|runs only when --filesizes is given" \
             "--filesizes-secs 60|set FILESIZES_SECS=N in the environment" "--filesizes-secs=60|set FILESIZES_SECS=N in the environment" \
             "--event-days 90|set EVENT_DAYS=N in the environment" "--event-days=0|set EVENT_DAYS=N in the environment" \
             "--hours 48|set JOURNAL_HOURS=N in the environment" "--hours=48|set JOURNAL_HOURS=N in the environment"; do
@@ -730,20 +717,22 @@ hh="$("$C" --help)"
 for o in --sample --window-start --no-filesizes --filesizes-secs --event-days --hours; do hasnt "--help no longer lists $o" "$hh" "$o"; done
 chk "--help lists 10 options" "--bundle --file --filesizes --help --home --out --quiet --stdout --window --zdb" "$(printf '%s\n' "$hh" | grep -oE -- '--[a-z-]+' | sort -u | tr '\n' ' ' | sed 's/ $//')"
 for v in CMD_TIMEOUT RUN_DEADLINE FILESIZES_SECS EVENT_DAYS JOURNAL_HOURS; do has "--help's Environment block names $v" "$hh" "    $v=N"; done
-has "--help shows DUR@START" "$hh" "--window=DUR@START"
-# a long window with a start in the full-date form: the deadline grows by the
-# wait and the window; a TERM during the wait still writes the report
-K23="$ROOT/k23"; txgs_gen "$K23" 2 20 3 >/dev/null 2>&1
-st23="$(date -d "@$(( $(date +%s) + 3600 ))" +%Y-%m-%dT%H:%M:%S)"
-O23="$ROOT/o23"
-COLLZFS_KSTAT_DIR="$K23" PATH="$S16" "$C" --stdout --window="2h@$st23" </dev/null >| "$O23" 2>/dev/null & c23=$!
-sleep 4; kill -TERM "$c23"; wait "$c23"; rc=$?
-out="$(cat "$O23")"
-chk "TERM during the wait: exit 0" "0" "$rc"
-has "the window was not started, and says why" "$out" "window: not started (SIGTERM while waiting for the start)"
-dl23="$(printf '%s\n' "$out" | sed -n 's/.*run deadline(s): \([0-9]*\).*/\1/p')"
-[ "${dl23:-0}" -ge $((300 + 7200 + 60 + 3590)) ] && ok "the deadline covers the wait and 2h ($dl23 s)" || bad "deadline covers wait + 2h" ">= 11150" "${dl23:-none}"
-has "[1] names the window and its start" "$out" "window=7200s from $st23"
+
+echo "== 23b. 0.11.0: --window=DUR@START and a bare --filesizes stop, naming the replacement =="
+# ignoring either would collect another span, or skip the walk that was asked for
+for pair in "--window=2h@02:00|start the run at START (at, cron) with --window=DUR" \
+            "--window 10@2026-01-01T00:00|start the run at START (at, cron) with --window=DUR" \
+            "--window=10@|start the run at START (at, cron) with --window=DUR" \
+            "--filesizes|use --filesizes=PATH"; do
+  a="${pair%%|*}"; m="${pair#*|}"
+  # shellcheck disable=SC2086
+  err="$("$C" --stdout $a </dev/null 2>&1 >/dev/null)"; rc=$?
+  chk "$a exits 2" "2" "$rc"
+  has "$a names the replacement" "$err" "$m"
+  chk "$a prints one line" "1" "$(printf '%s\n' "$err" | wc -l | tr -d ' ')"
+done
+hasnt "--help no longer shows DUR@START" "$hh" "@START"
+hasnt "--help no longer shows a bare --filesizes" "$hh" "--filesizes  "
 out="$(FILESIZES_SECS=abc PATH="$S" "$C" --stdout </dev/null 2>&1)"
 has "FILESIZES_SECS that is not a number is ignored, and said" "$out" "FILESIZES_SECS=abc ignored"
 

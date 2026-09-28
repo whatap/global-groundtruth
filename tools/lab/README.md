@@ -77,6 +77,7 @@ with a clean tree) to see the noise floor, as with capture-compare.
 | `apm-php-alpine` | `jjsong-ggt-apm-php-alpine:1` | Alpine (musl), php-fpm 8.3 + nginx, WhaTap PHP 2.14.2 Alpine tarball, PID 1 `sleep` |
 | `apm-payara` | `jjsong-ggt-apm-payara:1` | `payara/server-full:6.2025.10` (GlassFish lineage), Zulu 11, Java agent 2.2.77 baked into domain1's `domain.xml` `<jvm-options>` (no asadmin restart cycle needed, see the image's Dockerfile), JVM uid 1000 `payara` |
 | `java-zoo` | `jjsong-ggt-java-zoo:1` | the apmjava edge cases below |
+| `db-agent` | `jjsong-ggt-db-agent:1` | collect-db.sh's JDK 8 JDBC runner (jrunscript/Nashorn, no jshell on JDK 8) against the real, permanent `jjsong-ggt-postgres` (TLS on) and `jjsong-ggt-mysql-primary`; mock DBX-agent host, no real agent jar needed for the runner |
 | `zfs` | `jjsong-ggt-zfs` (ssh) | collzfs against the real zpool `yard`; root over sudo -n |
 | `collsrv` | `jjsong-ggt-collsrv` (ssh) | collserver + collmysql against a real on-prem install; collmysql's `--binlog` argset runs as root (unix-socket auth, binlog files are mode 640 owner mysql) |
 | `k8sproxy` | `jjsong-ggt-k8sproxy` (local + ssh) | collect-k8s.sh against the MEA 2026-08-18 webhook-fail-open repro, once from this machine (bastion shape, `KUBECONFIG=~/.kube/config-ggt-k8sproxy`) and once from inside the VM (the serving-chain probe needs a route to the pod/service CIDR) |

@@ -257,7 +257,8 @@ and every collector must keep them.
     `--with-rotated=DAYS`) in 0.11.0; collmysql `--no-sudo` (an option that
     did nothing) and `--sample` (now the window of every run, `--window=DUR`)
     in 0.10.0; collzfs `--sample`, `--window-start`, `--no-filesizes`,
-    `--filesizes-secs`, `--event-days` and `--hours` in 0.8.0.
+    `--filesizes-secs`, `--event-days` and `--hours` in 0.8.0; collzfs
+    `--window=DUR@START` and a bare `--filesizes` in 0.11.0.
 
 - **Leave nothing behind.** Put every temporary file under the run's own
   directory (`_tmp NAME` in the shared block returns a path in it). The shared

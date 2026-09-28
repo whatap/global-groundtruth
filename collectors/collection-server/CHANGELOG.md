@@ -125,6 +125,14 @@ one entry at the top of its section (docs/authoring-guide.md, step 2);
 
 ## collect-collzfs.sh
 
+- **0.11.0** — Fewer options. `--window=DUR@START` goes: `--window=DUR` sets
+  the length only, and a window at a later time is a run started then (at,
+  cron). A bare `--filesizes` no longer walks the whole yardbase: the walk
+  needs `--filesizes=PATH`. Both exit 2 with one line naming the
+  replacement, because collecting DUR from now, or no walk, is not what was
+  asked for. `--window-start`'s message now names the same replacement.
+  The default run's report is unchanged; section O's title reads "--window
+  sets its length" (was "its length and start").
 - **0.10.1** — `_run_init` (skeleton) also takes the script as read from stdin when `$0` is the shell's own binary (`/bin/bash -s`, `$0 -ef /proc/$$/exe`): bash 3.2 under musl otherwise faulted in a loop at full CPU after `4<&0`.
 - **0.10.0** — A prints `/etc/os-release` raw, and the kernel from
   `/proc/sys/kernel/{ostype,osrelease}` (`uname -sr` only where they are

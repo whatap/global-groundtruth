@@ -421,10 +421,11 @@ One `.txt` report, MECE domains `[1]` + A..O:
   cannot finish in its bound. Every run has `df -i` for each WhaTap path (the
   file count), and `--zdb` gives the block-size histogram. When the size
   distribution itself is needed, walk a narrow sample (`--filesizes=PATH`, e.g.
-  one day's directory). A walk that hits its bound (`FILESIZES_SECS` in the
+  one day's directory; since 0.11.0 a PATH is required and the whole yardbase
+  is not walked). A walk that hits its bound (`FILESIZES_SECS` in the
   environment, default 300) is labelled `PARTIAL`.
-- **O. Time window** — in every run, 15 s by default (`--window=DUR[@START]`
-  sets the length, 10 s to 24 h, and a start time). It collects the following
+- **O. Time window** — in every run, 15 s by default (`--window=DUR` sets the
+  length, 10 s to 24 h). It collects the following
   over the same span:
   - every txg of the window from the `txgs` ring (`otime` / `qtime` / `wtime` /
     `stime`, `ndirty`, `nwritten` and `writes` per txg);
@@ -443,12 +444,12 @@ Values are **discovered, not assumed**; an absent value is reported as
 
 The question it serves: after a tunable changes (for example `zfs_txg_timeout`
 5 -> 10), how long each txg stayed open, how much each one carried, and what the
-write counters did, over a chosen span of wall-clock time (for example 02:00-04:00
-local time). **Every run** includes a window: 15 s by default, because it
+write counters did, over a span of wall-clock time (for example a two-hour run
+started at 02:00 local time). **Every run** includes a window: 15 s by default, because it
 reads kstat files and takes interval samples, which costs wall-clock and puts no
 load on the pool. It answers "is the device busy now"; every other interval
 number in the report is an average since boot or import. `--window` only
-changes its length and start. Section O of the report holds:
+changes its length; for a later span, start the run then (`at`, `cron`). Section O of the report holds:
 
 - **Every txg of the window** from `/proc/spl/kstat/zfs/<pool>/txgs`, one row per
   txg (`txg birth state ndirty nread nwritten reads writes otime qtime wtime stime`,
@@ -565,7 +566,7 @@ hand over one file (CONTRACT rule 3):
 ```sh
 ./collect-collzfs.sh --file                 # -> whatap-collzfs-<host>-<UTC>.txt   (attach this; includes a 15 s window)
 ./collect-collzfs.sh --bundle               # -> whatap-collzfs-<host>-<UTC>.tar.gz (report + raw artifacts)
-./collect-collzfs.sh --file --window=2h@02:00   # wait until 02:00 local, then a 2 h window
+./collect-collzfs.sh --file --window=2h     # a 2 h window from now
 ./collect-collzfs.sh --file --home /whatap  # force WHATAP_HOME if auto-resolution is n/a
 ./collect-collzfs.sh --file --quiet         # no progress narration (for automation)
 ./collect-collzfs.sh                        # no arguments -> prints help (does not collect)
@@ -573,7 +574,7 @@ hand over one file (CONTRACT rule 3):
 ```
 
 **Options** (10): `--file`, `--stdout`, `--bundle`, `--quiet`, `--home DIR`,
-`--out DIR`, `--window=DUR[@START]`, `--filesizes[=PATH]`, `--zdb`, `--help`.
+`--out DIR`, `--window=DUR`, `--filesizes=PATH`, `--zdb`, `--help`.
 Since 0.8.1 `--out`, `--home`, `--window` and `--filesizes=` with no value, or
 with the next option taken for it (`--out --file`), exit 2 naming the option.
 
@@ -590,20 +591,14 @@ default is used):
 
 **The window, run by run.**
 
-- `--window=DUR[@START]` sets the window's length and start. `DUR` is `N`
-  (seconds), `Ns`, `Nm` or `Nh`, from 10 s to 24 h.
-- `START` is the host's local time (its `TZ`, printed with the zone), written
-  without spaces. `HH:MM[:SS]` means the next occurrence of that time; the next
-  day's time is resolved by `date` on tomorrow's calendar date, so a DST change in
-  between is accounted for. `YYYY-MM-DDTHH:MM[:SS]` must fall within the next 24 h.
-- The run exits 2 before anything runs when:
-  - `START` is in the past or more than 24 h away;
-  - `--window` or `@` has no value;
-  - `DUR` is out of range.
-- The wait is announced on the terminal (`!! --window: waiting until ...`). One
-  window per run: for two windows, start two runs.
-- The run deadline grows by the window's length and 60 s, plus the wait for
-  `START`, unless the caller set `RUN_DEADLINE`. A caller's `RUN_DEADLINE` is not raised:
+- `--window=DUR` sets the window's length. `DUR` is `N` (seconds), `Ns`, `Nm`
+  or `Nh`, from 10 s to 24 h. The window starts when the run does: for a window
+  at a later time, start the run then (`at`, `cron`). One window per run: for
+  two windows, start two runs.
+- The run exits 2 before anything runs when `--window` has no value or `DUR`
+  is out of range.
+- The run deadline grows by the window's length and 60 s, unless the caller
+  set `RUN_DEADLINE`. A caller's `RUN_DEADLINE` is not raised:
   - with `--window`, one that leaves the window under 10 s exits 2, and one that
     cuts it says so at the start;
   - for the default window, one that leaves it no time means the window is not
@@ -614,11 +609,10 @@ default is used):
 - Measured on the VM (idle, `--file`, two runs each): 0.7.0 took 15.7-15.8 s and
   0.8.0 takes 33.2-34.9 s. The difference is the 15 s window plus about 2.5 s for
   the interval jobs' last block.
-- The window runs **before** the rest of the report. That way the start time is met
-  on time, and the Tier 0 sections record the state at the window's end. Keep the
-  session open for the whole wait and window (`nohup`, `tmux`, `screen`).
-- **Ending early.** A first `INT`, `TERM` or `HUP` during the wait or the window
-  ends it. The report is still written: section O says `ended early: SIG... after
+- The window runs **before** the rest of the report, so the Tier 0 sections
+  record the state at the window's end. Keep the session open for the whole
+  window (`nohup`, `tmux`, `screen`).
+- **Ending early.** A first `INT`, `TERM` or `HUP` during the window ends it. The report is still written: section O says `ended early: SIG... after
   X of Y` and gives what was collected, and the goal is blocked with the same
   words. A second signal, also during the last reads, aborts the run as in any
   other run and stops both iostat jobs.
@@ -646,7 +640,7 @@ default is used):
 | removed | use instead |
 |---|---|
 | `--sample[=SEC]` | nothing for 15 s (every run has a window); `--window=30s` or any `--window=DUR` for longer |
-| `--window-start=TIME` | `--window=DUR@HH:MM` or `--window=DUR@YYYY-MM-DDTHH:MM` |
+| `--window-start=TIME` | start the run at that time (`at`, `cron`) with `--window=DUR` (until 0.11.0 the message named `--window=DUR@START`) |
 | `--no-filesizes` | nothing: the walk runs only when `--filesizes` is given |
 | `--filesizes-secs N` | `FILESIZES_SECS=N` in the environment (default 300). The walk also stays under `RUN_DEADLINE`, which grows by `FILESIZES_SECS` unless the caller set it. |
 | `--event-days N` | `EVENT_DAYS=N` in the environment (default 30; 0 keeps the detail of every event) |
@@ -656,6 +650,14 @@ The environment values are checked like `CMD_TIMEOUT` and `RUN_DEADLINE`: a
 value that is not a whole number is ignored with a warning, and the default is
 used. `--help` lists the five in an Environment block. That leaves 10 options:
 `--file --stdout --bundle --quiet --home --out --window --filesizes --zdb --help`.
+
+**Removed in 0.11.0.** Each exits 2 with one line naming its replacement:
+collecting from now, or skipping the walk, is not what the runbook asked for.
+
+| removed | use instead |
+|---|---|
+| `--window=DUR@START` | start the run at `START` (`at`, `cron`) with `--window=DUR` |
+| `--filesizes` with no PATH (walked the whole yardbase) | `--filesizes=PATH`, a narrow sample such as one day's directory |
 
 The report changed where `--sample` was: section J has no "interval sample
 (--sample)" subsection, and `[1]`'s tiers line is
@@ -702,15 +704,15 @@ or the snapshot list failed, was refused or hung, or when `zfs` is absent.
   Safe to run any time.
 - **Tier 1** — `--bundle` adds the raw artifacts (full property dumps, the whole
   kstat tree except `dbufs`, all module parameters, block-device settings, journal).
-  Measured at **~34 s / 89 KB** on the same host. `--window=DUR[@START]`
-  (10 s to 24 h, default 15 s) sets the length and start of the time window:
+  Measured at **~34 s / 89 KB** on the same host. `--window=DUR`
+  (10 s to 24 h, default 15 s) sets the length of the time window:
   read-only, it costs the window's wall-clock, not disk load.
 - **Tier 2** (opt-in, announced on stderr before running):
   - `--zdb` — `zdb -C`, `zdb -Lbbbs` (block/psize/lsize histograms and **measured**
     compression), `zdb -mm` (metaslab free-space histograms). Traverses pool
     metadata: **minutes on a large pool, and it reads the data disks.**
-  - `--filesizes[=PATH]` — power-of-two file-size histogram under `yardbase` (or
-    `PATH`), by walking the tree. Metadata-only, `-xdev`, bounded to
+  - `--filesizes=PATH` — power-of-two file-size histogram under `PATH`, by
+    walking the tree. Metadata-only, `-xdev`, bounded to
     `FILESIZES_SECS` (environment, default 300 s). A walk that hits the bound, or that
     could not read part of the tree (`find` exits 1 on a denied directory), is
     labelled `PARTIAL` with the reason.
@@ -718,7 +720,7 @@ or the snapshot list failed, was refused or hung, or when `zfs` is absent.
 **Bounds.** Every `zpool` / `zfs` / `zdb` / `journalctl` / `find` call runs
 under the shared `_bounded` cap. Unless `RUN_DEADLINE` is set, the run deadline
 (300 s) is raised to fit:
-- the time window: its length plus 60 s, plus the wait for its `START`. The
+- the time window: its length plus 60 s. The
   120 s the window leaves for the rest of the report come out of the base 300 s;
 - the file-size walk;
 - `--zdb`: 280 s plus, per pool, 3,720 s in a report run or 7,500 s in a bundle
@@ -776,7 +778,7 @@ but not which section has it:
   - a forced ring wrap: `zfs_txg_history` was set to 10 on the VM and put back,
     with a `zpool sync` burst, so the gaps were counted and the read interval
     went from 23 s down to 2 s;
-  - `@START` waits;
+  - `@START` waits (the form was removed in 0.11.0);
   - INT and TERM;
   - `--bundle`.
 

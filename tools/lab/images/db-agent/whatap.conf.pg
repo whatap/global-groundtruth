@@ -1,0 +1,7 @@
+# mock DBX instance conf — jjsong-ggt-postgres (see collect-db.sh sections D/G/K/L)
+dbms=postgres
+db_ip=jjsong-ggt-postgres
+db_port=5432
+db=postgres
+connect_option=sslmode=require
+whatap.server.port=6600

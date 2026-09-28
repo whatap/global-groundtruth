@@ -1,0 +1,7 @@
+# mock DBX instance conf — jjsong-ggt-mysql-primary (see collect-db.sh sections D/G/K/L)
+dbms=mysql
+db_ip=jjsong-ggt-mysql-primary
+db_port=3306
+db=ggt_lab
+connect_option=allowPublicKeyRetrieval=true&useSSL=false
+whatap.server.port=6600
