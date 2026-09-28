@@ -291,7 +291,7 @@ and re-validate after edits:
   | 0.4.0 `--with-rotated` | 19,871,166 | 104,846,391 | 70 | 57 |
   | 0.4.0 `--with-rotated --max-total-mb 50` | 8,274,635 | 52,434,658 | 58 | 69 |
 
-  (0.4.0 took the caps as options; since 0.11.0 `--max-total-mb 5` is
+  (0.4.0 took the caps as options; today `--max-total-mb 5` is
   `LOG_TOTAL_MB=5` in the environment.)
 
   Defaults cut the copied logs from 412 MB to 13 MB and the archive from 63.3 MB
@@ -317,7 +317,7 @@ a judgment about ZFS behaviour — and stops there. It prints the measured value
 the tunable that governs it; the threshold, the target and the "good/bad" belong to
 the reader (CONTRACT rule 1).
 
-It reports ZFS only and does not look for WhaTap (since 0.12.0). Which
+It reports ZFS only and does not look for WhaTap. Which
 filesystem and dataset the yardbase is on is in `collect-collserver.sh`
 section C (fstype, `findmnt` SOURCE, `df`, `zfs get` of that dataset,
 `YARDB_LOCK`); runbooks run both, and this report's D, E and F have every
@@ -325,8 +325,8 @@ dataset's rows, so the two join on the dataset name.
 
 ### (a) Facts it collects — ZFS
 
-One `.txt` report, MECE domains `[1]` + A..L, N, O (M, the WhaTap paths, was
-removed in 0.12.0; the other letters are unchanged):
+One `.txt` report, MECE domains `[1]` + A..L, N, O (the WhaTap paths and
+their dataset are in collect-collserver.sh section C):
 
 - **`[1]` Collection environment** — bash, uid, privilege, boot time, tool presence, whether the
   kstat tree and the module-parameter dir exist, pool/dataset/snapshot counts,
@@ -344,16 +344,14 @@ removed in 0.12.0; the other letters are unchanged):
   and scrub/trim are rows of it; a tunable this build lacks is absent from it),
   then the **persisted** values in `/etc/modprobe.d/*zfs*` and the kernel
   cmdline. Runtime and persisted values are reported separately because they
-  can differ. Before 0.9.0 a list of about 70 named tunables was printed ahead
-  of the full dump.
+  can differ.
 - **C. Pool topology & allocation classes** — raw `zpool list -v` (asked once:
   the same output is the bundle's `zpool-list-v.txt`). Its lines carry each
   top-level vdev's SIZE/ALLOC/FREE/FRAG/CAP/HEALTH, the allocation class it sits
   under (a `special` / `logs` / `cache` / `dedup` line; none means data) and its
   shape in its name (`mirror-N`, `raidzP-N`, `draid*`, `indirect-N`; a bare
   device is a single-device vdev). `zpool status -vt`, `-x`, leaf device paths,
-  and the `metaslab_stats` kstat. Before 0.9.0 C also printed a per-class
-  view and a shape count derived from these lines, and H a SLOG line.
+  and the `metaslab_stats` kstat.
 - **D. Pool properties, features & capacity** — `zpool list`, `zpool get all` per
   pool (ashift, fragmentation, capacity, every `feature@*`), `zfs list -o space`,
   and `df -i -t zfs`, the file count of every mounted dataset. Reading `df -i`
@@ -371,8 +369,7 @@ removed in 0.12.0; the other letters are unchanged):
   values, each with its **property source** (`local`, `default`, `inherited
   from X`) — a deliberately set value and an inherited one are different facts.
   Then the volume list (`volblocksize` is fixed at creation), every locally-set
-  property, and the `zstd` runtime kstat. Before 0.9.0 the same properties were
-  a one-line-per-dataset matrix of human-readable values.
+  property, and the `zstd` runtime kstat.
 - **F. Snapshots, clones & space accounting** — where used space sits: `used`,
   `avail` and `usedby*` are D's `zfs list -o space`, and F adds the `zfs get`
   rows of `referenced`, `logicalused`, `logicalreferenced`, `written`, `quota`
@@ -392,8 +389,7 @@ removed in 0.12.0; the other letters are unchanged):
   (`dataset_name`, cumulative writes / bytes written / reads / bytes read /
   unlinks, the `zil_*` counters) **per dataset**, which is the only per-dataset
   byte counter available without instrumenting the application. Plus an
-  inventory of every kstat entry not inlined. Before 0.9.0 I printed a
-  one-line view of five of those counters instead.
+  inventory of every kstat entry not inlined.
 - **J. I/O request size & latency distribution** — `zpool iostat -v`, `-lv`,
   `-qv`, and the **`-r` request-size** and **`-w` latency histograms**,
   cumulative since boot (instant kstat reads). The same views over a span of
@@ -422,13 +418,13 @@ removed in 0.12.0; the other letters are unchanged):
   zdb call runs once: in a report run N prints its first 400-500 lines; in a
   bundle run its whole output goes to `zdb/zdb-<C|Lbbbs|mm>-<pool>.txt` and N
   names each file with its size and exit status. The
-  **file-size histogram is opt-in (`--filesizes`, Tier 2)** since 0.6.2. It walks
+  **file-size histogram is opt-in (`--filesizes`, Tier 2)**. It walks
   the whole tree reading metadata (`find -printf '%s'`); on a yard of ~10^8 files
   that loads the device holding the metadata (a special vdev) and the ARC, and it
   cannot finish in its bound. Every run has `df -i` of every mounted dataset
   in D (the file count), and `--zdb` gives the block-size histogram. When the size
   distribution itself is needed, walk a narrow sample (`--filesizes=PATH`, e.g.
-  one day's directory; since 0.11.0 a PATH is required and the whole yardbase
+  one day's directory; a PATH is required and the whole yardbase
   is not walked). A walk that hits its bound (`FILESIZES_SECS` in the
   environment, default 300) is labelled `PARTIAL`.
 - **O. Time window** — in every run, 15 s by default (`--window=DUR` sets the
@@ -462,9 +458,8 @@ changes its length; for a later span, start the run then (`at`, `cron`). Section
   txg (`txg birth state ndirty nread nwritten reads writes otime qtime wtime stime`,
   the kernel's own columns, unchanged), from the txg open when the window starts
   to the txg open when it ends.
-- How many rows were seen completed (state `C`). Before 0.9.0 a per-pool
-  count/min/p50/p90/p99/max table of those rows' columns followed; the rows
-  themselves are printed in full below it.
+- How many rows were seen completed (state `C`). The rows themselves are
+  printed in full below it.
 - **Counters at start and end, and the delta**: the global `dmu_tx` kstat
   (`dmu_tx_assigned`, `dmu_tx_delay`, `dmu_tx_dirty_delay`, `dmu_tx_dirty_over_max`,
   `dmu_tx_dirty_frees_delay`, ...) and every dataset's `objset-*` kstat (`writes`,
@@ -581,7 +576,7 @@ hand over one file (CONTRACT rule 3):
 
 **Options** (9): `--file`, `--stdout`, `--bundle`, `--quiet`,
 `--out DIR`, `--window=DUR`, `--filesizes=PATH`, `--zdb`, `--help`.
-Since 0.8.1 `--out`, `--window` and `--filesizes=` with no value, or
+`--out`, `--window` and `--filesizes=` with no value, or
 with the next option taken for it (`--out --file`), exit 2 naming the option.
 
 **Environment** (whole numbers; another value is ignored with a warning, and the
@@ -636,7 +631,7 @@ default is used):
   once.
 - The window goal's inputs are the txgs, the kstat deltas and `zpool iostat`;
   a missing `zpool` blocks it. `iostat -x` only adds the block-device view:
-  since 0.8.1 an absent (no sysstat), failed or stopped `iostat` is a fact line
+  an absent (no sysstat), failed or stopped `iostat` is a fact line
   in section O (`not delivered: iostat -x: command not found (sysstat)`) and
   does not block the goal (docs/output-format.md, "A tool that only adds
   detail").
@@ -648,11 +643,11 @@ CHANGELOG.md.
 The environment values (`FILESIZES_SECS`, `EVENT_DAYS`, `JOURNAL_HOURS`,
 `CMD_TIMEOUT`, `RUN_DEADLINE`) are checked the same way: a value that is not a
 whole number is ignored with a warning, and the default is used. `--help`
-lists the five in an Environment block. That leaves 9 options (since 0.12.0,
-without `--home`):
+lists the five in an Environment block. That leaves 9 options (`--home` is
+named and ignored):
 `--file --stdout --bundle --quiet --out --window --filesizes --zdb --help`.
 
-Since 0.12.0 `--home` is ignored: collzfs reports ZFS only, and the WhaTap
+collzfs reports ZFS only, and the WhaTap
 paths and their dataset are in collect-collserver.sh section C instead. The
 file count is D's `df -i -t zfs`.
 
@@ -676,7 +671,7 @@ that hangs during discovery is not asked again: every later call says
 snapshots, is declared wherever ZFS is found: it is blocked when `zfs get all`
 or the snapshot list failed, was refused or hung, or when `zfs` is absent.
 
-**Reading the report** (explanations that used to be `note:` lines in it):
+**Reading the report** (explanations that are not printed in it):
 
 - A tunable printed as `not present in this zfs build` is a version fact, not a
   collection failure.
@@ -914,11 +909,11 @@ warning, and the default is used):
 **Options removed in 0.10.0.** A removed option exits 2 with its replacement
 named; the list is in CHANGELOG.md.
 
-**Removed in 0.12.0: the password prompt.** A bare `-p` in `--mysql-args`
-(or `--password`, or a cluster ending in `p` such as `-Bp`) no longer asks for
+**There is no password prompt.** A bare `-p` in `--mysql-args`
+(or `--password`, or a cluster ending in `p` such as `-Bp`) does not ask for
 the password on the terminal. It exits 2 before any child starts, with one line
 naming `--defaults-extra-file`: a run that went on would log in without the
-password the operator meant to give. `PROMPT_TIMEOUT` is no longer read.
+password the operator meant to give.
 
 A 0.6/0.7 runbook line `./collect-collmysql.sh --file --no-sudo --sample` is
 now `./collect-collmysql.sh --file` (or `--file --window=60s`).
@@ -941,8 +936,8 @@ uid (not elevated: run again with sudo)`); that hint appears only in the status
 section and on the terminal, never in a fact line. On a failed login the hint only states that the
 run was not elevated, as in every collector; it does not claim that sudo would
 fix the login (a TCP login, or a password account, is decided by the server). Under sudo the `--file`
-report is handed back to the invoking user. `--no-sudo`, which 0.6/0.7 needed,
-exits 2 since 0.10.0 (see the removed options above).
+report is handed back to the invoking user. `--no-sudo`
+exits 2 (see the removed options above).
 
 **Passwords never go on a command line.** A command line is readable by every
 account in `ps` and `/proc/<pid>/cmdline`. So the collector hands the password
@@ -986,8 +981,8 @@ the real clients, measured against the 5.6, 5.7.32, 8.0.46 and 8.4.10 clients
 prefixes `loose-`, `maximum-`, `skip-`, `enable-`, `disable-` before them, with
 `_` and `-` interchangeable (`--loose_password=X`), and any other option name
 that spells password. A bare `-p` (or `--password`, or a cluster ending in `p`
-such as `-Bp`, or `-p X` with a space) exits 2 too, since 0.12.0 (the prompt
-was removed; see the removed options above).
+such as `-Bp`, or `-p X` with a space) exits 2 too (there is no prompt; see
+the removed options above).
 
 **Every wait ends within `RUN_DEADLINE`.** The caps come from the environment
 only (`CMD_TIMEOUT`, `RUN_DEADLINE`, `BINLOG_TIMEOUT`, whole numbers
@@ -1023,8 +1018,7 @@ the process table locally, and fall back to `n/a (...)` when run from elsewhere.
   `HUP` during the window stops both samplers (none is left running) and the
   report is still written: J says `ended early: SIG... after Xs of Ys` and
   keeps what the samplers had written, and the goal is blocked with the same
-  words. A second signal aborts the run. Until 0.9.0 this was `--sample`, which ran the two
-  samplers one after the other (about 50 s).
+  words. A second signal aborts the run.
 - **Tier 2** — `--binlog[=N]` decodes the N newest binary logs (default 2) with
   `mysqlbinlog --base64-output=DECODE-ROWS` and counts row events per table.
   This reads whole log files, so it costs I/O proportional to their size and is

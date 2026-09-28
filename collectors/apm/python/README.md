@@ -79,10 +79,10 @@ Every interpreter this run starts gets `PYTHONPATH` without its
 `*/whatap/bootstrap` entries. That directory holds the agent's
 `sitecustomize.py`, which calls `whatap.agent()` in any interpreter that finds
 it; the operator puts it on the container's `PYTHONPATH`, and the
-`kubectl exec` shell inherits it. Before 0.10.2 one run started the agent in
-its own interpreter: the application's `whatap_python` Go module was killed
-and replaced by orphaned copies (parent pid 1, two or three per run in the
-lab) that outlived the run. The other entries
+`kubectl exec` shell inherits it. This keeps a run from starting the agent in
+its own interpreter, which would kill the application's `whatap_python` Go
+module and replace it with orphaned copies (parent pid 1, two or three per
+run in the lab) that outlive the run. The other entries
 stay, so a package found through them (`/whatap-agent`) is still found. `[1]`
 names the entries removed.
 
@@ -115,7 +115,7 @@ are the entries `pip list` reads, so the names and versions agree; on the
 validation host (Ubuntu 24.04 `/usr/bin/python3`, 2026-09-26) both gave the
 same 66 name/version pairs, and the directory listing also showed a
 version-less duplicate `cryptography.egg-info` from the distribution package.
-What `pip list` adds (it runs in every run since 0.10.0):
+What `pip list` adds (it runs in every run):
 
 - the version of an `.egg-info` entry whose name carries none (read from its
   `PKG-INFO`), and names normalised from the metadata instead of the
@@ -158,7 +158,7 @@ absence is `missed` and names those pids or paths. A process whose environ
 the run cannot read counts as an unread input only when its command line
 names whatap or a `whatap_python` process runs on the host. So the root
 python daemons of a stock distribution (`networkd-dispatcher`,
-`unattended-upgrades`) alone no longer make a non-root run `missed` on a host
+`unattended-upgrades`) alone do not make a non-root run `missed` on a host
 without the agent; their count and pids are named in the `na` reason. An app
 whose whatap marker is only in its environ (the bootstrap on `PYTHONPATH`, a
 `WHATAP_*` variable) and whose `whatap_python` process has exited is then

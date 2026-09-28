@@ -224,15 +224,14 @@ live in four different places — the collector puts them side by side:
 | 3 | what the runtime permits | agent-host JDK + driver | `jdk.tls.disabledAlgorithms` from the runtime's `java.security` (per discovered java), JDBC driver jar name/version (defaults flip across versions) |
 | 4 | what actually gets negotiated | the live session | SQL pack `[6b]`/`[3b]`: `pg_stat_ssl` / `Ssl_version` for THIS session — and since `--sql` reuses the agent's own `connect_option`, this measures the agent's negotiation, not an approximation |
 
-Section K is part of every run (0.8.0; it was the opt-in `--tls`, which is now
-refused with that message): one handshake per instance whose section G
+Section K is part of every run: one handshake per instance whose section G
 connect succeeded, each capped at 15 s and all of them together at 30 s
 (instances left after that say `n/a (not run: TLS probes stopped after 30s)`). It sends no credentials and nothing after
-the handshake. Since 0.9.5 the TLS 1.3 post-handshake session tickets are
-also left out (and the "---" line right before the first one): they arrive
-only when a ticket lands before s_client exits, one or several, so section K
-differed run to run; "DONE" after a ticket (openssl 1.1.1) is kept, and so is
-a trailing "---". Measured 2026-09-26 against PostgreSQL 16.15 (ssl on, and
+the handshake, including the TLS 1.3 post-handshake session tickets (and the
+"---" line right before the first one): they arrive only when a ticket lands
+before s_client exits, one or several, so section K would otherwise differ
+run to run; when a "DONE" after a ticket (openssl 1.1.1) or a trailing "---"
+is printed, it is kept. Measured 2026-09-26 against PostgreSQL 16.15 (ssl on, and
 ssl off) and MySQL 8.4.10 containers, the handshake leaves the same server
 trace as the section G connect probe that every run already sent: nothing in
 the default logs; with `log_connections=on` one `connection received` line
@@ -240,7 +239,7 @@ each; at MySQL `log_error_verbosity=3` one `Got an error reading
 communication packets` note each; MySQL `Aborted_connects` +1 each, and the
 handshake also adds 1 to `Ssl_accepts` / `Ssl_finished_accepts`; nothing in
 the MySQL general log for either. A run therefore opens two connections per
-TLS-probeable instance. Since 0.9.0 nothing is parsed out of the s_client
+TLS-probeable instance. Nothing is parsed out of the s_client
 output: all of it (stdout and stderr) is printed verbatim but for the PEM
 blocks and the per-connection random values (session ticket hex dump,
 Session-ID, Session-ID-ctx, Master-Key, Resumption PSK, Start Time), openssl's own reasons included ("MySQL server does not support
@@ -321,7 +320,6 @@ Collection-server-side facts (server version, metrics categories) belong to
   path with spaces, a missing `-Home` (`missed`), an unwritable current
   directory (the `!!` line and exit 1), `RUN_DEADLINE` / `CMD_TIMEOUT` and
   invalid values of them. Every `-File` report passes `validate.sh --report`.
-  Before 0.3.0 it was not runnable (`-Home` clashed with `$HOME`).
   0.6.0 (2026-09-27, same host) was run beside 0.5.1 under both PowerShells,
   elevated, not elevated in a local logon and over OpenSSH: the only
   differences are the new section B lines, identical in every run

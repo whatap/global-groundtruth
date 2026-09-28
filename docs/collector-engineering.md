@@ -252,12 +252,10 @@ and every collector must keep them.
     environment`, so an old runbook stops instead of running with something
     silently ignored.
   - An option that broke these rules is removed, each occurrence exiting 2
-    with its replacement — for example collserver `--max-log-mb` /
-    `--max-total-mb` (caps as options, now `LOG_FILE_MB` / `LOG_TOTAL_MB`) in
-    0.11.0 — or, when ignoring it cannot change what is collected, named and
-    ignored instead (one `!!` line on stderr, the run goes on), as with
-    collzfs `--home` in 0.12.0. The full per-version list is in each
-    collector's CHANGELOG.md.
+    with its replacement, or, when ignoring it cannot change what is
+    collected, named and ignored instead (one `!!` line on stderr, the run
+    goes on). The full per-version list is in each collector's
+    CHANGELOG.md.
 
 - **Leave nothing behind.** Put every temporary file under the run's own
   directory (`_tmp NAME` in the shared block returns a path in it). The shared

@@ -151,7 +151,8 @@ pass.
 
 Add or update `collectors/<domain>/README.md`: what facts it collects, how the
 field engineer runs it, what the report can contain (see step 3), and its
-status. From here the collector belongs to your team.
+status. From here the collector belongs to your team. A README describes the
+current behaviour; what changed and when is in CHANGELOG.md.
 
 The status table's version column is headed **validated at** and holds the
 last version that was run against a real environment of that kind, with what it
