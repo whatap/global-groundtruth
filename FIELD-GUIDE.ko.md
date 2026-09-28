@@ -213,6 +213,10 @@ cd global-groundtruth\collectors\apm\dotnet
 - Kubernetes, NMS, 데이터베이스, collection server collector는 `bash`가 필요합니다.
   위에 적힌 대로(`./collect-...sh`) 실행하십시오. `sh collect-...sh`로 실행하면
   바로 멈추고 그 이유를 출력합니다.
+- Ctrl-C를 누르면 실행이 멈추고 임시 파일이 지워집니다. `bash`에서는 드물게
+  Ctrl-C가 먹지 않을 수 있습니다. 이것은 `bash`의 한계이며 실행에 문제가 있다는
+  뜻이 아닙니다. 실행이 계속되면 Ctrl-C를 한 번 더 누르거나, 다른 터미널에서
+  `kill <pid>`를 실행하고 필요하면 반복하십시오.
 
 ## 5. 회신하기
 

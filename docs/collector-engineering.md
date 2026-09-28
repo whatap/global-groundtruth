@@ -264,6 +264,20 @@ and every collector must keep them.
   temp path from `$$` under a shared directory; a root run writing to a
   predictable name follows whatever symlink is planted there.
 
+- **A signal can be lost while `bash` runs `$(...)`.** A SIGINT that reaches
+  `bash` while it waits for a command substitution's child only runs the trap
+  when that child itself died of the signal; otherwise it is dropped (bash 5.3
+  `jobs.c`, `wait_sigint_handler`: a command substitution is not a job, so the
+  saved SIGINT is never turned into a trap). bash 5.2 can also run a trap while
+  it parses `$(...)`, where the trap string fails to parse and TERM is lost as
+  well. Measured on 2026-09-28: a loop of `x=$(true)` lost 18 % of single
+  SIGINTs on bash 5.3 and no SIGTERM; collmysql on bash 5.2 lost 2 of 240
+  SIGINTs and 1 of 80 SIGTERMs. The skeleton's traps have no gap; the loss is
+  inside `bash`, and dash is not affected. The collectors do not work around
+  it: that would need the report written by a child while the main shell waits
+  in `wait`, a rewrite of the run's signal handling to save the operator a
+  second Ctrl-C. The field guide (4.6) tells the operator to send it again.
+
 ---
 
 ## Checklist

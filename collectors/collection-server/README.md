@@ -616,7 +616,8 @@ default is used):
 - **Ending early.** A first `INT`, `TERM` or `HUP` during the window ends it. The report is still written: section O says `ended early: SIG... after
   X of Y` and gives what was collected, and the goal is blocked with the same
   words. A second signal, also during the last reads, aborts the run as in any
-  other run and stops both iostat jobs.
+  other run and stops both iostat jobs. Under `bash` a signal is occasionally lost
+  ([collector-engineering.md](../../docs/collector-engineering.md)); send it again.
 - The window never runs into the last 120 s of the deadline, which are left
   for the rest of the report. They come out of the base 300 s, not out of
   the window's raise. A window cut this way says so.
@@ -1018,7 +1019,8 @@ the process table locally, and fall back to `n/a (...)` when run from elsewhere.
   `HUP` during the window stops both samplers (none is left running) and the
   report is still written: J says `ended early: SIG... after Xs of Ys` and
   keeps what the samplers had written, and the goal is blocked with the same
-  words. A second signal aborts the run.
+  words. A second signal aborts the run. Under `bash` a signal is occasionally lost
+  ([collector-engineering.md](../../docs/collector-engineering.md)); send it again.
 - **Tier 2**: `--binlog[=N]` decodes the N newest binary logs (default 2) with
   `mysqlbinlog --base64-output=DECODE-ROWS` and counts row events per table.
   This reads whole log files, so it costs I/O proportional to their size and is

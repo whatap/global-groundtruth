@@ -215,6 +215,10 @@ Notes:
 - The Kubernetes, NMS, database and collection-server collectors need `bash`.
   Start them as shown (`./collect-...sh`); under `sh collect-...sh` they stop
   at once and say so.
+- Ctrl-C stops a run and removes its temporary files. Under `bash` it is
+  occasionally not taken (a `bash` limitation, not a fault of the run). If the
+  run keeps going, press Ctrl-C again, or run `kill <pid>` from another
+  terminal and repeat it if needed.
 
 ## 5. Send it back
 

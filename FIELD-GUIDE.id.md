@@ -226,6 +226,10 @@ Catatan:
 - Collector Kubernetes, NMS, database, dan collection server memerlukan `bash`.
   Jalankan seperti yang ditunjukkan (`./collect-...sh`); dengan
   `sh collect-...sh` collector langsung berhenti dan menyebutkan alasannya.
+- Ctrl-C menghentikan eksekusi dan menghapus file sementaranya. Di `bash`,
+  sesekali Ctrl-C tidak diterima (keterbatasan `bash`, bukan kesalahan
+  eksekusi). Jika eksekusi terus berjalan, tekan Ctrl-C sekali lagi, atau
+  jalankan `kill <pid>` dari terminal lain dan ulangi bila perlu.
 
 ## 5. Mengirimkan kembali
 
