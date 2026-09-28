@@ -5,6 +5,10 @@ first. Every change to the script bumps its `VERSION` and adds one entry at
 the top of this list (docs/authoring-guide.md, step 2); `tools/validate.sh`
 checks that the newest entry is the script's `VERSION`.
 
+- **0.15.7** — `_jvm_maps_lib` reads the VM library path as the whole rest of
+  the maps line (paths with spaces were cut at the first space) without a "
+  (deleted)" suffix, and takes only a path ending in /libjvm.so or libj9vm*.so
+  (a libjvm.so.debug no longer confirms a JVM).
 - **0.15.6** — Section B: a JVM whose exe link is marked (deleted) is listed
   only, never run with -version, even when the path exists again (a JDK
   upgraded in place); its VM library comes from the maps, and when that

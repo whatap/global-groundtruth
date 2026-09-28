@@ -32,7 +32,7 @@ export LC_ALL=C
 # ---- collector metadata ------------------------------------------------------
 COLLECTOR_NAME="whatap-apmjava"
 # History: CHANGELOG.md (next to this file).
-VERSION="0.15.6"
+VERSION="0.15.7"
 DOMAIN="apm"
 TARGET="host/$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || uname -n 2>/dev/null || echo unknown)"
 
@@ -1627,9 +1627,13 @@ _jvm_sysprop() {
 
 # _jvm_maps_lib PID -> the VM shared library mapped into the process, or empty.
 # HotSpot and its derivatives map libjvm.so; OpenJ9 / IBM J9 map
-# libj9vm<ver>.so beside their own libjvm.so.
+# libj9vm<ver>.so beside their own libjvm.so. The path is the rest of the line
+# after the fifth field (it may hold spaces), without a " (deleted)" suffix.
 _jvm_maps_lib() {
-    grep -m1 -oE '/[^[:space:]]*/(libjvm\.so|libj9vm[^/[:space:]]*\.so)' "/proc/$1/maps" 2>/dev/null | head -n1
+    awk 'index($0, "libj") == 0 { next }
+         { p = $0; for (i = 0; i < 5; i++) sub(/^[^ ]+ +/, "", p)
+           sub(/ \(deleted\)$/, "", p)
+           if (p ~ /^\/.*\/(libjvm\.so|libj9vm[^\/]*\.so)$/) { print p; exit } }' "/proc/$1/maps" 2>/dev/null
 }
 
 # _is_java_launcher PATH -> success when the binary is a java launcher by name
