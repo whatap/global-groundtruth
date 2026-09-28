@@ -1,11 +1,11 @@
-# collectors/apm/dotnet — WhaTap .NET APM agent collector (Windows)
+# collectors/apm/dotnet: WhaTap .NET APM agent collector (Windows)
 
 > **Status: SEEDED (v0; validated at: 0.6.0 on Windows Server 2022 Standard
 > Evaluation 10.0.20348 under Windows PowerShell 5.1.20348.558 and pwsh 7.6.6,
 > elevated and not elevated, with a simulated agent, 2026-09-26; see
 > "Validation" below).**
 > `collect-apmdotnet.ps1` is a working Tier-0
-> collector seeded by the Global team (CONTRACT rule 4 — interim ownership).
+> collector seeded by the Global team (CONTRACT rule 4, interim ownership).
 > Ongoing ownership belongs to the .NET agent developers once handed over.
 > Linux .NET hosts are **not covered yet** (see "Not covered" below).
 
@@ -22,7 +22,7 @@ managed DLLs ship with FileVersion pinned at `1.0.0.0` across product
 releases, and the GAC folder names (`v4.0_1.0.0.0__…`) never change. The only
 trustworthy product-version markers on a host are the uninstall registry
 (`HKLM\...\Uninstall\WhaTap .NET_is1` → `DisplayVersion`) and the
-mtime/SHA256 of the profiler DLL copies — so the collector captures all of
+mtime/SHA256 of the profiler DLL copies, so the collector captures all of
 them, plus the version lines the agent writes into its own logs. Multiple
 support threads hinged on "reported version ≠ version actually on disk".
 
@@ -30,7 +30,7 @@ support threads hinged on "reported version ≠ version actually on disk".
 `WHATAP_*` keys to the machine environment, but the CLR injection variables
 (`COR_ENABLE_PROFILING`, `COR_PROFILER`, `COR(ECLR)_PROFILER_PATH_32/64`,
 `DOTNET_STARTUP_HOOKS`) go into the **W3SVC and WAS service registry
-`Environment` (multi-sz)** — IIS worker processes only. The tracer sends
+`Environment` (multi-sz)**: IIS worker processes only. The tracer sends
 UDP to `127.0.0.1:6600` where the `WhaTap .NET` service (`whatap_dotnet.exe
 -t 7`) relays TCP to the collection server on the same port number. Only the
 IIS HTTP pipeline is instrumented (self-hosted Windows services are not), so
@@ -83,13 +83,13 @@ redirection as UTF-16LE; `tools/validate.sh --report` rejects such a copy.
 | 2 | A. Host & platform | OS build, memory, clock+timezone, IIS version, .NET Framework `NDP\v4\Full` Release/Version, `dotnet --list-runtimes` / `--list-sdks` |
 | 3 | B. Agent installation on disk | uninstall registry entries (**DisplayVersion** = the product version), agent-home candidates from every discovery source with existence+marker flags, per-home inventory (`core\`, `net461\`, `net6.0\` with sizes/mtimes/FileVersions), **native profiler DLL mtime+SHA256**, net461 facade assembly versions, `VERSION` file, GAC_MSIL inventory of the 9 installer-set assemblies, machine `Path` (registry) leftovers, ISAPI filter dll presence |
 | 4 | C. Profiler registration & environment scopes | machine env registry vs **W3SVC/WAS service `Environment` (multi-sz, verbatim)** vs collector-process env; for every configured `*_PROFILER_PATH` / `DOTNET_STARTUP_HOOKS` value: does that exact file exist (+ its facts); CLSID `{21CAE18A-…}` and legacy `{D76F1D76-…}` InProcServer32 in both registry views; Fusion log settings (read-only); `applicationHost.config` lines naming COR/WHATAP variables |
-| 5 | D. WhaTap service & runtime processes | `WhaTap .NET` service state/account/binpath/pid, whatap-named processes, per w3wp: pid ↔ app pool (from `-ap`), exe path bitness marker, **loaded profiler-related modules** (WhaTap and other APM vendors — surfaces profiler-slot conflicts as facts), **loaded runtime modules** (`clr.dll`, `coreclr.dll`, `aspnetcorev2*.dll` with FileVersion: the runtime build actually running), dotnet.exe processes with their loaded runtime modules |
-| 6 | E. IIS topology | app pools (state, CLR version, pipeline, `enable32BitAppOnWin64`, identity), sites/apps/vdirs with physical paths, ISAPI filters — via appcmd, WebAdministration, or applicationHost.config fallback |
+| 5 | D. WhaTap service & runtime processes | `WhaTap .NET` service state/account/binpath/pid, whatap-named processes, per w3wp: pid ↔ app pool (from `-ap`), exe path bitness marker, **loaded profiler-related modules** (WhaTap and other APM vendors, surfaces profiler-slot conflicts as facts), **loaded runtime modules** (`clr.dll`, `coreclr.dll`, `aspnetcorev2*.dll` with FileVersion: the runtime build actually running), dotnet.exe processes with their loaded runtime modules |
+| 6 | E. IIS topology | app pools (state, CLR version, pipeline, `enable32BitAppOnWin64`, identity), sites/apps/vdirs with physical paths, ISAPI filters, via appcmd, WebAdministration, or applicationHost.config fallback |
 | 7 | F. Agent configuration | `whatap.conf` verbatim per home **plus byte facts (first bytes/BOM, CR count)** |
 | 8 | G. Agent logs | both log dirs (`C:\ProgramData\WhaTap\dotnet\logs` fixed + `<home>\logs` legacy): inventory with **file owners**, native `core-YYYYMMDD.log` banner+head+tail, newest tracer log version/identity lines+head+tail, exception-line count, **PID-named log files cross-referenced against currently running PIDs** (PID-reuse leftovers owned by another pool's identity have caused w3wp CPU spins), audit dir presence/size only, `WT_TRACE_LOG_PATH` override |
 | 9 | H. Network endpoints | `netstat -ano` lines on port 6600 with owning pids (local tracer→daemon UDP and daemon→server TCP), one live TCP probe per `whatap.server.host:whatap.server.port` endpoint named in any conf |
 | 10 | I. Windows event logs | Application log (.NET Runtime / ASP.NET / Application Error / WER / WhaTap) and System log (WAS/W3SVC/HTTP), bounded to last 7 days, capped counts |
-| 11 | J. Application facts | per IIS app (≤10, capped with a note): `web.config` targetFramework lines and ASP.NET Core `hostingModel` lines + `<runtime>` assemblyBinding block verbatim, `bin\` facade assembly versions (`System.Net.Http` and friends — the assembly-binding case), `bin\Whatap.*` files, .NET Core markers (`*.runtimeconfig.json` dumped) |
+| 11 | J. Application facts | per IIS app (≤10, capped with a note): `web.config` targetFramework lines and ASP.NET Core `hostingModel` lines + `<runtime>` assemblyBinding block verbatim, `bin\` facade assembly versions (`System.Net.Http` and friends, the assembly-binding case), `bin\Whatap.*` files, .NET Core markers (`*.runtimeconfig.json` dumped) |
 
 ## Reading the report (explanations kept out of the report)
 
@@ -144,11 +144,11 @@ are ASCII, so Windows PowerShell 5.1 and pwsh 7 read it the same way.
 
 ## What the report can contain
 
-Framework policy: configuration is dumped **verbatim, never masked** — a
+Framework policy: configuration is dumped **verbatim, never masked**, so a
 mistyped license or server address must be readable to be verified or
 refuted. A secret can arrive from:
 
-- **`whatap.conf`** (section F) — the license key and anything else in it.
+- **`whatap.conf`** (section F): the license key and anything else in it.
 - **Environment values** (section C): machine environment registry, W3SVC /
   WAS service `Environment`, and the collector's own process env filtered to
   `WHATAP_*` / `COR_*` / `CORECLR_*` / `DOTNET_STARTUP_HOOKS`.
@@ -183,15 +183,15 @@ Windows PowerShell that lists that process's modules (about 1–3 s on the lab h
 Registry values are read through the .NET registry API, which answers an
 absent key at once where the PowerShell registry provider took 1.2-1.5 s per
 absent key under `HKLM:\SOFTWARE\Classes`. Managed assemblies are identified via metadata-only reflection
-(`AssemblyName.GetAssemblyName`) — no assembly is loaded for execution.
+(`AssemblyName.GetAssemblyName`); no assembly is loaded for execution.
 
 ## Not covered (v0)
 
-- **Linux .NET hosts** — different artifact set (`/usr/whatap/agent/dotnet/`,
+- **Linux .NET hosts**: different artifact set (`/usr/whatap/agent/dotnet/`,
   `whatap-dotnet.service` + `whatap.env`, `Whatap.ClrProfiler.so`,
   `CORECLR_PROFILER_PATH`, `VERSION` file, `/etc/profile.d/whatap-dotnet.sh`);
   needs a separate `collect-apmdotnet.sh` following the same fact map.
-- **Per-process live environment of w3wp** — Windows exposes no supported
+- **Per-process live environment of w3wp**: Windows exposes no supported
   read-only API for another process's environment block; the service-registry
   scope plus loaded-module facts cover the same question indirectly.
 - No `--bundle` tier yet; copy the bundle plumbing from

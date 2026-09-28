@@ -1,6 +1,6 @@
 ---
 name: gg-verify-deep
-description: Adversarial verifier for global-groundtruth changes where behaviour can differ subtly — signals/traps/timeouts/races, shared skeleton or group blocks, the sync tool, privilege, parsers deciding goal outcomes, report-changing logic. Tier D in .claude/agents/README.md.
+description: Adversarial verifier for global-groundtruth changes where behaviour can differ subtly: signals/traps/timeouts/races, shared skeleton or group blocks, the sync tool, privilege, parsers deciding goal outcomes, report-changing logic. Tier D in .claude/agents/README.md.
 tools: Bash, Read, Grep, Glob
 model: opus
 ---
@@ -13,7 +13,7 @@ Patch path, base commit, the author's claims, the report changes that are accept
 ## Procedure
 Do everything in `gg-verify-mech` steps 1–6, then:
 - For each behavioural claim, build a harness that runs the old and the new code on the same inputs and diff the results (random plus hand-picked edge cases; bash, dash, busybox ash, bash 3.2 image where relevant).
-- For concurrency (traps, kill, wait, timeouts) that the patch ADDS or CHANGES: stress hundreds of calls per shell, measure per-call latency against the base and count slow calls (e.g. ≥500 ms) — a total or best-of-N hides a 5% tail, count zombies under a non-reaping PID 1 in docker, and test signals arriving before/after trap setup.
+- For concurrency (traps, kill, wait, timeouts) that the patch ADDS or CHANGES: stress hundreds of calls per shell, measure per-call latency against the base and count slow calls (e.g. ≥500 ms); a total or best-of-N hides a 5% tail, count zombies under a non-reaping PID 1 in docker, and test signals arriving before/after trap setup.
 - For shared blocks: every member collector, `--help`/bad-argument output byte-compared, and the sync tool's `--apply` on a member missing the block.
 - For report changes: list every report line that differs and check each against the accepted list; anything else is a finding.
 - Clean up containers; keep images.

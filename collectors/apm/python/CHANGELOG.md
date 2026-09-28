@@ -1,31 +1,31 @@
-# collect-apmpython.sh — changelog
+# collect-apmpython.sh: changelog
 
 The version history of [`collect-apmpython.sh`](collect-apmpython.sh), newest
 first. Every change to the script bumps its `VERSION` and adds one entry at
 the top of this list (docs/authoring-guide.md, step 2); `tools/validate.sh`
 checks that the newest entry is the script's `VERSION`.
 
-- **0.11.7** — The shared main no longer calls _init_probe; _run_init sets
+- **0.11.7**: The shared main no longer calls _init_probe; _run_init sets
   _errfile, so the collector's one-line copy is gone. Report unchanged.
-- **0.11.6** — Run helpers (skeleton): `_why_124` and `_out_dir_check` move
+- **0.11.6**: Run helpers (skeleton): `_why_124` and `_out_dir_check` move
   into the skeleton run helpers (the `--out` mkdir now runs under the command
   cap), and `_run_init` sets the probe error file and reads the uid once;
   `probe_merged` comes from the skeleton; the CLI harness banner loses "DO NOT
   EDIT"; no report change.
-- **0.11.5** — `_disc_go`'s Go-process read (`_go_rows`) is kept in a
+- **0.11.5**: `_disc_go`'s Go-process read (`_go_rows`) is kept in a
   variable, not a file under `_tmp`: with no private temp directory it lost
   every Go-module pid (homes, `D_UNREAD` split, `resolve_fs` order). A timeout
   of that read records its reason (deadline vs command timeout) once, at read
   time, so section 4 and the goal-gap text agree.
-- **0.11.4** — Discovery takes the Go module pids from the same
+- **0.11.4**: Discovery takes the Go module pids from the same
   `/proc/\<pid>/stat` read as section 4 (`_disc_go`; zombies are listed but
   not followed, and a timeout of that read is a goal gap). The section 4 line
   drops the per-state tally. `run/` is listed from one glob walk. `_rep_odoo`
   is split into three helpers, and hidepid, Go-agent homes, pid files and
   `WHATAP_PYTHON_AGENT_PATH` come from group helpers, all unchanged in effect.
-- **0.11.3** — Collection status (skeleton `_emit_time`): when a bounded call was slow, capped or not run, the per-command "where the time went" table (sums largest first, time outside bounded calls) gives way to the time log's own records, one line per such call in the order they ran (`<ms> ms  <outcome>  <command>`, the first 40, then `(N more in this run)`); CONTRACT rule 1. `_run_init` sets its EXIT/INT/TERM/HUP traps before it creates the private directory: a signal in between left `ggt.*` behind.
-- **0.11.2** — `_run_init` (skeleton) also takes the script as read from stdin when `$0` is the shell's own binary (`/bin/bash -s`, `$0 -ef /proc/$$/exe`): bash 3.2 under musl otherwise faulted in a loop at full CPU after `4<&0`.
-- **0.11.1** — The host section adds `/sys/class/dmi/id/product_uuid`: its
+- **0.11.3**: Collection status (skeleton `_emit_time`): when a bounded call was slow, capped or not run, the per-command "where the time went" table (sums largest first, time outside bounded calls) gives way to the time log's own records, one line per such call in the order they ran (`<ms> ms  <outcome>  <command>`, the first 40, then `(N more in this run)`); CONTRACT rule 1. `_run_init` sets its EXIT/INT/TERM/HUP traps before it creates the private directory: a signal in between left `ggt.*` behind.
+- **0.11.2**: `_run_init` (skeleton) also takes the script as read from stdin when `$0` is the shell's own binary (`/bin/bash -s`, `$0 -ef /proc/$$/exe`): bash 3.2 under musl otherwise faulted in a loop at full CPU after `4<&0`.
+- **0.11.1**: The host section adds `/sys/class/dmi/id/product_uuid`: its
   `ls -l` line and `dmi product_uuid readable by uid N:` (yes or no, from an
   open and a read of the file); the value follows only when it was read (group
   block `apm: report helpers`, `_product_uuid`). Command lines and environ
@@ -59,7 +59,7 @@ checks that the newest entry is the script's `VERSION`.
   spaces. A relative argv0 is not joined to a cwd holding a newline or CR,
   PYTHONPATH entries split on CR too, and the python environ lines are cut
   with `u8cut` in the awk that builds them. Goals unchanged.
-- **0.11.0** — Section 4 lists the Go module (`whatap_python`) processes
+- **0.11.0**: Section 4 lists the Go module (`whatap_python`) processes
   from one read of `/proc/<pid>/stat`, so a zombie is listed too (its
   cmdline is empty, and the process table skipped it: in
   jjsong-ggt-apm-python:1 with 20,000 unreaped `whatap_python` children,
@@ -80,18 +80,18 @@ checks that the newest entry is the script's `VERSION`.
   inside a UTF-8 sequence (`cut -c` and `substr` count bytes under
   `LC_ALL=C`; a cut Korean argument made the report invalid UTF-8 on this
   host). `WHATAP_*` environ lines stay uncut.
-- **0.10.7** — Comments only; report content unchanged. Shortened long
+- **0.10.7**: Comments only; report content unchanged. Shortened long
   comment runs in `_pyrun`, `_pyreport` and the process-scan comment; the
   batching rationale now points to README "How each interpreter is asked".
-- **0.10.6** — `apm: file helpers` (templates/groups/apm.sh): `wc -l` reading
+- **0.10.6**: `apm: file helpers` (templates/groups/apm.sh): `wc -l` reading
   an unreadable file no longer leaks "Permission denied" to the operator's
   stderr (the `<` redirect ran before `2>/dev/null`, so its own failure was
   not yet silenced). Report content unchanged.
-- **0.10.5** — Split the large functions (_rep_runtimes, _rep_binding,
+- **0.10.5**: Split the large functions (_rep_runtimes, _rep_binding,
   discover) into per-section helpers; /proc/\<pid>/environ reads no longer
   print Permission denied on stderr as root without CAP_SYS_PTRACE. Report
   content unchanged.
-- **0.10.4** — Shared code in synced blocks (R2 refactor): the skeleton's emit
+- **0.10.4**: Shared code in synced blocks (R2 refactor): the skeleton's emit
   helpers now hold _optval, _emit_labeled, _tool_rows (the [1] tool table) and
   _indent (the indent loops), and its run helpers hold probe and read_proc.
   New apm blocks: report helpers (environment head, cgroup, container markers)
@@ -106,7 +106,7 @@ checks that the newest entry is the script's `VERSION`.
   read as 8. A value option without its value exits 2 without printing the
   usage after the message. Compared with 0.10.3 on this host and in
   jjsong-ggt-apm-python:1: reports equal but live values.
-- **0.10.3** — [1]'s privilege line says when uid 0 has no CAP_SYS_PTRACE (bit 19
+- **0.10.3**: [1]'s privilege line says when uid 0 has no CAP_SYS_PTRACE (bit 19
   of CapEff; the default in docker and k8s): "root without
   CAP_SYS_PTRACE (other uids' /proc/\<pid>/environ, root, cwd are not
   readable: run as the target's uid, ...)". It read "root" while
@@ -116,7 +116,7 @@ checks that the newest entry is the script's `VERSION`.
   timer outlived each call, is not used; the watchdog caps instead.
   Under a PID 1 that does not reap (sleep infinity), one run of each
   collector left 1 zombie on debian and 41-55 on alpine; now 0 (2026-09-27).
-- **0.10.2** — The interpreters this run starts (the python -c lookups, pip list)
+- **0.10.2**: The interpreters this run starts (the python -c lookups, pip list)
   run without the whatap/bootstrap entries of PYTHONPATH. Run by
   kubectl exec in an operator-injected pod, the shell inherits
   PYTHONPATH=/whatap-agent:/whatap-agent/whatap/bootstrap; its
@@ -129,12 +129,12 @@ checks that the newest entry is the script's `VERSION`.
   version and release_date lines of its build.py ("build.py: version
   = '2.1.2' release_date = '20260722'"): the operator's copy has no
   dist-info, so its version was n/a everywhere in section 3.
-- **0.10.1** — main is the apm group block `apm: main`; report unchanged. A --file run
+- **0.10.1**: main is the apm group block `apm: main`; report unchanged. A --file run
   on a host without hostname(1) names the report after
   /proc/sys/kernel/hostname, else `uname -n`, and so does Target (both
   were: unknown, and validate.sh --report refused Target: host/unknown);
   the file name reuses the name Target resolved.
-- **0.10.0** — Fewer options (user decision, 2026-09-26): `pip list` runs in every
+- **0.10.0**: Fewer options (user decision, 2026-09-26): `pip list` runs in every
   run again (it starts each detailed interpreter once more and reads
   what the default inventory reads, so it is not an opt-in by the load
   rule); --pip is refused with exit 2. It declares no goal: the library
@@ -145,9 +145,9 @@ checks that the newest entry is the script's `VERSION`.
   help names APM_INTERP_CAP. An error reason over 100 bytes (probe)
   or 140 (interpreter lookups) keeps both its start (the error kind)
   and its end (where "No module named pip" is after a long path).
-- **0.9.1** — Shared helpers moved into the apm group block; report unchanged.
+- **0.9.1**: Shared helpers moved into the apm group block; report unchanged.
   The apm: blocks are copies of templates/groups/apm.sh.
-- **0.9.0** — Cheaper sources (decision 4). The Odoo release.py lookup joins the one
+- **0.9.0**: Cheaper sources (decision 4). The Odoo release.py lookup joins the one
   interpreter start of section [3] instead of a start of its own per
   interpreter; one that did not answer is named in section [8]. The
   library inventory is the dist-info/egg-info/egg/egg-link names in
@@ -158,21 +158,21 @@ checks that the newest entry is the script's `VERSION`.
   stdout encoding lacks), so one odd name cannot break a line or lose
   the list; a sys.path directory that cannot be stat'ed says why
   (2026-09-26).
-- **0.8.0** — Only candidates count (decision 1): with no whatap_python process on
+- **0.8.0**: Only candidates count (decision 1): with no whatap_python process on
   the host, a process whose environ this uid cannot read and whose
   command line does not name whatap is not counted as an unread input,
   and the na reason names it. A stock distribution's root python
   daemons no longer make a non-root run INCOMPLETE. conf is missed, not
   na, when homes were found without a whatap.conf while a candidate's
   environ/cwd was unread (its home is unknown) (2026-09-26).
-- **0.7.5** — A directory this uid can read but not enter lists its names again
+- **0.7.5**: A directory this uid can read but not enter lists its names again
   (the refactor's _names dropped them; ls did not).
-- **0.7.4** — Readability refactor; report unchanged.
-- **0.7.3** — Only a first re-run that also times out stops the re-runs. Once a
+- **0.7.4**: Readability refactor; report unchanged.
+- **0.7.3**: Only a first re-run that also times out stops the re-runs. Once a
   lookup run alone has answered, the interpreter still answers, so a later
   hang is that lookup's own and the ones after it are still run
   (two separate hangs lost the last answer in 0.7.2; 2026-09-25).
-- **0.7.2** — When a lookup run alone after a hang also times out, the lookups
+- **0.7.2**: When a lookup run alone after a hang also times out, the lookups
   after it are not run (each would wait a full cap for the same
   cause): a common hang costs about two caps per interpreter, not ten.
   A lookup cut short by the run deadline says so, not "timed out"

@@ -14,7 +14,7 @@ The starter for a new collector. It already emits the shared report shape
       collectors/<domain>/collect-<token>.sh
    ```
 
-   Name it `collect-<token>.sh` (never a bare `collect.sh`) — `<token>` matches
+   Name it `collect-<token>.sh` (never a bare `collect.sh`), `<token>` matches
    the output-file prefix `whatap-<token>-…`, so no two collectors collide when
    copied side by side. `validate.sh` enforces this; see
    [../../docs/authoring-guide.md](../../docs/authoring-guide.md) step 2.
@@ -23,7 +23,7 @@ The starter for a new collector. It already emits the shared report shape
    (`whatap-<token>`), `VERSION` (`x.y.z`), `DOMAIN` (the top-level directory
    name), `TARGET` (`<kind>/<name>[@<qualifier>]`, never an outcome). Start
    `collectors/<domain>/CHANGELOG.md` next to the README with the first entry,
-   `- **<VERSION>** — First version.`; the script keeps only the pointer line
+   `- **<VERSION>**: First version.`; the script keeps only the pointer line
    `# History: CHANGELOG.md (next to this file).` above `VERSION`. Every later
    change bumps `VERSION` and adds an entry at the top of that list
    ([../../docs/authoring-guide.md](../../docs/authoring-guide.md) step 2).
@@ -34,7 +34,7 @@ The starter for a new collector. It already emits the shared report shape
    |------------------------|----------------------------------------------------------------|
    | `section "TITLE"`      | the next numbered section header (`[1]`, `[2]`, …)             |
    | `fact "text"`          | one fact line under the current section                        |
-   | `probe "label" CMD…`   | output as facts, or `label: n/a (<why>)` — the reasoned form   |
+   | `probe "label" CMD…`   | output as facts, or `label: n/a (<why>)`, the reasoned form   |
    | `probe_merged "label" CMD…` | the same with stderr folded into stdout (tools that answer on stderr) |
    | `read_proc "label" P`  | a `/proc` or `/sys` file's content, or a classified reason     |
    | `_emit_labeled L BODY` | `L: BODY`, or `L:` and BODY's lines indented under it         |
@@ -48,7 +48,7 @@ The starter for a new collector. It already emits the shared report shape
    | `goal` / `got` / `na` / `missed` | declare and resolve what the run came for      |
 
    Keep to **facts only** (Contract rule 1) and **discover, don't assume**
-   (Contract rule 2 — resolve symlinks/mounts/config; when a value is absent,
+   (Contract rule 2: resolve symlinks/mounts/config; when a value is absent,
    report `n/a` rather than a default). Use `probe`/`read_proc` so a missing
    value carries *why* it is missing (guideline 4).
 
@@ -77,7 +77,7 @@ Design guidelines (MECE, load tiers, portability, reasoned absence):
 `emit_header`, `section`, `fact`, and `emit_footer` produce the shared
 format that `validate.sh` and every reader depend on. Add your sections **inside
 `run_report()`**; leave the helpers alone. The script intentionally does **not**
-use `set -e` — a collector must always run to completion and emit its footer.
+use `set -e`, so a collector must always run to completion and emit its footer.
 
 The **CLI harness** (`usage`, argument parsing and the `main`
 dispatch) and the `run_report()` wrapper are copies you extend, not blocks left
@@ -108,7 +108,7 @@ time, run helpers and collection completeness. Change them here, in the
 skeleton, and run `tools/sync-shared-block.sh --apply`; `--check` reports
 drift. Helpers only some collectors share are **group blocks**, owned by
 `../groups/<group>.sh` (or `../groups/<group>.ps1` for the `collect-<stem>.ps1`
-collectors — `ps1.ps1` holds the PowerShell port of these blocks): the apm
+collectors, `ps1.ps1` holds the PowerShell port of these blocks): the apm
 collectors' `main` is one, `apm: main`, owned by `../groups/apm.sh`; the other
 collectors' mains start as copies of the one here and carry their own steps.
 The block format itself (banner, end line, `# members:`, STRAY, `place: end`)

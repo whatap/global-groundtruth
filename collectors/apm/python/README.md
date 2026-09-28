@@ -1,4 +1,4 @@
-# collectors/apm/python — WhaTap Python APM agent collector
+# collectors/apm/python: WhaTap Python APM agent collector
 
 > **Status: SEEDED (v0; validated at `collect-apmpython.sh` 0.11.2 on
 > 2026-09-28 on the lab `apm-python` / `apm-python-op` containers (same setup
@@ -9,7 +9,7 @@
 > under plain gunicorn; as root, as the app's user and as another user, bash
 > and `sh -s`; no collection server was reachable, so the Go module opened no
 > UDP listener and no TCP session).** `collect-apmpython.sh` is a working Tier-0
-> collector seeded by the Global team (CONTRACT rule 4 — interim ownership).
+> collector seeded by the Global team (CONTRACT rule 4, interim ownership).
 > Ongoing ownership belongs to the Python agent developers once handed over.
 
 Collects the hidden facts a remote WhaTap Python-agent developer repeatedly
@@ -25,7 +25,7 @@ Run **where the Python application runs**:
 # VM / bare metal
 ./collect-apmpython.sh --file          # -> whatap-apmpython-<host>-<UTC>.txt
 
-# Kubernetes — pipe the script over stdin; nothing to copy into the pod,
+# Kubernetes: pipe the script over stdin; nothing to copy into the pod,
 # nothing written to a possibly read-only rootfs
 kubectl exec -i <pod> -c <container> -- sh -s -- --stdout --quiet \
     < collect-apmpython.sh > report.txt
@@ -46,7 +46,7 @@ raises the interpreter detail cap (8).
 Container notes (all verified against real images):
 
 - **POSIX sh is enough.** The script runs under bash, dash, and busybox ash
-  (`alpine`, `python:*-slim` — no bash/ss/procps required; socket facts fall
+  (`alpine`, `python:*-slim`, no bash/ss/procps required; socket facts fall
   back to raw `/proc/net/udp|tcp`).
 - **Use `--stdout` in containers.** `--file` writes to the current directory,
   which fails on `readOnlyRootFilesystem` pods.
@@ -65,12 +65,12 @@ Container notes (all verified against real images):
 | --- | --- | --- |
 | 1 | Collection environment | which tools were available to this collection |
 | 2 | Host / platform | OS, arch (amd64/arm64), `ls -l` of `/sys/class/dmi/id/product_uuid` and whether this run could read it (the value only when it could; see [../README.md](../README.md)), container markers, cgroup CPU/memory limits (container-vs-host metric questions) |
-| 3 | Python runtimes and whatap-python package | every interpreter (those of whatap-marked processes first, so the detail cap of 8 does not fill with unrelated ones) (multiple versions and **virtualenvs are kept distinct** — identity is the invocation path, not the resolved binary), whatap-python version/location per interpreter, the `whatap_python-*` metadata dirs next to the package (`.dist-info` = wheel install, `.egg-info`/`.egg` = setup.py-era install), `sys.prefix` / `base_prefix` (they differ inside a virtualenv), setuptools / `pkg_resources` import facts (Python 3.12 install issues), bundled Go module binaries per arch, `bootstrap/sitecustomize.py`, console scripts on PATH, **application library inventory** — the `.dist-info`/`.egg-info`/`.egg`/`.egg-link` names in every `sys.path` directory of each interpreter (see "Library inventory" below; then `pip list` per interpreter), plus a no-exec fallback (the same names next to each whatap package dir seen in process environ), plus the **instrumentation surface of the installed agent** (`trace/mod` tree, grouped: application/database/httpc/amqp/...) which differs across agent versions |
-| 4 | Runtime processes | Go common module (`whatap_python`) processes, zombies included, read from the one `/proc/<pid>/stat` scan discovery already did (`_disc_go`): the count found, then the first 20 (state Z last) with ppid, uid/state and cwd/env; python app processes (matched by comm, argv0 or `/proc/<pid>/exe`, see below; whatap-marked ones first) with argv0, `PYTHONPATH contains whatap/bootstrap`, `VIRTUAL_ENV`, `WHATAP_*`, `OTEL_*` (co-instrumentation); **libraries the process actually loaded** — C-extension packages and the real `site-packages` path from `/proc/<pid>/maps` (pure-Python imports do not appear there) |
+| 3 | Python runtimes and whatap-python package | every interpreter (those of whatap-marked processes first, so the detail cap of 8 does not fill with unrelated ones) (multiple versions and **virtualenvs are kept distinct**: identity is the invocation path, not the resolved binary), whatap-python version/location per interpreter, the `whatap_python-*` metadata dirs next to the package (`.dist-info` = wheel install, `.egg-info`/`.egg` = setup.py-era install), `sys.prefix` / `base_prefix` (they differ inside a virtualenv), setuptools / `pkg_resources` import facts (Python 3.12 install issues), bundled Go module binaries per arch, `bootstrap/sitecustomize.py`, console scripts on PATH, **application library inventory**: the `.dist-info`/`.egg-info`/`.egg`/`.egg-link` names in every `sys.path` directory of each interpreter (see "Library inventory" below; then `pip list` per interpreter), plus a no-exec fallback (the same names next to each whatap package dir seen in process environ), plus the **instrumentation surface of the installed agent** (`trace/mod` tree, grouped: application/database/httpc/amqp/...) which differs across agent versions |
+| 4 | Runtime processes | Go common module (`whatap_python`) processes, zombies included, read from the one `/proc/<pid>/stat` scan discovery already did (`_disc_go`): the count found, then the first 20 (state Z last) with ppid, uid/state and cwd/env; python app processes (matched by comm, argv0 or `/proc/<pid>/exe`, see below; whatap-marked ones first) with argv0, `PYTHONPATH contains whatap/bootstrap`, `VIRTUAL_ENV`, `WHATAP_*`, `OTEL_*` (co-instrumentation); **libraries the process actually loaded**: C-extension packages and the real `site-packages` path from `/proc/<pid>/maps` (pure-Python imports do not appear there) |
 | 5 | Agent homes and configuration | every `WHATAP_HOME` candidate (env, port registry `/tmp/whatap-python.lock`, process cwd/environ, `/whatap-agent`), and per home: `whatap.conf` / `container.conf` verbatim, `whatap_python` symlink resolution, pid files (entry with the full mtime from `stat -c`, else `ls -l`; content, and whether that pid exists, with its state and ppid), `security.conf` / `paramkey.txt` presence and size, `logs/` inventory, `run/` listing (one `stat -c` line per entry with the full mtime, else `ls -la`; first 40 entries and the count), LLM module dir. A home that cannot be read says `path not found` or `permission denied` |
 | 6 | Network endpoints and port registry | UDP sockets on 66xx plus the `net_udp_port` of the readable `whatap.conf` files and the port registry, TCP sessions on 6600 plus the `whatap.server.port` named there (each port labelled by its source), plus every socket of a whatap-named process; port registry contents |
-| 7 | Agent logs | `whatap-hook.log` head (banner + `successfully injected <module>` lines = which libraries the agent hooked in this process) and tail (recent), the newest `whatap-boot-YYYYMMDD.log` (Go side) head + tail — all bounded reads |
-| 8 | Odoo application facts | odoo master/worker processes, Odoo version (`odoo/release.py`, read as text — no odoo code runs), `odoo.conf` (path from `-c`/`ODOO_RC`/packaged defaults; see "What the report can contain" below) with the `logfile` key resolved and the worker log tailed (with `logfile` unset, odoo writes to the process stdout/stderr, e.g. the container log) (the HTTP-worker traceback lives there, not in the master/startup log), listening sockets (8069/8072), systemd unit facts (`Environment=`/`ExecStart` visibility for `whatap-start-agent` PATH issues), `injected odoo` hook-evidence counts. On non-Odoo hosts it starts no interpreter: where each interpreter would import `odoo` from is looked up in the one start of section 3, and an interpreter whose lookup did not answer is named here. Interpretation aid: the agent's Odoo support matrix (14–19 from agent 2.1.3; JSON-RPC errors return HTTP 200 and are not captured; WebSocket/Longpolling/Cron not instrumented) is maintained in the internal "Odoo 지원" Notion document |
+| 7 | Agent logs | `whatap-hook.log` head (banner + `successfully injected <module>` lines = which libraries the agent hooked in this process) and tail (recent), the newest `whatap-boot-YYYYMMDD.log` (Go side) head + tail, all bounded reads |
+| 8 | Odoo application facts | odoo master/worker processes, Odoo version (`odoo/release.py`, read as text, no odoo code runs), `odoo.conf` (path from `-c`/`ODOO_RC`/packaged defaults; see "What the report can contain" below) with the `logfile` key resolved and the worker log tailed (with `logfile` unset, odoo writes to the process stdout/stderr, e.g. the container log) (the HTTP-worker traceback lives there, not in the master/startup log), listening sockets (8069/8072), systemd unit facts (`Environment=`/`ExecStart` visibility for `whatap-start-agent` PATH issues), `injected odoo` hook-evidence counts. On non-Odoo hosts it starts no interpreter: where each interpreter would import `odoo` from is looked up in the one start of section 3, and an interpreter whose lookup did not answer is named here. Interpretation aid: the agent's Odoo support matrix (14–19 from agent 2.1.3; JSON-RPC errors return HTTP 200 and are not captured; WebSocket/Longpolling/Cron not instrumented) is maintained in the internal "Odoo 지원" Notion document |
 | 9 | Kubernetes / operator injection context | `/whatap-agent` volume, `WHATAP_PYTHON_AGENT_PATH` (symlink vs regular file), k8s env facts |
 
 ## How each interpreter is asked

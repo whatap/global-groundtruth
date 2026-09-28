@@ -1,20 +1,20 @@
-# collect-apmjava.sh — changelog
+# collect-apmjava.sh: changelog
 
 The version history of [`collect-apmjava.sh`](collect-apmjava.sh), newest
 first. Every change to the script bumps its `VERSION` and adds one entry at
 the top of this list (docs/authoring-guide.md, step 2); `tools/validate.sh`
 checks that the newest entry is the script's `VERSION`.
 
-- **0.15.8** — Section B names each unexecuted binary's own case: "binary
+- **0.15.8**: Section B names each unexecuted binary's own case: "binary
   deleted since the JVM started" for an exe link marked (deleted), "not
   executable by uid N" for a binary that is there but not executable, "not
   found at this path" when it is not there; the binary of an unconfirmed
   process keeps ", binary deleted".
-- **0.15.7** — `_jvm_maps_lib` reads the VM library path as the whole rest of
+- **0.15.7**: `_jvm_maps_lib` reads the VM library path as the whole rest of
   the maps line (paths with spaces were cut at the first space) without a "
   (deleted)" suffix, and takes only a path ending in /libjvm.so or libj9vm*.so
   (a libjvm.so.debug no longer confirms a JVM).
-- **0.15.6** — Section B: a JVM whose exe link is marked (deleted) is listed
+- **0.15.6**: Section B: a JVM whose exe link is marked (deleted) is listed
   only, never run with -version, even when the path exists again (a JDK
   upgraded in place); its VM library comes from the maps, and when that
   library is deleted too the release file now at its path is not read. One
@@ -23,12 +23,12 @@ checks that the newest entry is the script's `VERSION`.
   n/a` becomes `weaving list: n/a`. The --class-without---library warning
   comes from run_report, right after the collecting-facts progress line (so
   not on a --file run stopped by a bad --out).
-- **0.15.5** — Run helpers (skeleton): `_why_124` and `_out_dir_check` move
+- **0.15.5**: Run helpers (skeleton): `_why_124` and `_out_dir_check` move
   into the skeleton run helpers (the `--out` mkdir now runs under the command
   cap), and `_run_init` sets the probe error file and reads the uid once;
   `probe_merged` comes from the skeleton; the CLI harness banner loses "DO NOT
   EDIT"; no report change.
-- **0.15.4** — Section B lists a JVM whose binary was deleted after it
+- **0.15.4**: Section B lists a JVM whose binary was deleted after it
   started, or is not executable by this uid, among the binaries not run, with
   the reason `binary deleted or not executable`; it used to be dropped, so
   section B could say `java binaries: none` while section D listed the JVM.
@@ -42,9 +42,9 @@ checks that the newest entry is the script's `VERSION`.
   instead of `sh`. Internal: helpers `_release_block`, `_conf_overflow`,
   `_zcat` and `_fd_ls` (one fd snapshot for sections D and F); `_rep_jvms`,
   `_rep_weaving` and `discover` are split into functions.
-- **0.15.3** — Collection status (skeleton `_emit_time`): when a bounded call was slow, capped or not run, the per-command "where the time went" table (sums largest first, time outside bounded calls) gives way to the time log's own records, one line per such call in the order they ran (`<ms> ms  <outcome>  <command>`, the first 40, then `(N more in this run)`); CONTRACT rule 1. `_run_init` sets its EXIT/INT/TERM/HUP traps before it creates the private directory: a signal in between left `ggt.*` behind.
-- **0.15.2** — `_run_init` (skeleton) also takes the script as read from stdin when `$0` is the shell's own binary (`/bin/bash -s`, `$0 -ef /proc/$$/exe`): bash 3.2 under musl otherwise faulted in a loop at full CPU after `4<&0`.
-- **0.15.1** — The host section adds `/sys/class/dmi/id/product_uuid`: its
+- **0.15.3**: Collection status (skeleton `_emit_time`): when a bounded call was slow, capped or not run, the per-command "where the time went" table (sums largest first, time outside bounded calls) gives way to the time log's own records, one line per such call in the order they ran (`<ms> ms  <outcome>  <command>`, the first 40, then `(N more in this run)`); CONTRACT rule 1. `_run_init` sets its EXIT/INT/TERM/HUP traps before it creates the private directory: a signal in between left `ggt.*` behind.
+- **0.15.2**: `_run_init` (skeleton) also takes the script as read from stdin when `$0` is the shell's own binary (`/bin/bash -s`, `$0 -ef /proc/$$/exe`): bash 3.2 under musl otherwise faulted in a loop at full CPU after `4<&0`.
+- **0.15.1**: The host section adds `/sys/class/dmi/id/product_uuid`: its
   `ls -l` line and `dmi product_uuid readable by uid N:` (yes or no, from an
   open and a read of the file); the value follows only when it was read (group
   block `apm: report helpers`, `_product_uuid`). Command lines and environ
@@ -75,11 +75,11 @@ checks that the newest entry is the script's `VERSION`.
   reads
   `not followed: the working directory of pid N ... holds a newline or CR (<path with spaces>)`.
   Goals unchanged.
-- **0.15.0** — The default run prints the version facts that place an
+- **0.15.0**: The default run prints the version facts that place an
   environment in or out of the supported range; no flag added, goals
   unchanged. Section D, per attached JVM (and per JVM whose environ was not
   read): the application server's own version file, read as a file, never
-  by running a server tool — Tomcat `org/apache/catalina/util/ServerInfo.properties`
+  by running a server tool: Tomcat `org/apache/catalina/util/ServerInfo.properties`
   from `lib/catalina.jar` under `-Dcatalina.base`, else `-Dcatalina.home`
   (comment lines left out); JBoss/WildFly `<jboss.home.dir>/version.txt`, and
   `modules/system/layers/base/org/jboss/as/product/*/dir/META-INF/MANIFEST.MF`
@@ -112,7 +112,7 @@ checks that the newest entry is the script's `VERSION`.
   Tomcat 9.0.122 (Temurin 17, dash) and WildFly 41.0.1.Final (JDK 25, bash)
   with agent 2.2.77 attached by `-javaagent`, and on the java-zoo target;
   WebLogic, JEUS and GlassFish/Payara are not verified.
-- **0.14.0** — Report reduced to what confirms a cause; no flag added or
+- **0.14.0**: Report reduced to what confirms a cause; no flag added or
   removed. Section K (Kubernetes / operator injection context) is gone, so L,
   M and N are now `[12]`–`[14]` (letters kept): the collector shell's
   `JAVA_TOOL_OPTIONS` (0.13.2), `JAVA_HOME`, `WHATAP_JAVA_AGENT_PATH` and the
@@ -166,18 +166,18 @@ checks that the newest entry is the script's `VERSION`.
   search). The usage text of `--library`, `--appclasses` and
   `--dump-file` says the same. On a development host with one attached and
   one unattached JVM the default run went from 646 to 464 lines.
-- **0.14.0** (defects present in 0.13.7) — Section C: the in-jar
+- **0.14.0** (defects present in 0.13.7): Section C: the in-jar
   `whatap/v.properties` of agent builds that ship it with CRLF put CR into
   the report (`validate.sh --report` fails on it); CR is removed. Section J:
   the port filter's `$(for ... case ... in ''|*[!0-9]*) ...)` was a syntax
   error under bash 3.2; the case patterns now carry a leading `(`.
-- **0.13.7** — Comments only; report content unchanged. Shortened long
+- **0.13.7**: Comments only; report content unchanged. Shortened long
   comment runs in `_proc_env`, `_all_jvm_args`, `_jvm_opt_val`,
   `_jcmd_recover`, the path-resolution and `_nsresolve` header comments,
   `_find_jvms`, the JVM thread-name detection comment and
   `_appcls_strip_root`; the longer rationales moved to README "Design
   notes".
-- **0.13.6** — Section F: a `-cp`/`-classpath` directory entry ending in `/`
+- **0.13.6**: Section F: a `-cp`/`-classpath` directory entry ending in `/`
   (e.g. `/srv/cp app/classes/`) is used without the slash: its "directory
   root" line drops the trailing `/`, and section N no longer shows its class
   names as `.srv.cp app.classes.com.acme…`. `--class-path X` and
@@ -195,11 +195,11 @@ checks that the newest entry is the script's `VERSION`.
   roots, and `BOOT-INF.classes.r.X` for a doubled segment. The size check of a
   jar before a --class-refs scan no longer prints an open error on stderr.
   Report content otherwise unchanged.
-- **0.13.5** — Split _rep_libs, _rep_tier2, _rep_appclasses and _rep_conf into
+- **0.13.5**: Split _rep_libs, _rep_tier2, _rep_appclasses and _rep_conf into
   per-subsection functions; -jar/-cp extraction is _jvm_opt_val, /proc link
   reads are _link_or_na, the WEB-INF/classes search is _libs_classes_under.
   Report content unchanged.
-- **0.13.4** — Shared code in synced blocks (R2 refactor): the skeleton's emit
+- **0.13.4**: Shared code in synced blocks (R2 refactor): the skeleton's emit
   helpers now hold _optval, _emit_labeled, _tool_rows (the [1] tool table) and
   _indent (the indent loops), and its run helpers hold probe and read_proc.
   The opening facts of the environment section, the cgroup facts and the
@@ -207,7 +207,7 @@ checks that the newest entry is the script's `VERSION`.
   its value (`--out` last) exits 2 with "missing value for --out" and no
   longer prints the usage after it. Report unchanged (compared with 0.13.3 on
   this host and in jjsong-ggt-apm-java:1).
-- **0.13.3** — [1]'s privilege line says when uid 0 has no CAP_SYS_PTRACE (bit 19
+- **0.13.3**: [1]'s privilege line says when uid 0 has no CAP_SYS_PTRACE (bit 19
   of CapEff; the default in docker and k8s): "root without
   CAP_SYS_PTRACE (other uids' /proc/\<pid>/environ, root, cwd are not
   readable: run as the target's uid, ...)". It read "root" while
@@ -217,7 +217,7 @@ checks that the newest entry is the script's `VERSION`.
   timer outlived each call, is not used; the watchdog caps instead.
   Under a PID 1 that does not reap (sleep infinity), one run of each
   collector left 1 zombie on debian and 41-55 on alpine; now 0 (2026-09-27).
-- **0.13.2** — Every JVM this run starts (java -version, javap, jcmd, jstack) runs
+- **0.13.2**: Every JVM this run starts (java -version, javap, jcmd, jstack) runs
   without JAVA_TOOL_OPTIONS, JDK_JAVA_OPTIONS and _JAVA_OPTIONS. Run
   by kubectl exec in an operator-injected pod, the shell inherits
   JAVA_TOOL_OPTIONS=-javaagent:..., and each java -version loaded the
@@ -226,12 +226,12 @@ checks that the newest entry is the script's `VERSION`.
   the agent's own (lab k8s, 2026-09-27). Report: [1] names the
   variables removed; B's -version loses the "Picked up
   JAVA_TOOL_OPTIONS" lines; K prints the value the shell had.
-- **0.13.1** — main is the apm group block `apm: main`; report unchanged. The
+- **0.13.1**: main is the apm group block `apm: main`; report unchanged. The
   warning for --class without --library comes from _init_probe, right
   after the private temp directory is made (was: right before).
   Without hostname(1) and /proc, Target and the --file name take
   `uname -n` (was: unknown); the file name reuses Target's name.
-- **0.13.0** — Fewer options (user decision, 2026-09-26): --library '*' details
+- **0.13.0**: Fewer options (user decision, 2026-09-26): --library '*' details
   every enumerated jar (cap 40) and --library-all is refused with exit
   2 naming it. --class-refs turns on --appclasses (it searches the class
   roots that index reads; alone it did nothing), and [1] says so.
@@ -245,5 +245,5 @@ checks that the newest entry is the script's `VERSION`.
   every shell; --threads=N takes a whole number 1..999999 only.
   --library patterns are matched with globbing off. A
   probe error line over 100 bytes keeps its start and its end.
-- **0.12.6** — Shared helpers moved into the apm group block; report unchanged.
+- **0.12.6**: Shared helpers moved into the apm group block; report unchanged.
   The apm: blocks are copies of templates/groups/apm.sh.

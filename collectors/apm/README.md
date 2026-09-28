@@ -1,4 +1,4 @@
-# collectors/apm — language sub-family collectors
+# collectors/apm: language sub-family collectors
 
 > **Status: SEEDED.** `java/` holds a working v0
 > ([java/collect-apmjava.sh](java/collect-apmjava.sh), see
@@ -26,12 +26,12 @@ directory (e.g. `apm/java/…`, `apm/nodejs/…`).
 Per language runtime, the facts a remote WhaTap agent developer repeatedly asks
 a field engineer for:
 
-- **Runtime version** — JVM / Node / Python / PHP / .NET version and vendor.
-- **How the agent is attached** — e.g. `-javaagent` on the JVM command line;
+- **Runtime version**: JVM / Node / Python / PHP / .NET version and vendor.
+- **How the agent is attached**: e.g. `-javaagent` on the JVM command line;
   Node `--require` / preload; Python `sitecustomize` / import hook; PHP
   extension (`.ini`); .NET profiler environment variables.
 - **Agent version** actually loaded.
-- **Agent config** — `whatap.conf` location and contents; relevant `WHATAP_*`
+- **Agent config**: `whatap.conf` location and contents; relevant `WHATAP_*`
   environment variables.
 - **App server / framework** hosting the process.
 
@@ -41,7 +41,7 @@ values reported as `n/a`.
 ## (b) Delivery mechanism
 
 A **per-language script** run **in-host or in-container** next to the target
-process — one command, paste the output (CONTRACT rule 3). In containers, it is
+process, one command, paste the output (CONTRACT rule 3). In containers, it is
 run via `kubectl exec` / `docker exec` into the app container.
 
 ## Options the Linux collectors share
