@@ -259,6 +259,11 @@ and every collector must keep them.
     in 0.10.0; collzfs `--sample`, `--window-start`, `--no-filesizes`,
     `--filesizes-secs`, `--event-days` and `--hours` in 0.8.0; collzfs
     `--window=DUR@START` and a bare `--filesizes` in 0.11.0.
+    One removed option is named and ignored instead (one `!!` line on
+    stderr, the run goes on), because ignoring it cannot change what is
+    collected: collserver `--time-ref` in 0.14.0, collzfs `--home` in 0.12.0
+    (collzfs reports ZFS only; the WhaTap paths and their dataset are in
+    collserver section C).
 
 - **Leave nothing behind.** Put every temporary file under the run's own
   directory (`_tmp NAME` in the shared block returns a path in it). The shared

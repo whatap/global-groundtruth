@@ -7,7 +7,7 @@
 > | Entrypoint | Token | Scope | validated at | Status |
 > | ---------- | ----- | ----- | ------------ | ------ |
 > | [`collect-collserver.sh`](collect-collserver.sh) | `collserver` | the WhaTap backend itself | 0.15.0 | 0.15.0 run on 2026-09-28 on the lab `collsrv` VM (jjsong-ggt-collsrv, on-prem `whatap_multi` install on Ubuntu `openjdk-17-jre-headless`, `--stdout`/`--bundle`, and `--bundle --jvm` as the `whatap` user: a thread dump and a histo of each of the 8 server JVMs through `java -m jdk.jcmd`): COMPLETE, `validate.sh --report` pass — a lab VM, not a production host. 0.4.1 run against three live production backends (Smartfren, 2026-09-23); log selection re-measured against that bundle's own log tree. `--du` still unvalidated on either. |
-> | [`collect-collzfs.sh`](collect-collzfs.sh) | `collzfs` | ZFS under the backend's data path | 0.10.1 | 0.10.1 run on 2026-09-28 as root on the lab `zfs` VM (jjsong-ggt-zfs, zpool `yard`, `--stdout`/`--bundle`): COMPLETE, `validate.sh --report` pass. 0.8.0 run as root on the same VM (Ubuntu 26.04, zfs 2.4.1, pool with a special vdev): the default run and the time window (idle, under an append load, a forced ring wrap, signals). 0.4.1 validated non-root on two live hosts (zfs 2.2.2 and 2.2.6), one of them a real collection server with `yardbase` on ZFS. `--zdb` still unvalidated. Stub tests: `tools/test-collzfs.sh` |
+> | [`collect-collzfs.sh`](collect-collzfs.sh) | `collzfs` | ZFS under the backend's data path | 0.12.0 | 0.12.0 run on 2026-09-28 as root on the lab `zfs` VM (jjsong-ggt-zfs, zpool `yard`, `--stdout`/`--bundle`): COMPLETE, `validate.sh --report` pass. 0.8.0 run as root on the same VM (Ubuntu 26.04, zfs 2.4.1, pool with a special vdev): the default run and the time window (idle, under an append load, a forced ring wrap, signals). 0.4.1 validated non-root on two live hosts (zfs 2.2.2 and 2.2.6), one of them a real collection server with `yardbase` on ZFS. `--zdb` still unvalidated. Stub tests: `tools/test-collzfs.sh` |
 > | [`collect-collmysql.sh`](collect-collmysql.sh) | `collmysql` | the MySQL that holds the backend's `account` / `notihub` metadata | 0.11.1 | 0.11.1 run on 2026-09-28 on the lab `collsrv` VM's own MySQL 8.4.11 (`--stdout`/`--binlog` as root): COMPLETE, `validate.sh --report` pass; the `mysql-ha` fixture (replicating pair, MySQL 5.6.51/5.7.32/8.4.10, MariaDB 10.11.19) was not re-run this round, so its scope note is unchanged — a replicating pair, section I on 8.4 and real `iostat` sampling are still unverified. |
 >
 > "validated at" is the last version run on a real environment, not the current
@@ -327,9 +327,16 @@ a judgment about ZFS behaviour — and stops there. It prints the measured value
 the tunable that governs it; the threshold, the target and the "good/bad" belong to
 the reader (CONTRACT rule 1).
 
+It reports ZFS only and does not look for WhaTap (since 0.12.0). Which
+filesystem and dataset the yardbase is on is in `collect-collserver.sh`
+section C (fstype, `findmnt` SOURCE, `df`, `zfs get` of that dataset,
+`YARDB_LOCK`); runbooks run both, and this report's D, E and F have every
+dataset's rows, so the two join on the dataset name.
+
 ### (a) Facts it collects — ZFS
 
-One `.txt` report, MECE domains `[1]` + A..O:
+One `.txt` report, MECE domains `[1]` + A..L, N, O (M, the WhaTap paths, was
+removed in 0.12.0; the other letters are unchanged):
 
 - **`[1]` Collection environment** — bash, uid, privilege, boot time, tool presence, whether the
   kstat tree and the module-parameter dir exist, pool/dataset/snapshot counts,
@@ -358,10 +365,18 @@ One `.txt` report, MECE domains `[1]` + A..O:
   and the `metaslab_stats` kstat. Before 0.9.0 C also printed a per-class
   view and a shape count derived from these lines, and H a SLOG line.
 - **D. Pool properties, features & capacity** — `zpool list`, `zpool get all` per
-  pool (ashift, fragmentation, capacity, every `feature@*`), `zfs list -o space`.
-- **E. Dataset block size & compression** — the `zfs get` rows (NAME PROPERTY
-  VALUE SOURCE) of `type`, `recordsize`, `special_small_blocks`, `volblocksize`,
-  `compression`, `compressratio`, `logbias`, `sync`, `primarycache` and `atime`
+  pool (ashift, fragmentation, capacity, every `feature@*`), `zfs list -o space`,
+  and `df -i -t zfs`, the file count of every mounted dataset. Reading `df -i`
+  on ZFS: ZFS has no fixed inode table. `IUsed` is the number of
+  objects in the dataset (files, directories and the like), so it is the file
+  count without a walk. `Inodes` and `IFree` are derived from the free space and
+  move with it; read them as estimates, not as a limit (추정 — to be checked on a
+  real ZFS host).
+- **E. Dataset block size, compression, cache and mount** — the `zfs get` rows
+  (NAME PROPERTY VALUE SOURCE) of `type`, `recordsize`, `special_small_blocks`,
+  `volblocksize`, `compression`, `compressratio`, `logbias`, `sync`,
+  `primarycache`, `atime`, `mounted`, `canmount`, `secondarycache`, `relatime`,
+  `dedup`, `checksum`, `copies`, `reservation`, `refreservation` and `snapdir`
   for every filesystem and volume, from discovery's one `zfs get -Hp all`: exact
   values, each with its **property source** (`local`, `default`, `inherited
   from X`) — a deliberately set value and an inherited one are different facts.
@@ -413,20 +428,6 @@ One `.txt` report, MECE domains `[1]` + A..O:
   question and is bundled only for a recent window (`EVENT_DAYS` in the
   environment, default 30),
   because the full `-v` dump of that buffer was 192MB.
-- **M. WhaTap collection-server paths → dataset mapping** — for `WHATAP_HOME`,
-  `yardbase`, `logs`, `conf`, `db`, `keeperbase`, `logsink`: which filesystem and
-  which **dataset** each lives on, that dataset's `zfs get` rows of `mounted`,
-  `mountpoint`, `canmount`, `secondarycache`, `relatime`, `dedup`, `checksum`,
-  `copies`, `reservation`, `refreservation` and `snapdir` (its block-size,
-  compression and space properties are its rows in D, E and F), and `df`.
-  This is the only WhaTap-specific section; backend services, configs and logs
-  are `collect-collserver.sh`'s job.
-
-  Reading `df -i` on ZFS: ZFS has no fixed inode table. `IUsed` is the number of
-  objects in the dataset (files, directories and the like), so it is the file
-  count without a walk. `Inodes` and `IFree` are derived from the free space and
-  move with it; read them as estimates, not as a limit (추정 — to be checked on a
-  real ZFS host).
 - **N. Deep block & metaslab statistics** — `zdb` is opt-in (see tiers). Each
   zdb call runs once: in a report run N prints its first 400-500 lines; in a
   bundle run its whole output goes to `zdb/zdb-<C|Lbbbs|mm>-<pool>.txt` and N
@@ -434,8 +435,8 @@ One `.txt` report, MECE domains `[1]` + A..O:
   **file-size histogram is opt-in (`--filesizes`, Tier 2)** since 0.6.2. It walks
   the whole tree reading metadata (`find -printf '%s'`); on a yard of ~10^8 files
   that loads the device holding the metadata (a special vdev) and the ARC, and it
-  cannot finish in its bound. Every run has `df -i` for each WhaTap path (the
-  file count), and `--zdb` gives the block-size histogram. When the size
+  cannot finish in its bound. Every run has `df -i` of every mounted dataset
+  in D (the file count), and `--zdb` gives the block-size histogram. When the size
   distribution itself is needed, walk a narrow sample (`--filesizes=PATH`, e.g.
   one day's directory; since 0.11.0 a PATH is required and the whole yardbase
   is not walked). A walk that hits its bound (`FILESIZES_SECS` in the
@@ -583,15 +584,14 @@ hand over one file (CONTRACT rule 3):
 ./collect-collzfs.sh --file                 # -> whatap-collzfs-<host>-<UTC>.txt   (attach this; includes a 15 s window)
 ./collect-collzfs.sh --bundle               # -> whatap-collzfs-<host>-<UTC>.tar.gz (report + raw artifacts)
 ./collect-collzfs.sh --file --window=2h     # a 2 h window from now
-./collect-collzfs.sh --file --home /whatap  # force WHATAP_HOME if auto-resolution is n/a
 ./collect-collzfs.sh --file --quiet         # no progress narration (for automation)
 ./collect-collzfs.sh                        # no arguments -> prints help (does not collect)
 ./collect-collzfs.sh --help                 # all options
 ```
 
-**Options** (10): `--file`, `--stdout`, `--bundle`, `--quiet`, `--home DIR`,
+**Options** (9): `--file`, `--stdout`, `--bundle`, `--quiet`,
 `--out DIR`, `--window=DUR`, `--filesizes=PATH`, `--zdb`, `--help`.
-Since 0.8.1 `--out`, `--home`, `--window` and `--filesizes=` with no value, or
+Since 0.8.1 `--out`, `--window` and `--filesizes=` with no value, or
 with the next option taken for it (`--out --file`), exit 2 naming the option.
 
 **Environment** (whole numbers; another value is ignored with a warning, and the
@@ -664,8 +664,9 @@ default is used):
 
 The environment values are checked like `CMD_TIMEOUT` and `RUN_DEADLINE`: a
 value that is not a whole number is ignored with a warning, and the default is
-used. `--help` lists the five in an Environment block. That leaves 10 options:
-`--file --stdout --bundle --quiet --home --out --window --filesizes --zdb --help`.
+used. `--help` lists the five in an Environment block. That leaves 9 options
+(since 0.12.0, without `--home`):
+`--file --stdout --bundle --quiet --out --window --filesizes --zdb --help`.
 
 **Removed in 0.11.0.** Each exits 2 with one line naming its replacement:
 collecting from now, or skipping the walk, is not what the runbook asked for.
@@ -674,6 +675,16 @@ collecting from now, or skipping the walk, is not what the runbook asked for.
 |---|---|
 | `--window=DUR@START` | start the run at `START` (`at`, `cron`) with `--window=DUR` |
 | `--filesizes` with no PATH (walked the whole yardbase) | `--filesizes=PATH`, a narrow sample such as one day's directory |
+
+**Removed in 0.12.0, and ignored.** `--home DIR` (or `--home=DIR`) prints one
+`!!` line, `--home is no longer used: collzfs reports ZFS only; the WhaTap
+paths and their dataset are in collect-collserver.sh section C`, and the run
+goes on: no ZFS fact depended on it. With it went section M (WhaTap paths →
+filesystem → dataset, those datasets' `zfs get` rows again, `df -h` / `df -i`
+of each path, `YARDB_LOCK` and the yardbase listing), the `paths` goal, and the
+bundle's `whatap/` directory (`paths.txt`, `path-dataset-map.txt`); the
+bundle's whole-host `df-h.txt` / `df-i.txt` moved to `host/`. The file count
+is now D's `df -i -t zfs`.
 
 The report changed where `--sample` was: section J has no "interval sample
 (--sample)" subsection, and `[1]`'s tiers line is
@@ -707,8 +718,9 @@ or the snapshot list failed, was refused or hung, or when `zfs` is absent.
 - L's event tally covers the whole ring buffer, whose depth is set by
   `zfs_zevent_len_max` (B). `zpool events` and `zpool history` read `/dev/zfs`,
   so their content depends on the uid in `[1]`.
-- WhaTap `conf/*.conf`, JVM flags, ports and service logs are collected by
-  `collect-collserver.sh`, not here.
+- WhaTap `conf/*.conf`, JVM flags, ports, service logs and which dataset the
+  yardbase is on (its section C) are collected by `collect-collserver.sh`, not
+  here.
 
 #### Collection-load tiers — ZFS
 

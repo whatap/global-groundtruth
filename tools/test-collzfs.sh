@@ -57,19 +57,6 @@ status_adds_up() {
   chk "$2 ($line)" "$d" "$((g + n + b))"
 }
 
-# The collector finds whatap JVMs with one `xargs grep` over /proc/*/cmdline.
-# This xargs, first on PATH, passes on only the PIDs in ONLY_PIDS (empty: none),
-# so a whatap-looking process elsewhere on the host (a parallel suite's fake
-# JVM) cannot change what a test sees.
-mkdir -p "$ROOT/only"
-stub_write "$ROOT/only/xargs" <<EOF
-#!$(type -P bash)
-while IFS= read -r -d '' p; do
-    q="\${p#/proc/}"; case " \${ONLY_PIDS:-} " in *" \${q%%/*} "*) printf '%s\\0' "\$p" ;; esac
-done | exec $(type -P xargs) -r "\$@"
-EOF
-export PATH="$ROOT/only:$PATH" ONLY_PIDS=""
-
 # A PATH of the ordinary tools and no zfs userland; each group adds its own
 # zpool stub. ZPOOL_MODE picks what the stub does.
 S="$ROOT/stub"; mkdir -p "$S"
@@ -78,7 +65,6 @@ for c in cat ls date wc tail head sed awk grep tr id hostname find sort mktemp c
          readlink findmnt lsblk kill xargs; do
   p="$(type -P "$c" 2>/dev/null)" && [ -n "$p" ] && ln -sf "$p" "$S/$c"
 done
-rm -f "$S/xargs"; stub_write "$S/xargs" < "$ROOT/only/xargs"
 stub_write "$S/zpool" <<'STUB'
 #!/bin/sh
 case "${ZPOOL_MODE:-empty}" in
@@ -246,105 +232,28 @@ if [ -n "$t" ]; then
   chk "and leaves no work dir beside it" "1" "$(ls -A "$B" | wc -l | tr -d ' ')"
 else bad "bundle written" "a .tar.gz" "none"; fi
 
-echo "== 8. read from stdin (bash -s): the /proc scan still sees a JVM =="
-H8="$ROOT/home8"; mkdir -p "$H8/conf"
-( exec -a "java -Dwhatap.server.home=$H8 -jar whatap.server.yard.jar" sleep 60 ) >/dev/null 2>&1 </dev/null &
-jvm=$!
-sleep 1
-out="$(ONLY_PIDS="$jvm" PATH="$S0" bash -s -- --stdout < "$C" 2>/dev/null)"
-kill "$jvm" 2>/dev/null; wait "$jvm" 2>/dev/null
-has "bash -s: WHATAP_HOME comes from a whatap JVM" "$out" "(-Dwhatap.server.home)"
+echo "== 13. 0.12.0: the default report has df -i of every mounted ZFS dataset, and no WhaTap paths =="
+# 0.6.2 put the file count in df -i instead of a walk; 0.12.0 takes it for every
+# mounted dataset (df -i -t zfs) instead of for the WhaTap paths it resolved.
+out="$(PATH="$S" "$C" --stdout </dev/null 2>/dev/null)"
+has "D has df -i -t zfs" "$out" "df -i -t zfs"
+chk "and no other df -i" "0" "$(printf '%s\n' "$out" | grep -c '^    df -i /')"
+hasnt "no WHATAP_HOME line" "$out" "WHATAP_HOME"
+hasnt "no section M" "$out" "M. WhaTap"
+hasnt "no paths goal" "$out" "WhaTap path to dataset mapping"
 
-echo "== 9. WHATAP_HOME from a whatap JVM's working directory =="
-H9="$ROOT/home9"; mkdir -p "$H9/conf"; : >| "$H9/conf/yard.conf"
-( cd "$H9" && exec -a "java -jar whatap.server.yard.jar" sleep 60 ) >/dev/null 2>&1 </dev/null &
-jvm=$!
-sleep 1
-out="$(ONLY_PIDS="$jvm" PATH="$S0" "$C" --stdout </dev/null 2>/dev/null)"
-kill "$jvm" 2>/dev/null; wait "$jvm" 2>/dev/null
-has "the home is the JVM's cwd" "$out" "WHATAP_HOME: $H9"
-has "and says so" "$out" "working directory"
-
-echo "== 10. a whatap JVM whose cwd this uid cannot read: blocked, not n/a =="
-if [ "$(id -u)" != 0 ] && sudo -n true 2>/dev/null; then
-  sudo -n -u nobody bash -c 'cd /tmp && exec -a "java -jar whatap.server.yard.jar" sleep 60' >/dev/null 2>&1 </dev/null &
-  sleep 1
-  opid="$(pgrep -u nobody -f '^java -jar whatap.server.yard.jar' | head -1)"
-  out="$(ONLY_PIDS="$opid" PATH="$S0" "$C" --stdout </dev/null 2>/dev/null)"
-  [ -n "$opid" ] && sudo -n kill "$opid" 2>/dev/null; wait 2>/dev/null
-  has "the cwd is said to be unreadable" "$out" "whatap JVM working directory: n/a (not readable by uid $(id -u): pid"
-  has "and the paths goal is blocked with the privilege hint" "$out" "WhaTap path to dataset mapping — whatap JVM pid"
-  has "which names the uid" "$out" "its cwd not readable by uid $(id -u) (not elevated: run again with sudo)"
-  has "and the run is INCOMPLETE" "$out" "status: INCOMPLETE"
-else skip "the unreadable-cwd case (needs a non-root account with passwordless sudo)"; fi
-
-echo "== 11. only a java process that runs a server module counts =="
-F11="$ROOT/f11"; mkdir -p "$F11"; : >| "$F11/whatap.server.log"
-( cd "$F11" && exec -a "java -Dwhatap.server.host=10.0.0.1 -jar app.jar" sleep 60 ) >/dev/null 2>&1 </dev/null &
-p1=$!
-tail -f "$F11/whatap.server.log" >/dev/null 2>&1 </dev/null &
-p2=$!
-sleep 1
-out="$(ONLY_PIDS="$p1 $p2" PATH="$S0" "$C" --stdout </dev/null 2>/dev/null)"
-kill "$p1" "$p2" 2>/dev/null; wait "$p1" "$p2" 2>/dev/null
-hasnt "an app JVM with the agent and a tail of a whatap log: no paths goal" "$out" "WhaTap path to dataset mapping"
-has "and the host stays COMPLETE" "$out" "status: COMPLETE"
-
-echo "== 12. the paths goal is declared whatever route resolved the home =="
-H12="$ROOT/home12"; mkdir -p "$H12/conf"
-( exec -a "java -Dwhatap.server.home=$H12 -jar whatap.server.yard.jar" sleep 60 ) >/dev/null 2>&1 </dev/null &
-jvm=$!
-sleep 1
-out="$(ONLY_PIDS="$jvm" PATH="$S0" "$C" --stdout </dev/null 2>/dev/null)"
-has "-Dwhatap.server.home: the goal is declared and obtained" "$out" "obtained: WhaTap path to dataset mapping"
-out="$(ONLY_PIDS="$jvm" PATH="$S0" "$C" --stdout --home "$ROOT/home12" </dev/null 2>/dev/null)"
-has "--home with a module running: declared too" "$out" "WhaTap path to dataset mapping"
-kill "$jvm" 2>/dev/null; wait "$jvm" 2>/dev/null
-( exec -a "java -Dwhatap.server.home=$ROOT/gone12 -jar whatap.server.yard.jar" sleep 60 ) >/dev/null 2>&1 </dev/null &
-jvm=$!
-sleep 1
-out="$(ONLY_PIDS="$jvm" PATH="$S0" "$C" --stdout </dev/null 2>/dev/null)"
-kill "$jvm" 2>/dev/null; wait "$jvm" 2>/dev/null
-# na_block REPORT -> only the lines under "not applicable to this host"
-na_block() { printf '%s\n' "$1" | awk '/not applicable to this host/ {f=1; next} f && /^        / {print; next} {f=0}'; }
-nas="$(na_block "$out")"
-has "a home that does not exist: n/a, path not found" "$nas" "WhaTap path to dataset mapping — WHATAP_HOME $ROOT/gone12 (via process $jvm (-Dwhatap.server.home)): path not found"
-has "and the run stays COMPLETE" "$out" "status: COMPLETE"
-# home12_case HOME -> the report with a module whose -D home is HOME
-home12_case() {
-    ( exec -a "java -Dwhatap.server.home=$1 -jar whatap.server.yard.jar" sleep 60 ) >/dev/null 2>&1 </dev/null &
-    local j=$!
-    sleep 1
-    ONLY_PIDS="$j" PATH="$S0" "$C" --stdout </dev/null 2>/dev/null
-    kill "$j" 2>/dev/null; wait "$j" 2>/dev/null
-}
-out="$(home12_case "$ROOT/nodata12/whatap")"
-has "a missing parent too (a /data/whatap on a host without /data): path not found" \
-    "$(na_block "$out")" "WHATAP_HOME $ROOT/nodata12/whatap (via process"
-has "and COMPLETE" "$out" "status: COMPLETE"
-ln -s "$ROOT/gone12b" "$ROOT/link12"
-out="$(home12_case "$ROOT/link12")"
-has "a dangling home link says so" "$out" "WHATAP_HOME $ROOT/link12 (via process"
-has "as a dangling symlink, not applicable" "$(na_block "$out")" "dangling symlink to $ROOT/gone12b"
-printf '%s' "$out" | grep -q "$ROOT/link12 (via process.*is not readable" && bad "not as unreadable" "absent" "present" || ok "not as unreadable"
-if [ "$(id -u)" != 0 ]; then
-    mkdir -p "$ROOT/locked12"; chmod 000 "$ROOT/locked12"
-    out="$(home12_case "$ROOT/locked12")"
-    has "an unlistable home: blocked with the uid and the hint" "$out" "WHATAP_HOME $ROOT/locked12 (via process"
-    has "which names the uid" "$out" "is not readable by uid $(id -u) (not elevated: run again with sudo)"
-    chmod 755 "$ROOT/locked12"
-else skip "the unlistable-home case (root lists everything)"; fi
-
-echo "== 13. the default report has df -i for every WhaTap path that exists =="
-# 0.6.2 put the file count in df -i instead of a walk; the bundle test above
-# covers df-i.txt, this the report.
-H13="$ROOT/home13"; mkdir -p "$H13/conf" "$H13/logs" "$H13/yardbase"
-out="$(PATH="$S0" "$C" --stdout --home "$H13" </dev/null 2>/dev/null)"
-for p13 in "$H13" "$H13/yardbase" "$H13/logs" "$H13/conf"; do
-  has "df -i $p13" "$out" "df -i $p13:"
+echo "== 13b. 0.12.0: --home is named and ignored; the run goes on =="
+# ignoring it cannot change the ZFS facts collected, so it does not stop the run
+ref="$(PATH="$S0" "$C" --stdout </dev/null 2>/dev/null | grep -c .)"
+for a in "--home /opt/whatap" "--home=/opt/whatap"; do
+  # shellcheck disable=SC2086
+  err="$(PATH="$S0" "$C" --stdout $a </dev/null 2>&1 >/dev/null)"; rc=$?
+  chk "$a exits 0" "0" "$rc"
+  chk "$a prints one !! line" "1" "$(printf '%s\n' "$err" | grep -c '^!! ')"
+  has "$a points at collserver C" "$err" "--home is no longer used: collzfs reports ZFS only; the WhaTap paths and their dataset are in collect-collserver.sh section C"
+  # shellcheck disable=SC2086
+  chk "$a: the report has as many lines as without it" "$ref" "$(PATH="$S0" "$C" --stdout $a </dev/null 2>/dev/null | grep -c .)"
 done
-hasnt "and none for a path that is not there" "$out" "df -i $H13/db"
-chk "one df -i per distinct present path" "4" "$(printf '%s\n' "$out" | grep -c '^    df -i ')"
 
 echo "== 14. 0.7.0: zpool list -v is asked once, for the raw lines and the bundle =="
 S14="$ROOT/stub14"; stub_clone "$S" "$S14"; ZC14="$ROOT/zcalls14"; : >| "$ZC14"
@@ -715,7 +624,7 @@ for pair in "--sample|use --window=30s" "--sample=10|use --window=30s" "--window
 done
 hh="$("$C" --help)"
 for o in --sample --window-start --no-filesizes --filesizes-secs --event-days --hours; do hasnt "--help no longer lists $o" "$hh" "$o"; done
-chk "--help lists 10 options" "--bundle --file --filesizes --help --home --out --quiet --stdout --window --zdb" "$(printf '%s\n' "$hh" | grep -oE -- '--[a-z-]+' | sort -u | tr '\n' ' ' | sed 's/ $//')"
+chk "--help lists 9 options" "--bundle --file --filesizes --help --out --quiet --stdout --window --zdb" "$(printf '%s\n' "$hh" | grep -oE -- '--[a-z-]+' | sort -u | tr '\n' ' ' | sed 's/ $//')"
 for v in CMD_TIMEOUT RUN_DEADLINE FILESIZES_SECS EVENT_DAYS JOURNAL_HOURS; do has "--help's Environment block names $v" "$hh" "    $v=N"; done
 
 echo "== 23b. 0.11.0: --window=DUR@START and a bare --filesizes stop, naming the replacement =="

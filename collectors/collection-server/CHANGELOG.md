@@ -143,6 +143,23 @@ one entry at the top of its section (docs/authoring-guide.md, step 2);
 
 ## collect-collzfs.sh
 
+- **0.12.0** — ZFS only: the collector no longer looks for WhaTap. E now lists
+  `mounted canmount secondarycache relatime dedup checksum copies reservation
+  refreservation snapdir` for every dataset (M printed them for the WhaTap
+  paths' datasets only; the values come from the one `zfs get all`). Section M
+  goes (WHATAP_HOME and yardbase resolution from whatap JVMs, their cwd, systemd
+  WorkingDirectory or the script's parent; each path's fstype, dataset and pool;
+  those datasets' `zfs get` rows again; `df -h` / `df -i`
+  of each path; `YARDB_LOCK` and the yardbase listing), and with it the `paths`
+  goal and the bundle's `whatap/` directory. `collect-collserver.sh` section C
+  has the yardbase's fstype, dataset, `df`, `zfs get` of that dataset and
+  `YARDB_LOCK`; runbooks run both. The file count, which came from `df -i` of
+  the WhaTap paths, is now `df -i -t zfs` in D, for every mounted dataset. The
+  bundle's whole-host `df-h.txt` / `df-i.txt` moved to `host/`. `--home DIR` is
+  named in one `!!` line and ignored (no ZFS fact depended on it). The other
+  letters are unchanged (no M). The process-scan and file-helper group blocks
+  stay (their members line is shared with collserver); their WhaTap helpers are
+  unused here.
 - **0.11.0** — Fewer options. `--window=DUR@START` goes: `--window=DUR` sets
   the length only, and a window at a later time is a run started then (at,
   cron). A bare `--filesizes` no longer walks the whole yardbase: the walk

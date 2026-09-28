@@ -8,12 +8,11 @@
 # path and free-space fragmentation — WITHOUT the collector itself making that
 # judgment (CONTRACT rule 1).
 #
-# Companion collector: collect-collserver.sh collects the WhaTap backend facts
-# (WHATAP_HOME layout, JVMs, ports, conf/*.conf, service logs). This collector
-# deliberately does NOT repeat those; it stops at "which dataset does each
-# WhaTap path live on, and what are that dataset's properties" (section M).
-# The two reports are each self-contained; the MECE rule applies within a
-# report, not across collectors.
+# ZFS only: it does not look for WhaTap. Companion collector:
+# collect-collserver.sh collects the WhaTap backend facts (WHATAP_HOME layout,
+# JVMs, ports, conf/*.conf, service logs) and, in its section C, which
+# filesystem and dataset the yardbase is on; runbooks run both. This report has
+# every dataset's properties, so the two join on the dataset name.
 #
 # Question -> report section map: see README.md, "Design notes" under this
 # collector.
@@ -36,7 +35,7 @@ export LC_ALL=C
 # ---- collector metadata -----------------------------------------------------
 # History: CHANGELOG.md, section collect-collzfs.sh (next to this file).
 COLLECTOR_NAME="whatap-collzfs"
-VERSION="0.11.0"
+VERSION="0.12.0"
 DOMAIN="collection-server"
 TARGET="collection-server-zfs/$(hostname 2>/dev/null || echo unknown)"   # refined after pool discovery
 
@@ -116,7 +115,6 @@ OPT_STDOUT=0
 OPT_BUNDLE=0
 OPT_QUIET=0          # suppress progress narration on stderr
 OPT_OUT="."
-OPT_HOME=""
 # journal window in hours: JOURNAL_HOURS in the environment (checked in main)
 OPT_HOURS="${JOURNAL_HOURS:-24}"
 OPT_ZDB=0            # Tier 2: zdb -C / -Lbbbs / -mm
@@ -157,12 +155,11 @@ explicit action flag (--file / --stdout / --bundle) so nothing starts by acciden
   collect-collzfs.sh --stdout               print the report to stdout instead of a file
   collect-collzfs.sh --bundle               Tier 0 report + Tier 1 raw artifacts -> tar.gz
   collect-collzfs.sh --quiet ...            silence progress on stderr (for automation)
-  collect-collzfs.sh --home DIR             force WHATAP_HOME (else auto-resolved)
   collect-collzfs.sh --out DIR              output directory (default: .)
 
   Tier 0 always includes the cumulative-since-boot zpool iostat histograms
   (-r request size, -w latency), which are instant kstat reads, and df -i
-  (inodes, i.e. the file count) of every WhaTap path.
+  (inodes, i.e. the file count) of every mounted ZFS dataset.
 
   zpool events. The tally (count, first date, last date per class) always covers
   the WHOLE ring buffer, because what the buffer answers is when a class started
@@ -222,6 +219,7 @@ ARGC=$#              # 0 args -> usage (handled in main, below)
 # replaced it (fd 3 is not open yet, so stderr)
 _removed() { printf '!! %s\n' "$1" >&2; exit 2; }
 # ---- end collection-server: options
+_HOME_SEEN=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --file) OPT_FILE=1 ;;
@@ -230,8 +228,9 @@ while [ $# -gt 0 ]; do
         --quiet) OPT_QUIET=1 ;;
         --out) _optval --out "${2:-}"; OPT_OUT="$2"; shift ;;
         --out=*) _optval --out "${1#*=}"; OPT_OUT="${1#*=}" ;;
-        --home) _optval --home "${2:-}"; OPT_HOME="$2"; shift ;;
-        --home=*) _optval --home "${1#*=}"; OPT_HOME="${1#*=}" ;;
+        # removed, and nothing the run collects depends on it: named, then ignored
+        --home) _optval --home "${2:-}"; _HOME_SEEN=1; shift ;;
+        --home=*) _optval --home "${1#*=}"; _HOME_SEEN=1 ;;
         --hours|--hours=*)
             _removed "--hours was removed: set JOURNAL_HOURS=N in the environment (default 24)" ;;
         --sample|--sample=*)
@@ -255,6 +254,7 @@ while [ $# -gt 0 ]; do
     esac
     shift
 done
+[ -n "${_HOME_SEEN:-}" ] && printf '!! %s\n' "--home is no longer used: collzfs reports ZFS only; the WhaTap paths and their dataset are in collect-collserver.sh section C" >&2
 
 blk() { printf '        %s\n' "$1"; }
 
@@ -923,7 +923,6 @@ run_bounded() {
     CMD_TIMEOUT="$s" _bounded "$@" 2>/dev/null
 }
 
-# ---- portable helpers -------------------------------------------------------
 # ---- collection-server: process scan — DO NOT EDIT --------------------------
 # members: collserver collzfs
 # cmdline_of PID -> sets _CL to the process's argv joined by spaces (the bytes
@@ -992,7 +991,11 @@ _is_whatap_server() {
     [ "$comm" = java ] || [ "${a0##*/}" = java ]
 }
 # ---- end collection-server: process scan
-
+# Since 0.12.0 collzfs calls nothing in the process scan: it stays only because
+# the block's members line, shared with collserver, still names collzfs. This
+# reference keeps shellcheck from reading the block's status variable as unused
+# until collzfs leaves the members.
+: "${CMDLINE_SCAN_WHY:-}"
 
 # ---- collection-server: systemd — DO NOT EDIT -------------------------------
 # members: collserver collzfs
@@ -1166,62 +1169,6 @@ discover_zfs() {
 has_property() {
     [ -n "$_ZGETALL" ] && [ -s "$_ZGETALL" ] || return 1
     awk -F'\t' -v p="$1" '$2==p {found=1; exit} END{exit !found}' "$_ZGETALL" 2>/dev/null
-}
-
-# ---- WhaTap layout discovery (only enough to map paths to datasets) ---------
-WHATAP_UNITS="yard proxy gateway keeper account notihub eureka front router billing crane flexreport"
-WHOME=""
-WHOME_SRC=""
-
-# A whatap JVM seen during resolve_home, and those whose cwd this uid could not
-# read: then "not resolved" is not an answer (the paths goal is blocked).
-ZH_JVM=""; ZH_UNREAD=""
-resolve_home() {
-    local d cl v unit wd sd
-    # The process scan runs whatever route resolves the home: a running server
-    # module is what declares the paths goal (ZH_JVM).
-    local f jvms="" p u dhome="" dpid=""
-    _scan_cmdlines
-    while IFS= read -r f; do
-        [ -n "$f" ] || continue
-        d="${f%/cmdline}"
-        cmdline_of "${d#/proc/}"; cl="$_CL"
-        _is_whatap_server "${d#/proc/}" "$cl" || continue
-        jvms="$jvms ${d#/proc/}"
-        [ -n "$dhome" ] && continue
-        v="$(printf '%s\n' "$cl" | grep -oE '[-]Dwhatap\.server\.home=[^ ]+' | head -n1 | cut -d= -f2-)"
-        [ -n "$v" ] && { dhome="$v"; dpid="${d#/proc/}"; }
-    done <<EOF
-$_SCAN_OUT
-EOF
-    [ -n "$jvms" ] && ZH_JVM="${jvms# }" && ZH_JVM="${ZH_JVM%% *}"
-    if [ -n "$OPT_HOME" ]; then WHOME="$OPT_HOME"; WHOME_SRC="option --home"; return; fi
-    if [ -n "$dhome" ]; then WHOME="$dhome"; WHOME_SRC="process $dpid (-Dwhatap.server.home)"; return; fi
-    # a JVM's working directory, as collect-collserver.sh does: start scripts
-    # cd into the home; it counts when it holds a module conf or a server jar
-    for p in $jvms; do
-        wd="$(readlink "/proc/$p/cwd" 2>/dev/null)"
-        if [ -z "$wd" ]; then ZH_UNREAD="$ZH_UNREAD $p"; continue; fi
-        [ "$wd" != / ] || continue
-        for u in $WHATAP_UNITS; do
-            [ -f "$wd/conf/$u.conf" ] && { WHOME="$wd"; WHOME_SRC="process $p working directory"; return; }
-        done
-        for f in "$wd"/lib/whatap.server.*.jar "$wd"/lib/whatap.opslake.*.jar; do
-            [ -e "$f" ] && { WHOME="$wd"; WHOME_SRC="process $p working directory"; return; }
-        done
-    done
-    if have systemctl; then
-        for unit in $WHATAP_UNITS; do
-            unit_loaded "$unit.service" || continue
-            wd="$(sd_show WorkingDirectory "$unit.service")"
-            if [ -n "$wd" ] && [ "$wd" != "/" ]; then WHOME="$wd"; WHOME_SRC="systemd $unit.service WorkingDirectory"; return; fi
-        done
-    fi
-    sd="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
-    if [ -n "$sd" ] && [ -d "$sd/../conf" ] && [ -d "$sd/../logs" ]; then
-        WHOME="$(cd "$sd/.." && pwd)"; WHOME_SRC="script parent dir"; return
-    fi
-    WHOME=""; WHOME_SRC="n/a (not resolved)"
 }
 
 # =============================================================================
@@ -1488,6 +1435,10 @@ _rep_d() {
     [ -z "$ZPOOLS" ] && fact "zpool get all: n/a ($(_nopool_why))"
     subsection "dataset space overview (zfs list -o space)"
     probe_t 60 "zfs list -o space" zfs list -o space
+    # The file count of each mounted dataset: ZFS has no inode table, and IUsed
+    # is the number of objects (README.md, section D). statfs only, no walk.
+    subsection "file count per mounted dataset (df -i -t zfs)"
+    probe_t 60 "df -i -t zfs" df -i -t zfs
 }
 
 # -- E. Dataset block size & compression ----------------------------------
@@ -1501,8 +1452,8 @@ _rep_e() {
     else
         fact "special_small_blocks property: not reported by this zfs build (or no dataset enumerated)"
     fi
-    subsection "block size & compression properties, every filesystem and volume (zfs get rows)"
-    local r; r="$(zget_rows "type recordsize special_small_blocks volblocksize compression compressratio logbias sync primarycache atime")"
+    subsection "block size, compression, cache and mount properties, every filesystem and volume (zfs get rows)"
+    local r; r="$(zget_rows "type recordsize special_small_blocks volblocksize compression compressratio logbias sync primarycache atime mounted canmount secondarycache relatime dedup checksum copies reservation refreservation snapdir")"
     if [ -n "$r" ]; then printf '%s\n' "$r" | _indent '        '
     else fact "n/a (no dataset property dump — zfs get returned nothing)"; fi
     subsection "volumes (volblocksize is set at creation time)"
@@ -1804,8 +1755,6 @@ run_report() {
 
     goal zfs   "ZFS present on this host"
     goal pools "pool topology and properties"
-    # Only where a whatap JVM runs: the path-to-dataset mapping is then expected.
-    [ -n "$ZH_JVM" ] && goal paths "WhaTap path to dataset mapping"
     [ "$ZFS_ON_HOST" = 1 ] && goal datasets "dataset properties and snapshots"
 
     _rep_env
@@ -1813,8 +1762,6 @@ run_report() {
         section "A. ZFS software & kernel module"
         fact "n/a (not applicable: no zfs/zpool command and no $KSTAT_DIR on this host)"
         fact "sections B..L: not collected (no zfs/zpool command and no $KSTAT_DIR)"
-        section "M. WhaTap collection-server paths"
-        report_whatap_paths
         # A short report that answers none of this collector's questions: the
         # status says so.
         na zfs "no zfs or zpool command and no $KSTAT_DIR on this host"
@@ -1838,10 +1785,8 @@ run_report() {
     _rep_j
     _rep_k
     _rep_l
-    # -- M. WhaTap collection-server paths -> dataset mapping -----------------
-    section "M. WhaTap collection-server paths -> dataset mapping"
-    report_whatap_paths
-
+    # M (WhaTap paths -> dataset) was removed in 0.12.0: collect-collserver.sh
+    # section C has it. N and O keep their letters.
     _rep_n
     _rep_o
     got zfs
@@ -1912,85 +1857,6 @@ _resolve_datasets() {
     elif [ "$DS_COUNT" -gt 0 ] 2>/dev/null; then got datasets
     elif [ "${ZPOOL_COUNT:-0}" -gt 0 ] 2>/dev/null; then missed datasets "zfs get listed no dataset while zpool listed $ZPOOL_COUNT pools"
     else na datasets "zfs get ran and listed no filesystem or volume"; fi
-}
-
-# Section M body — also used in the "no ZFS on this host" short path.
-report_whatap_paths() {
-    fact "WHATAP_HOME: ${WHOME:-n/a (not resolved)}"
-    fact "WHATAP_HOME resolved by: $WHOME_SRC"
-    [ -n "$CMDLINE_SCAN_WHY" ] && fact "whatap process scan: n/a ($CMDLINE_SCAN_WHY)"
-    [ -n "$ZH_UNREAD" ] && fact "whatap JVM working directory: n/a (not readable by uid $(id -u 2>/dev/null || echo '?'): pid$ZH_UNREAD)"
-    if [ -n "$ZH_JVM" ]; then
-        local _u; _u="$(id -u 2>/dev/null || echo '?')"
-        local _hs=""; [ -n "$WHOME" ] && _hs="$(_path_state "$WHOME")"
-        if [ -n "$WHOME" ]; then
-            case "$_hs" in
-                ok)         got paths ;;
-                absent)     na paths "WHATAP_HOME $WHOME (via $WHOME_SRC): path not found" ;;
-                dangling:*) na paths "WHATAP_HOME $WHOME (via $WHOME_SRC): dangling symlink to ${_hs#dangling:}" ;;
-                notdir)     na paths "WHATAP_HOME $WHOME (via $WHOME_SRC): not a directory" ;;
-                *)          missed paths "WHATAP_HOME $WHOME (via $WHOME_SRC) is not readable by uid $_u$(_priv_hint)" ;;
-            esac
-        elif [ -n "$ZH_UNREAD" ]; then missed paths "whatap JVM pid$ZH_UNREAD running, its cwd not readable by uid $(id -u 2>/dev/null || echo '?')$(_priv_hint); pass --home DIR"
-        else missed paths "whatap JVM pid $ZH_JVM running, home not resolved: no -Dwhatap.server.home and no module conf or server jar in its cwd; pass --home DIR"; fi
-    fi
-    fact "yardbase: ${YARDBASE:-n/a (not resolved from yard.conf or WHATAP_HOME/yardbase)}"
-    subsection "path -> filesystem -> dataset"
-    local paths p ex ft sr pool
-    paths="$WHOME $YARDBASE"
-    [ -n "$WHOME" ] && paths="$paths $WHOME/logs $WHOME/conf $WHOME/db $WHOME/keeperbase $WHOME/logsink"
-    if [ -z "$WHOME" ] && [ -z "$YARDBASE" ]; then
-        fact "n/a (WHATAP_HOME and yardbase both unresolved: no -Dwhatap.server.home and no home as the cwd of a readable whatap JVM, no WorkingDirectory in a loaded whatap unit, no conf/ + logs/ beside this script)"
-        return
-    fi
-    # zmap: "path<TAB>dataset" of each present path on zfs, for the next loop
-    local seen="" zmap=""
-    for p in $paths; do
-        [ -n "$p" ] || continue
-        case " $seen " in *" $p "*) continue ;; esac
-        seen="$seen $p"
-        if [ -e "$p" ]; then ex="present"; else ex="path not found"; fi
-        ft="$(fstype_of "$p")"
-        sr="$(source_of "$p")"
-        [ "$ft" = zfs ] && [ -e "$p" ] && [ -n "$sr" ] && zmap="$zmap$p$_tab$sr$_nl"
-        [ -z "$ft" ] && ft="n/a"
-        [ -z "$sr" ] && sr="n/a"
-        # The pool is the part of the dataset name before the first '/', but only
-        # when the mount source IS a dataset. Deriving it unconditionally turns a
-        # device path (/dev/vda2) into an empty pool and "n/a" into "n".
-        if [ "$ft" = "zfs" ]; then pool="${sr%%/*}"; else pool="n/a (not zfs)"; fi
-        blk "$(printf '%-42s %-14s fstype=%-8s dataset=%-30s pool=%s' "$p" "$ex" "$ft" "$sr" "$pool")"
-    done
-    subsection "dataset properties for the paths above"
-    local done_ds=""
-    while IFS="$_tab" read -r p sr; do
-        [ -n "$p" ] || continue
-        case " $done_ds " in *" $sr "*) continue ;; esac
-        done_ds="$done_ds $sr"
-        fact "$sr (mounted at or containing $p)"
-    done <<EOF
-$zmap
-EOF
-    # Their other properties are rows of D (zfs list -o space), E and F.
-    local r=""
-    # shellcheck disable=SC2086  # a dataset name is one word
-    [ -n "$done_ds" ] && r="$(zget_rows "mounted mountpoint canmount secondarycache relatime dedup checksum copies reservation refreservation snapdir" $done_ds)"
-    [ -n "$r" ] && printf '%s\n' "$r" | _indent '        '
-    [ -z "$done_ds" ] && fact "no WhaTap path resolved to a ZFS dataset"
-    subsection "capacity as the filesystem reports it"
-    for p in $paths; do
-        [ -n "$p" ] || continue
-        [ -e "$p" ] || continue
-        probe "df -h $p" df -h "$p"
-        probe "df -i $p" df -i "$p"
-    done
-    subsection "data directory markers"
-    if [ -n "$YARDBASE" ] && [ -d "$YARDBASE" ]; then
-        fact "YARDB_LOCK: $( [ -e "$YARDBASE/YARDB_LOCK" ] && echo "present (mtime $(date -u -r "$YARDBASE/YARDB_LOCK" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown))" || echo 'absent' )"
-        probe "yardbase entries (depth 1)" ls -1 "$YARDBASE"
-    else
-        fact "YARDB_LOCK / yardbase entries: n/a (yardbase not present)"
-    fi
 }
 
 # zevents_split DESTDIR -> split one read of `zpool events` into a tally and a
@@ -2834,24 +2700,9 @@ bundle_host() {
             [ $? -eq 124 ] && printf '\n(journalctl stopped at the %ss cap)\n' "$CMD_TIMEOUT" >> "$d/$u.journal.txt"
         done
     fi
-    progress "host: block device and kernel snapshot written"
-}
-
-bundle_whatap() {
-    local d="$1"; mkdir -p "$d" 2>/dev/null
-    {
-        printf 'WHATAP_HOME=%s\n' "${WHOME:-n/a}"
-        printf 'WHATAP_HOME_resolved_by=%s\n' "$WHOME_SRC"
-        printf 'YARDBASE=%s\n' "${YARDBASE:-n/a}"
-    } > "$d/paths.txt" 2>/dev/null
-    local p
-    for p in "$WHOME" "$YARDBASE" "$WHOME/logs" "$WHOME/db" "$WHOME/keeperbase" "$WHOME/logsink"; do
-        [ -n "$p" ] && [ -e "$p" ] || continue
-        printf '%s\tfstype=%s\tdataset=%s\n' "$p" "$(fstype_of "$p")" "$(source_of "$p")" >> "$d/path-dataset-map.txt" 2>/dev/null
-    done
     have df && _bounded df -h > "$d/df-h.txt" 2>/dev/null
     have df && _bounded df -i > "$d/df-i.txt" 2>/dev/null
-    progress "whatap: path-to-dataset map written"
+    progress "host: block device and kernel snapshot written"
 }
 
 # _zdb_bundle DIR -> section N in a bundle run: zdb -C / -Lbbbs / -mm per pool,
@@ -2896,7 +2747,6 @@ do_bundle() {
     bundle_kstat  "$work/kstat"
     bundle_params "$work/params"
     bundle_host   "$work/host"
-    bundle_whatap "$work/whatap"
     bundle_window "$work/window"
 
     tarball="$OPT_OUT/$BASENAME.tar.gz"
@@ -3020,15 +2870,12 @@ if [ -z "$_RUN_DEADLINE_ENV" ] && [ "$OPT_ZDB" = 1 ]; then
 fi
 # every unit sd_show will be asked about, in one call (the zfs units are asked
 # as <name>.service, zfs.target included, as section A always has)
-_pf=""; for _u in $WHATAP_UNITS zfs.target zfs-import-cache zfs-import-scan zfs-mount zfs-share zfs-zed zfs-volume-wait zfs-load-key; do _pf="$_pf $_u.service"; done
+_pf=""; for _u in zfs.target zfs-import-cache zfs-import-scan zfs-mount zfs-share zfs-zed zfs-volume-wait zfs-load-key; do _pf="$_pf $_u.service"; done
 # shellcheck disable=SC2086
 _sd_prefetch $_pf
-progress "resolving WHATAP_HOME / yardbase ..."
-resolve_home
-resolve_yardbase
 _zp="$(printf '%s' "$ZPOOLS" | tr -s ' ' ',' | sed 's/^,//; s/,$//')"
 TARGET="collection-server-zfs/$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || echo unknown)${_zp:+@pools=$_zp}"
-progress "pools: ${ZPOOLS:-none}; datasets: ${DS_COUNT:-0}; snapshots: ${SNAP_COUNT:-0}; WHATAP_HOME: ${WHOME:-n/a}"
+progress "pools: ${ZPOOLS:-none}; datasets: ${DS_COUNT:-0}; snapshots: ${SNAP_COUNT:-0}"
 
 # The window runs before the report, so the report's snapshot is taken at
 # the window's end.
