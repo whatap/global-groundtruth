@@ -108,6 +108,15 @@ raw check output). Quality comes from what is checked, so cut reading only:
   version), read only what passes, and record the last-read timestamp per
   channel so the next pass reads only newer threads.
 
+## Verification time
+
+A D verification aims at 30 minutes (gg-verify-deep "Time budget"). Stress runs
+are for patches that add or change traps, kills, waits or timeouts; a patch
+that only removes such code gets a few signals compared base vs new. On
+2026-09-28 the collmysql 0.12.0 check (prompt code removed) ran over an hour
+on a 25-minute stress script, while collzfs 0.11.0 (same kind of removal)
+was verified in 22 minutes without one.
+
 ## Waiting for background work
 
 A wait loop must be able to end. `until ! pgrep -f "tools/lab/run.sh …"; do sleep 5; done`
