@@ -35,7 +35,7 @@ unset JAVA_TOOL_OPTIONS JDK_JAVA_OPTIONS _JAVA_OPTIONS _v
 # ---- collector metadata -----------------------------------------------------
 # History: CHANGELOG.md, section collect-collserver.sh (next to this file).
 COLLECTOR_NAME="whatap-collserver"
-VERSION="0.15.2"
+VERSION="0.15.3"
 DOMAIN="collection-server"
 TARGET="collection-server/$(hostname 2>/dev/null || echo unknown)"   # refined after WHATAP_HOME is resolved
 
@@ -180,6 +180,9 @@ ARGC=$#              # 0 args -> usage (handled in main, below)
 # replaced it (fd 3 is not open yet, so stderr)
 _removed() { printf '!! %s\n' "$1" >&2; exit 2; }
 # ---- end collection-server: options
+# _ignored MESSAGE -> an option that no longer exists but need not exit: named,
+# then ignored (right where it is named, so it prints before a later error)
+_ignored() { printf '!! %s\n' "$1" >&2; }
 _BUNDLE_ONLY=""      # the bundle-only options given, named when --bundle is not
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -209,13 +212,13 @@ while [ $# -gt 0 ]; do
             _removed "--heap is no longer an option: the collector takes no heap dump; run jcmd <pid> GC.heap_dump <file> by hand if one is needed" ;;
         --du) OPT_DU=1; _BUNDLE_ONLY="$_BUNDLE_ONLY --du" ;;
         # removed, and nothing the run collects depends on it: named, then ignored
-        --time-ref|--time-ref=*) _TIMEREF_SEEN=1 ;;
+        --time-ref|--time-ref=*)
+            _ignored "--time-ref is no longer an option (ignored): the external time query is not made; B has the NTP daemon's own offset" ;;
         -h|--help) usage; exit 0 ;;
         *) printf 'unknown argument: %s\n' "$1" >&2; usage >&2; exit 2 ;;
     esac
     shift
 done
-[ -n "${_TIMEREF_SEEN:-}" ] && printf '!! %s\n' "--time-ref is no longer an option (ignored): the external time query is not made; B has the NTP daemon's own offset" >&2
 
 # ---- reasoned-absence helpers (see docs/collector-engineering.md) -----------
 _classify_err() {
@@ -1249,8 +1252,29 @@ EOF
 # executable's own -version, run only in this run's mount namespace and only
 # for an executable that is still there. The executable is readlink
 # /proc/<pid>/exe, else an absolute argv0.
+# _jvm_bin_ls HOME RP VIA A0 E -> "ls -A HOME/bin" as one fact line (a JRE
+# has no jstack/jmap); only for a home from /proc/<pid>/exe named java (an
+# argv0 /usr/bin/java would list all of /usr/bin), at most 60 entries
+_jvm_bin_ls() {
+    local home="$1" rp="$2" via="$3" a0="$4" e="$5" _e _o _rc _n
+    _e="${e% (deleted)}"
+    if [ "$a0" = 1 ]; then fact "  ls -A $home/bin: not run (exe not readable; home from argv0)"; return; fi
+    if [ "${_e##*/}" != java ]; then fact "  ls -A $home/bin: not run (the executable is ${_e##*/}, not java)"; return; fi
+    _o="$(_bounded ls -A "${rp%/release}/bin" 2>&1)"; _rc=$?
+    if [ "$_rc" -eq 0 ]; then
+        _n="$(printf '%s\n' "$_o" | wc -l | tr -d ' ')"
+        [ "${_n:-0}" -gt 60 ] && _o="$(printf '%s\n' "$_o" | head -n 60)
+($((_n - 60)) more)"
+    fi
+    if [ "$_rc" -eq 124 ]; then
+        if _past_deadline; then fact "  ls -A $home/bin$via: n/a (run deadline reached: ${RUN_DEADLINE}s)"
+        else fact "  ls -A $home/bin$via: n/a (timed out: ${CMD_TIMEOUT:-20}s)"; fi
+    elif [ "$_rc" -ne 0 ]; then fact "  ls -A $home/bin$via: n/a (exit $_rc: ${_o//$'\n'/ })"
+    else fact "  ls -A $home/bin$via: ${_o//$'\n'/ }"; fi
+}
+
 _rep_a_jvm_runtime() {
-    local i pid exe a0 j e ns home rel rp p0 uid selfns tab via _o _rc _a0 _e _n
+    local i pid exe a0 j e ns home rel rp p0 uid selfns tab via _a0
     tab="$(printf '\t')"
     uid="$(id -u 2>/dev/null || echo '?')"
     selfns="$(readlink /proc/self/ns/mnt 2>/dev/null)"
@@ -1296,22 +1320,7 @@ _rep_a_jvm_runtime() {
         # what the home's bin holds (a JRE has no jstack/jmap), one line of at
         # most 60 entries; only for a home from /proc/<pid>/exe named java (an
         # argv0 /usr/bin/java would list all of /usr/bin)
-        _e="${e% (deleted)}"
-        if [ "$_a0" = 1 ]; then fact "  ls -A $home/bin: not run (exe not readable; home from argv0)"
-        elif [ "${_e##*/}" != java ]; then fact "  ls -A $home/bin: not run (the executable is ${_e##*/}, not java)"
-        else
-        _o="$(_bounded ls -A "${rp%/release}/bin" 2>&1)"; _rc=$?
-        if [ "$_rc" -eq 0 ]; then
-            _n="$(printf '%s\n' "$_o" | wc -l | tr -d ' ')"
-            [ "${_n:-0}" -gt 60 ] && _o="$(printf '%s\n' "$_o" | head -n 60)
-($((_n - 60)) more)"
-        fi
-        if [ "$_rc" -eq 124 ]; then
-            if _past_deadline; then fact "  ls -A $home/bin$via: n/a (run deadline reached: ${RUN_DEADLINE}s)"
-            else fact "  ls -A $home/bin$via: n/a (timed out: ${CMD_TIMEOUT:-20}s)"; fi
-        elif [ "$_rc" -ne 0 ]; then fact "  ls -A $home/bin$via: n/a (exit $_rc: ${_o//$'\n'/ })"
-        else fact "  ls -A $home/bin$via: ${_o//$'\n'/ }"; fi
-        fi
+        _jvm_bin_ls "$home" "$rp" "$via" "$_a0" "$e"
         if [ "$e" != "${e% (deleted)}" ]; then
             if [ -f "$rp" ]; then read_proc "  release now at $rel; the running executable was replaced$via" "$rp"
             else fact "  release ($rel)$via: n/a (path not found)"; fi
@@ -1924,86 +1933,31 @@ collect_conf() {
 LOGSEL_RAN=0 LOGSEL_KEPT_N=0 LOGSEL_KEPT_BYTES=0 LOGSEL_SRC_BYTES=0
 LOGSEL_TRUNC_N=0 LOGSEL_DROP_N=0 LOGSEL_DROP_BYTES=0 LOGSEL_REASON=""
 
-collect_logs() {
-    local dest="$1"
-    [ -n "$WHOME" ] && _dir_ok "$WHOME/logs" || { warn "logs: not copied ($(home_why logs))"; return; }
-
-    # Two caps: one huge file and many large files are different failures.
-    #   * per-file cap  — tail, so the newest end of a big log survives
-    #   * total cap     — stop once all copied logs together reach it
-    #   * rotated logs  — opt-in; current logs alone answer most questions
-    # What is not copied is listed with its reason, so it does not read as absent.
-    local cap=$((OPT_MAXLOG_MB * 1024 * 1024))
-    local total_cap=$((OPT_MAXTOTAL_MB * 1024 * 1024))
-    local days="$OPT_LOG_DAYS"
-    local list sel
-    list="$(_tmp logsel.list)"
-    sel="$dest/SELECTION.txt"
-    mkdir -p "$dest" 2>/dev/null
-
-    # Candidates, newest first. Current (non-rotated) logs sort ahead of rotated
-    # ones so the total cap never spends itself on history before the live logs.
-    _bounded find "$WHOME/logs" -maxdepth 2 -type f \( -name '*.log' -o -name '*.log.*' \) 2>/dev/null |
+# _logsel_candidates DIR -> DIR's *.log / *.log.* files, one "kind<TAB>mtime<TAB>
+# path" line each, newest first; current sorts ahead of rotated so the total
+# cap never spends itself on history before the live logs
+_logsel_candidates() {
+    _bounded find "$1" -maxdepth 2 -type f \( -name '*.log' -o -name '*.log.*' \) 2>/dev/null |
     while IFS= read -r f; do
         local kind=current
         case "$f" in
             *.[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].*.log|*.log.[0-9]*|*.log.gz) kind=rotated ;;
         esac
         printf '%s\t%s\t%s\n' "$kind" "$(date -u -r "$f" +%s 2>/dev/null || echo 0)" "$f"
-    done | sort -t"$(printf '\t')" -k1,1 -k2,2nr > "$list"
+    done | sort -t"$(printf '\t')" -k1,1 -k2,2nr
+}
 
-    : > "$sel"
-    printf 'log selection by %s %s\n' "$COLLECTOR_NAME" "$VERSION" >> "$sel"
-    printf 'caps: %sMB per file, %sMB total; rotated logs: %s\n' \
-        "$OPT_MAXLOG_MB" "$OPT_MAXTOTAL_MB" \
-        "$([ "$OPT_ROTATED" = 1 ] && printf 'included (last %sd)' "$days" || printf 'not copied (--with-rotated to include)')" >> "$sel"
-    printf '\nstate\tkept_bytes\tsource_bytes\tfile\treason\n' >> "$sel"
+# _logsel_drop SZ REL REASON -> counts REL (SZ bytes) as dropped and appends
+# its SELECTION.txt row; $sel is the caller's (collect_logs's) open path
+_logsel_drop() {
+    local sz="$1" rel="$2" reason="$3"
+    LOGSEL_DROP_N=$((LOGSEL_DROP_N + 1)); LOGSEL_DROP_BYTES=$((LOGSEL_DROP_BYTES + sz))
+    printf 'dropped\t0\t%s\t%s\t%s\n' "$sz" "$rel" "$reason" >> "$sel"
+}
 
-    LOGSEL_RAN=1 LOGSEL_KEPT_N=0 LOGSEL_KEPT_BYTES=0 LOGSEL_SRC_BYTES=0
-    LOGSEL_TRUNC_N=0 LOGSEL_DROP_N=0 LOGSEL_DROP_BYTES=0
-
-    # Redirect (not a pipe) so the loop runs in this shell and the totals survive.
-    # The middle field is the mtime the candidate list was sorted on; it is
-    # consumed into _ because only the order it produced is wanted here.
-    local kind f rel sub sz take
-    while IFS="$(printf '\t')" read -r kind _ f; do
-        [ -n "$f" ] && [ -f "$f" ] || continue
-        rel="${f#"$WHOME"/logs/}"
-        sz="$( { wc -c < "$f"; } 2>/dev/null | tr -d ' ')"; [ -z "$sz" ] && sz=0
-        LOGSEL_SRC_BYTES=$((LOGSEL_SRC_BYTES + sz))
-
-        if [ "$kind" = rotated ] && [ "$OPT_ROTATED" != 1 ]; then
-            LOGSEL_DROP_N=$((LOGSEL_DROP_N + 1)); LOGSEL_DROP_BYTES=$((LOGSEL_DROP_BYTES + sz))
-            printf 'dropped\t0\t%s\t%s\trotated log, --with-rotated not given\n' "$sz" "$rel" >> "$sel"
-            continue
-        fi
-        if [ "$kind" = rotated ] && [ -z "$(_bounded find "$f" -mtime "-$days" 2>/dev/null)" ]; then
-            LOGSEL_DROP_N=$((LOGSEL_DROP_N + 1)); LOGSEL_DROP_BYTES=$((LOGSEL_DROP_BYTES + sz))
-            printf 'dropped\t0\t%s\t%s\trotated log older than %s days\n' "$sz" "$rel" "$days" >> "$sel"
-            continue
-        fi
-
-        take="$sz"; [ "$take" -gt "$cap" ] && take="$cap"
-        if [ $((LOGSEL_KEPT_BYTES + take)) -gt "$total_cap" ]; then
-            LOGSEL_DROP_N=$((LOGSEL_DROP_N + 1)); LOGSEL_DROP_BYTES=$((LOGSEL_DROP_BYTES + sz))
-            printf 'dropped\t0\t%s\t%s\ttotal cap %sMB reached\n' "$sz" "$rel" "$OPT_MAXTOTAL_MB" >> "$sel"
-            continue
-        fi
-
-        sub="$(dirname "$rel")"; mkdir -p "$dest/$sub" 2>/dev/null
-        if [ "$sz" -le "$cap" ]; then
-            cp -a "$f" "$dest/$rel" 2>/dev/null
-            printf 'kept\t%s\t%s\t%s\t-\n' "$sz" "$sz" "$rel" >> "$sel"
-        else
-            tail -c "$cap" "$f" > "$dest/$rel" 2>/dev/null
-            printf 'truncated to last %sMB of %s bytes\n' "$OPT_MAXLOG_MB" "$sz" > "$dest/$rel.trunc"
-            LOGSEL_TRUNC_N=$((LOGSEL_TRUNC_N + 1))
-            printf 'truncated\t%s\t%s\t%s\tper-file cap %sMB, tail kept\n' "$cap" "$sz" "$rel" "$OPT_MAXLOG_MB" >> "$sel"
-        fi
-        LOGSEL_KEPT_N=$((LOGSEL_KEPT_N + 1)); LOGSEL_KEPT_BYTES=$((LOGSEL_KEPT_BYTES + take))
-    done < "$list"
-    rm -f "$list" 2>/dev/null
-
+# _logsel_summary -> the SELECTION.txt totals, LOGSEL_REASON and the
+# progress/warn lines; reads the LOGSEL_* counters collect_logs left set
+_logsel_summary() {
     # kept_bytes is what landed in the bundle; a truncated file contributes its
     # cap, not its source size. So kept_bytes + dropped_bytes does not add up to
     # the candidate total, and the third line says where the rest went.
@@ -2026,6 +1980,77 @@ collect_logs() {
             warn "logs: $LOGSEL_DROP_N files not copied; --with-rotated (and a larger LOG_TOTAL_MB in the environment) copies more"
         fi
     fi
+}
+
+collect_logs() {
+    local dest="$1"
+    [ -n "$WHOME" ] && _dir_ok "$WHOME/logs" || { warn "logs: not copied ($(home_why logs))"; return; }
+
+    # Two caps: one huge file and many large files are different failures.
+    #   * per-file cap  — tail, so the newest end of a big log survives
+    #   * total cap     — stop once all copied logs together reach it
+    #   * rotated logs  — opt-in; current logs alone answer most questions
+    # What is not copied is listed with its reason, so it does not read as absent.
+    local cap=$((OPT_MAXLOG_MB * 1024 * 1024))
+    local total_cap=$((OPT_MAXTOTAL_MB * 1024 * 1024))
+    local days="$OPT_LOG_DAYS"
+    local list sel
+    list="$(_tmp logsel.list)"
+    sel="$dest/SELECTION.txt"
+    mkdir -p "$dest" 2>/dev/null
+
+    _logsel_candidates "$WHOME/logs" > "$list"
+
+    : > "$sel"
+    printf 'log selection by %s %s\n' "$COLLECTOR_NAME" "$VERSION" >> "$sel"
+    printf 'caps: %sMB per file, %sMB total; rotated logs: %s\n' \
+        "$OPT_MAXLOG_MB" "$OPT_MAXTOTAL_MB" \
+        "$([ "$OPT_ROTATED" = 1 ] && printf 'included (last %sd)' "$days" || printf 'not copied (--with-rotated to include)')" >> "$sel"
+    printf '\nstate\tkept_bytes\tsource_bytes\tfile\treason\n' >> "$sel"
+
+    LOGSEL_RAN=1 LOGSEL_KEPT_N=0 LOGSEL_KEPT_BYTES=0 LOGSEL_SRC_BYTES=0
+    LOGSEL_TRUNC_N=0 LOGSEL_DROP_N=0 LOGSEL_DROP_BYTES=0
+
+    # Redirect (not a pipe) so the loop runs in this shell and the totals survive.
+    # The middle field is the mtime the candidate list was sorted on; it is
+    # consumed into _ because only the order it produced is wanted here.
+    local kind f rel sub sz take
+    while IFS="$(printf '\t')" read -r kind _ f; do
+        [ -n "$f" ] && [ -f "$f" ] || continue
+        rel="${f#"$WHOME"/logs/}"
+        sz="$( { wc -c < "$f"; } 2>/dev/null | tr -d ' ')"; [ -z "$sz" ] && sz=0
+        LOGSEL_SRC_BYTES=$((LOGSEL_SRC_BYTES + sz))
+
+        if [ "$kind" = rotated ] && [ "$OPT_ROTATED" != 1 ]; then
+            _logsel_drop "$sz" "$rel" "rotated log, --with-rotated not given"
+            continue
+        fi
+        if [ "$kind" = rotated ] && [ -z "$(_bounded find "$f" -mtime "-$days" 2>/dev/null)" ]; then
+            _logsel_drop "$sz" "$rel" "rotated log older than $days days"
+            continue
+        fi
+
+        take="$sz"; [ "$take" -gt "$cap" ] && take="$cap"
+        if [ $((LOGSEL_KEPT_BYTES + take)) -gt "$total_cap" ]; then
+            _logsel_drop "$sz" "$rel" "total cap ${OPT_MAXTOTAL_MB}MB reached"
+            continue
+        fi
+
+        sub="$(dirname "$rel")"; mkdir -p "$dest/$sub" 2>/dev/null
+        if [ "$sz" -le "$cap" ]; then
+            cp -a "$f" "$dest/$rel" 2>/dev/null
+            printf 'kept\t%s\t%s\t%s\t-\n' "$sz" "$sz" "$rel" >> "$sel"
+        else
+            tail -c "$cap" "$f" > "$dest/$rel" 2>/dev/null
+            printf 'truncated to last %sMB of %s bytes\n' "$OPT_MAXLOG_MB" "$sz" > "$dest/$rel.trunc"
+            LOGSEL_TRUNC_N=$((LOGSEL_TRUNC_N + 1))
+            printf 'truncated\t%s\t%s\t%s\tper-file cap %sMB, tail kept\n' "$cap" "$sz" "$rel" "$OPT_MAXLOG_MB" >> "$sel"
+        fi
+        LOGSEL_KEPT_N=$((LOGSEL_KEPT_N + 1)); LOGSEL_KEPT_BYTES=$((LOGSEL_KEPT_BYTES + take))
+    done < "$list"
+    rm -f "$list" 2>/dev/null
+
+    _logsel_summary
 }
 
 collect_fs() {

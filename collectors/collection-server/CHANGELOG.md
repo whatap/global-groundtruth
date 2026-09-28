@@ -7,6 +7,10 @@ one entry at the top of its section (docs/authoring-guide.md, step 2);
 
 ## collect-collserver.sh
 
+- **0.15.3** — Split collect_logs and _rep_a_jvm_runtime into smaller helpers
+  (_logsel_candidates/_logsel_drop/_logsel_summary, _jvm_bin_ls); a removed
+  option that is ignored (`--time-ref`) prints its `!!` note when it is read
+  instead of after the option loop.
 - **0.15.2** — Collection status (skeleton `_emit_time`): when a bounded call was slow, capped or not run, the per-command "where the time went" table (sums largest first, time outside bounded calls) gives way to the time log's own records, one line per such call in the order they ran (`<ms> ms  <outcome>  <command>`, the first 40, then `(N more in this run)`); CONTRACT rule 1. `_run_init` sets its EXIT/INT/TERM/HUP traps before it creates the private directory: a signal in between left `ggt.*` behind. Group blocks: `file helpers` is split into `file helpers` (`dump_file`) and `path helpers` (`fstype_of`, `source_of`, `_dir_ok`, `_path_state`, `resolve_yardbase`), code unchanged, so collzfs carries only `dump_file`.
 - **0.15.1** — C adds `df -i` of the yardbase next to its `df -h`: inode
   exhaustion on an ext4/xfs yardbase was in no default report once collzfs
@@ -147,6 +151,10 @@ one entry at the top of its section (docs/authoring-guide.md, step 2);
 
 ## collect-collzfs.sh
 
+- **0.12.2** — Split window_run's planning into _win_plan; define the zfs-*
+  unit lists once (ZFS_UNITS/ZFS_JOURNAL_UNITS); drop the stat/nproc/free
+  rows, never run, from the [1] tools list; `--home` prints its `!!` ignored
+  note when it is read instead of after the option loop.
 - **0.12.1** — Collection status (skeleton `_emit_time`): when a bounded call was slow, capped or not run, the per-command "where the time went" table (sums largest first, time outside bounded calls) gives way to the time log's own records, one line per such call in the order they ran (`<ms> ms  <outcome>  <command>`, the first 40, then `(N more in this run)`); CONTRACT rule 1. `_run_init` sets its EXIT/INT/TERM/HUP traps before it creates the private directory: a signal in between left `ggt.*` behind. Group blocks: collzfs leaves `process scan` (the block and the `CMDLINE_SCAN_WHY` reference are gone; nothing here called it), and `file helpers` holds only `dump_file` (the yard path helpers are the new block `path helpers`, collserver only).
 - **0.12.0** — ZFS only: the collector no longer looks for WhaTap. E now lists
   `mounted canmount secondarycache relatime dedup checksum copies reservation
@@ -283,6 +291,9 @@ one entry at the top of its section (docs/authoring-guide.md, step 2);
 
 ## collect-collmysql.sh
 
+- **0.12.2** — Split _binlog_proc's identity checks into _bl_check, and
+  _window's sampler start/wait/trap-restore into _win_run_samplers; drop the
+  lsblk row, never run, from the [1] tools list.
 - **0.12.1** — Collection status (skeleton `_emit_time`): when a bounded call was slow, capped or not run, the per-command "where the time went" table (sums largest first, time outside bounded calls) gives way to the time log's own records, one line per such call in the order they ran (`<ms> ms  <outcome>  <command>`, the first 40, then `(N more in this run)`); CONTRACT rule 1. `_run_init` sets its EXIT/INT/TERM/HUP traps before it creates the private directory: a signal in between left `ggt.*` behind.
 - **0.12.0** — The password prompt is removed. A bare `-p` in
   `--mysql-args` (`--password`, `-Bp`, `-p X`) exits 2 before any child

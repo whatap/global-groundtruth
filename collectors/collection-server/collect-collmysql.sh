@@ -27,7 +27,7 @@ export LC_ALL=C
 # ---- collector metadata -----------------------------------------------------
 # History: CHANGELOG.md, section collect-collmysql.sh (next to this file).
 COLLECTOR_NAME="whatap-collmysql"
-VERSION="0.12.1"
+VERSION="0.12.2"
 DOMAIN="collection-server"
 TARGET="collection-server-mysql/$(hostname 2>/dev/null || echo unknown)"
 
@@ -1044,10 +1044,92 @@ EOF
 # Sets _BL_PID, _BL_ROOT, _BL_VIA, _BL_LS (the listing), or _BL_WHY (a fact),
 # _BL_ADVICE (how to run it differently: for the goal reason only) and
 # _BL_PRIV=1 when a pid file could not be read for want of privilege.
+# _bl_check D -> 0 with a row appended to $ok (P|RT|HOW|NS|MT), $hits and
+# $_BL_LS set; or 1 with $other (or $unread) extended by "P(reason)". Runs
+# the 5 identity checks in order: netns ownership, pid file (inside/outside
+# /proc/P/root), mtime vs server start, auto.cnf server-uuid, newest binlog.
+# $pf $srv $last $lsz $asked $rows2 $r2last $r2sz $ok $other $unread $hits
+# $owned are the caller's (_binlog_proc's) locals, read and updated in place;
+# $asked stays 0..1 per run: SHOW BINARY LOGS is asked again at most once.
+_bl_check() {
+    local d="$1" p rt how ns v mt u l lsout chk
+    p="${d##*/}"
+    if [ "$_BL_TGT" = ips ]; then
+        _bl_netns_owns "$d" || { other="$other $p(its network namespace does not own ${_BL_TGT_IPS//$_nl/ })"; return 1; }
+        owned=$((owned + 1))
+    fi
+    # 1. the pid file
+    if [ -d "$d/root/." ]; then
+        rt="$d/root"; how="read through $rt"; ns="$p"
+        while IFS= read -r l; do
+            case "$l" in NSpid:*) ns="${l##*[[:space:]]}" ;; esac
+        done 2>/dev/null < "$d/status"
+        # absent only when its directory could be searched (a datadir of
+        # mode 700 hides it from a mysql-group user: unreadable, not absent)
+        v="$rt$pf"; v="${v%/*}"
+        if [ ! -e "$rt$pf" ] && [ -x "${v:-/}" ]; then other="$other $p(pid file absent)"; return 1; fi
+        v=""
+        [ -r "$rt$pf" ] || { unread="$unread $p"; return 1; }
+        { IFS= read -r v < "$rt$pf"; } 2>/dev/null
+    else
+        # a root this uid may not enter (another uid; no CAP_SYS_PTRACE in
+        # a container): the pid file as seen here, holding P's own pid
+        rt=""; how="read here"; ns="$p"
+        v="${pf%/*}"
+        if [ ! -e "$pf" ] && [ -x "${v:-/}" ]; then other="$other $p(pid file absent here; /proc/$p/root not enterable by uid $(id -u 2>/dev/null || echo '?'))"; return 1; fi
+        v=""
+        [ -r "$pf" ] || { unread="$unread $p"; return 1; }
+        { IFS= read -r v < "$pf"; } 2>/dev/null
+    fi
+    if [ "$v" != "$ns" ]; then other="$other $p(pid file holds ${v:-nothing})"; return 1; fi
+    # 2. the pid file written with the server's start
+    mt="$(_bounded stat -c %Y -- "$rt$pf" 2>/dev/null)"
+    case "$mt$srv" in
+        *[!0-9]*|'') other="$other $p(pid file time or server start unknown)"; return 1 ;;
+    esac
+    if [ "$mt" -lt $((srv - 3)) ] || [ "$mt" -gt $((srv + 1800)) ]; then
+        other="$other $p(pid file written at $mt, the server started at $srv)"; return 1
+    fi
+    # 2. the uuid, where MySQL keeps one
+    if [ -n "$SRV_UUID" ] && [ -n "$DATADIR" ] && [ -r "$rt${DATADIR%/}/auto.cnf" ]; then
+        u=""
+        while IFS= read -r l; do case "$l" in server-uuid=*) u="${l#server-uuid=}" ;; esac; done 2>/dev/null < "$rt${DATADIR%/}/auto.cnf"
+        if [ -n "$u" ] && [ "$u" != "$SRV_UUID" ]; then other="$other $p(auto.cnf server-uuid $u, the server's $SRV_UUID)"; return 1; fi
+    fi
+    # 3. the server's newest log, and nothing newer
+    lsout=""
+    if [ -n "$last" ] && [ -n "$BINLOG_DIR" ] && [ -r "$rt$BINLOG_DIR" ] && [ -x "$rt$BINLOG_DIR" ]; then
+        lsout="$(_bounded ls -l --time-style=+%Y-%m-%dT%H:%M:%SZ -- "$rt$BINLOG_DIR" 2>/dev/null)"
+        chk="$(_bl_newest "$lsout" "$last" "$lsz")"
+        case "$chk" in
+            N\ *)
+                # a newer file only: a rotation since SHOW BINARY LOGS, or
+                # another server's log. Asked once more, once per run.
+                if [ "$asked" = 0 ]; then
+                    asked=1; rows2="$(mysql_q "SHOW BINARY LOGS")" || rows2=""
+                    if [ -n "$rows2" ]; then
+                        l="${rows2%"$_nl"}"; l="${l##*"$_nl"}"; set -f; set -- $l; set +f
+                        r2last="${1:-}"; r2sz="${2:-}"
+                        # the listing's newest is now listed (rotation may
+                        # have gone on since): the fresh rows count
+                        case "$_nl$rows2" in *"$_nl${chk#N }$_tab"*)
+                            _bl_rows="$rows2"; last="$r2last"; lsz="$r2sz"; chk="" ;;
+                        esac
+                    fi
+                fi
+                [ -n "$chk" ] && chk="holds ${chk#N }, which SHOW BINARY LOGS does not list (asked again; its newest: ${r2last:-$last})" ;;
+        esac
+        [ -n "$chk" ] && { other="$other $p($chk)"; return 1; }
+    fi
+    ok="$ok$p|$rt|$how|$ns|$mt$_nl"
+    hits=$((hits + 1)); _BL_LS="$lsout"
+    return 0
+}
+
 _binlog_proc() {
     _BL_PID=""; _BL_ROOT=""; _BL_VIA=""; _BL_WHY=""; _BL_PRIV=0; _BL_LS=""; _BL_ADVICE=""
     if [ "$MYSQL_OK" != 1 ]; then _BL_WHY="not queried: $MYSQL_WHY"; return; fi
-    local pf="$PID_FILE" d c p ns l v st rt how u lsout chk last="" lsz="" rows2 asked=0
+    local pf="$PID_FILE" d c p ns l st how last="" lsz="" rows2 asked=0
     local srv="" hits=0 cand=0 unread="" other="" ok="" mt r2last="" r2sz=""
     case "$pf" in
         '') _BL_WHY="@@pid_file gave no path, so the server's process cannot be identified"; return ;;
@@ -1068,76 +1150,8 @@ _binlog_proc() {
         p="${d##*/}"
         st=""; { IFS= read -r st < "$d/stat"; } 2>/dev/null; st="${st##*) }"
         case "$st" in Z*|X*) continue ;; esac      # a zombie holds no files
-        cand=$((cand + 1)); v=""
-        if [ "$_BL_TGT" = ips ]; then
-            _bl_netns_owns "$d" || { other="$other $p(its network namespace does not own ${_BL_TGT_IPS//$_nl/ })"; continue; }
-            owned=$((owned + 1))
-        fi
-        # 1. the pid file
-        if [ -d "$d/root/." ]; then
-            rt="$d/root"; how="read through $rt"; ns="$p"
-            while IFS= read -r l; do
-                case "$l" in NSpid:*) ns="${l##*[[:space:]]}" ;; esac
-            done 2>/dev/null < "$d/status"
-            # absent only when its directory could be searched (a datadir of
-            # mode 700 hides it from a mysql-group user: unreadable, not absent)
-            v="$rt$pf"; v="${v%/*}"
-            if [ ! -e "$rt$pf" ] && [ -x "${v:-/}" ]; then other="$other $p(pid file absent)"; v=""; continue; fi
-            v=""
-            [ -r "$rt$pf" ] || { unread="$unread $p"; continue; }
-            { IFS= read -r v < "$rt$pf"; } 2>/dev/null
-        else
-            # a root this uid may not enter (another uid; no CAP_SYS_PTRACE in
-            # a container): the pid file as seen here, holding P's own pid
-            rt=""; how="read here"; ns="$p"
-            v="${pf%/*}"
-            if [ ! -e "$pf" ] && [ -x "${v:-/}" ]; then other="$other $p(pid file absent here; /proc/$p/root not enterable by uid $(id -u 2>/dev/null || echo '?'))"; v=""; continue; fi
-            v=""
-            [ -r "$pf" ] || { unread="$unread $p"; continue; }
-            { IFS= read -r v < "$pf"; } 2>/dev/null
-        fi
-        if [ "$v" != "$ns" ]; then other="$other $p(pid file holds ${v:-nothing})"; continue; fi
-        # 2. the pid file written with the server's start
-        mt="$(_bounded stat -c %Y -- "$rt$pf" 2>/dev/null)"
-        case "$mt$srv" in
-            *[!0-9]*|'') other="$other $p(pid file time or server start unknown)"; continue ;;
-        esac
-        if [ "$mt" -lt $((srv - 3)) ] || [ "$mt" -gt $((srv + 1800)) ]; then
-            other="$other $p(pid file written at $mt, the server started at $srv)"; continue
-        fi
-        # 2. the uuid, where MySQL keeps one
-        if [ -n "$SRV_UUID" ] && [ -n "$DATADIR" ] && [ -r "$rt${DATADIR%/}/auto.cnf" ]; then
-            u=""
-            while IFS= read -r l; do case "$l" in server-uuid=*) u="${l#server-uuid=}" ;; esac; done 2>/dev/null < "$rt${DATADIR%/}/auto.cnf"
-            if [ -n "$u" ] && [ "$u" != "$SRV_UUID" ]; then other="$other $p(auto.cnf server-uuid $u, the server's $SRV_UUID)"; continue; fi
-        fi
-        # 3. the server's newest log, and nothing newer
-        lsout=""
-        if [ -n "$last" ] && [ -n "$BINLOG_DIR" ] && [ -r "$rt$BINLOG_DIR" ] && [ -x "$rt$BINLOG_DIR" ]; then
-            lsout="$(_bounded ls -l --time-style=+%Y-%m-%dT%H:%M:%SZ -- "$rt$BINLOG_DIR" 2>/dev/null)"
-            chk="$(_bl_newest "$lsout" "$last" "$lsz")"
-            case "$chk" in
-                N\ *)
-                    # a newer file only: a rotation since SHOW BINARY LOGS, or
-                    # another server's log. Asked once more, once per run.
-                    if [ "$asked" = 0 ]; then
-                        asked=1; rows2="$(mysql_q "SHOW BINARY LOGS")" || rows2=""
-                        if [ -n "$rows2" ]; then
-                            l="${rows2%"$_nl"}"; l="${l##*"$_nl"}"; set -f; set -- $l; set +f
-                            r2last="${1:-}"; r2sz="${2:-}"
-                            # the listing's newest is now listed (rotation may
-                            # have gone on since): the fresh rows count
-                            case "$_nl$rows2" in *"$_nl${chk#N }$_tab"*)
-                                _bl_rows="$rows2"; last="$r2last"; lsz="$r2sz"; chk="" ;;
-                            esac
-                        fi
-                    fi
-                    [ -n "$chk" ] && chk="holds ${chk#N }, which SHOW BINARY LOGS does not list (asked again; its newest: ${r2last:-$last})" ;;
-            esac
-            [ -n "$chk" ] && { other="$other $p($chk)"; continue; }
-        fi
-        ok="$ok$p|$rt|$how|$ns|$mt$_nl"
-        hits=$((hits + 1)); _BL_LS="$lsout"
+        cand=$((cand + 1))
+        _bl_check "$d"
     done
     if [ "$hits" = 1 ]; then
         IFS='|' read -r _BL_PID _BL_ROOT how ns mt <<EOF
@@ -1227,8 +1241,38 @@ _win_on_sig() {
     _WIN_SIG="$1"
 }
 
+# _win_run_samplers D IV CAP -> starts iostat -x and vmstat as background jobs
+# writing into D, traps INT/TERM/HUP so the first one stops them and ends the
+# window (a second one aborts, as outside the window), waits for them, then
+# restores the run helpers' traps. Sets the caller's (_window's) t0/t1 (elapsed
+# seconds at start/end) for its "ended early" and timing facts.
+_win_run_samplers() {
+    local d="$1" iv="$2" cap="$3" t p
+    t0="$(_elapsed)"; _WIN_PIDS=""; _WIN_SIG=""
+    for t in iostat vmstat; do
+        have "$t" || continue
+        ( if [ "$t" = iostat ]; then set -- iostat -x "$iv" "$WIN_REPORTS"; else set -- vmstat "$iv" "$WIN_REPORTS"; fi
+          CMD_TIMEOUT="$cap" _bounded "$@" > "$d/$t.out" 2> "$d/$t.err"
+          echo $? > "$d/$t.rc" ) &
+        _WIN_PIDS="$_WIN_PIDS $!"
+    done
+    # set after the fork, so the jobs keep the run helpers' traps
+    trap '_win_on_sig INT' INT
+    trap '_win_on_sig TERM' TERM
+    trap '_win_on_sig HUP' HUP
+    # a trapped signal returns wait early; then the jobs are stopped and waited
+    for p in $_WIN_PIDS; do
+        while kill -0 "$p" 2>/dev/null; do wait "$p" 2>/dev/null; done
+    done
+    t1="$(_elapsed)"
+    trap '_run_cleanup; exit 129' HUP
+    trap '_run_cleanup; exit 130' INT
+    trap '_run_cleanup; exit 143' TERM
+    _WIN_PIDS=""
+}
+
 _window() {
-    local w="$WIN_SECS" left iv len cap d t lab rc cut="" rnd="" why="" pkg ok_n=0 p t0 t1
+    local w="$WIN_SECS" left iv len cap d t lab rc cut="" rnd="" why="" pkg ok_n=0 t0 t1
     if ! have iostat && ! have vmstat; then
         fact "window: not run (no sampler installed)"
         fact "iostat -x: n/a (command not found: iostat, sysstat)"
@@ -1257,27 +1301,7 @@ _window() {
     d="$(_tmp win)"; mkdir -p "$d" 2>/dev/null
     fact "window: ${len}s${cut:+ ($cut)}${rnd:+ ($rnd)}, from $(date '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null || echo n/a); interval ${iv}s, $WIN_REPORTS reports each"
     progress "window: iostat -x and vmstat for ${len}s"
-    t0="$(_elapsed)"; _WIN_PIDS=""; _WIN_SIG=""
-    for t in iostat vmstat; do
-        have "$t" || continue
-        ( if [ "$t" = iostat ]; then set -- iostat -x "$iv" "$WIN_REPORTS"; else set -- vmstat "$iv" "$WIN_REPORTS"; fi
-          CMD_TIMEOUT="$cap" _bounded "$@" > "$d/$t.out" 2> "$d/$t.err"
-          echo $? > "$d/$t.rc" ) &
-        _WIN_PIDS="$_WIN_PIDS $!"
-    done
-    # set after the fork, so the jobs keep the run helpers' traps
-    trap '_win_on_sig INT' INT
-    trap '_win_on_sig TERM' TERM
-    trap '_win_on_sig HUP' HUP
-    # a trapped signal returns wait early; then the jobs are stopped and waited
-    for p in $_WIN_PIDS; do
-        while kill -0 "$p" 2>/dev/null; do wait "$p" 2>/dev/null; done
-    done
-    t1="$(_elapsed)"
-    trap '_run_cleanup; exit 129' HUP
-    trap '_run_cleanup; exit 130' INT
-    trap '_run_cleanup; exit 143' TERM
-    _WIN_PIDS=""
+    _win_run_samplers "$d" "$iv" "$cap"
     if [ -n "$_WIN_SIG" ]; then
         fact "ended early: SIG$_WIN_SIG after $((t1 - t0))s of ${len}s; what follows is what the samplers wrote until then"
         warn "window: SIG$_WIN_SIG after $((t1 - t0))s of ${len}s; writing the report with what was collected (a second one aborts)"
@@ -1323,7 +1347,7 @@ _rep_env() {
     # The whole run is bounded by this, raised for what this run was asked to do.
     fact "run deadline(s): $RUN_DEADLINE"
     fact "tools:"
-    _tool_rows mysql mysqlbinlog iostat vmstat ss findmnt lsblk timeout
+    _tool_rows mysql mysqlbinlog iostat vmstat ss findmnt timeout
     fact "mysql client: ${MYSQL_BIN:-n/a (command not found)}"
     # What the connection was attempted with: it survives a refused login, which
     # never reaches section A. The password is never printed, only its source.

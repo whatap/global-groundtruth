@@ -35,7 +35,7 @@ export LC_ALL=C
 # ---- collector metadata -----------------------------------------------------
 # History: CHANGELOG.md, section collect-collzfs.sh (next to this file).
 COLLECTOR_NAME="whatap-collzfs"
-VERSION="0.12.1"
+VERSION="0.12.2"
 DOMAIN="collection-server"
 TARGET="collection-server-zfs/$(hostname 2>/dev/null || echo unknown)"   # refined after pool discovery
 
@@ -219,7 +219,9 @@ ARGC=$#              # 0 args -> usage (handled in main, below)
 # replaced it (fd 3 is not open yet, so stderr)
 _removed() { printf '!! %s\n' "$1" >&2; exit 2; }
 # ---- end collection-server: options
-_HOME_SEEN=""
+# _ignored MESSAGE -> an option that no longer exists but need not exit: named,
+# then ignored (right where it is named, so it prints before a later error)
+_ignored() { printf '!! %s\n' "$1" >&2; }
 while [ $# -gt 0 ]; do
     case "$1" in
         --file) OPT_FILE=1 ;;
@@ -229,8 +231,11 @@ while [ $# -gt 0 ]; do
         --out) _optval --out "${2:-}"; OPT_OUT="$2"; shift ;;
         --out=*) _optval --out "${1#*=}"; OPT_OUT="${1#*=}" ;;
         # removed, and nothing the run collects depends on it: named, then ignored
-        --home) _optval --home "${2:-}"; _HOME_SEEN=1; shift ;;
-        --home=*) _optval --home "${1#*=}"; _HOME_SEEN=1 ;;
+        --home) _optval --home "${2:-}"
+            _ignored "--home is no longer used: collzfs reports ZFS only; the WhaTap paths and their dataset are in collect-collserver.sh section C"
+            shift ;;
+        --home=*) _optval --home "${1#*=}"
+            _ignored "--home is no longer used: collzfs reports ZFS only; the WhaTap paths and their dataset are in collect-collserver.sh section C" ;;
         --hours|--hours=*)
             _removed "--hours was removed: set JOURNAL_HOURS=N in the environment (default 24)" ;;
         --sample|--sample=*)
@@ -254,7 +259,6 @@ while [ $# -gt 0 ]; do
     esac
     shift
 done
-[ -n "${_HOME_SEEN:-}" ] && printf '!! %s\n' "--home is no longer used: collzfs reports ZFS only; the WhaTap paths and their dataset are in collect-collserver.sh section C" >&2
 
 blk() { printf '        %s\n' "$1"; }
 
@@ -973,6 +977,10 @@ ZGET_ERR=""
 ZSNAP_RC=""
 ZSNAP_CAP=120
 ZSNAP_ERR=""
+# the zfs-* systemd units: section A's per-unit rows and the prefetch (main)
+# read this list; the journal ones (section D and the bundle) read the next.
+ZFS_UNITS="zfs.target zfs-import-cache zfs-import-scan zfs-mount zfs-share zfs-zed zfs-volume-wait zfs-load-key"
+ZFS_JOURNAL_UNITS="zfs-zed zfs-import-cache zfs-import-scan zfs-mount zfs-share"
 
 discover_zfs() {
     if have zfs || have zpool || [ -d "$KSTAT_DIR" ]; then ZFS_ON_HOST=1; fi
@@ -1134,8 +1142,8 @@ _rep_env() {
     # The whole run is bounded by this, raised for what this run was asked to do.
     fact "run deadline(s): $RUN_DEADLINE"
     fact "tools:"
-    _tool_rows zfs zpool zdb arcstat arc_summary findmnt df stat lsblk iostat modinfo dkms \
-        systemctl journalctl dmesg timeout tar awk find sort head tail nproc free
+    _tool_rows zfs zpool zdb arcstat arc_summary findmnt df lsblk iostat modinfo dkms \
+        systemctl journalctl dmesg timeout tar awk find sort head tail
     fact "kstat tree ($KSTAT_DIR): $( [ -d "$KSTAT_DIR" ] && echo present || echo 'absent (path not found)' )"
     fact "module parameter dir (/sys/module/zfs/parameters): $( [ -d /sys/module/zfs/parameters ] && echo present || echo 'absent (path not found)' )"
     fact "ZFS present on this host: $( [ "$ZFS_ON_HOST" = 1 ] && echo yes || echo 'no (zfs/zpool commands and kstat tree all absent)' )"
@@ -1220,7 +1228,7 @@ _rep_a() {
     subsection "ZFS systemd units & pool cache"
     if have systemctl; then
         local u any=0
-        for u in zfs.target zfs-import-cache zfs-import-scan zfs-mount zfs-share zfs-zed zfs-volume-wait zfs-load-key; do
+        for u in $ZFS_UNITS; do
             unit_loaded "$u.service" || [ "$u" = "zfs.target" ] || continue
             any=1
             fact "$u: active=$(sd_state is-active "$u") enabled=$(sd_state is-enabled "$u")"
@@ -1531,7 +1539,7 @@ _rep_l() {
     subsection "journal for zfs units (last ${OPT_HOURS}h, bounded)"
     if have journalctl; then
         local u2
-        for u2 in zfs-zed zfs-import-cache zfs-import-scan zfs-mount zfs-share; do
+        for u2 in $ZFS_JOURNAL_UNITS; do
             unit_loaded "$u2.service" || continue
             local jo
             jo="$(_bounded journalctl -u "$u2.service" -p warning --since "${OPT_HOURS} hours ago" -n 30 --no-pager 2>/dev/null)"
@@ -2168,21 +2176,26 @@ _win_iv() {
 # window_run -> the window, before the report: reads counters, every pool's
 # txgs until the end, and counters again. Its
 # files are in WIN_DIR; section O prints them and the bundle copies them.
-window_run() {
-    local e0 end left iv pn io_cap k n
+# _win_plan -> sets WIN_DIR, traps INT/TERM/HUP, WIN_RAN, WIN_T0 and the
+# caller's (window_run's) e0/end/WIN_PLAN, with the run-deadline cut (WIN_CUT)
+# and its warn already printed; or sets WIN_SKIP and returns 1 when the
+# window will not run (no private temp dir, no kstat tree, no pool, or the
+# run deadline leaves it no time)
+_win_plan() {
+    local left k n
     WIN_DIR="$(_tmp win)"
-    case "$WIN_DIR" in /dev/null) WIN_SKIP="no private temp directory could be made under ${TMPDIR:-/tmp}"; return ;; esac
-    [ -d "$KSTAT_DIR" ] || { WIN_SKIP="path not found: $KSTAT_DIR"; return; }
+    case "$WIN_DIR" in /dev/null) WIN_SKIP="no private temp directory could be made under ${TMPDIR:-/tmp}"; return 1 ;; esac
+    [ -d "$KSTAT_DIR" ] || { WIN_SKIP="path not found: $KSTAT_DIR"; return 1; }
     k=""; for n in "$KSTAT_DIR"/*/txgs; do [ -e "$n" ] && { k=1; break; }; done
-    [ -n "$k" ] || { WIN_SKIP=nopool; return; }
+    [ -n "$k" ] || { WIN_SKIP=nopool; return 1; }
     # a caller's RUN_DEADLINE that leaves the (default) window no time
     left=$((RUN_DEADLINE - WIN_RESERVE - $(_elapsed)))
     if [ "$left" -lt 1 ]; then
         WIN_SKIP="RUN_DEADLINE=$RUN_DEADLINE leaves no time for the ${WIN_SECS}s window (${WIN_RESERVE}s are kept for the report)"
         warn "window: not run: $WIN_SKIP"
-        return
+        return 1
     fi
-    mkdir -p "$WIN_DIR/txg" 2>/dev/null || { WIN_SKIP="cannot create $WIN_DIR"; return; }
+    mkdir -p "$WIN_DIR/txg" 2>/dev/null || { WIN_SKIP="cannot create $WIN_DIR"; return 1; }
     trap '_win_on_sig INT' INT
     trap '_win_on_sig TERM' TERM
     trap '_win_on_sig HUP' HUP
@@ -2196,6 +2209,12 @@ window_run() {
     fi
     WIN_PLAN=$((end - e0))
     progress "window: $(_win_hms $((end - e0))) from $(_win_local "$WIN_T0")"
+    return 0
+}
+
+window_run() {
+    local e0 end left iv pn io_cap k n
+    _win_plan || return
     # The interval jobs (README.md, section O): about 120 blocks over the
     # window, so (N - 1) x I <= its length and they end with it whatever I is.
     WIN_IO_IV=$(( (end - e0) / 120 ))
@@ -2557,7 +2576,7 @@ bundle_host() {
         # Capped by time and by size: zed on a pool that logs a deadman per
         # second writes millions of lines. The newest JOURNAL_LINES are kept.
         local u JOURNAL_LINES=20000
-        for u in zfs-zed zfs-import-cache zfs-import-scan zfs-mount zfs-share; do
+        for u in $ZFS_JOURNAL_UNITS; do
             unit_loaded "$u.service" || continue
             _bounded journalctl -u "$u.service" --since "${OPT_HOURS} hours ago" -n "$JOURNAL_LINES" --no-pager > "$d/$u.journal.txt" 2>&1
             [ $? -eq 124 ] && printf '\n(journalctl stopped at the %ss cap)\n' "$CMD_TIMEOUT" >> "$d/$u.journal.txt"
@@ -2733,7 +2752,7 @@ if [ -z "$_RUN_DEADLINE_ENV" ] && [ "$OPT_ZDB" = 1 ]; then
 fi
 # every unit sd_show will be asked about, in one call (the zfs units are asked
 # as <name>.service, zfs.target included, as section A always has)
-_pf=""; for _u in zfs.target zfs-import-cache zfs-import-scan zfs-mount zfs-share zfs-zed zfs-volume-wait zfs-load-key; do _pf="$_pf $_u.service"; done
+_pf=""; for _u in $ZFS_UNITS; do _pf="$_pf $_u.service"; done
 # shellcheck disable=SC2086
 _sd_prefetch $_pf
 _zp="$(printf '%s' "$ZPOOLS" | tr -s ' ' ',' | sed 's/^,//; s/,$//')"
