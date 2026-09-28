@@ -5,6 +5,9 @@ Every change to the script bumps its `VERSION` and adds one entry at the top
 of this list (docs/authoring-guide.md, step 2); `tools/validate.sh` checks
 that the newest entry is the script's `VERSION`.
 
+- **0.8.7**: Emit helpers (skeleton): `progress`, `warn` and `notice` return 0
+  when their write fails, so a run whose stderr is closed or full no longer
+  exits 1 after a complete report.
 - **0.8.6**: _init_probe only sets the php -i file and is called by
   run_report; the shared main no longer calls it. Report unchanged.
 - **0.8.5**: Run helpers (skeleton): `_why_124` and `_out_dir_check` move

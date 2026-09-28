@@ -27,7 +27,7 @@ export LC_ALL=C
 # ---- collector metadata -----------------------------------------------------
 # History: CHANGELOG.md, section collect-collmysql.sh (next to this file).
 COLLECTOR_NAME="whatap-collmysql"
-VERSION="0.12.4"
+VERSION="0.12.5"
 DOMAIN="collection-server"
 TARGET="collection-server-mysql/$(hostname 2>/dev/null || echo unknown)"
 
@@ -56,7 +56,7 @@ section() {
 subsection() { printf '\n    -- %s --\n' "$1"; }
 fact()       { printf '    %s\n' "$1"; }
 emit_footer() { printf '\n==== END OF COLLECTION (no diagnosis by design) ====\n'; }
-progress()   { [ "$OPT_QUIET" = 1 ] && return; printf '>> %s\n' "$*" >&3 2>/dev/null; }
+progress()   { [ "$OPT_QUIET" = 1 ] && return; printf '>> %s\n' "$*" >&3 2>/dev/null || :; }
 have()       { command -v "$1" >/dev/null 2>&1; }
 
 # _indent PREFIX -> stdin with PREFIX before every line; a last line without a
@@ -332,7 +332,7 @@ _nl='
 _tab="$(printf '\t')"
 
 # Falls back to stderr when fd 3 is not open yet (an error before main).
-warn() { { printf '!! %s\n' "$*" >&3; } 2>/dev/null || printf '!! %s\n' "$*" >&2; }
+warn() { { printf '!! %s\n' "$*" >&3; } 2>/dev/null || printf '!! %s\n' "$*" >&2 || :; }
 
 # _elapsed -> seconds since _run_init; 0 without a clock, which disables the
 # deadline rather than tripping it at once
@@ -668,7 +668,7 @@ missed() { _res="$_res$1${_tab}missed$_tab$(_flat "$2")$_nl"; }
 
 # notice: like progress, but NOT silenced by --quiet; reserved for the status
 # roll-up, the one line an automated caller wants most.
-notice() { printf '>> %s\n' "$*" >&3 2>/dev/null; }
+notice() { printf '>> %s\n' "$*" >&3 2>/dev/null || :; }
 
 # _emit_time -> the run time; when a call was slow (SLOW_SEC), capped or not
 # run, also the host load at start and end, the counts, and each such call as

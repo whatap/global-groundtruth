@@ -5,6 +5,9 @@ change to the script bumps its `VERSION` and adds one entry at the top of this
 list (docs/authoring-guide.md, step 2); `tools/validate.sh` checks that the
 newest entry is the script's `VERSION`.
 
+- **0.7.8**: Emit helpers (skeleton): `progress`, `warn` and `notice` return 0
+  when their write fails, so a run whose stderr is closed or full no longer
+  exits 1 after a complete report.
 - **0.7.7**: Run helpers (skeleton): `_why_124` and `_out_dir_check` move
   into the skeleton run helpers (the `--out` mkdir now runs under the command
   cap), and `_run_init` sets the probe error file and reads the uid once;

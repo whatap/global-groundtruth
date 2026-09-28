@@ -7,6 +7,9 @@ one entry at the top of its section (docs/authoring-guide.md, step 2);
 
 ## collect-db.sh
 
+- **0.9.6**: Emit helpers (skeleton): `progress`, `warn` and `notice` return 0
+  when their write fails, so a run whose stderr is closed or full no longer
+  exits 1 after a complete report.
 - **0.9.5**: Section K leaves out the TLS 1.3 post-handshake session tickets
   (and the "---" just before the first): they print only when a ticket lands
   before s_client exits, one or several, so K differed run to run. "DONE"

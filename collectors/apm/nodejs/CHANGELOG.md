@@ -5,6 +5,9 @@ first. Every change to the script bumps its `VERSION` and adds one entry at
 the top of this list (docs/authoring-guide.md, step 2); `tools/validate.sh`
 checks that the newest entry is the script's `VERSION`.
 
+- **0.9.9**: Emit helpers (skeleton): `progress`, `warn` and `notice` return 0
+  when their write fails, so a run whose stderr is closed or full no longer
+  exits 1 after a complete report.
 - **0.9.8**: The shared main no longer calls _init_probe; _run_init sets
   _errfile, so the collector's one-line copy is gone. Report unchanged.
 - **0.9.7**: Run helpers (skeleton): `_why_124` and `_out_dir_check` move

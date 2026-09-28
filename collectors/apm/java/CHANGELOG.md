@@ -5,6 +5,9 @@ first. Every change to the script bumps its `VERSION` and adds one entry at
 the top of this list (docs/authoring-guide.md, step 2); `tools/validate.sh`
 checks that the newest entry is the script's `VERSION`.
 
+- **0.15.9**: Emit helpers (skeleton): `progress`, `warn` and `notice` return
+  0 when their write fails, so a run whose stderr is closed or full no longer
+  exits 1 after a complete report.
 - **0.15.8**: Section B names each unexecuted binary's own case: "binary
   deleted since the JVM started" for an exe link marked (deleted), "not
   executable by uid N" for a binary that is there but not executable, "not
