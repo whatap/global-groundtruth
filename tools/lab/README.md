@@ -69,6 +69,7 @@ with a clean tree) to see the noise floor, as with capture-compare.
 | `local` | this host | every shell collector in the capture-compare modes (help, bad argument, `--stdout` as a file, deadline, `dash`/`dash -s`/`bash -s` for apm, `sh` for collection-server) |
 | `apm-java` | `jjsong-ggt-apm-java:1` | Temurin 21, Java agent 2.2.77 via `-javaagent`, JVM uid 1500; image without `unzip` (v.properties and weaving list are `n/a`) |
 | `apm-java-jto` | same image | the operator shape: agent only in `JAVA_TOOL_OPTIONS`, nothing on the command line |
+| `apm-java-bash52` | `jjsong-ggt-apm-java-bash52:1` | the only target on Ubuntu 24.04 noble's shells (bash 5.2.21, dash 0.5.12-6ubuntu5) — everything else here is jammy/bookworm; a JVM whose JDK copy dir is deleted after it starts (section B "binary deleted or not executable", apmjava 0.15.4) and a `-javaagent` JVM whose `whatap.conf` weaving list names a real module (`spring-boot-3.0`) and a bogus one (`nonexistent-9.9`); section G lists the jar's raw `weaving/*` entries |
 | `apm-nodejs` | `jjsong-ggt-apm-nodejs:1` | Node 22, npm `whatap@2.0.6` required by the app, user `node` |
 | `apm-nodejs-op` | `jjsong-ggt-apm-nodejs-op:1` | agent from `apm-init-nodejs` in `/whatap-agent`, `NODE_OPTIONS=-r whatap` |
 | `apm-python` | `jjsong-ggt-apm-python:1` | Python 3.12 venv, PyPI `whatap-python==2.2.0`, `whatap-start-agent gunicorn` |
