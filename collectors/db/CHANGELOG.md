@@ -183,6 +183,13 @@ one entry at the top of its section (docs/authoring-guide.md, step 2);
   interface list (the cmdlets' module imports cost 1.4-5.5 s); sqlservr
   processes come from the process inventory with their instance
   argument; an empty service or task list says "none".
+  `windows/mssql.sql` (v0.2.0 to v0.3.0, 2026-09-27): classic sqlcmd 16.0
+  strips leading `[...]` groups from a PRINT message, so the section labels
+  `[n] title` arrived as ` title`; they now read `==== [n] title ====` and
+  arrive intact through classic sqlcmd 16.0, go-sqlcmd 1.10.0 (stdout and
+  `-o`) and `Invoke-Sqlcmd` of the SQLPS 16.0 module, on both instances of
+  the lab host (the pack ran without an error as a sysadmin and as a login
+  holding only VIEW SERVER STATE and VIEW ANY DEFINITION).
 - **0.4.0**: The status gives the run time, and when a bounded call was slow (3s),
   capped or not run past the deadline, the host load at start and end
   and where the time went, as the shell collectors do. CIM queries go

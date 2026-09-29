@@ -48,3 +48,8 @@ newest entry is the script's `VERSION`.
   cannot be written stops the run before it collects (2026-09-26).
   A value option given nothing, or a value starting with '-', exits 2
   ("missing value for --out"); it took the next option as its value.
+  Earlier validation (0.3.0, 2026-07-03, Ubuntu 24.04, whatap-nms 1.0.2 deb):
+  the install root resolved from the dpkg manifest (a doc-path false match was
+  caught and excluded), and a real failed postinst (`httptools` vs
+  `uvicorn[standard]==0.49.0`, `ResolutionImpossible` with pypi reachable, dpkg
+  `half-configured`) was captured in one report.
