@@ -240,6 +240,12 @@ checks that the newest entry is the script's `VERSION`.
   the agent's own (lab k8s, 2026-09-27). Report: [1] names the
   variables removed; B's -version loses the "Picked up
   JAVA_TOOL_OPTIONS" lines; K prints the value the shell had.
+  Validated 2026-09-27 against real agents: an operator-injected Spring Boot
+  pod on the lab cluster (Temurin 17.0.18, agent 2.2.68 from
+  `apm-init-java:latest`, connected to the collection server) and Temurin
+  21.0.12 containers with agent 2.2.77 attached by `-javaagent` and by
+  `JAVA_TOOL_OPTIONS`; as root, as the JVM's user and as another user, under
+  bash and `sh -s`.
 - **0.13.1**: main is the apm group block `apm: main`; report unchanged. The
   warning for --class without --library comes from _init_probe, right
   after the private temp directory is made (was: right before).
@@ -261,3 +267,27 @@ checks that the newest entry is the script's `VERSION`.
   probe error line over 100 bytes keeps its start and its end.
 - **0.12.6**: Shared helpers moved into the apm group block; report unchanged.
   The apm: blocks are copies of templates/groups/apm.sh.
+  Facts from before this entry (0.6.0 to 0.12.0), moved from the README
+  (Cases, Load profile, status block): the
+  FIF runs of 2026-09-17 were at 0.6.0. Process identification, measured on a
+  development host: 0.11.1 took 16.7 s at 704 processes, 0.12.0 took 4-7 s at
+  about 720 (one ls, one grep -z, one awk, one maps grep instead of a fork per
+  pid). Cases behind the sections: 2026-06-16 JBoss 5.1 `eorder_uat` (a library
+  scan that included the agent jar matched spring-boot-2.1 to 4.0 at once, so
+  the -javaagent jar is excluded from every library list and the exclusion is
+  stated, F); 2026-06-24 `KBANESCFServer` socket gateway (the transaction entry
+  was not a servlet: server markers and program identity D, hook_service_* G,
+  thread dumps L); 2026-06-30 keypro GlassFish (a console/JUL loop produced
+  19.8M events while the on-disk server log stayed small: logging properties,
+  libraries, config files, console destination and server log directories side
+  by side, H); 2026-09-11 BAF `hqapimgmtdev1` (section D reported no JVM while
+  section J listed two `vshell` processes ESTAB to :6600, and sections C and
+  E-L cascaded to n/a: the libjvm.so mapping test and --jcmd argument
+  recovery); 2026-09-17 FIF (one unit carried 282 jars, the customer's own
+  sorting at "f"; a thread dump arrived over Slack and was counted by hand;
+  which of 72 batchprocess classes are Quartz jobs; 40 detailed jars made 988
+  of the report's 2738 lines, all from one of two units: every jar recorded
+  though 120 are printed F, --dump-file L, --class-refs N, a byte-identical
+  copy named not detailed again M); 2026-09-25 verification (a relative
+  -Dwhatap.home was reported "not visible from this mount namespace": every
+  path is resolved as the JVM that names it resolves it).
