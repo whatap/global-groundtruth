@@ -151,8 +151,31 @@ pass.
 
 Add or update `collectors/<domain>/README.md`: what facts it collects, how the
 field engineer runs it, what the report can contain (see step 3), and its
-status. From here the collector belongs to your team. A README describes the
-current behaviour; what changed and when is in CHANGELOG.md.
+status. From here the collector belongs to your team. A domain that holds
+several collectors may keep an index README and one `collect-<token>.md` per
+collector next to its script (collection-server does); each per-collector doc
+then carries the status line and "What the report can contain".
+
+A README describes the current behaviour; what changed and when is in
+CHANGELOG.md:
+
+| Content | Where |
+|---|---|
+| Current behaviour, what a report line means, when a goal is blocked | README |
+| A design reason that still holds | README, in the present tense, with no date or version |
+| Last validated version, date, environment, what is not yet validated, owner | README, one status line |
+| What changed and when, measurements of older versions, removed options | CHANGELOG.md |
+| The case that led to a feature | CHANGELOG.md, in the entry of the version that added it |
+
+Moving a history fact to the CHANGELOG puts it in the entry of the version it
+belongs to; find that version with `git log -S '<text>'` and the script's
+`VERSION` in that commit, and add an entry for an older version when none
+exists. A fact whose version cannot be found is not given a guessed one.
+
+The status line reads:
+
+> **Status:** validated at `collect-<token>.sh` x.y.z on YYYY-MM-DD, <environment>.
+> Not yet run on: <kinds of environment>. Owner: <team>.
 
 The status table's version column is headed **validated at** and holds the
 last version that was run against a real environment of that kind, with what it
