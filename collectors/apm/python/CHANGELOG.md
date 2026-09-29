@@ -183,6 +183,8 @@ checks that the newest entry is the script's `VERSION`.
   stdout encoding lacks), so one odd name cannot break a line or lose
   the list; a sys.path directory that cannot be stat'ed says why
   (2026-09-26).
+  On the validation host (Ubuntu 24.04 `/usr/bin/python3`, 2026-09-26) the
+  inventory and `pip list` gave the same 66 name/version pairs.
 - **0.8.0**: Only candidates count (decision 1): with no whatap_python process on
   the host, a process whose environ this uid cannot read and whose
   command line does not name whatap is not counted as an unread input,

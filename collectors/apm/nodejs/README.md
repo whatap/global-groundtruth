@@ -1,11 +1,12 @@
 # collectors/apm/nodejs: WhaTap Node.js APM agent collector
 
-> **Status:** `collect-apmnodejs.sh` 0.9.4 validated at 2026-09-28 on the lab
-> `apm-nodejs` / `apm-nodejs-op` containers (real `whatap` npm agent 2.0.6 and the
-> operator `apm-init-nodejs` copy; as root, as the app user and as another user,
-> bash and `sh -s`), `validate.sh --report` pass; no collection server was
-> reachable, so no TCP session to :6600 was seen. Tier 0, seeded by the Global
-> team; ownership passes to the Node.js agent developers (CONTRACT rule 4).
+> **Status:** validated at `collect-apmnodejs.sh` 0.9.4 on 2026-09-28, lab `apm-nodejs`
+> / `apm-nodejs-op` containers (real `whatap` npm agent 2.0.6 and the operator
+> `apm-init-nodejs` copy; as root, as the app user and as another user, bash and `sh
+> -s`; `validate.sh --report` pass).
+> Not yet run on: an environment with a reachable collection server (no TCP session to
+> :6600 seen). Owner: Global team until handover to the Node.js agent developers
+> (CONTRACT rule 4).
 
 Collects the hidden facts a remote WhaTap Node.js-agent developer repeatedly
 asks a field engineer for. The fact list comes from a review of `#ask-dev-apm`

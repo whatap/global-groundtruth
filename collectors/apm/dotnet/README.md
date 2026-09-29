@@ -1,12 +1,13 @@
 # collectors/apm/dotnet: WhaTap .NET APM agent collector (Windows)
 
-> **Status:** `collect-apmdotnet.ps1` 0.6.0 validated at 2026-09-27 on Windows Server 2022
-> Standard Evaluation 10.0.20348 (lab VM jjsong-ggt-win) under Windows PowerShell
-> 5.1.20348.558 and pwsh 7.6.6, elevated and not elevated (local logon and OpenSSH), with a
-> **simulated** agent (no installer is publicly downloadable); `validate.sh --report`
-> pass. A real agent install is not validated. Tier 0, seeded by the Global team;
-> ownership passes to the .NET agent developers (CONTRACT rule 4). Linux .NET hosts are
-> not covered (see "Not covered").
+> **Status:** validated at `collect-apmdotnet.ps1` 0.6.0 on 2026-09-27, Windows Server
+> 2022 Standard Evaluation 10.0.20348 (lab VM jjsong-ggt-win), Windows PowerShell
+> 5.1.20348.558 and pwsh 7.6.6, elevated and not elevated (local logon and OpenSSH),
+> with a **simulated** agent (no installer is publicly downloadable); `validate.sh
+> --report` pass.
+> Not yet run on: a real agent install; Linux .NET hosts (not covered, see "Not
+> covered"). Owner: Global team until handover to the .NET agent developers (CONTRACT
+> rule 4).
 
 Collects the hidden facts a remote WhaTap .NET-agent developer repeatedly asks
 a field engineer for, from the Windows host where the instrumented application runs.
@@ -190,7 +191,3 @@ loaded for execution.
 tools/validate.sh collectors/apm/dotnet/collect-apmdotnet.ps1
 tools/validate.sh --report whatap-apmdotnet-<host>-<UTC>.txt   # the -File report
 ```
-
-Last validated run: see Status. Elevated with all four worker processes up, 5.1 and 7
-gave the same runtime modules for every w3wp; not elevated, a w3wp says
-`n/a (module list not readable)` and the goals fall to the privilege hint.

@@ -1,11 +1,12 @@
 # collectors/apm/php: WhaTap PHP APM agent collector
 
-> **Status:** `collect-apmphp.sh` 0.8.2 validated at 2026-09-28 on the lab targets
+> **Status:** validated at `collect-apmphp.sh` 0.8.2 on 2026-09-28, lab targets
 > `apm-php-rocky` / `apm-php-alpine` (real whatap-php 2.14-2 rpm on Rocky 9 with PHP 8.2
-> php-fpm + nginx under systemd, and the Alpine tarball on `php:8.3-fpm-alpine`; web user
-> and root without CAP_SYS_PTRACE, `sh -s`, `bash -s`, file), `validate.sh --report`
-> pass; no collection server was reachable. Tier 0, seeded by the Global team; ownership
-> passes to the PHP agent developers (CONTRACT rule 4).
+> php-fpm + nginx under systemd, and the Alpine tarball on `php:8.3-fpm-alpine`; web
+> user and root without CAP_SYS_PTRACE, `sh -s`, `bash -s`, file; `validate.sh --report`
+> pass).
+> Not yet run on: an environment with a reachable collection server. Owner: Global team
+> until handover to the PHP agent developers (CONTRACT rule 4).
 
 Collects the hidden facts a remote WhaTap PHP-agent developer repeatedly asks a
 field engineer for. The fact list comes from a review of `#ask-dev-apm` PHP support

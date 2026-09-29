@@ -1,13 +1,14 @@
 # collectors/apm/python: WhaTap Python APM agent collector
 
-> **Status:** `collect-apmpython.sh` 0.11.2 validated at 2026-09-28 on the lab
-> `apm-python` / `apm-python-op` containers (real `whatap-python` agents: 2.2.0 from
-> PyPI in a virtualenv under `whatap-start-agent gunicorn`, and the operator
-> `apm-init-python` copy 2.1.2 with `PYTHONPATH=/whatap-agent:/whatap-agent/whatap/bootstrap`
-> under plain gunicorn; as root, as the app user and as another user, bash and
-> `sh -s`), `validate.sh --report` pass; no collection server was reachable, so the
-> Go module opened no UDP listener and no TCP session. Tier 0, seeded by the Global
-> team; ownership passes to the Python agent developers (CONTRACT rule 4).
+> **Status:** validated at `collect-apmpython.sh` 0.11.2 on 2026-09-28, lab `apm-python`
+> / `apm-python-op` containers (real `whatap-python` agents: 2.2.0 from PyPI in a
+> virtualenv under `whatap-start-agent gunicorn`, and the operator `apm-init-python`
+> copy 2.1.2 with `PYTHONPATH=/whatap-agent:/whatap-agent/whatap/bootstrap` under plain
+> gunicorn; as root, as the app user and as another user, bash and `sh -s`; `validate.sh
+> --report` pass).
+> Not yet run on: an environment with a reachable collection server (the Go module
+> opened no UDP listener and no TCP session). Owner: Global team until handover to the
+> Python agent developers (CONTRACT rule 4).
 
 Collects the hidden facts a remote WhaTap Python-agent developer repeatedly
 asks a field engineer for. The fact list comes from a review of `#ask-dev-apm`
@@ -82,9 +83,8 @@ interpreter whose lookups did not answer within the cap.
 The inventory is the names of the metadata entries (`*.dist-info`, `*.egg-info`,
 `*.egg`, `*.egg-link`) in each directory on the interpreter's `sys.path`, listed by that
 interpreter start; nothing is imported and pip is not needed (uv-made environments have
-no pip module). These are the entries `pip list` reads, so names and versions agree: on
-the validation host (Ubuntu 24.04 `/usr/bin/python3`, 2026-09-26) both gave the same 66
-name/version pairs. What `pip list` adds (it runs in every run):
+no pip module). These are the entries `pip list` reads, so names and versions agree.
+What `pip list` adds (it runs in every run):
 
 - the version of an `.egg-info` entry whose name carries none (from its `PKG-INFO`),
   and names normalised from the metadata;
@@ -154,9 +154,8 @@ Tier 0 only: read-only, bounded reads (`tail -n`, line-capped dumps, capped
 process/interpreter detail: 20 `whatap_python` processes, 20 python processes, 8
 interpreters), every external command capped at 15 s and the whole run at
 `RUN_DEADLINE` (300 s). Each detailed interpreter is started once for all twelve lookups
-and once more for `-m pip list` (8 detailed interpreters on the validation host,
-2026-09-26: a default run took 6.7 to 7.1 s). The kernel and machine come from one
-`uname -srm`.
+and once more for `-m pip list` (a default run takes about 7 s with 8 detailed
+interpreters). The kernel and machine come from one `uname -srm`.
 
 ## Validate
 
