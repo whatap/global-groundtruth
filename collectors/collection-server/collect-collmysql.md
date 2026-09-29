@@ -1,15 +1,12 @@
 # `collect-collmysql.sh`: the backend's MySQL
 
-> **Status.** Owned for now by the Global team (framework owner); handover to
-> the collection-server (backend) team follows CONTRACT rule 4. Validated at
-> **0.11.1**: run on 2026-09-28 on the lab `collsrv` VM's own MySQL 8.4.11
-> (`--stdout`, `--binlog` as root): COMPLETE, `validate.sh --report` pass. The
-> `mysql-ha` fixture (a replicating pair, MySQL 5.6.51 / 5.7.32 / 8.4.10 and
-> MariaDB 10.11.19) was last run at an earlier version. Not yet validated: a
-> replicating pair, section I on 8.4 (the `mysql:8` image ships no
-> `mysqlbinlog`), section J against a real `iostat` (absent in the test
-> images), and the MariaDB-specific replication and `performance_schema`
-> differences.
+> **Status:** validated at `collect-collmysql.sh` 0.11.1 on 2026-09-28, the lab
+> `collsrv` VM's own MySQL 8.4.11 (`--stdout`, `--binlog` as root), COMPLETE,
+> `validate.sh --report` pass.
+> Not yet run on: a replicating pair, section I on 8.4 (the `mysql:8` image ships no
+> `mysqlbinlog`), section J against a real `iostat` (absent in the test images), the
+> MariaDB-specific replication and `performance_schema` differences. Owner: Global
+> team until handover to the collection-server (backend) team (CONTRACT rule 4).
 
 Part of the [collection-server family](README.md).
 
@@ -173,7 +170,7 @@ a newline is refused (exit 2): an option-file value ends at a newline.
 A password written into `--mysql-args` ends the run with exit 2 before any
 child starts: it is already on the collector's own command line (the
 operator's choice), and the collector does not hand it on. Detection follows
-the real clients (5.6, 5.7.32, 8.0.46 and 8.4.10 checked, 2026-09-25): `-pX`, a
+the real clients (5.6, 5.7.32, 8.0.46 and 8.4.10 checked): `-pX`, a
 short-option cluster holding `p` (`-BpX`), `--password[1..3]=X`, the abbreviated
 and `loose-` / `maximum-` / `skip-` / `enable-` / `disable-` prefixed
 spellings, with `_` and `-` interchangeable. A bare `-p` (or `--password`, or

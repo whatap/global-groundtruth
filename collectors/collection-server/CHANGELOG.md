@@ -168,8 +168,7 @@ one entry at the top of its section (docs/authoring-guide.md, step 2);
   grep over /proc and one `systemctl show`. The bundle is built in the
   private directory; bad numeric options exit 2, a failed write exits 1;
   output is handed back under sudo. Needs bash. Measured 2026-09-25 on a
-  739-process host: collserver 8.1 s -> 2.4 s, collzfs 5.2 s -> 0.5 s; with
-  2,000 more processes, 20.5 s -> 4.2 s and 17.2 s -> 0.8 s.
+  739-process host: 8.1 s -> 2.4 s; with 2,000 more processes, 20.5 s -> 4.2 s.
 - **0.4.1**: An unreadable `conf/` is no longer reported as "n/a (path not found
   or WHATAP_HOME not resolved)". Found on three live production backends
   (Smartfren, 2026-09-23): the collector ran as uid 3103 while WhaTap is
@@ -348,7 +347,8 @@ one entry at the top of its section (docs/authoring-guide.md, step 2);
   from 23 s down to 2 s); `@START` waits; INT and TERM; `--bundle`. The
   allocation-class view showed `class=special`. A default `--file` run took
   33.2-34.9 s against 15.7-15.8 s at 0.7.0 (the 15 s window plus about 2.5 s
-  for the interval jobs' last block).
+  for the interval jobs' last block). Before the txgs ring was full, H's
+  first row was txg 5, not txg 1.
 - **0.7.0**: zpool list -v runs once: the raw probe's output feeds the derived
   views of sections C and H and the bundle's zpool-list-v.txt (it was
   run a second time, capped at 20s, for the views, and a third time
@@ -363,7 +363,22 @@ one entry at the top of its section (docs/authoring-guide.md, step 2);
   it loads the special vdev and the ARC and cannot finish in its bound.
   df -i of every WhaTap path is in the report and df-i.txt in the
   bundle, so the file count is there without a walk.
-- **0.4.1**: Validated non-root on two live ZFS hosts: a KVM host (Ubuntu
+- **0.6.0**: Discovery of the running processes is one bounded `grep` over
+  `/proc` instead of one fork per process (the collserver 0.9.0 change). Measured
+  2026-09-25 on a 739-process host: 5.2 s -> 0.5 s; with 2,000 more processes,
+  17.2 s -> 0.8 s. A `zpool` / `zfs` that fails or hangs is reported with its
+  reason, not as "no pool", and the snapshot count is `n/a`.
+- **0.2.0**: `zpool events` is read once and split three ways: a tally (class x
+  date x vdev) and a per-class overview (count, first, last) over the whole
+  ring buffer, and per-event detail only for the `--event-days` window
+  (default 30). Cut to a recent window, the buffer loses what it answers, when a class
+  started and stopped: a host with no `deadman` event this month reads the same
+  whether it never had one or they ended two months ago. Case (XLSMART web01-bsd,
+  bundles of 2026-09-23): the `zpool events` dump was 192 MB because
+  `zfs_zevent_len_max` was INT_MAX; the buffer held 136,337 `deadman` events,
+  the last on 2026-07-29, and that date decided the judgment. Measured: 192 MB
+  became 224 KB with the last date kept. L carries the same tally.
+- **0.1.0**: Validated non-root on two live ZFS hosts: a KVM host (Ubuntu
   24.04, zfs 2.2.2, pool 2.72 T, FRAG 56 %, 19 datasets, 2 zvols, 2 clones, a
   removed vdev leaving `indirect-0/1`; Tier 0 about 13 s, `--bundle` about 34 s /
   89 KB), and a real WhaTap collection server (Ubuntu 24.10, zfs 2.2.6, pool
@@ -372,7 +387,9 @@ one entry at the top of its section (docs/authoring-guide.md, step 2);
   `-Dwhatap.server.home` and reported the mixed layout: only `yardbase` on ZFS
   (`recordsize=64K` local, `compressratio 4.43x`), while `logs` / `conf` / `db` /
   `logsink` sat on the ext4 root. The `arcstat` sampling branch was exercised
-  there (that binary is absent on the KVM host).
+  there (that binary is absent on the KVM host). The status rows of later
+  versions (0.2.0, 0.4.1) carried this validation forward; no later run on
+  those hosts is recorded.
 
 ## collect-collmysql.sh
 
@@ -507,7 +524,9 @@ one entry at the top of its section (docs/authoring-guide.md, step 2);
   run (exit 2); it comes from a bare -p, MYSQL_PWD or an option file and
   reaches the client in a mode-600 file. Every wait is bounded; refused
   SHOW BINARY LOGS, a failed or capped decode, a NULL log_bin_basename and
-  no local mysqld without arguments are gaps with reasons. Needs bash.
+  no local mysqld without arguments are gaps with reasons. Needs bash. The
+  password notations were checked against the real 5.6, 5.7.32, 8.0.46 and
+  8.4.10 clients (2026-09-25).
 - **0.4.0**: Run end to end on MySQL 5.6.51, 5.7.32, 8.4.10 and MariaDB 10.11.19
   (2026-09-17), each seeded with a scheduler-shaped write load; all four reach
   the footer and attribute binary log rows to the right tables (8.4 excepted:

@@ -13,9 +13,10 @@ ownership to the collection-server (backend) team (CONTRACT rule 4).
 | [`collect-collzfs.sh`](collect-collzfs.sh) | `collzfs` | ZFS under the backend's data path: block sizing, allocation classes, the write path, free-space fragmentation | [collect-collzfs.md](collect-collzfs.md) |
 | [`collect-collmysql.sh`](collect-collmysql.sh) | `collmysql` | the MySQL that holds the backend's `account` / `notihub` metadata: replication and HA state, binary log growth and content, InnoDB I/O counters | [collect-collmysql.md](collect-collmysql.md) |
 
-Each document opens with that collector's status line. "Validated at" there is
-the last version run on a real environment, not the current `VERSION` in the
-script. The version history is in [CHANGELOG.md](CHANGELOG.md).
+Each document opens with that collector's status line. Its "validated at"
+version is the last one run on a real environment, not the script's current
+`VERSION`; a gap between the two means later changes have not met a real host
+yet. The version history is in [CHANGELOG.md](CHANGELOG.md).
 
 ## Which one to run
 
@@ -35,9 +36,9 @@ file dumping, the systemd helpers, the sampling-window duration parser,
 chown-to-operator-under-sudo helper) are the group blocks
 `collection-server: <name>`, owned by
 [templates/groups/collection-server.sh](../../templates/groups/collection-server.sh):
-edit them there and run `tools/sync-shared-block.sh --apply`. The path helpers,
-process scan and probe helpers are collserver's own code; the probe helpers
-came from the skeleton's run helpers.
+edit them there and run `tools/sync-shared-block.sh --apply`. The path helpers
+and process scan are collserver's own code; the probe helpers (`probe`,
+`probe_merged`) are in the skeleton's run helpers block.
 
 ## How to maintain
 
@@ -52,8 +53,8 @@ and re-validate after edits:
 ../../tools/validate.sh collect-collserver.sh   # or collect-collzfs.sh, collect-collmysql.sh
 ```
 
-Two habits that paid off in collzfs and apply to any of them: ask the binary
-what it supports instead of inferring from a version (a build that lacks a
-property omits it, and the omission is reported as a fact), and parse tool
-output by column name, not position (`zpool list -v` gained `CKPOINT` /
-`EXPANDSZ` / `DEDUP` columns over time).
+Two habits apply to any of them: ask the binary what it supports instead of
+inferring from a version (a build that lacks a property omits it, and the
+omission is reported as a fact), and parse tool output by column name, not
+position (the columns of `zpool list -v` differ between ZFS versions, such as
+`CKPOINT`, `EXPANDSZ` and `DEDUP`).

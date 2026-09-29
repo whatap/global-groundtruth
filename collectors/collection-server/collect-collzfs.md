@@ -1,19 +1,16 @@
 # `collect-collzfs.sh`: ZFS facts
 
-> **Status.** Owned for now by the Global team (framework owner); handover to
-> the collection-server (backend) team follows CONTRACT rule 4. Validated at
-> **0.12.0**: run on 2026-09-28 as root on the lab `zfs` VM (jjsong-ggt-zfs,
-> zpool `yard`; `--stdout`, `--bundle`): COMPLETE, `validate.sh --report` pass.
-> Earlier versions were run as root on the same VM (Ubuntu 26.04, zfs 2.4.1,
-> pool with a special vdev; the time window idle and under an append load, a
-> forced ring wrap, signals) and non-root on two live hosts (zfs 2.2.2 and
-> 2.2.6, one a real collection server with `yardbase` on ZFS). Not yet
-> validated: `--zdb`; the content of the root-only probes (`zdb`,
-> `zpool history`, `zpool events`, `dbgmsg`) on a production host, since a
-> non-root run only reports their absence with the reason; a pool with a
-> **logs** vdev. Stub tests: `tools/test-collzfs.sh`.
+> **Status:** validated at `collect-collzfs.sh` 0.12.0 on 2026-09-28, as root on the
+> lab `zfs` VM (jjsong-ggt-zfs, Ubuntu 26.04, zfs 2.4.1, zpool `yard` with a special
+> vdev; `--stdout`, `--bundle`), COMPLETE, `validate.sh --report` pass.
+> Not yet run on: `--zdb`; the content of the root-only probes (`zdb`, `zpool
+> history`, `zpool events`, `dbgmsg`) on a production host, since a non-root run
+> only reports their absence with the reason; a pool with a **logs** vdev. Owner:
+> Global team until handover to the collection-server (backend) team (CONTRACT rule
+> 4).
 
-Part of the [collection-server family](README.md).
+Part of the [collection-server family](README.md). Stub tests:
+`tools/test-collzfs.sh`.
 
 For a collection-server host whose data path (`yardbase` / `logs` / `db`) sits on
 ZFS. It collects the measurements a reviewer needs in order to **verify or refute**
@@ -112,12 +109,10 @@ their dataset are in [collect-collserver.md](collect-collserver.md) section C):
   The tally covers the whole buffer on purpose. What that buffer answers is **when
   a class started and when it stopped**, and a recent-only view cannot answer it:
   a host with no `deadman` event this month reads identically whether it never had
-  one or whether they ended two months ago. On one production pool the buffer
-  held 136,337 `deadman` events, the last of them two months before the run, and
-  that last date is what decided the case. The per-event **detail** is a separate
+  one or whether they ended two months ago. The per-event **detail** is a separate
   question and is bundled only for a recent window (`EVENT_DAYS` in the
-  environment, default 30),
-  because the full `-v` dump of that buffer was 192MB.
+  environment, default 30), because the full `-v` dump of a long-lived pool's
+  buffer can reach hundreds of MB.
 - **N. Deep block & metaslab statistics**: `zdb` is opt-in (see tiers). Each
   zdb call runs once: in a report run N prints its first 400-500 lines; in a
   bundle run its whole output goes to `zdb/zdb-<C|Lbbbs|mm>-<pool>.txt` and N
@@ -229,8 +224,7 @@ reader whose place was dropped gets `EIO`, not a jump. Section H prints the file
 in one read when it has up to 150 lines. Past 150 lines it prints the header,
 an explicit `... (N earlier records omitted ...)` line and the tail. The rows of
 one txg ring are therefore contiguous in H. Before the ring is full, its first row is
-the first txg recorded after the pool was imported or created (txg 5 in the VM
-test report), not txg 1.
+the first txg recorded after the pool was imported or created (not txg 1).
 
 **Where the rows go.**
 

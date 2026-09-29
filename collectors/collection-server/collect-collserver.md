@@ -1,14 +1,12 @@
 # `collect-collserver.sh`: WhaTap backend facts
 
-> **Status.** Owned for now by the Global team (framework owner); handover to
-> the collection-server (backend) team follows CONTRACT rule 4. Validated at
-> **0.15.0**: run on 2026-09-28 on the lab `collsrv` VM (jjsong-ggt-collsrv,
-> on-prem `whatap_multi` install, Ubuntu `openjdk-17-jre-headless`; `--stdout`,
-> `--bundle`, and `--bundle --jvm` as the `whatap` user: a thread dump and a
-> histo of each of the 8 server JVMs through `java -m jdk.jcmd`): COMPLETE,
-> `validate.sh --report` pass. A lab VM, not a production host; production
-> backends were run at an earlier version (Smartfren, 2026-09-23). Not yet
-> validated: `--du`.
+> **Status:** validated at `collect-collserver.sh` 0.15.0 on 2026-09-28, the lab
+> `collsrv` VM (jjsong-ggt-collsrv, on-prem `whatap_multi` install, Ubuntu
+> `openjdk-17-jre-headless`; `--stdout`, `--bundle`, and `--bundle --jvm` as the
+> `whatap` user: a thread dump and a histo of each of the 8 server JVMs through
+> `java -m jdk.jcmd`), COMPLETE, `validate.sh --report` pass.
+> Not yet run on: a production host at this version; `--du` anywhere. Owner: Global
+> team until handover to the collection-server (backend) team (CONTRACT rule 4).
 
 Part of the [collection-server family](README.md). For anything about the
 backend itself: services, ports, configs, logs.
