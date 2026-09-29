@@ -145,6 +145,12 @@ checks that the newest entry is the script's `VERSION`.
   version and release_date lines of its build.py ("build.py: version
   = '2.1.2' release_date = '20260722'"): the operator's copy has no
   dist-info, so its version was n/a everywhere in section 3.
+  Validated 2026-09-27 against real whatap-python agents: 2.2.0 from PyPI in
+  a virtualenv under whatap-start-agent gunicorn, and the operator's
+  apm-init-python copy (2.1.2, PYTHONPATH=/whatap-agent:/whatap-agent/whatap/bootstrap)
+  under plain gunicorn; as root, as the app's user and as another user, bash
+  and sh -s; no collection server was reachable, so the Go module opened no
+  UDP listener and no TCP session.
 - **0.10.1**: main is the apm group block `apm: main`; report unchanged. A --file run
   on a host without hostname(1) names the report after
   /proc/sys/kernel/hostname, else `uname -n`, and so does Target (both
@@ -161,6 +167,9 @@ checks that the newest entry is the script's `VERSION`.
   help names APM_INTERP_CAP. An error reason over 100 bytes (probe)
   or 140 (interpreter lookups) keeps both its start (the error kind)
   and its end (where "No module named pip" is after a long path).
+  On the validation host (8 detailed interpreters, 2026-09-26) a default run
+  took 5.1-5.4 s with 0.9.1 and 6.7-7.1 s with 0.10.0, the same as 0.9.1
+  with --pip (6.9-7.3 s).
 - **0.9.1**: Shared helpers moved into the apm group block; report unchanged.
   The apm: blocks are copies of templates/groups/apm.sh.
 - **0.9.0**: Cheaper sources (decision 4). The Odoo release.py lookup joins the one

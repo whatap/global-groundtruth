@@ -1,21 +1,18 @@
 # collectors/apm/python: WhaTap Python APM agent collector
 
-> **Status: SEEDED (v0; validated at `collect-apmpython.sh` 0.11.2 on
-> 2026-09-28 on the lab `apm-python` / `apm-python-op` containers (same setup
-> as below); COMPLETE, `validate.sh --report` pass. 0.10.2 was run on
-> 2026-09-27 against real `whatap-python` agents: 2.2.0 from PyPI in a
-> virtualenv under `whatap-start-agent gunicorn`, and the operator's
-> `apm-init-python` copy (2.1.2, `PYTHONPATH=/whatap-agent:/whatap-agent/whatap/bootstrap`)
-> under plain gunicorn; as root, as the app's user and as another user, bash
-> and `sh -s`; no collection server was reachable, so the Go module opened no
-> UDP listener and no TCP session).** `collect-apmpython.sh` is a working Tier-0
-> collector seeded by the Global team (CONTRACT rule 4, interim ownership).
-> Ongoing ownership belongs to the Python agent developers once handed over.
+> **Status:** `collect-apmpython.sh` 0.11.2 validated at 2026-09-28 on the lab
+> `apm-python` / `apm-python-op` containers (real `whatap-python` agents: 2.2.0 from
+> PyPI in a virtualenv under `whatap-start-agent gunicorn`, and the operator
+> `apm-init-python` copy 2.1.2 with `PYTHONPATH=/whatap-agent:/whatap-agent/whatap/bootstrap`
+> under plain gunicorn; as root, as the app user and as another user, bash and
+> `sh -s`), `validate.sh --report` pass; no collection server was reachable, so the
+> Go module opened no UDP listener and no TCP session. Tier 0, seeded by the Global
+> team; ownership passes to the Python agent developers (CONTRACT rule 4).
 
 Collects the hidden facts a remote WhaTap Python-agent developer repeatedly
-asks a field engineer for. The fact list was derived from an exhaustive review
-of `#ask-dev-apm` Python support threads (2025-02 .. 2026-07) and verified
-against the `whatap-python` package source (2.1.2).
+asks a field engineer for. The fact list comes from a review of `#ask-dev-apm`
+Python support threads (2025-02 .. 2026-07), checked against the `whatap-python`
+package source (2.1.2).
 
 ## One field command
 
@@ -35,29 +32,17 @@ docker exec -i <container> sh -s -- --stdout --quiet \
     < collect-apmpython.sh > report.txt
 ```
 
-Paste or attach the entire output. No arguments prints usage; nothing runs by
-accident. Progress is narrated on stderr (`--quiet` silences it).
-`--out DIR` writes the `--file` report into DIR (created when missing; an
-unwritable one ends the run before anything is collected). Every run also
-runs `python -m pip list` in each detailed interpreter (one more start each);
-`--pip`, the opt-in of 0.9.x, is refused with exit 2. `APM_INTERP_CAP=<n>`
-raises the interpreter detail cap (8).
+Paste or attach the entire output; delivery notes for containers and Kubernetes are in
+[../README.md](../README.md), "Running a Linux apm collector". Every run also runs
+`python -m pip list` in each detailed interpreter (one more start each).
 
-Container notes (all verified against real images):
+Notes:
 
 - **POSIX sh is enough.** The script runs under bash, dash, and busybox ash
-  (`alpine`, `python:*-slim`, no bash/ss/procps required; socket facts fall
-  back to raw `/proc/net/udp|tcp`).
-- **Use `--stdout` in containers.** `--file` writes to the current directory,
-  which fails on `readOnlyRootFilesystem` pods.
-- **Distroless / no shell in the app container**: attach an ephemeral debug
-  container sharing the pod's process namespace
-  (`kubectl debug <pod> -it --image=busybox:stable --target=<container> -- sh`)
-  and run the collector there. Agent homes and package dirs that are not
-  visible in the debug container's own mount namespace are read through
-  `/proc/<pid>/root/...` of the discovered agent/app processes, and the
-  whatap-python version is read from package metadata files without executing
-  any interpreter.
+  (`alpine`, `python:*-slim`; no bash/ss/procps required, socket facts fall back to
+  raw `/proc/net/udp|tcp`).
+- From a debug container the whatap-python version is read from package metadata
+  files without executing any interpreter.
 
 ## Facts collected (report sections)
 
@@ -76,64 +61,42 @@ Container notes (all verified against real images):
 ## How each interpreter is asked
 
 Every interpreter this run starts gets `PYTHONPATH` without its
-`*/whatap/bootstrap` entries. That directory holds the agent's
-`sitecustomize.py`, which calls `whatap.agent()` in any interpreter that finds
-it; the operator puts it on the container's `PYTHONPATH`, and the
-`kubectl exec` shell inherits it. This keeps a run from starting the agent in
-its own interpreter, which would kill the application's `whatap_python` Go
-module and replace it with orphaned copies (parent pid 1, two or three per
-run in the lab) that outlive the run. The other entries
-stay, so a package found through them (`/whatap-agent`) is still found. `[1]`
-names the entries removed.
+`*/whatap/bootstrap` entries. That directory holds the agent's `sitecustomize.py`,
+which calls `whatap.agent()` in any interpreter that finds it; the operator puts it on
+the container's `PYTHONPATH` and the `kubectl exec` shell inherits it, so an interpreter
+started by the run would start an agent and kill the application's `whatap_python` Go
+module. The other entries stay, so a package found through them (`/whatap-agent`) is
+still found. `[1]` names the entries removed.
 
-The lookups of section 3 (version, prefixes, whatap-python version and
-location, metadata dirs, setuptools, `pkg_resources`, bundled binaries,
-`sitecustomize.py`, `trace/mod`, the library inventory, and the `odoo`
-location that section 8 reads `release.py` from) run in **one** start of each interpreter,
-not one `python -c` each: every snippet runs with fresh globals, its own
-stdout, stderr and exit status, and an uncaught exception is printed by the
-interpreter's own `sys.excepthook`, so each line and each `n/a (...)` reads
-as a separate `python -c` would have made it. The `pkg_resources` import runs
-last, as it rewires namespace packages. A snippet that hangs says `timed out`;
-the snippets after it, and those after one that ends the process, never
-started, so each is then run on its own under its own cap, as before (past the
-run deadline they say `not run: ...` instead). When the interpreter cannot run
-the combined script at all, every snippet is run on its own; when the cap
-stops it before any snippet started, every snippet says `timed out`, as each
-`python -c` would have. The marker lines that separate the snippets are random
-per run and read in order, so output that imitates one stays output. `pip list`
-stays a call of its own, and is not started in an interpreter whose lookups
-did not answer within the cap.
+The lookups of section 3 (version, prefixes, whatap-python version and location,
+metadata dirs, setuptools, `pkg_resources`, bundled binaries, `sitecustomize.py`,
+`trace/mod`, the library inventory, and the `odoo` location section 8 reads) run in
+**one** start of each interpreter; each line and each `n/a (...)` reads as a separate
+`python -c` would have made it. A snippet that hangs says `timed out`, and the snippets
+that never started are re-run one by one under their own cap (past the run deadline
+they say `not run: ...`). `pip list` is a call of its own and is not started in an
+interpreter whose lookups did not answer within the cap.
 
 ## Library inventory
 
-By default the inventory is the names of the metadata entries
-(`*.dist-info`, `*.egg-info`, `*.egg`, `*.egg-link`) in each directory on the
-interpreter's `sys.path`, listed by the interpreter start above; nothing is
-imported and pip is not needed (uv-made environments have no pip module). These
-are the entries `pip list` reads, so the names and versions agree; on the
-validation host (Ubuntu 24.04 `/usr/bin/python3`, 2026-09-26) both gave the
-same 66 name/version pairs, and the directory listing also showed a
-version-less duplicate `cryptography.egg-info` from the distribution package.
-What `pip list` adds (it runs in every run):
+The inventory is the names of the metadata entries (`*.dist-info`, `*.egg-info`,
+`*.egg`, `*.egg-link`) in each directory on the interpreter's `sys.path`, listed by that
+interpreter start; nothing is imported and pip is not needed (uv-made environments have
+no pip module). These are the entries `pip list` reads, so names and versions agree: on
+the validation host (Ubuntu 24.04 `/usr/bin/python3`, 2026-09-26) both gave the same 66
+name/version pairs. What `pip list` adds (it runs in every run):
 
-- the version of an `.egg-info` entry whose name carries none (read from its
-  `PKG-INFO`), and names normalised from the metadata instead of the
-  directory name;
-- one entry per distribution: where the same distribution sits in two
-  `sys.path` directories, pip shows the first, the listing shows both;
+- the version of an `.egg-info` entry whose name carries none (from its `PKG-INFO`),
+  and names normalised from the metadata;
+- one entry per distribution: where the same distribution sits in two `sys.path`
+  directories, pip shows the first, the listing shows both;
 - whether pip itself runs in that interpreter.
 
-A legacy editable install (`setup.py develop`, pip before 21.3) shows as
-`<name>.egg-link` in site-packages, and its source directory (on `sys.path`
-through `easy-install.pth`) is listed with its `<name>.egg-info`. A PEP 660
-editable install has an ordinary `.dist-info`. The empty `sys.path` entry
-(the collector's working directory) is not listed.
-
-`pip list` declares no goal: the directory listing above already gives the
-inventory, so an interpreter whose `pip list` gave no list (no pip module, an
-error, a timeout) is a fact line with its reason, and the run stays COMPLETE
-on that account. (0.9.x declared the goal `pip` when `--pip` was given.)
+A legacy editable install (`setup.py develop`) shows as `<name>.egg-link` and its source
+directory is listed with its `<name>.egg-info`; a PEP 660 editable install has an
+ordinary `.dist-info`. `pip list` declares no goal: an interpreter without a working pip
+(no module, an error, a timeout) is a fact line with its reason, and the run stays
+COMPLETE on that account.
 
 ## How python processes are found
 
@@ -148,70 +111,52 @@ the matches.
 
 ## Collection status
 
-`agent` is obtained when a visible agent home, a whatap package dir, a
-whatap package found by an interpreter, or a `whatap_python` process exists.
-Its absence is `na` only when every input was read. When the run cannot read
-the `environ`/`cwd` of a candidate process (other users' processes as
-non-root), `/proc` is mounted with `hidepid`, a home path is behind a
-directory it may not search, or an interpreter's package lookup fails, the
-absence is `missed` and names those pids or paths. A process whose environ
-the run cannot read counts as an unread input only when its command line
-names whatap or a `whatap_python` process runs on the host. So the root
-python daemons of a stock distribution (`networkd-dispatcher`,
-`unattended-upgrades`) alone do not make a non-root run `missed` on a host
-without the agent; their count and pids are named in the `na` reason. An app
-whose whatap marker is only in its environ (the bootstrap on `PYTHONPATH`, a
-`WHATAP_*` variable) and whose `whatap_python` process has exited is then
-seen only by a root run. `conf` is obtained when a
-`whatap.conf` in an agent home is readable; a home whose path does not exist
-gives `na` with `path not found`, a home or file the run may not read gives
-`missed` with `permission denied`, and no `whatap.conf` in the homes found
-while a candidate's `environ`/`cwd` was unread is `missed` (that candidate's
-home is unknown).
+Goals and their `na` / `missed` rules are those of
+[../README.md](../README.md), "Agent goal". `agent` is obtained when a visible agent home,
+a whatap package dir, a whatap package found by an interpreter, or a `whatap_python`
+process exists; an interpreter's package lookup failing also makes an absence `missed`.
+A process whose environ the run cannot read counts as an unread input only when its
+command line names whatap or a `whatap_python` process runs on the host, so the root
+python daemons of a stock distribution (`networkd-dispatcher`, `unattended-upgrades`)
+alone do not make a non-root run `missed` on a host without the agent; their count and
+pids are named in the `na` reason. An app whose whatap marker is only in its environ and
+whose `whatap_python` process has exited is then seen only by a root run. `conf` is
+obtained when a `whatap.conf` in an agent home is readable; a home whose path does not
+exist gives `na` with `path not found`, a home or file the run may not read gives
+`missed` with `permission denied`, and no `whatap.conf` in the homes found while a
+candidate's `environ`/`cwd` was unread is `missed` (that candidate's home is unknown).
 
 ## What the report can contain
 
-Nothing is masked, with one omission: in `odoo.conf` the `db_password` and
-`admin_passwd` lines are not collected (the report says how many were left
-out). That is the only content the collector leaves out. Every place a secret
-can arrive from:
+The common items are in [../README.md](../README.md), "What every Linux apm report can
+contain". Python specific: `odoo.conf` is dumped without its `db_password` and
+`admin_passwd` lines (the report says how many were left out), the only content this
+collector omits besides key material. Every place a secret can arrive from:
 
 - `whatap.conf` and `container.conf` of every agent home, verbatim
   (`license`, server addresses, any other key the operator put there).
 - The environment of python and `whatap_python` processes: every `WHATAP_*`
   and `OTEL_*` variable (OTLP headers can carry tokens), `PYTHONPATH`,
   `VIRTUAL_ENV`, `PYTHONHOME`.
-- Command lines of python, `whatap_python` and odoo processes and of pid 1
-  (first 160-300 bytes, NULs, newlines and CRs as spaces): an argument such
-  as `--db_password=...` appears as given.
-- `/sys/class/dmi/id/product_uuid`, when this run can read it.
+- Command lines of python, `whatap_python` and odoo processes and of pid 1: an argument
+  such as `--db_password=...` appears as given.
 - The installed-distribution names (package names and versions), and the
   `pip list` output.
-- `odoo.conf`, verbatim, **except** the `db_password` and `admin_passwd` lines,
-  which are not collected (the report states how many were left out); the tail
-  of the odoo `logfile`.
+- `odoo.conf` verbatim except those two lines; the tail of the odoo `logfile`.
 - `whatap-hook.log` and `whatap-boot-*.log` heads and tails, and
   `systemctl cat 'odoo*'` (an `Environment=` line can carry a secret).
 - The collector's own environment: `WHATAP_PYTHON_AGENT_PATH`, `POD_NAME`,
   `NODE_NAME`, `POD_NAMESPACE`, `OKIND`, `ONAME`, `ONODE`.
 
-`security.conf` and `paramkey.txt` in an agent home are reported by presence
-and size only; their content is not collected.
-
-The collector itself puts no credential on a command line.
-
 ## Load profile
 
 Tier 0 only: read-only, bounded reads (`tail -n`, line-capped dumps, capped
-process/interpreter detail: 20 `whatap_python` processes, 20 python processes, 8 interpreters), every external command capped at 15 s and the
-whole run at `RUN_DEADLINE` (300 s). Each detailed interpreter (cap 8) is
-started once for all twelve lookups (a lookup cut off by a hang is re-run on
-its own, see above), and once more for `-m pip list` (on the validation host, 8 detailed
-interpreters, 2026-09-26: a default run took 5.1–5.4 s with 0.9.1 and
-6.7–7.1 s with 0.10.0, the same as 0.9.1 with `--pip`, 6.9–7.3 s). The kernel
-and machine come from one `uname -srm`. No `--bundle` tier yet;
-copy the bundle plumbing from `collect-collserver.sh` if the domain team
-needs raw log artifacts.
+process/interpreter detail: 20 `whatap_python` processes, 20 python processes, 8
+interpreters), every external command capped at 15 s and the whole run at
+`RUN_DEADLINE` (300 s). Each detailed interpreter is started once for all twelve lookups
+and once more for `-m pip list` (8 detailed interpreters on the validation host,
+2026-09-26: a default run took 6.7 to 7.1 s). The kernel and machine come from one
+`uname -srm`.
 
 ## Validate
 

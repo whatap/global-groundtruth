@@ -1,23 +1,17 @@
 # collectors/apm/nodejs: WhaTap Node.js APM agent collector
 
-> **Status: SEEDED (v0; validated at `collect-apmnodejs.sh` 0.9.4 on
-> 2026-09-28 on the lab `apm-nodejs` / `apm-nodejs-op` containers (same setup
-> as below); COMPLETE, `validate.sh --report` pass. 0.8.2 was run on
-> 2026-09-27 against the real `whatap` npm agent 2.0.6 (`require('whatap')` in
-> the app, master `whatap_nodejs` in a Node 22 container) and the operator's
-> `apm-init-nodejs` copy (`NODE_OPTIONS=-r whatap`, `/whatap-agent`); as root,
-> as the app's user and as another user, bash and `sh -s`; no collection
-> server was reachable, so no TCP session to :6600 was seen).**
-> `collect-apmnodejs.sh` is a working Tier-0
-> collector seeded by the Global team (CONTRACT rule 4, interim ownership).
-> Ongoing ownership belongs to the Node.js agent developers once handed over.
+> **Status:** `collect-apmnodejs.sh` 0.9.4 validated at 2026-09-28 on the lab
+> `apm-nodejs` / `apm-nodejs-op` containers (real `whatap` npm agent 2.0.6 and the
+> operator `apm-init-nodejs` copy; as root, as the app user and as another user,
+> bash and `sh -s`), `validate.sh --report` pass; no collection server was
+> reachable, so no TCP session to :6600 was seen. Tier 0, seeded by the Global
+> team; ownership passes to the Node.js agent developers (CONTRACT rule 4).
 
 Collects the hidden facts a remote WhaTap Node.js-agent developer repeatedly
-asks a field engineer for. The fact list was derived from an exhaustive review
-of `#ask-dev-apm` Node.js support threads (2025-06 .. 2026-08), verified
-against the `whatap` npm package source (2.0.6 latest **and** 0.5.27 legacy),
-docs.whatap.io, and the operator `apm-init-nodejs` init-container image
-(1.0.1), and exercised against live agents of both lines.
+asks a field engineer for. The fact list comes from a review of `#ask-dev-apm`
+Node.js support threads (2025-06 .. 2026-08), checked against the `whatap` npm
+package source (2.0.6 latest and 0.5.27 legacy), docs.whatap.io and the operator
+`apm-init-nodejs` image (1.0.1).
 
 **Why the agent generation is the first fact.** The two shipping lines have
 different architectures, so the artifacts that *can* exist differ:
@@ -60,23 +54,9 @@ docker exec -i <container> sh -s -- --stdout --quiet \
     < collect-apmnodejs.sh > report.txt
 ```
 
-Paste or attach the entire output. No arguments prints usage; nothing runs by
-accident. Progress is narrated on stderr (`--quiet` silences it). `--out DIR`
-writes the `--file` report into DIR (created when missing; an unwritable one
-ends the run before anything is collected).
-
-Container notes:
-
-- **POSIX sh is enough.** Verified under bash 5, dash, and busybox ash
-  (`busybox:stable` container, stdin-pipe delivery).
-- **Use `--stdout` in containers.** `--file` writes to the current directory,
-  which fails on `readOnlyRootFilesystem` pods.
-- **Distroless / no shell in the app container**: attach an ephemeral debug
-  container sharing the pod's process namespace
-  (`kubectl debug <pod> -it --image=busybox:stable --target=<container> -- sh`)
-  and run the collector there. Agent homes and package dirs that are not
-  visible in the debug container's own mount namespace are read through
-  `/proc/<pid>/root/...` of the discovered agent/app processes.
+Paste or attach the entire output; container and Kubernetes delivery notes are in
+[../README.md](../README.md), "Running a Linux apm collector". POSIX sh is enough
+(verified under bash 5, dash and busybox ash).
 
 ## Facts collected (report sections)
 
@@ -94,23 +74,15 @@ Container notes:
 
 ## Installed package versions
 
-The app `package.json` gives declared ranges (`"express": "^4.18.0"`);
-whether an environment is in the supported range is decided by what is
-installed. For each whatap-marked node process section 4 reads the
-`"version"` line of `<dir>/node_modules/<pkg>/package.json` for express,
-next, @nestjs/core, koa, fastify and whatap, where `<dir>` is the process
-cwd and then each parent (at most 32 directories, a directory itself named
-`node_modules` skipped), then the `NODE_PATH` entries of that process (at most
-50; a relative one taken against the cwd). The first file found is printed as
-`pkg: version (path)`; one found through `NODE_PATH` says `via NODE_PATH`.
-Only the top-level `"version"` string is taken (brace depth tracked, string
-contents skipped), so `scripts.version` or `publishConfig.version` never
-stands in for it; a non-string value is printed with `not a string`. A
-`node_modules` or `@scope` directory this uid cannot search is named as
-`permission denied`, and a marked process whose cwd cannot be read says
-`permission denied: /proc/<pid>/cwd`. When the process is in another mount
-namespace (a host run against a container), the files are read through
-`/proc/<pid>/root` and the path printed carries that prefix.
+The app `package.json` gives declared ranges (`"express": "^4.18.0"`); whether an
+environment is in the supported range is decided by what is installed. For each
+whatap-marked node process section 4 prints the `"version"` of express, next,
+@nestjs/core, koa, fastify and whatap as `pkg: version (path)`, looked up from the
+process cwd and each parent `node_modules`, then the process `NODE_PATH` entries
+(`via NODE_PATH`). Only the top-level `"version"` string counts, so
+`scripts.version` never stands in for it. A directory this uid cannot search is
+named `permission denied`. When the process is in another mount namespace, the
+files are read through `/proc/<pid>/root` and the printed path carries that prefix.
 
 This is the order node uses for a module preloaded with `-r whatap` /
 `NODE_OPTIONS=-r whatap`, which is resolved from the cwd, so the `whatap`
@@ -128,20 +100,18 @@ actually loaded.
 
 ## Collection status
 
-`agent` is obtained when a visible agent home, a whatap package dir or a
-`whatap_nodejs` process exists. Its absence is `na` only when every input was
-read. When the run cannot read the `environ`/`cwd` of a candidate process
-(other users' processes as non-root), `/proc` is mounted with `hidepid`, a
-home path is behind a directory it may not search, or `npm root -g` gives
-nothing, the absence is `missed` and names those pids or paths. `conf` looks
-at every file name section 5 dumps (`whatap.conf` and each `WHATAP_CONF`
-value): obtained when one is readable, `na` with `path not found` when none
-exists, `missed` with `permission denied` when one exists but cannot be read.
+Goals and their `na` / `missed` rules are those of
+[../README.md](../README.md), "Agent goal". `agent` is obtained when a visible agent
+home, a whatap package dir or a `whatap_nodejs` process exists; `npm root -g` giving
+nothing also makes an absence `missed`. `conf` looks at every file name section 5
+dumps (`whatap.conf` and each `WHATAP_CONF` value): obtained when one is readable,
+`na` with `path not found` when none exists, `missed` with `permission denied` when
+one exists but cannot be read.
 
 ## What the report can contain
 
-Nothing is masked; the only content not collected is named at the end of
-this list. Every place a secret can arrive from:
+The common items are in [../README.md](../README.md), "What every Linux apm report
+can contain". Node.js specific:
 
 - `whatap.conf`, the `WHATAP_CONF`-named conf files and `container.conf` of
   every agent home, verbatim (`license`, server addresses, any other key).
@@ -151,7 +121,6 @@ this list. Every place a secret can arrive from:
   `name`, `instances`, `POD_NAME`, `NODE_NAME`, `NODE_IP`.
 - Command lines of node, `whatap_nodejs` and pm2 processes and of pid 1
   (first 160-300 bytes, NULs, newlines and CRs as spaces).
-- `/sys/class/dmi/id/product_uuid`, when this run can read it.
 - `ecosystem.config.js` / `.cjs` / `.json` / `ecosystem.json` of each app root,
   **verbatim**, first 120 lines: pm2 files commonly carry `env` blocks with
   database passwords and API keys.
@@ -168,29 +137,18 @@ this list. Every place a secret can arrive from:
   `WHATAP_OKIND`, `WHATAP_ONODE`, `WHATAP_MICRO_ENABLED`, `APP_NAME`,
   `APP_PROCESS_NAME`.
 
-`paramkey.txt` and `security.conf` (in an agent home or the package dir) hold
-the SQL-parameter encryption key; the report states presence and size only.
-
-The collector itself puts no credential on a command line.
-
 ## Load profile
 
-Tier 0 only: read-only, bounded reads (`head`/`tail -n`, line-capped dumps,
-capped process/binary detail), every external command capped at 15 s and the
-whole run at `RUN_DEADLINE` (300 s). `/proc` is read in one pass for every pid
-(about 7 s on a 714-process host with 163 node processes, down from 31 s). The
-only processes executed are standard tools plus `node --version` and one
-`npm root -g`. The npm and pm2 versions are read as text from the
-`package.json` of the package each command's entry script resolves to (the
-report line names the file); `npm --version` / `pm2 --version`, each of which
-starts node, run only when no such file gives the version, and the report line
-then names the command. The whatap module is never loaded: every node this
-run starts runs without `NODE_OPTIONS` (the operator injects `-r whatap`
-there, the `kubectl exec` shell inherits it, and `npm root -g` then started
-the agent in npm, which tried to rewrite `whatap.conf`); `[1]` says whether it
-was removed and whether it named whatap. No
-`--bundle` tier yet; copy the bundle plumbing from `collect-collserver.sh` if
-the domain team needs raw log artifacts.
+Tier 0 only: read-only, bounded reads (`head`/`tail -n`, line-capped dumps, capped
+process/binary detail), every external command capped at 15 s and the whole run at
+`RUN_DEADLINE` (300 s); `/proc` is read in one pass for every pid (about 7 s on a
+714-process host with 163 node processes). The only processes executed are standard
+tools plus `node --version` and one `npm root -g`. The npm and pm2 versions are read
+as text from the `package.json` of the package each command resolves to (the report
+line names the file); `npm --version` / `pm2 --version` run only when no such file
+gives the version. The whatap module is never loaded: every node this run starts
+runs without `NODE_OPTIONS` (the operator injects `-r whatap`); `[1]` says whether
+it was removed and whether it named whatap.
 
 ## Validate
 

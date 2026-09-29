@@ -85,6 +85,8 @@ that the newest entry is the script's `VERSION`.
   README names its get_php_api_version()). In section 6, a relative scan dir no process
   cwd resolved is listed in the ini directory list as "n/a (relative scan dir of <bin>, not
   resolved)", as the per-runtime block printed it.
+  Validated 2026-09-27 on the lab targets apm-php-rocky / apm-php-alpine (web
+  user and root without CAP_SYS_PTRACE, sh -s, bash -s, file).
 - **0.7.6**: `apm: file helpers`/`apm: conf bytes` (templates/groups/apm.sh):
   `wc -l`/`wc -c`/`tr -dc '\r'` reading an unreadable file no longer leak
   "Permission denied" to the operator's stderr (the `<` redirect ran before
@@ -125,6 +127,11 @@ that the newest entry is the script's `VERSION`.
   2026-09-27). A service file reached by two paths (/lib ->
   usr/lib) is dumped once. Report: section 3 and 6 carry php-cgi's
   values; section 7 loses the second copy of the unit file.
+  Validated 2026-09-27 against the real agent: whatap-php 2.14-2 rpm on Rocky 9
+  (PHP 8.2 php-fpm + nginx, systemd whatap-php.service) and the Alpine
+  tarball on php:8.3-fpm-alpine (whatap_php_static started by the wrapper); as
+  root, as a web user and as another user, bash and sh -s; no collection
+  server was reachable.
 - **0.7.1**: main is the apm group block `apm: main`; report unchanged. A --file run
   on a host without hostname(1) names the report after
   /proc/sys/kernel/hostname, else `uname -n`, and so does Target (both

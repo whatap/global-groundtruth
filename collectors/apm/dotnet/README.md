@@ -1,21 +1,19 @@
 # collectors/apm/dotnet: WhaTap .NET APM agent collector (Windows)
 
-> **Status: SEEDED (v0; validated at: 0.6.0 on Windows Server 2022 Standard
-> Evaluation 10.0.20348 under Windows PowerShell 5.1.20348.558 and pwsh 7.6.6,
-> elevated and not elevated, with a simulated agent, 2026-09-26; see
-> "Validation" below).**
-> `collect-apmdotnet.ps1` is a working Tier-0
-> collector seeded by the Global team (CONTRACT rule 4, interim ownership).
-> Ongoing ownership belongs to the .NET agent developers once handed over.
-> Linux .NET hosts are **not covered yet** (see "Not covered" below).
+> **Status:** `collect-apmdotnet.ps1` 0.6.0 validated at 2026-09-27 on Windows Server 2022
+> Standard Evaluation 10.0.20348 (lab VM jjsong-ggt-win) under Windows PowerShell
+> 5.1.20348.558 and pwsh 7.6.6, elevated and not elevated (local logon and OpenSSH), with a
+> **simulated** agent (no installer is publicly downloadable); `validate.sh --report`
+> pass. A real agent install is not validated. Tier 0, seeded by the Global team;
+> ownership passes to the .NET agent developers (CONTRACT rule 4). Linux .NET hosts are
+> not covered (see "Not covered").
 
 Collects the hidden facts a remote WhaTap .NET-agent developer repeatedly asks
-a field engineer for, from the Windows host where the instrumented application
-runs. The fact list was derived from an exhaustive review of `#ask-dev-apm`
-.NET support threads (2025-06 .. 2026-08), verified against the `dotnet-apm`
-source repo (installer `release.iss`, `Whatap.ClrProfiler`, `Whatap.Tracer`,
-`Whatap.Loader`, `Whatap.Startup`) and docs.whatap.io (install-check,
-supported-spec).
+a field engineer for, from the Windows host where the instrumented application runs.
+The fact list comes from a review of `#ask-dev-apm` .NET support threads (2025-06 ..
+2026-08), checked against the `dotnet-apm` source repo (installer `release.iss`,
+`Whatap.ClrProfiler`, `Whatap.Tracer`, `Whatap.Loader`, `Whatap.Startup`) and
+docs.whatap.io (install-check, supported-spec).
 
 **Why version identification is the first fact.** The agent's native and
 managed DLLs ship with FileVersion pinned at `1.0.0.0` across product
@@ -59,14 +57,12 @@ powershell -ExecutionPolicy Bypass -File .\collect-apmdotnet.ps1 -File
 .\collect-apmdotnet.ps1 -File -Out "D:\case files"
 ```
 
-Paste or attach the entire output. No arguments prints usage; nothing runs by
-accident. Progress is narrated on the console (`-Quiet` silences it); the
-report itself goes to the `.txt` (or stdout with `-Stdout`). The shell
-collectors' spellings work too (`--file`, `--stdout`, `--quiet`, `--help`,
-`--home <dir>`, `--out <dir>`, `--out=<dir>`); `-Help` and `-h` print the
-usage; an unknown argument, or `--home`/`--out` without a directory, prints
-usage to stderr and exits 2. `-Out` is checked for writing before the run. There is no opt-in: every probe is
-Tier 0 and runs by default.
+Paste or attach the entire output. No arguments prints usage; nothing runs by accident.
+Progress goes to the console (`-Quiet` silences it); the report goes to the `.txt` (or
+stdout with `-Stdout`). The shell collectors' spellings work too (`--file`, `--stdout`,
+`--quiet`, `--help`, `--home <dir>`, `--out <dir>`, `--out=<dir>`); `-Help` and `-h` print
+the usage; an unknown argument, or `--home`/`--out` without a directory, prints usage to
+stderr and exits 2. There is no opt-in: every probe is Tier 0 and runs by default.
 
 **Send the `-File` report.** It is written as UTF-8 without a BOM with LF line
 ends, the bytes a shell collector writes, whichever PowerShell ran it.
@@ -126,21 +122,16 @@ redirection as UTF-16LE; `tools/validate.sh --report` rejects such a copy.
 - A collection-server endpoint is probed once; a second conf naming it shows
   the first answer with `(probed once above)`. Windows retries a refused
   connect, so a refused probe takes about 2 s, an unanswered one its 5 s cap.
-- `run time` and, when a call was slow, capped or cut by the deadline, the
-  host load (CPU busy over a 250 ms sample, processor and disk queue, free
-  memory) and each slow, stopped or not-run call in time-log order
-  (`<ms> ms  <outcome>  <command>`, the first 40, then `(N more in this run)`)
-  close the status section, as in the shell collectors. `CMD_TIMEOUT` and `RUN_DEADLINE` are read from the
-  environment.
+- The status section closes with `run time` and, when a call was slow, capped or cut by
+  the deadline, the host load and each such call in time-log order, as in the shell
+  collectors. `CMD_TIMEOUT` and `RUN_DEADLINE` are read from the environment.
 
 Goals: `agent` (a home or an uninstall entry; `missed` when the HKLM
 uninstall registry could not be read) and `conf` (a readable `whatap.conf`;
 an unreadable one is `missed` with the privilege gap).
 
-Operator messages (`>>` progress, `!!` warnings, the status roll-up) go to
-stderr through `[Console]::Error.WriteLine`, so `-Stdout > file` holds the
-report only. The script is saved as UTF-8 with a BOM and its emitted strings
-are ASCII, so Windows PowerShell 5.1 and pwsh 7 read it the same way.
+Operator messages (`>>` progress, `!!` warnings, the status roll-up) go to stderr, so
+`-Stdout > file` holds the report only.
 
 ## What the report can contain
 
@@ -172,20 +163,18 @@ Two data-scope exceptions (not masking):
 
 ## Load profile
 
-Tier 0 only: read-only registry/file/process queries, bounded reads
-(`-TotalCount` / `-Tail` caps, `-MaxEvents` caps, per-app and per-list caps
-with explicit "omitted" notes). Nothing is written to the target: no registry
-value is set (Fusion settings are only read), no app pool is recycled, no
-iisreset, no service restart. The only external processes executed are
-`appcmd list …`, `dotnet --list-runtimes` / `--list-sdks`, `netstat -ano`,
-and, under Windows PowerShell 5.1 with a 32-bit w3wp running, one 32-bit
-Windows PowerShell that lists that process's modules (about 1–3 s on the lab host).
-Registry values are read through the .NET registry API, which answers an
-absent key at once where the PowerShell registry provider took 1.2-1.5 s per
-absent key under `HKLM:\SOFTWARE\Classes`. Managed assemblies are identified via metadata-only reflection
-(`AssemblyName.GetAssemblyName`); no assembly is loaded for execution.
+Tier 0 only: read-only registry/file/process queries, bounded reads (`-TotalCount` /
+`-Tail` caps, `-MaxEvents` caps, per-app and per-list caps with explicit "omitted"
+notes). Nothing is written to the target: no registry value is set (Fusion settings are
+only read), no app pool is recycled, no iisreset, no service restart. The only external
+processes executed are `appcmd list ...`, `dotnet --list-runtimes` / `--list-sdks`,
+`netstat -ano`, and, under Windows PowerShell 5.1 with a 32-bit w3wp running, one 32-bit
+Windows PowerShell that lists that process's modules (about 1 to 3 s on the lab host).
+Registry values are read through the .NET registry API and managed assemblies are
+identified via metadata-only reflection (`AssemblyName.GetAssemblyName`); no assembly is
+loaded for execution.
 
-## Not covered (v0)
+## Not covered
 
 - **Linux .NET hosts**: different artifact set (`/usr/whatap/agent/dotnet/`,
   `whatap-dotnet.service` + `whatap.env`, `Whatap.ClrProfiler.so`,
@@ -194,8 +183,6 @@ absent key under `HKLM:\SOFTWARE\Classes`. Managed assemblies are identified via
 - **Per-process live environment of w3wp**: Windows exposes no supported
   read-only API for another process's environment block; the service-registry
   scope plus loaded-module facts cover the same question indirectly.
-- No `--bundle` tier yet; copy the bundle plumbing from
-  `collect-collserver.sh` if the domain team needs raw log artifacts.
 
 ## Validate
 
@@ -204,10 +191,6 @@ tools/validate.sh collectors/apm/dotnet/collect-apmdotnet.ps1
 tools/validate.sh --report whatap-apmdotnet-<host>-<UTC>.txt   # the -File report
 ```
 
-## Validation
-
-| version | where | how | result |
-|---|---|---|---|
-| 0.6.0 | same host, 2026-09-27 | 0.5.1 and 0.6.0 run side by side under both PowerShells, elevated with all four worker processes up, not elevated in a local logon (scheduled task as `ggtuser`) and over OpenSSH | every `-File` report passes `validate.sh --report`; the only differences are the new lines. Elevated, 5.1 and 7 give the same runtime modules for every w3wp (Framework64 or Framework `clr.dll` 4.8.4420.0, `aspnetcorev2.dll` 18.0.26234.31, `coreclr.dll` 8.0.31 in CoreApp and the Kestrel dotnet.exe); 5.1 reaches Classic32's through the 32-bit read (0.8–2.8 s across runs; the whole run 13–17 s against 14–15 s). Not elevated: `n/a (module list not readable)`, goals as in 0.5.1. |
-| 0.5.0 | Windows Server 2022 Standard Evaluation 10.0.20348 (lab VM jjsong-ggt-win), Windows PowerShell 5.1.20348.558 and pwsh 7.6.6 | IIS 10 with ASP.NET 4.8 pools (64- and 32-bit, one app with a failing `bindingRedirect`), a .NET 8.0.31 in-process pool (ANCM) and a standalone `dotnet.exe`; the WhaTap .NET agent **simulated** as this README describes (install dir, uninstall entry `WhaTap .NET_is1`, machine and W3SVC/WAS service environment, CLSID registration, ProgramData logs, a stopped `WhaTap .NET` service, a `whatap_dotnet.exe` holding UDP 6600), since no installer is publicly downloadable. Elevated (Administrator over OpenSSH), not elevated in a local logon (scheduled task as a Users-only account) and not elevated over OpenSSH; `-File`, `-Stdout`, `--help`, an unknown argument, `RUN_DEADLINE`/`CMD_TIMEOUT`, a clean host without IIS or agent | every `-File` report passes `validate.sh --report`. Elevated: COMPLETE, 15 s (5.1) / 12 s (7), 7 s of it the two collection-server probes of the fixture conf (one refused, one unanswered at its 5 s cap); the same host under 0.4.0 took 24 s / 19 s and its status explained none of it. Not elevated, local logon: INCOMPLETE on `agent configuration` with the privilege hint (the fixture `whatap.conf` is readable by Administrators, SYSTEM and IIS_IUSRS only), 7 s / 3 s. Not elevated over OpenSSH: the same, 14 s / 12 s (was 36 s before the CIM fail-fast). |
-
+Last validated run: see Status. Elevated with all four worker processes up, 5.1 and 7
+gave the same runtime modules for every w3wp; not elevated, a w3wp says
+`n/a (module list not readable)` and the goals fall to the privilege hint.

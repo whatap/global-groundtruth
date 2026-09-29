@@ -20,6 +20,15 @@ entry at the top of this list (docs/authoring-guide.md, step 2);
   2026-09-27); such a process's list is now read by the 32-bit Windows
   PowerShell, one bounded call for all of them (about 1–3 s: 2.8 s and 0.8 s in two lab runs), and its lines
   say so.
+  Validated 2026-09-27 on the same host: 0.5.1 and 0.6.0 run side by side under
+  both PowerShells, elevated with all four worker processes up, not elevated
+  in a local logon (scheduled task as ggtuser) and over OpenSSH; every -File
+  report passes validate.sh --report. Elevated, 5.1 and 7 give the same
+  runtime modules for every w3wp (Framework64 or Framework clr.dll 4.8.4420.0,
+  aspnetcorev2.dll 18.0.26234.31, coreclr.dll 8.0.31 in CoreApp and the
+  Kestrel dotnet.exe); 5.1 reaches Classic32's through the 32-bit read (0.8 to
+  2.8 s across runs; the whole run 13-17 s against 14-15 s). Not elevated:
+  n/a (module list not readable), goals as in 0.5.1.
 - **0.5.1**: The shared blocks (templates/groups/ps1.ps1) are synced by
   tools/sync-shared-block.sh; report unchanged.
 - **0.5.0**: First runs on a real Windows host (Windows Server 2022 Standard Eval
@@ -44,6 +53,18 @@ entry at the top of this list (docs/authoring-guide.md, step 2);
   "64-bit path" and "none".
   An event message keeps the lines that name the failure (an ASP.NET
   1310 event's "Exception message") when it is cut at 400 characters.
+  Validated on Windows Server 2022 Standard Evaluation 10.0.20348 (lab VM
+  jjsong-ggt-win), Windows PowerShell 5.1.20348.558 and pwsh 7.6.6, with the
+  agent simulated (install dir, uninstall entry, machine and W3SVC/WAS
+  service environment, CLSID registration, ProgramData logs, a stopped
+  service, a process holding UDP 6600) on IIS 10 with ASP.NET 4.8 pools (64-
+  and 32-bit, one with a failing bindingRedirect), a .NET 8.0.31 in-process
+  pool and a standalone dotnet.exe. Elevated: COMPLETE, 15 s (5.1) / 12 s
+  (7), 7 s of it the two collection-server probes of the fixture conf (one
+  refused, one unanswered at its 5 s cap); 0.4.0 took 24 s / 19 s on the
+  same host. Not elevated, local logon: INCOMPLETE on agent configuration
+  with the privilege hint, 7 s / 3 s. Not elevated over OpenSSH: the same,
+  14 s / 12 s (36 s before the CIM fail-fast).
 - **0.4.0**: The status gives the run time, and when a bounded call was slow (3s),
   capped or not run past the deadline, the host load at start and end
   and where the time went, as the shell collectors do. CIM queries go

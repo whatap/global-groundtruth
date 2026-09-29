@@ -142,6 +142,11 @@ checks that the newest entry is the script's `VERSION`.
   became the "global node_modules" value (lab container, 2026-09-27).
   Report: [1] says whether NODE_OPTIONS was removed and whether it
   named whatap; section 3 gets the real npm root -g.
+  Validated 2026-09-27 against the real whatap npm agent 2.0.6
+  (require('whatap') in the app, master whatap_nodejs in a Node 22 container)
+  and the operator's apm-init-nodejs copy (NODE_OPTIONS=-r whatap,
+  /whatap-agent), as root, as the app's user and as another user, bash and
+  sh -s; no collection server was reachable.
 - **0.8.1**: main is the apm group block `apm: main`; report unchanged. A --file run
   on a host without hostname(1) names the report after
   /proc/sys/kernel/hostname, else `uname -n`, and so does Target (both
@@ -167,3 +172,6 @@ checks that the newest entry is the script's `VERSION`.
   reused by the report, and the detail list reads each environ once.
   The report is unchanged; 8.4 s -> 4.9 s on a host with 168 node
   processes, 18.3 s -> 9.5 s with 300 more (2026-09-25).
+- **0.5.0**: /proc is read in one pass for every pid (comm, exe, argv0,
+  cmdline): about 7 s on a 714-process host with 163 node processes, down
+  from 31 s.

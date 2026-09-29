@@ -1,29 +1,18 @@
 # collectors/apm/php: WhaTap PHP APM agent collector
 
-> **Status: SEEDED (v0.2; validated at `collect-apmphp.sh` 0.8.2 on
-> 2026-09-28 on the lab targets `apm-php-rocky` / `apm-php-alpine` (same
-> setup as 0.8.0 below); COMPLETE, `validate.sh --report` pass. 0.8.0 on
-> 2026-09-27 on the lab targets `apm-php-rocky` / `apm-php-alpine` (web user
-> and root without CAP_SYS_PTRACE, `sh -s`, `bash -s`, file); 0.7.2 on
-> 2026-09-27 against the real agent: whatap-php 2.14-2 rpm on Rocky 9 (PHP 8.2
-> php-fpm + nginx, systemd `whatap-php.service`) and the Alpine tarball on
-> `php:8.3-fpm-alpine` (`whatap_php_static` started by the wrapper); as root,
-> as a web user and as another user, bash and `sh -s`; no collection server was
-> reachable).** `collect-apmphp.sh` is a working Tier-0 collector
-> seeded by the Global team (CONTRACT rule 4, interim ownership). Ongoing
-> ownership belongs to the PHP agent developers once handed over.
+> **Status:** `collect-apmphp.sh` 0.8.2 validated at 2026-09-28 on the lab targets
+> `apm-php-rocky` / `apm-php-alpine` (real whatap-php 2.14-2 rpm on Rocky 9 with PHP 8.2
+> php-fpm + nginx under systemd, and the Alpine tarball on `php:8.3-fpm-alpine`; web user
+> and root without CAP_SYS_PTRACE, `sh -s`, `bash -s`, file), `validate.sh --report`
+> pass; no collection server was reachable. Tier 0, seeded by the Global team; ownership
+> passes to the PHP agent developers (CONTRACT rule 4).
 
 Collects the hidden facts a remote WhaTap PHP-agent developer repeatedly asks a
-field engineer for. The fact list was derived from an exhaustive review of
-`#ask-dev-apm` PHP support threads (2025-06 .. 2026-08) and verified against the
-shipped package itself: the RPM (`whatap-php-2.14-2.x86_64`) and the Alpine
-tarball (`repo.whatap.io/alpine/x86_64/whatap-php.tar.gz`): `install.sh`, the
-`whatap-php` service wrapper, `whatap-php.service`, `/etc/init.d/whatap-php`,
-`template.ini`, `modules/`, the `whatap_php` Go binary and the `whatap*.so`
-tracer modules, then exercised against three live installs, each performed
-with the vendor `install.sh` (agent 2.14.2): Apache 2.4 prefork + mod_php 8.2;
-Alpine musl + PHP-FPM 8.2 from the tarball; and a **multi-version** Debian host
-carrying PHP 8.1 + 8.3 with the tracer bound to 8.1 only.
+field engineer for. The fact list comes from a review of `#ask-dev-apm` PHP support
+threads (2025-06 .. 2026-08), checked against the shipped package itself: the RPM
+(`whatap-php-2.14-2.x86_64`) and the Alpine tarball (`install.sh`, the `whatap-php`
+service wrapper, `whatap-php.service`, `template.ini`, `modules/`, the `whatap_php`
+Go binary and the `whatap*.so` tracer modules).
 
 **Why the two halves are the first fact.** The PHP agent is installed as two
 separate things, configured by one installer run:
@@ -43,62 +32,28 @@ service file it can find; `logs/whatap-install-YYYYMMDD.log` records that run.
 Most support cases are a mismatch between what it resolved then and what runs
 now, so the collector reports both sides and lets the reader compare:
 
-- the running PHP's `PHP API` / `Thread Safety` vs the API and `_zts` marker
-  encoded in the module filename the `whatap.so` symlink resolves to;
-- the ini tree the installer wrote into vs the ini trees each SAPI reads
-  (`cli`, `fpm` and `apache2` trees are separate, a file in one is not read by
-  the others);
-- what is configured on disk vs what is **actually mapped** into the live
-  Apache/PHP-FPM workers (`/proc/<pid>/maps`);
-- the `WHATAP_CONFIG_HOME` written into the unit/init file vs the `WHATAP_*`
-  environment the running `whatap_php` actually has, started without it, the
-  agent looks for `whatap.conf` and logs
-  `[WA212] Not found config file, and not exists accesskey`, while the tracer
-  keeps reading the ini it was given.
+- the running PHP's `PHP API` / `Thread Safety` vs the API and `_zts` marker in the
+  module filename the `whatap.so` symlink resolves to;
+- the ini tree the installer wrote into vs the ini trees each SAPI reads (`cli`, `fpm`
+  and `apache2` trees are separate);
+- what is configured on disk vs what is **actually mapped** into the live workers
+  (`/proc/<pid>/maps`);
+- the `WHATAP_CONFIG_HOME` in the unit/init file vs the `WHATAP_*` environment the
+  running `whatap_php` has (started without it, the agent logs
+  `[WA212] Not found config file, and not exists accesskey`, while the tracer keeps
+  reading the ini it was given).
 
-The collector executes the PHP binaries it finds with read-only flags only
-(`-v`, `-m`, `-i`), the same calls the vendor installer makes; no
-application code runs. The agent binary is only ever executed with its
-`version` argument (running it bare would start an agent).
-
-**Several PHP versions on one host is the normal case.** `install.sh` binds the
-tracer to exactly one of them, the one its `php` lookup resolved to, and each
-version has its own `extension_dir`, its own ini scan dir, and often its own
-FPM service. Section `[3]` prints each runtime's own `php -i` lines (`PHP API`,
-`Thread Safety`, `extension_dir`, the scan dir and the ini files it parsed, its
-`whatap.*` directives) and section `[6]` prints `whatap.so` once per
-`extension_dir` (ls, sha256, symlink target, the file it resolves to), so the
-split is read by matching the two (shape, abridged, for a host like the
-multi-version Debian one above):
-
-```text
-[3] -- php binary: /usr/sbin/php-fpm8.1
-       php api / build:  PHP API => 20210902 ... Thread Safety => disabled
-       extension_dir: extension_dir => /usr/lib/php/20210902 => /usr/lib/php/20210902
-       additional ini files parsed: (no whatap.ini in the list)
-       whatap directives visible to this binary (local => master): n/a (no matching line in php -i output)
-[6] -- /usr/lib/php/20210902   <- php -i of /usr/sbin/php-fpm8.1
-       whatap.so:
-        lrwxrwxrwx ... /usr/lib/php/20210902/whatap.so -> /usr/whatap/php/modules/x64/whatap_20210902.so
-        sha256: ...
-    -- /usr/lib/php/20230831   <- php -i of /usr/bin/php
-       whatap.so: n/a (path not found: /usr/lib/php/20230831/whatap.so)
-```
-
-The collector does not decode the module name or rebuild a per-runtime table:
-the name (`whatap[_zts]_<API>.so`) and the `php -i` lines are both in the
-report as read.
-
-Supporting facts for the same question: what `php` / `php-fpm` on PATH resolve
-to and the `update-alternatives` entries (on a multi-version host `php -v` in a
-shell is frequently a different version from the one serving traffic), the
-per-version FPM units, and the module the live workers actually mapped. Binary
-discovery covers the distro packages, Sury/ondrej, Remi, SCL, cPanel
-EasyApache, Plesk, CloudLinux alt-php, LiteSpeed lsphp and source builds; ini
-scan dirs are taken from each runtime's own `php -i` rather than from a path
-list, so an unlisted layout still reports correctly. `php-cgi -i` prints
-phpinfo() as HTML (the CGI SAPI); its table rows are read as the
-`name => value` lines the CLI prints, so php-cgi gets the same facts.
+**Several PHP versions on one host is the normal case.** `install.sh` binds the tracer
+to exactly one of them, the one its `php` lookup resolved to, and each version has its
+own `extension_dir`, ini scan dir and often FPM service. Section `[3]` prints each
+runtime's own `php -i` lines (`PHP API`, `Thread Safety`, `extension_dir`, the scan dir
+and ini files parsed, its `whatap.*` directives) and section `[6]` prints `whatap.so`
+once per `extension_dir` (ls, sha256, symlink target, the file it resolves to), so the
+split is read by matching the two. The collector does not decode the module name or
+rebuild a per-runtime table. `php -v` in a shell is frequently a different version from
+the one serving traffic, so the `php` / `php-fpm` on PATH and the `update-alternatives`
+entries are printed too. `php-cgi -i` prints phpinfo() as HTML; its table rows are read
+as the `name => value` lines the CLI prints.
 
 ## One field command
 
@@ -118,24 +73,12 @@ docker exec -i <container> bash -s -- --stdout --quiet \
     < collect-apmphp.sh > report.txt
 ```
 
-Paste or attach the entire output. No arguments prints usage; nothing runs by
-accident. Progress is narrated on stderr (`--quiet` silences it). `--out DIR`
-writes the `--file` report into DIR (created when missing; an unwritable one
-ends the run before anything is collected).
-
-Notes:
-
-- **Run it as root where possible.** `/proc/<pid>/maps` and
-  `/proc/<pid>/environ` of the web server workers are what prove the tracer is
-  loaded and which configuration the agent really has; unreadable ones are
-  reported as `permission denied` with their pids, not silently skipped, and
-  when nothing else shows an installation they make the status INCOMPLETE
-  (see "Collection status").
-- **Use `--stdout` in containers.** `--file` writes to the current directory,
-  which fails on `readOnlyRootFilesystem` pods.
-- Paths that are not visible in the collector's own mount namespace (ephemeral
-  debug container) are read through `/proc/<pid>/root/...` of the discovered
-  agent/web processes.
+Paste or attach the entire output; container and Kubernetes delivery notes are in
+[../README.md](../README.md), "Running a Linux apm collector". **Run it as root where
+possible.** `/proc/<pid>/maps` and `/proc/<pid>/environ` of the web server workers prove
+the tracer is loaded and which configuration the agent really has; unreadable ones are
+reported as `permission denied` with their pids, and when nothing else shows an
+installation they make the status INCOMPLETE (see "Collection status").
 
 ## Facts collected (report sections)
 
@@ -154,15 +97,13 @@ Notes:
 
 ## Collection status
 
-`agent` is obtained when any part of an installation is seen: a visible agent
-home, a `whatap.so` in an `extension_dir`, a whatap ini, a `php.ini` carrying
-whatap lines, a service/unit file, or a `whatap_php` process. Its absence is
-`na` only when every input was read. It is `missed`, naming the pids or paths,
-when the run cannot read the `environ`/`cwd`/`exe` of a `whatap_php` process or
-the `/proc/<pid>/maps` of a web/php process (other users' processes as
-non-root), `/proc` is mounted with `hidepid`, a home path is behind a
-directory it may not search, or a `php -i` did not run (its ini scan dir and
-`extension_dir` are then unknown).
+Goals and their `na` / `missed` rules are those of
+[../README.md](../README.md), "Agent goal". `agent` is obtained when any part of an
+installation is seen: a visible agent home, a `whatap.so` in an `extension_dir`, a
+whatap ini, a `php.ini` carrying whatap lines, a service/unit file, or a `whatap_php`
+process. An absence is also `missed` when the run cannot read the `exe` of a
+`whatap_php` process or the `/proc/<pid>/maps` of a web/php process, or a `php -i` did
+not run (its ini scan dir and `extension_dir` are then unknown).
 
 `conf` is the whatap ini that the tracer and the agent both read (section 7),
 not a `whatap.conf`: obtained when a discovered whatap ini is readable or a
@@ -171,8 +112,8 @@ or when the search had the gaps above, `na` when none exists.
 
 ## What the report can contain
 
-Nothing is masked; the only content not collected is named at the end of
-this list. Every place a secret can arrive from:
+The common items are in [../README.md](../README.md), "What every Linux apm report can
+contain". PHP specific:
 
 - Every whatap ini found, verbatim (`whatap.license` / `whatap.accesskey`,
   `whatap.server.host`, every other directive), and the whatap lines of each
@@ -182,10 +123,8 @@ this list. Every place a secret can arrive from:
 - The service / unit / init files `install.sh` wrote, verbatim (first 120
   lines): they carry `WHATAP_CONFIG_HOME` and any `Environment=` line.
 - The `WHATAP_*` environment of `whatap_php`, web and php processes.
-- Command lines of web, php, persistent-worker and `whatap_php` processes and
-  of pid 1 (first 160-300 bytes, NULs, newlines and CRs as spaces): an
-  argument carrying a secret appears as given.
-- `/sys/class/dmi/id/product_uuid`, when this run can read it.
+- Command lines of web, php, persistent-worker and `whatap_php` processes: an argument
+  carrying a secret appears as given.
 - php-fpm `www.conf` pool settings without comments (first 60 lines):
   `env[...]` entries can carry secrets.
 - The last 300 lines of each known web server / php-fpm error log, filtered to
@@ -194,24 +133,19 @@ this list. Every place a secret can arrive from:
 - The collector's own environment: `POD_NAME`, `NODE_NAME`, `POD_NAMESPACE`,
   `OKIND`, `ONAME`, `ONODE`.
 
-Not collected: the content of `security.conf` / `paramkey.txt` in the agent
-home (encryption key material; presence and size only), and application
-source (only web server / php-fpm config files and bounded error-log tails are
-read).
-
-The collector itself puts no credential on a command line.
+Not collected: application source (only web server / php-fpm config files and bounded
+error-log tails are read).
 
 ## Load profile
 
-Tier 0 only: read-only, bounded reads (`head`/`tail -n`, line-capped dumps,
-capped process and binary detail: 10 PHP binaries, 20 processes), every
-external command capped at 15 s and the whole run at `RUN_DEADLINE` (300 s);
-`/proc` is read in one pass for every pid; ~5 s on a healthy host. Processes executed: standard tools,
-`php -v/-m/-i` (once each per binary), `apachectl -V/-M`, `php-fpm -v` (only
-when section 3 did not already run it on the file the PATH `php-fpm` resolves
-to), `ipcs`, and
-`whatap_php version`. No `--bundle` tier yet; copy the bundle plumbing from
-`collect-collserver.sh` if the domain team needs raw log artifacts.
+Tier 0 only: read-only, bounded reads (`head`/`tail -n`, line-capped dumps, capped
+process and binary detail: 10 PHP binaries, 20 processes), every external command capped
+at 15 s and the whole run at `RUN_DEADLINE` (300 s); `/proc` is read in one pass for every
+pid; about 5 s on a healthy host. Processes executed: standard tools, `php -v/-m/-i`
+(once each per binary, the same read-only calls the vendor installer makes; no
+application code runs), `apachectl -V/-M`, `php-fpm -v` (only when section 3 did not
+already run it on the file the PATH `php-fpm` resolves to), `ipcs`, and `whatap_php
+version` (the agent binary is never run bare, which would start an agent).
 
 ## Validate
 

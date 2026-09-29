@@ -1,33 +1,14 @@
 # collectors/server: STUB
 
-> **Status: NOT IMPLEMENTED.** This directory describes what a host/server
-> collector will gather and how it will be delivered. No collection code exists
-> here yet. It will be owned by the server domain team (CONTRACT rule 4); until
-> handover it is managed by the Global team.
+> **Status: NOT IMPLEMENTED.** No collection code exists here yet. The host/server
+> collector will be a host shell script the field engineer runs on the machine (one
+> command, paste the output; CONTRACT rule 3), owned by the server domain team
+> (CONTRACT rule 4) and managed by the Global team until handover. Start from
+> [../../templates/collector-skeleton/](../../templates/collector-skeleton/) and
+> [../../docs/authoring-guide.md](../../docs/authoring-guide.md).
 
-## (a) Hidden facts to collect
-
-Host environment facts a remote WhaTap agent developer repeatedly asks for:
-
-- **OS / distro / kernel / architecture** (`/etc/os-release`, `uname`).
-- **Resources**: CPU count, memory, and any cgroup limits the process runs under.
-- **Disk & mounts**: filesystems, free space, mount options for paths the agent
-  writes to.
-- **Network**: interfaces, DNS resolvers, and outbound proxy settings (relevant
-  to whether the agent can reach the collector servers).
-- **Time sync**: clock source / NTP state (affects timestamp correctness).
-- **WhaTap server agent**: presence, version, and config (`whatap.conf`)
-  location and contents; whether the agent process is running.
-
-Discovered, not assumed (CONTRACT rule 2); absent values reported as `n/a`.
-
-## (b) Delivery mechanism
-
-A **host shell script** the field engineer runs directly on the machine: one
-command, paste the output (CONTRACT rule 3).
-
-## (c) How to implement
-
-Copy [../../templates/collector-skeleton/](../../templates/collector-skeleton/),
-follow [../../docs/authoring-guide.md](../../docs/authoring-guide.md), keep to
-facts only, and validate with `tools/validate.sh`.
+Intended facts (discovered, not assumed; absent values `n/a`): OS / distro / kernel /
+architecture; CPU count, memory and cgroup limits; filesystems, free space and mount
+options for paths the agent writes to; interfaces, DNS resolvers and outbound proxy
+settings; clock source / NTP state; WhaTap server agent presence, version, `whatap.conf`
+location and contents, and whether the process is running.
