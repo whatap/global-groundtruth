@@ -267,27 +267,49 @@ checks that the newest entry is the script's `VERSION`.
   probe error line over 100 bytes keeps its start and its end.
 - **0.12.6**: Shared helpers moved into the apm group block; report unchanged.
   The apm: blocks are copies of templates/groups/apm.sh.
-  Facts from before this entry (0.6.0 to 0.12.0), moved from the README
-  (Cases, Load profile, status block): the
-  FIF runs of 2026-09-17 were at 0.6.0. Process identification, measured on a
-  development host: 0.11.1 took 16.7 s at 704 processes, 0.12.0 took 4-7 s at
-  about 720 (one ls, one grep -z, one awk, one maps grep instead of a fork per
-  pid). Cases behind the sections: 2026-06-16 JBoss 5.1 `eorder_uat` (a library
-  scan that included the agent jar matched spring-boot-2.1 to 4.0 at once, so
-  the -javaagent jar is excluded from every library list and the exclusion is
-  stated, F); 2026-06-24 `KBANESCFServer` socket gateway (the transaction entry
-  was not a servlet: server markers and program identity D, hook_service_* G,
-  thread dumps L); 2026-06-30 keypro GlassFish (a console/JUL loop produced
-  19.8M events while the on-disk server log stayed small: logging properties,
-  libraries, config files, console destination and server log directories side
-  by side, H); 2026-09-11 BAF `hqapimgmtdev1` (section D reported no JVM while
-  section J listed two `vshell` processes ESTAB to :6600, and sections C and
-  E-L cascaded to n/a: the libjvm.so mapping test and --jcmd argument
-  recovery); 2026-09-17 FIF (one unit carried 282 jars, the customer's own
-  sorting at "f"; a thread dump arrived over Slack and was counted by hand;
-  which of 72 batchprocess classes are Quartz jobs; 40 detailed jars made 988
-  of the report's 2738 lines, all from one of two units: every jar recorded
-  though 120 are printed F, --dump-file L, --class-refs N, a byte-identical
-  copy named not detailed again M); 2026-09-25 verification (a relative
-  -Dwhatap.home was reported "not visible from this mount namespace": every
-  path is resolved as the JVM that names it resolves it).
+- **0.12.0**: Process identification reads the whole `/proc` in a fixed
+  handful of commands (one `ls`, one `grep -z`, one `awk`, one maps `grep`)
+  instead of a fork per pid: 4-7 s at about 720 processes on a development
+  host, against 16.7 s at 704 processes at 0.11.1. Every path a JVM names is
+  resolved as that JVM resolves it (its working directory, its mount
+  namespace). Case 2026-09-25 verification: a relative `-Dwhatap.home` was
+  reported "not visible from this mount namespace".
+- **0.11.1**: Process identification forked per pid: 16.7 s at 704 processes,
+  measured on a development host (the figure 0.12.0 replaced).
+- **0.9.0**: Section M leaves the package histogram out for a jar that section
+  N indexes, and names the omission on that jar's lines. Case 2026-09-17 FIF:
+  the report ran to 2738 lines, 988 of them section M, 463 of those 988 the
+  package histograms of the 40 detailed jars.
+- **0.8.0**: `--class-refs FQCN` and one cap per distinct jar. Case
+  2026-09-17 FIF (the version of the run is not recorded): section N listed 72
+  classes of a batch package and nothing said which are Quartz jobs, so
+  `--class-refs` names the classes whose constant pool carries the type (N).
+  Section M spent its 40-jar cap on one of the two deployment units, because
+  the application ships the same jars in each; a byte-identical copy is named,
+  not detailed again, and the cap counts distinct jars (M).
+- **0.7.0**: The jars a reader names with `--library` enter the section N
+  class index (cap 60 jars). Case 2026-09-17 FIF, third live run at 0.6.0:
+  section M gave the jars' Maven coordinates and a package histogram but no
+  class name.
+- **0.6.0**: Every jar of a listed directory is recorded though only the first
+  120 are printed (F), so `--library` reaches one past the printed part. Case
+  2026-09-17 FIF, second live run at 0.5.1: one deployment unit carried 282
+  jars of the application's own code, the customer's own sorting at "f".
+- **0.5.0**: `--dump-file PATH` counts a thread dump the field already holds
+  without contacting a JVM (L). Case 2026-09-17 FIF: a WhaTap console thread
+  dump arrived over Slack and was counted by hand.
+- **0.4.0**: A fourth JVM test, a `libjvm.so` / `libj9vm*.so` mapping in
+  `/proc/<pid>/maps`, and `--jcmd` argument recovery for a JVM whose options
+  are absent from `/proc` (D). Case 2026-09-11 BAF `hqapimgmtdev1`: section D
+  reported no JVM while section J listed two `vshell` processes ESTAB to
+  :6600, and sections C and E-L cascaded to n/a.
+- **0.1.0**: Seeded from three Global cases. 2026-06-16 JBoss 5.1
+  `eorder_uat`: a library scan that included the agent jar matched
+  spring-boot-2.1 to 4.0 at once, so the `-javaagent` jar is excluded from
+  every library list and the exclusion is stated (F). 2026-06-24
+  `KBANESCFServer` socket gateway: the transaction entry was not a servlet, so
+  server markers and program identity (D), `hook_service_*` (G) and thread
+  dumps (L) sit next to each other. 2026-06-30 keypro GlassFish: a console/JUL
+  loop produced 19.8M events while the on-disk server log stayed small, so
+  logging properties, libraries, config files, console destination and server
+  log directories sit side by side (H).

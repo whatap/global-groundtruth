@@ -1,15 +1,10 @@
 # collectors/apm/java: WhaTap Java APM agent collector
 
-> **Status: SEEDED; validated at `collect-apmjava.sh` 0.15.2 on 2026-09-28 on
-> the lab `apm-java` / `apm-java-jto` containers (Temurin 21.0.12, real agent
-> 2.2.77 attached by `-javaagent` and by `JAVA_TOOL_OPTIONS`, JVM uid 1500);
-> COMPLETE, `validate.sh --report` pass. Not validated on a running server:
-> OpenJ9, WebLogic, JEUS, GlassFish/Payara.** `collect-apmjava.sh` is a
-> working Tier-0 collector, plus an opt-in library detail pack (`--library` /
-> `--class`) and two opt-in Tier-2 flags (`--threads` / `--jcmd`), seeded by
-> the Global team (CONTRACT rule 4, interim ownership). Ongoing ownership
-> belongs to the Java agent developers once handed over. Earlier validation
-> runs: [CHANGELOG.md](CHANGELOG.md).
+> **Status:** validated at `collect-apmjava.sh` 0.15.2 on 2026-09-28, the lab
+> `apm-java` / `apm-java-jto` containers (Temurin 21.0.12, real agent 2.2.77
+> attached by `-javaagent` and by `JAVA_TOOL_OPTIONS`, JVM uid 1500).
+> Not yet run on: a running OpenJ9, WebLogic, JEUS, GlassFish/Payara server.
+> Owner: Global team until handover to the Java agent developers (CONTRACT rule 4).
 
 Collects the hidden facts a remote WhaTap Java-agent developer repeatedly asks
 a field engineer for. The fact list was derived from the agent source
@@ -329,17 +324,26 @@ Kept short because the script's comments point here.
 
 ## Cases
 
-The support cases behind parts of the collector (the script's comments name
-the mechanism, not the case; details in [CHANGELOG.md](CHANGELOG.md)):
+The kinds of support case behind parts of the collector (the script's comments
+name the mechanism, not the case; the case that led to each feature is in the
+entry of [CHANGELOG.md](CHANGELOG.md) that added it):
 
-- 2026-06-16, JBoss 5.1 `eorder_uat`: agent jar in a library scan (F).
-- 2026-06-24, `KBANESCFServer` socket gateway: non-servlet entry (D, G, L).
-- 2026-06-30, keypro GlassFish: console/JUL loop, 19.8M events (H).
-- 2026-09-11, BAF: `vshell` missed by name (D).
-- 2026-09-17, FIF: 282-jar unit, dump over Slack, Quartz classes, duplicate jars (F, L, N, M).
-- 2026-09-25, verification: relative `-Dwhatap.home` (the Config row).
-- Slack C08U55BRDLJ: `parent unwritable: /var/run/whatap/agent` (C); JVM crash cases with `hs_err_pid*.log` (D).
-- 2026-09-27, java-zoo (Zulu 7, B) and lab cluster operator-injected pod ([1], Load profile).
+- A library scan that includes the agent jar reports the agent's own weaving
+  catalog: the agent jar is excluded (F).
+- A socket gateway whose entry is not a servlet: server markers and program
+  identity (D), `hook_service_*` (G) and thread dumps (L).
+- A console/JUL logging loop that fills events while the on-disk log stays
+  small: logging stack (H).
+- A native launcher (`vshell`) that no name test finds: the `libjvm.so`
+  mapping test (D).
+- An application shipped as hundreds of jars, a thread dump held by the field,
+  Quartz job classes, the same jars in several units: F, L, N, M.
+- A relative `-Dwhatap.home`: every path is resolved as the JVM that names it
+  resolves it (the Config row).
+- A `parent unwritable: /var/run/whatap/agent` log line (C) and JVM crashes
+  with `hs_err_pid*.log` (D).
+- A Zulu 7 `jre` parent directory (B) and an operator-injected pod ([1], Load
+  profile).
 
 ## Validate
 
