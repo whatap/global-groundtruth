@@ -1,8 +1,10 @@
 # collectors/k8s: Kubernetes collector
 
-> **Status:** validated at `collect-k8s.sh` 0.12.2 on 2026-09-28, against the lab `k8s-lab`
-> kubeadm cluster (v1.32.13, containerd, cilium, operator-injected APM pods) and the `k8sproxy`
-> MEA webhook-fail-open repro, from a bastion-shaped `KUBECONFIG` and from inside the cluster VM.
+> **Status:** validated at `collect-k8s.sh` 0.12.2 on 2026-09-28, against the lab
+> `k8s-lab` kubeadm cluster (v1.32.13, containerd 2.2.2, cilium, operator-injected
+> APM pods) and the `k8sproxy` MEA webhook-fail-open repro (kubeadm v1.32.13), both
+> from a bastion-shaped `KUBECONFIG`, `k8sproxy` also from inside the cluster VM;
+> COMPLETE, `validate.sh --report` pass.
 > Not yet run on: OpenShift, CCE, EKS, RBAC-restricted profiles. Owner: Global team until
 > handover to the k8s domain team (CONTRACT rule 4).
 
@@ -24,6 +26,10 @@ workstation, not on the node. One report, MECE sections:
 | [9] H. Helm & images | helm releases/history/values (verbatim); without the helm binary degrades to `sh.helm.release.v1.*` secret names; all deployed whatap image:tags, and the `image imageID` (digest) of every container of the whatap namespace pods |
 | [10] I. In-pod node facts | `kubectl exec` into up to 2 running node-agent pods: container-log symlink real target (standard `/var/log/pods` vs CCE `/mnt/paas/...`), log roots & runtime sockets (candidate paths derived from the DS's declared mounts, e.g. `/rootfs`), cgroup fs type, node-helper health endpoint, kubelet cmdline (only when hostPID), **the proxy lines of `<host root>/etc/kubernetes/manifests/kube-apiserver.yaml`** (`grep -i -A1`, only on a node running a kube-apiserver pod and when the exec container mounts the host root; the without-restarts sample is taken on such a node when one runs a node-agent pod, so no exec is added) |
 | [11] J. APM auto-instrumentation | **always**: the namespace side of the name mapping (every namespace's labels) and a cluster-wide inventory of instrumented pods by **two** markers (whatap init container **or** the `whatap-apm-injected` annotation) with the mismatch list. Per `--apm-target` pod: init-container command/args, container `imageID`, and each app-container log head followed by its `WhaTap version lines`. With `--apm-target NS[/NAME]`: workload template env **as declared** vs pod env **as admitted** (per container, API order, repeated names flagged, **including `envFrom` sources**), init-container state, volumes/mounts, securityContext, every pod's labels + injection markers, init-container and app-container log **head**, namespace events. Pods named by a CR target's `podSelector` are detailed first, so a per-target cap never skips the workloads the CR asks for. With `--apm-exec` (Tier 2): `/proc/1/environ` and cmdline, agent home, agent `package.json` version, `whatap.conf`, agent logs (first 5 and last 40 lines each), `/tmp/whatap-*.lock`, runtime version |
+
+A list that answered empty prints `none ...`; a list whose call failed or was
+refused prints `n/a (<reason>)` instead. External registry tag listings are out
+of scope (clusters are often air-gapped); section H lists the images in use.
 
 ### Collection status (goals)
 

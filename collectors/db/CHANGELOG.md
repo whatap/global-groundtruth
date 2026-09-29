@@ -188,8 +188,9 @@ one entry at the top of its section (docs/authoring-guide.md, step 2);
   `[n] title` arrived as ` title`; they now read `==== [n] title ====` and
   arrive intact through classic sqlcmd 16.0, go-sqlcmd 1.10.0 (stdout and
   `-o`) and `Invoke-Sqlcmd` of the SQLPS 16.0 module, on both instances of
-  the lab host (the pack ran without an error as a sysadmin and as a login
-  holding only VIEW SERVER STATE and VIEW ANY DEFINITION).
+  the lab host; SSMS was not run. On 2026-09-26 the pack (v0.2.0) ran without
+  an error on both instances as a sysadmin and as a login holding only VIEW
+  SERVER STATE and VIEW ANY DEFINITION.
 - **0.4.0**: The status gives the run time, and when a bounded call was slow (3s),
   capped or not run past the deadline, the host load at start and end
   and where the time went, as the shell collectors do. CIM queries go

@@ -1,10 +1,15 @@
 # collectors/db: WhaTap DB-monitoring collector
 
 > **Status:** validated at `collect-db.sh` 0.9.1 on 2026-09-28, live
-> `jjsong-ggt-postgres` container (DB host, PostgreSQL 16, no DBX agent installed there).
+> `jjsong-ggt-postgres` container (DB host, PostgreSQL 16, no DBX agent installed
+> there); COMPLETE, `validate.sh --report` pass.
 > Validated at `collect-db-mssql.ps1` 0.7.0 on 2026-09-27, Windows Server 2022.
 > Not yet run on: a real DBX agent host (the mock DBX tree was last run at 0.9.0).
 > Owner: Global team until handover to the DB domain team (CONTRACT rule 4).
+
+The fact list comes from a full read of #ext-db-모니터링-기술문의 (2025-04 to
+2026-07, about 282 field questions) and deep reads of the four longest support
+threads.
 
 ## Why the layout looks like this
 

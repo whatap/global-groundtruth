@@ -2,7 +2,8 @@
 
 > **Status:** validated at `collect-apmjava.sh` 0.15.2 on 2026-09-28, the lab
 > `apm-java` / `apm-java-jto` containers (Temurin 21.0.12, real agent 2.2.77
-> attached by `-javaagent` and by `JAVA_TOOL_OPTIONS`, JVM uid 1500).
+> attached by `-javaagent` and by `JAVA_TOOL_OPTIONS`, JVM uid 1500); COMPLETE,
+> `validate.sh --report` pass.
 > Not yet run on: a running OpenJ9, WebLogic, JEUS, GlassFish/Payara server.
 > Owner: Global team until handover to the Java agent developers (CONTRACT rule 4).
 
