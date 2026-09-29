@@ -71,7 +71,13 @@ One `.txt` report, organized into MECE domains (each fact in exactly one place):
 - **G. Logs & recent events**: log inventory, bounded ERROR/WARN/Exception
   counts, **a short tail of every base service log** (yard/proxy/gateway/keeper/
   … , newest-mtime first; rotated + `_self`/`_api`/`access` streams excluded),
-  heap-dump files, journal errors.
+  heap-dump files, journal errors, and the host system log. OOM kills, I/O
+  errors, hung tasks and clock steps are recorded there, not in a unit
+  journal. From a persistent system journal this account can read: kernel
+  lines at warning and above, and all entries at err and above (newest 50
+  each, newest first, last `--hours`). Otherwise the last 100 lines of
+  `/var/log/messages` or `/var/log/syslog` (not limited to the window), and,
+  only when neither file exists, a journal kept under `/run` (current boot).
 
 Values are **discovered, not assumed**; an absent value is reported as
 `n/a (<why>)`: `command not found`, `permission denied`, `path not found`,
@@ -120,7 +126,7 @@ A value option with no value, or with the next option taken for it
 |---|---|
 | `--home DIR` | forces `WHATAP_HOME` (else auto-resolved, see (a)) |
 | `--out DIR` | where `--file` / `--bundle` write (default `.`); checked before collecting, an unwritable one exits 1 |
-| `--hours N` | journal window in hours (default 24): the report's journal errors (G) and the bundle's journal |
+| `--hours N` | journal window in hours (default 24): the report's journal errors and host system log (G) and the bundle's journal |
 | `--with-rotated[=DAYS]` | bundle: also copy rotated logs from the last DAYS days (default 14) |
 | `--jvm` | Tier 2, bundle only: one `jstack -l` and one `jmap -histo` of each server JVM (below) |
 | `--du` | Tier 2, bundle only: recursive `du --max-depth=1` of yardbase (below) |

@@ -7,6 +7,12 @@ one entry at the top of its section (docs/authoring-guide.md, step 2);
 
 ## collect-collserver.sh
 
+- **0.15.9**: G gains `host system log`: kernel lines at warning and above
+  and all entries at err and above from a persistent system journal (newest
+  50 each, newest first, last `--hours`); otherwise the last 100 lines of
+  `/var/log/messages` or `/var/log/syslog`; a `/run`-only journal when
+  neither file exists. No goal is declared, so the run status does not
+  change.
 - **0.15.8**: Run helpers (skeleton): the `--out` mkdir always gets the
   command cap (plus 1 s), so a second boundary crossed right after the
   deadline check no longer skips it and exits 1 with a false "not writable"

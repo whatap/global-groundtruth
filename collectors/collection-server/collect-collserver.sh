@@ -35,7 +35,7 @@ unset JAVA_TOOL_OPTIONS JDK_JAVA_OPTIONS _JAVA_OPTIONS _v
 # ---- collector metadata -----------------------------------------------------
 # History: CHANGELOG.md, section collect-collserver.sh (next to this file).
 COLLECTOR_NAME="whatap-collserver"
-VERSION="0.15.8"
+VERSION="0.15.9"
 DOMAIN="collection-server"
 TARGET="collection-server/$(hostname 2>/dev/null || echo unknown)"   # refined after WHATAP_HOME is resolved
 
@@ -116,7 +116,7 @@ OPT_STDOUT=0
 OPT_QUIET=0          # suppress progress narration on stderr
 OPT_HOME=""
 OPT_OUT="."
-OPT_HOURS=24         # journal window: the report's journal errors and the bundle's journal
+OPT_HOURS=24         # journal window: the report's journal errors and host system log, and the bundle's journal
 # bundle: the log caps, from the environment (checked in main with _cap_or)
 OPT_MAXLOG_MB="${LOG_FILE_MB:-5}"      # per-file log copy cap (tail keeps the newest end)
 OPT_MAXTOTAL_MB="${LOG_TOTAL_MB:-100}" # cap on ALL copied logs together
@@ -143,7 +143,8 @@ explicit action flag (--file / --stdout / --bundle) so nothing starts by acciden
   collect-collserver.sh --home DIR               force WHATAP_HOME (else auto-resolved)
   collect-collserver.sh --out DIR                output directory (default: .)
   collect-collserver.sh --hours N ...            journal window in hours (default: 24): the
-                                                 report's journal errors and the bundle's journal
+                                                 report's journal errors and host system log,
+                                                 and the bundle's journal
   collect-collserver.sh --bundle --with-rotated[=DAYS]
                                                  also copy rotated logs from the last DAYS days
                                                  (default 14; without it: current logs only)
@@ -1664,6 +1665,7 @@ _rep_g() {
     fi
     _rep_g_heap
     _rep_g_journal
+    _rep_g_syslog
 }
 
 # _rep_g_inventory -> G: the logs on the host, and which of them this bundle carries
@@ -1826,6 +1828,43 @@ _rep_g_journal() {
         fact "journal: readable by uid ${_priv_uid:-?}; no err entries for the loaded whatap units in the last ${OPT_HOURS}h"
         na journal "the system journal is readable and holds no entries for the whatap units in the last ${OPT_HOURS}h"
     fi
+}
+
+# _rep_g_syslog -> G: the host's own log, beyond the whatap units: OOM kills,
+# I/O errors, hung tasks and clock steps land here and not in a unit journal.
+# A persistent system journal this uid can read comes first (kernel lines by
+# transport, so a previous boot is kept); otherwise the rsyslog file, whose
+# tail is not limited to the window; a journal kept only under /run (current
+# boot) is the last resort. -r: before systemd 254, --since with -n printed
+# the oldest N of the window, not the newest.
+_rep_g_syslog() {
+    subsection "host system log (last ${OPT_HOURS}h, bounded)"
+    local _swhy f
+    _swhy="$(journal_why)"
+    if [ -z "$_swhy" ] && ls /var/log/journal/*/system.journal >/dev/null 2>&1; then
+        _rep_g_syslog_journal; return
+    fi
+    [ -z "$_swhy" ] && _swhy="no persistent journal under /var/log/journal, so earlier boots are not kept"
+    fact "persistent system journal: n/a ($_swhy)"
+    for f in /var/log/messages /var/log/syslog; do
+        [ -e "$f" ] || continue
+        read_proc "$f (last 100 lines, any time)" "$f" 100
+        return
+    done
+    fact "/var/log/messages, /var/log/syslog: n/a (path not found)"
+    [ "$(journal_why)" = "" ] && _rep_g_syslog_journal
+}
+
+# _rep_g_syslog_journal -> the two journal reads, newest first; the second is
+# skipped when the first timed out, since it would wait as long again.
+_rep_g_syslog_journal() {
+    probe "kernel, warning and above (newest 50, newest first)" journalctl _TRANSPORT=kernel -p warning \
+        --since "${OPT_HOURS} hours ago" -n 50 -r -o short-iso --no-pager
+    if [ "$PROBE_RC" = 124 ]; then
+        fact "all entries, err and above: n/a (skipped: the kernel read timed out)"; return
+    fi
+    probe "all entries, err and above (newest 50, newest first)" journalctl -p err \
+        --since "${OPT_HOURS} hours ago" -n 50 -r -o short-iso --no-pager
 }
 
 run_report() {
