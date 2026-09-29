@@ -14,8 +14,7 @@
 # filesystem and dataset the yardbase is on; runbooks run both. This report has
 # every dataset's properties, so the two join on the dataset name.
 #
-# Question -> report section map: see README.md, "Design notes" under this
-# collector.
+# Question -> report section map: see collect-collzfs.md, "Design notes".
 #
 # Tier 0 (the default report) reads kstats, properties and since-boot iostat
 # only: no pool traversal, no tree walk, no device wake-up. What costs wall-clock
@@ -35,7 +34,7 @@ export LC_ALL=C
 # ---- collector metadata -----------------------------------------------------
 # History: CHANGELOG.md, section collect-collzfs.sh (next to this file).
 COLLECTOR_NAME="whatap-collzfs"
-VERSION="0.12.7"
+VERSION="0.12.8"
 DOMAIN="collection-server"
 TARGET="collection-server-zfs/$(hostname 2>/dev/null || echo unknown)"   # refined after pool discovery
 
@@ -1336,7 +1335,7 @@ _rep_d() {
     subsection "dataset space overview (zfs list -o space)"
     probe_t 60 "zfs list -o space" zfs list -o space
     # The file count of each mounted dataset: ZFS has no inode table, and IUsed
-    # is the number of objects (README.md, section D). statfs only, no walk.
+    # is the number of objects (collect-collzfs.md, section D). statfs only, no walk.
     subsection "file count per mounted dataset (df -i -t zfs)"
     probe_t 60 "df -i -t zfs" df -i -t zfs
 }
@@ -1534,7 +1533,7 @@ _rep_k() {
 _rep_l() {
     local p
     section "L. Pool events, errors & maintenance"
-    # One read of the ring (zevents_split; why the whole of it: README.md,
+    # One read of the ring (zevents_split; why the whole of it: collect-collzfs.md,
     # section L). A bundle run keeps its files in zfs/.
     if ! have zpool; then fact "zpool events: n/a (command not found: zpool)"
     elif _hung zpool; then fact "zpool events: n/a ($(_skip_why zpool))"
@@ -1760,7 +1759,7 @@ _resolve_datasets() {
 }
 
 # zevents_split DESTDIR -> split one read of `zpool events` into a tally and a
-# window. Why the tally covers the whole buffer: README.md, section L. Read ONCE
+# window. Why the tally covers the whole buffer: collect-collzfs.md, section L. Read ONCE
 # (a second pass costs the same minutes and sees a moved buffer) into:
 #   zpool-events-tally.tsv     class x date x vdev, counted over the whole buffer
 #   zpool-events-overview.tsv  class, count, first date, last date (section L)
@@ -1850,7 +1849,7 @@ zevents_split() {
 # =============================================================================
 # Write-path window (--window; Tier 1: wall-clock, kstat file reads only)
 # =============================================================================
-# How the ring is read, merged, gapped and retried: README.md, "How the txgs
+# How the ring is read, merged, gapped and retried: collect-collzfs.md, "How the txgs
 # ring is read" (section O). WIN_IV_MIN/MAX below are that read interval's
 # clamp.
 WIN_IV_MIN=2
@@ -1872,7 +1871,7 @@ _win_sp=""
 
 # ---- interval jobs of the window (zpool iostat, iostat -x, histograms, arcstat)
 # Why they start together at the same interval/count, and per-job output
-# files: README.md, section O.
+# files: collect-collzfs.md, section O.
 IOSTAT_FL=""         # the iostat -x flags this sysstat takes (_iostat_flags)
 IOSTAT_FL_NOTE=""    # what was dropped, and so what the output lacks
 
@@ -2244,7 +2243,7 @@ _win_plan() {
 window_run() {
     local e0 end left iv pn io_cap k n
     _win_plan || return
-    # The interval jobs (README.md, section O): about 120 blocks over the
+    # The interval jobs (collect-collzfs.md, section O): about 120 blocks over the
     # window, so (N - 1) x I <= its length and they end with it whatever I is.
     WIN_IO_IV=$(( (end - e0) / 120 ))
     [ "$WIN_IO_IV" -lt 1 ] && WIN_IO_IV=1

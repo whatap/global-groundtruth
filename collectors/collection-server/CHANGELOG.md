@@ -167,10 +167,40 @@ one entry at the top of its section (docs/authoring-guide.md, step 2);
   command is bounded (a hung systemctl is asked once); discovery is one
   grep over /proc and one `systemctl show`. The bundle is built in the
   private directory; bad numeric options exit 2, a failed write exits 1;
-  output is handed back under sudo. Needs bash.
+  output is handed back under sudo. Needs bash. Measured 2026-09-25 on a
+  739-process host: collserver 8.1 s -> 2.4 s, collzfs 5.2 s -> 0.5 s; with
+  2,000 more processes, 20.5 s -> 4.2 s and 17.2 s -> 0.8 s.
+- **0.4.1**: An unreadable `conf/` is no longer reported as "n/a (path not found
+  or WHATAP_HOME not resolved)". Found on three live production backends
+  (Smartfren, 2026-09-23): the collector ran as uid 3103 while WhaTap is
+  installed under uid 1001 (`whatap`); on `web02-bsd` uid 3103 could still
+  reach `/data/whatap`, on both `web01` hosts it could not, so the two `web01`
+  bundles carried no `conf/` and the reason printed two lines after the
+  resolved path read as a contradiction. The answer was never root but the
+  owning account, so the run should be started as that account.
+- **0.4.0**: Log selection for the bundle: a total cap (then the
+  `--max-total-mb` option, now `LOG_TOTAL_MB`) beside the per-file one. The
+  `web02-bsd` bundle of 0.3.0 was 63,327,061 bytes (393.3 MB unpacked, 180
+  entries), of which logs were 412,175,707 (99.95%); `access.log` was tail-cut
+  to 50 MiB as designed, but there was no cap on the total. Replaying that log
+  tree (127 files, 412,175,707 bytes) as `WHATAP_HOME/logs`: defaults gave a
+  532,099-byte archive (17 files copied, 110 left out, 12,963,143 bytes of
+  logs); `--max-total-mb 5` 260,084 bytes (15 copied, 112 left out, 3,310,276 bytes of
+  logs); `--with-rotated` 19,871,166 bytes (70 copied, 57 left out,
+  104,846,391 bytes of logs in the bundle; copied logs stopped at 104,838,469
+  bytes under the 100 MB cap); `--with-rotated --max-total-mb 50` 8,274,635
+  bytes (58 copied, 69 left out, 52,434,658 bytes of logs). Only the log
+  figures transfer; the non-log part of the replay is this workstation's. In every run
+  the three numbers in `SELECTION.txt` added back up to 412,175,707.
+- **0.3.0**: Run on three live production backends (Smartfren, 2026-09-23):
+  module labels, ports, systemd state, yardbase ZFS facts and the journal came
+  back correct.
 
 ## collect-collzfs.sh
 
+- **0.12.8**: Comments that point at the documentation name
+  `collect-collzfs.md` (the collector's own doc next to the script) instead of
+  README.md; report unchanged.
 - **0.12.7**: Run helpers (skeleton): the `--out` mkdir always gets the
   command cap (plus 1 s), so a second boundary crossed right after the
   deadline check no longer skips it and exits 1 with a false "not writable"
@@ -311,6 +341,14 @@ one entry at the top of its section (docs/authoring-guide.md, step 2);
   now FILESIZES_SECS, EVENT_DAYS and JOURNAL_HOURS in the environment
   (defaults 300, 30, 24). H's per-pool kstat paths no
   longer carry a double slash (yard//zil).
+  Validated as root on a ZFS VM (Ubuntu 26.04, zfs 2.4.1, TZ Asia/Jakarta,
+  pool `yard` with a special vdev, 200k small files): the default run; windows
+  idle and under an append load; a forced ring wrap (`zfs_txg_history` set to 10
+  and put back, with a `zpool sync` burst: gaps counted, the read interval went
+  from 23 s down to 2 s); `@START` waits; INT and TERM; `--bundle`. The
+  allocation-class view showed `class=special`. A default `--file` run took
+  33.2-34.9 s against 15.7-15.8 s at 0.7.0 (the 15 s window plus about 2.5 s
+  for the interval jobs' last block).
 - **0.7.0**: zpool list -v runs once: the raw probe's output feeds the derived
   views of sections C and H and the bundle's zpool-list-v.txt (it was
   run a second time, capped at 20s, for the views, and a third time
@@ -325,6 +363,16 @@ one entry at the top of its section (docs/authoring-guide.md, step 2);
   it loads the special vdev and the ARC and cannot finish in its bound.
   df -i of every WhaTap path is in the report and df-i.txt in the
   bundle, so the file count is there without a walk.
+- **0.4.1**: Validated non-root on two live ZFS hosts: a KVM host (Ubuntu
+  24.04, zfs 2.2.2, pool 2.72 T, FRAG 56 %, 19 datasets, 2 zvols, 2 clones, a
+  removed vdev leaving `indirect-0/1`; Tier 0 about 13 s, `--bundle` about 34 s /
+  89 KB), and a real WhaTap collection server (Ubuntu 24.10, zfs 2.2.6, pool
+  `yardbase` 99.5 G / FRAG 30 %, 10 running `whatap.server` JVMs; Tier 0 about
+  10 s), which resolved `WHATAP_HOME` from a running JVM's
+  `-Dwhatap.server.home` and reported the mixed layout: only `yardbase` on ZFS
+  (`recordsize=64K` local, `compressratio 4.43x`), while `logs` / `conf` / `db` /
+  `logsink` sat on the ext4 root. The `arcstat` sampling branch was exercised
+  there (that binary is absent on the KVM host).
 
 ## collect-collmysql.sh
 
@@ -460,3 +508,27 @@ one entry at the top of its section (docs/authoring-guide.md, step 2);
   reaches the client in a mode-600 file. Every wait is bounded; refused
   SHOW BINARY LOGS, a failed or capped decode, a NULL log_bin_basename and
   no local mysqld without arguments are gaps with reasons. Needs bash.
+- **0.4.0**: Run end to end on MySQL 5.6.51, 5.7.32, 8.4.10 and MariaDB 10.11.19
+  (2026-09-17), each seeded with a scheduler-shaped write load; all four reach
+  the footer and attribute binary log rows to the right tables (8.4 excepted:
+  the `mysql:8` image ships no `mysqlbinlog`). Three defects fixed: MariaDB
+  opens transactions with `START TRANSACTION`, not `BEGIN`, so the transaction
+  count read 0; `SELECT @@read_only, @@super_read_only` lost both values on 5.6
+  and MariaDB because the second variable does not exist there; MariaDB echoes
+  the statement between dashed rules before its error, so every reason read
+  `error: --------------`.
+- **0.3.0**: The binlog decode streams each file once through `awk` and keeps
+  only counters: an 82 MB binary log decoded to 95 MB of text (1.15x), which
+  0.2.0 held in a shell variable and walked six times (27 s for an 85 MB pair;
+  gigabytes of RSS at the default 1 GiB `max_binlog_size`); the same run takes
+  4 s. The decode is capped per file (`BINLOG_TIMEOUT`, 300 s) and says so when
+  it truncates; a log with no row events states that instead of an empty list.
+  Section F also reports the indexes of the 15 largest tables.
+- **0.2.0**: Run end to end on MySQL 5.7.32 and 8.4.10 containers (2026-09-17)
+  seeded with a scheduler-shaped write load (a lock row updated in a loop,
+  inserts and deletes on a second table); section I attributed row events to the
+  right tables on 5.7. Five defects fixed: the unbounded `SHOW BINARY LOGS`
+  listing (647 files became 647 lines and two thirds of the report), the
+  missing 8.4 binlog position, the group replication query that 5.7 rejects
+  whole, a missing `ps`/`ss` reported as "empty output", and a delimiter count
+  labelled "statement-format queries".
