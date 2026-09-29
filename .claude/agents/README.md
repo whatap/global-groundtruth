@@ -50,6 +50,10 @@ Take the highest tier that any part of the change hits.
   and the lab diff on every target that reaches the new code shows added
   lines only. Until five A verifications have also been run blind by
   `gg-verify-deep` and logged below, each one is; a miss moves A back into D.
+- **D** also for doc changes that move history between CHANGELOG version
+  entries or out of a README into them (2026-09-29 spot check: sonnet passed a
+  0.2.0 entry that used a name from 0.8.0). A doc edit that moves no history
+  stays M.
 - **M** if the change is a refactor that keeps the report byte-identical and
   the author claims it moves code without rewriting it.
 - **R** only for re-running checks on an already-verified patch (e.g. after a
@@ -143,6 +147,7 @@ match is unavoidable, bracket one character so the pattern cannot match itself
 | 2026-09-27 | r2-shared.patch (skeleton/group consolidation, D) | P1 collmysql --help prints unchecked BINLOG_TIMEOUT; P2 sync inserts a missing emit block after the options loop | haiku | no / no | Verdict "safe to commit" although the prompt named both areas; read base-vs-base deadline noise as "refactored code hits deadline sooner". Not a verifier. |
 | 2026-09-27 | r2-shared.patch (D) | P1 / P2 as above | sonnet | no / no | Much more thorough than haiku (traced _cap_or timing, _sd call sites, zprobe) and tested the hinted areas, but chose RUN_DEADLINE/CMD_TIMEOUT for --help (not BINLOG_TIMEOUT) and stripped the emit block from apmjava, where the insert happens to land correctly (the defect shows on k8s). Misses come from choosing one representative case where the defect needs the specific one. |
 | 2026-09-27 | fu-skel.patch (_bounded USR1 watchdog, D) | trap's `kill "$!"` (TERM) lost before exec → ~6% of bash watchdog calls +1 s | sonnet | contaminated | Verdict "fix first" for the right line, but found it by diffing against main, where the fix was already committed, not by testing. Its own latency test (best-of-5 totals over 300 calls) saw "no regression": a total/best-of hides a 6% tail. Lesson for every tier: count slow calls (≥500 ms), don't compare totals. |
+| 2026-09-29 | collection-server docs boundary pass (history moved between CHANGELOG versions, status lines; M, 5th-M blind spot check) | collzfs 0.2.0 entry named `EVENT_DAYS`, which only exists from 0.8.0 (was `--event-days`); index README called the probe helpers collserver's own code and the skeleton's in one sentence; the index lost the "validated at is not VERSION" reading note | sonnet (gg-verify-mech) | no / no / no | PASS with cosmetic notes; it checked each fact's version but not whether the moved text used names of a later version. opus (gg-verify-deep, blind) found all three. Kind moved to D: see "Grading a change". |
 
 **Outcome (2026-09-27):** haiku = R only. sonnet = M only, with the exhaustive rule (gg-verify-mech step 7); in both D calibrations it missed the defect by sampling one representative case. opus = D. Re-run a blind calibration when a new model is considered.
 
