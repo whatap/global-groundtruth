@@ -1,10 +1,10 @@
 # collectors/nms
 
-> **Status:** validated at `collect-nms.sh` 0.7.5 on 2026-09-28 (the script's own
-> `VERSION` is the current one) on the lab `nms` target (Rocky 9 + systemd, real
-> `whatap-nms` 1.3.3 rpm, all four units running): COMPLETE, `validate.sh --report`
-> pass. Also degrades to reasoned `n/a` on a host without the package. Owned, for
-> now, by the Global team; handover moves ownership to the NMS development team
+> **Status:** validated at `collect-nms.sh` 0.7.5 on 2026-09-28, lab `nms` target
+> (Rocky 9 + systemd, real `whatap-nms` 1.3.3 rpm, all four units running):
+> COMPLETE, `validate.sh --report` pass; also degrades to reasoned `n/a` on a
+> host without the package. Not yet run on: Debian-family (deb) hosts at this
+> version. Owner: Global team until handover to the NMS development team
 > (CONTRACT rule 4).
 
 The **WhaTap NMS Control Manager** is the on-prem network-monitoring manager
