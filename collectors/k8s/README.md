@@ -1,12 +1,10 @@
 # collectors/k8s: Kubernetes collector
 
-> **Status:** validated at `collect-k8s.sh` 0.12.2 on 2026-09-28 (the script's own
-> `VERSION` is the current one) against the lab `k8s-lab` kubeadm cluster (v1.32.13,
-> containerd, cilium, real operator-injected APM pods) and the `k8sproxy` MEA
-> webhook-fail-open repro, from a bastion-shaped `KUBECONFIG` and from inside the
-> cluster VM: COMPLETE, `validate.sh --report` pass. Not yet run on OpenShift / CCE /
-> EKS / RBAC-restricted profiles. Owned by the k8s domain team (CONTRACT rule 4);
-> until handover it is managed by the Global team.
+> **Status:** validated at `collect-k8s.sh` 0.12.2 on 2026-09-28, against the lab `k8s-lab`
+> kubeadm cluster (v1.32.13, containerd, cilium, operator-injected APM pods) and the `k8sproxy`
+> MEA webhook-fail-open repro, from a bastion-shaped `KUBECONFIG` and from inside the cluster VM.
+> Not yet run on: OpenShift, CCE, EKS, RBAC-restricted profiles. Owner: Global team until
+> handover to the k8s domain team (CONTRACT rule 4).
 
 ## (a) What it collects
 
@@ -87,7 +85,7 @@ See "What the report can contain" for what is printed verbatim.
   webhook as an HTTPS client that honours `https_proxy` / `no_proxy` from its
   environment; a `no_proxy` without `.svc` (or the service CIDR) sends the
   call to the proxy, and a proxy that presents its own certificate fails
-  x509 whatever the caBundle (MEA, 2026-08). A static-pod API server's
+  x509 whatever the caBundle. A static-pod API server's
   environment is its manifest's `env`, which the mirror pod spec carries. A
   managed control plane (GKE/EKS/AKS) runs no kube-apiserver pod the API can
   list, so its environment is not visible from the cluster; the section then
