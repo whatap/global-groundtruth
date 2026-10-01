@@ -72,7 +72,7 @@ param(
 
 $COLLECTOR_NAME = "whatap-apmdotnet"
 # History: CHANGELOG.md (next to this file).
-$VERSION        = "0.6.2"
+$VERSION        = "0.7.0"
 $DOMAIN         = "apm"
 $CompName = $env:COMPUTERNAME; if (-not $CompName) { $CompName = [Environment]::MachineName }
 $TARGET         = "host/$CompName"
@@ -880,7 +880,7 @@ $CLSID_LEGACY  = "{D76F1D76-A9E0-4C87-874F-C0AD93D4229B}"   # legacy 450/core li
 $PROGDATA_LOGS = "$ProgData\WhaTap\dotnet\logs"
 $PROGDATA_AUDIT = "$ProgData\WhaTap\dotnet\audit"
 $MACHINE_ENV_KEY = "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment"
-$ENV_NAME_PATTERN = '^(WHATAP_|COR_ENABLE_PROFILING|COR_PROFILER|CORECLR_|DOTNET_STARTUP_HOOKS|WT_TRACE_LOG_PATH)'
+$ENV_NAME_PATTERN = '^(WHATAP_|COR_ENABLE_PROFILING|COR_PROFILER|CORECLR_|DOTNET_STARTUP_HOOKS|WT_TRACE_LOG_PATH|MicrosoftInstrumentationEngine_)'
 
 # ---- discovery: agent home candidates ------------------------------------------
 $homeCandidates = New-Object System.Collections.Generic.List[string]
@@ -948,15 +948,17 @@ foreach ($ck in @("HKLM:\SOFTWARE\Classes\CLSID\$CLSID_CURRENT\InProcServer32",
     } catch { Note-DiscErr "CLSID registry" $_ }
 }
 # uninstall registry InstallLocation
-$uninstallEntries = @(); $uninstallRead = 0
+$uninstallEntries = @(); $uninstallAll = @(); $uninstallRead = 0
 foreach ($uk in @("HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
                   "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
                   "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall")) {
     try {
-        $uninstallEntries += @(Get-ChildItem -LiteralPath $uk -ErrorAction Stop | ForEach-Object {
+        $entries = @(Get-ChildItem -LiteralPath $uk -ErrorAction Stop | ForEach-Object {
             $p = Get-ItemProperty -LiteralPath $_.PSPath -ErrorAction SilentlyContinue
-            if ($p.DisplayName -match '[Ww]ha[Tt]ap') { $p | Add-Member NoteProperty RegPath $_.PSPath -PassThru }
+            if ($p -and $p.DisplayName) { $p | Add-Member NoteProperty RegPath $_.PSPath -PassThru }
         } | Where-Object { $_ })
+        $uninstallAll += $entries
+        $uninstallEntries += @($entries | Where-Object { $_.DisplayName -match '[Ww]ha[Tt]ap' })
         if ($uk -like "HKLM:*") { $uninstallRead++ }
     } catch { Note-DiscErr "uninstall registry $uk" $_ }
 }
@@ -1146,20 +1148,64 @@ Emit ""
 # every configured profiler/hook path -> does that exact file exist, and what is it
 $cfgPaths = @{}
 foreach ($line in ($svcEnvLines + $machineEnvPairs + @($liveHits | ForEach-Object { "$($_.Name)=$($_.Value)" }))) {
-    if ($line -match '^(COR_PROFILER_PATH(_32|_64)?|CORECLR_PROFILER_PATH(_32|_64)?|DOTNET_STARTUP_HOOKS)=(.+)$') {
-        $cfgPaths[$Matches[1] + "=" + $Matches[4]] = $Matches[4]
+    if ($line -match '^(COR_PROFILER_PATH(_32|_64)?|CORECLR_PROFILER_PATH(_32|_64)?|DOTNET_STARTUP_HOOKS|MicrosoftInstrumentationEngine_RawProfilerHookPath(_32|_64)?)=(.+)$') {
+        $cfgPaths[$Matches[1] + "=" + $Matches[5]] = $Matches[5]
     }
 }
 if ($cfgPaths.Count -eq 0) { Fact "configured profiler/startup-hook paths: none found in any scope above" }
 foreach ($k in ($cfgPaths.Keys | Sort-Object)) {
     $var = ($k -split '=', 2)[0]
-    FileFacts "configured $var target" $cfgPaths[$k]
+    FileFacts "configured $var target" $cfgPaths[$k] -Hash
 }
 Emit ""
-foreach ($pair in @(@($CLSID_CURRENT, "current 2.5.x line"), @($CLSID_LEGACY, "legacy 450/core line"))) {
-    $clsid = $pair[0]; $tag = $pair[1]
-    RegValue "CLSID $clsid ($tag) InProcServer32 (64-bit view)" "HKLM:\SOFTWARE\Classes\CLSID\$clsid\InProcServer32" "(default)"
-    RegValue "CLSID $clsid ($tag) InProcServer32 (WOW6432Node view)" "HKLM:\SOFTWARE\Classes\WOW6432Node\CLSID\$clsid\InProcServer32" "(default)"
+# every profiler CLSID named in any scope (COR_PROFILER, CORECLR_PROFILER, the
+# CLR Instrumentation Engine raw profiler hook) plus the two WhaTap CLSIDs
+$envLinesAll = @($svcEnvLines + $machineEnvPairs + @($liveHits | ForEach-Object { "$($_.Name)=$($_.Value)" }))
+$clsids = [ordered]@{}
+$clsids[$CLSID_CURRENT] = "WhaTap current 2.5.x line"
+$clsids[$CLSID_LEGACY]  = "WhaTap legacy 450/core line"
+foreach ($line in $envLinesAll) {
+    if ($line -match '^(COR_PROFILER|CORECLR_PROFILER|MicrosoftInstrumentationEngine_RawProfilerHook)=(\{[0-9A-Fa-f-]{36}\})\s*$') {
+        $c = $Matches[2].ToUpper()
+        if (-not $clsids.Contains($c)) { $clsids[$c] = "named by $($Matches[1])" }
+    }
+}
+$clsidDlls = @()
+foreach ($c in $clsids.Keys) {
+    $tag = $clsids[$c]
+    foreach ($view in @(@("64-bit view", "HKLM:\SOFTWARE\Classes\CLSID\$c\InProcServer32"), @("WOW6432Node view", "HKLM:\SOFTWARE\Classes\WOW6432Node\CLSID\$c\InProcServer32"))) {
+        RegValue "CLSID $c ($tag) InProcServer32 ($($view[0]))" $view[1] "(default)"
+        try { $k = Reg-Open $view[1]; if ($k) { $v = $k.GetValue(''); $k.Close(); if ($v) { $clsidDlls += "$c|$v" } } } catch { }
+    }
+}
+foreach ($cd in ($clsidDlls | Select-Object -Unique)) {
+    $c, $dll = $cd -split '\|', 2
+    if ($c -ne $CLSID_CURRENT -and $c -ne $CLSID_LEGACY) { FileFacts "CLSID $c registered DLL" $dll -Hash }
+}
+Emit ""
+# CLR Instrumentation Engine configuration files named by MicrosoftInstrumentationEngine_ConfigPath*
+$iePaths = @{}
+foreach ($line in $envLinesAll) {
+    if ($line -match '^(MicrosoftInstrumentationEngine_ConfigPath\w*)=(.+)$') { $iePaths[$Matches[1] + "=" + $Matches[2]] = $Matches[2] }
+}
+if ($iePaths.Count -eq 0) { Fact "MicrosoftInstrumentationEngine_ConfigPath* values: none in any scope above" }
+foreach ($k in ($iePaths.Keys | Sort-Object)) {
+    $var = ($k -split '=', 2)[0]
+    FileFacts "$var file" $iePaths[$k]
+    HeadFile "$var content" $iePaths[$k] 80
+}
+# uninstall entries of other profiler products: CLR Instrumentation Engine by
+# name, and any entry whose InstallLocation contains a profiler DLL seen above
+$profDlls = @($cfgPaths.Values) + @($clsidDlls | ForEach-Object { ($_ -split '\|', 2)[1] })
+$otherEntries = @($uninstallAll | Where-Object {
+    $u = $_
+    ($u.DisplayName -notmatch '[Ww]ha[Tt]ap') -and (
+        ($u.DisplayName -match 'Instrumentation Engine') -or
+        ($u.InstallLocation -and @($profDlls | Where-Object { $_ -and $_.StartsWith($u.InstallLocation.TrimEnd('\'), [StringComparison]::OrdinalIgnoreCase) }).Count -gt 0))
+})
+Fact "uninstall entries of other profiler products (CLR Instrumentation Engine, or InstallLocation holding a profiler DLL above): $($otherEntries.Count)"
+foreach ($u in $otherEntries) {
+    Fact "  DisplayName=$($u.DisplayName)  DisplayVersion=$($u.DisplayVersion)  Publisher=$($u.Publisher)  InstallDate=$($u.InstallDate)  InstallLocation=$($u.InstallLocation)"
 }
 Emit ""
 Fact "-- Fusion assembly-binding log settings (HKLM\SOFTWARE\Microsoft\Fusion; read-only report) --"
@@ -1363,6 +1409,10 @@ foreach ($ld in @($PROGDATA_LOGS) + @($existingHomes | ForEach-Object { Join-Pat
             $m = @(Get-Content -LiteralPath $core[0].FullName -TotalCount 500 -Encoding UTF8 -ErrorAction Stop | Select-String -Pattern 'CLR Profiler' | Select-Object -First 5)
             if ($m.Count -eq 0) { "no matching lines in first 500" } else { $m | ForEach-Object { $_.Line.Trim() } }
         }
+        TryFact "CLR Instrumentation Engine / loader-injection lines in $($core[0].Name) (first 20 matching lines of the last 5000)" {
+            $m = @(Get-Content -LiteralPath $core[0].FullName -Tail 5000 -Encoding UTF8 -ErrorAction Stop | Select-String -Pattern 'Instrumentation Engine|UserBuffer|LOADER INJECTION|AddIISPreStartInitFlags|ILRewriter' | Select-Object -First 20)
+            if ($m.Count -eq 0) { "no matching lines" } else { $m | ForEach-Object { $_.Line.Trim() } }
+        }
         HeadFile "native profiler log $($core[0].Name)" $core[0].FullName 40
         TailFile "native profiler log $($core[0].Name)" $core[0].FullName 120
     } else {
@@ -1453,7 +1503,7 @@ TryFact "Application log: .NET/ASP.NET/crash/WhaTap events (newest 15 of last 30
     $raw = @(); try { $raw = @(Invoke-BoundedBlock { Get-WinEvent -FilterHashtable @{ LogName = 'Application'; Level = 1,2,3; StartTime = (Get-Date).AddDays(-7) } -MaxEvents 300 -ErrorAction Stop }) }
     catch { if ("$($_.Exception.Message)" -notmatch 'No events were found') { throw } }
     $ev = @($raw |
-        Where-Object { $_.ProviderName -match '\.NET Runtime|ASP\.NET|Application Error|Windows Error Reporting|[Ww]ha[Tt]ap' } |
+        Where-Object { $_.ProviderName -match '\.NET Runtime|ASP\.NET|AspNetCore|Application Error|Windows Error Reporting|[Ww]ha[Tt]ap' } |
         Select-Object -First 15)
     if ($ev.Count -eq 0) { $(if ($isAdmin) { "none matching in window" } else { "none matching among the events this account can read (not elevated)" }) }
     else {

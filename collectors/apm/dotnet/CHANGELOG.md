@@ -5,6 +5,25 @@ newest first. Every change to the script bumps its `VERSION` and adds one
 entry at the top of this list (docs/authoring-guide.md, step 2);
 `tools/validate.sh` checks that the newest entry is the script's `VERSION`.
 
+- **0.7.0**: Section C reads the CLR Instrumentation Engine (CLRIE) setup:
+  `MicrosoftInstrumentationEngine_*` joins the environment filter; every CLSID
+  named by `COR_PROFILER`, `CORECLR_PROFILER` or
+  `MicrosoftInstrumentationEngine_RawProfilerHook` gets its InProcServer32 in both
+  views and, when it is not a WhaTap CLSID, the registered DLL's facts and SHA256;
+  raw-hook paths get file facts like the profiler paths; each
+  `MicrosoftInstrumentationEngine_ConfigPath*` file is listed with its first 80
+  lines; uninstall entries of other profiler products (the Instrumentation Engine by
+  name, or an `InstallLocation` that holds a profiler DLL found above) are listed.
+  Section G prints the newest native log's CLRIE and loader-injection lines (first
+  20 of the last 5000). Section I's Application filter takes the ASP.NET Core Module
+  provider. Why: a SecuPi + CLRIE case (DOTNET-431) needed which product holds which
+  profiler slot, and 0.6.2 printed the service `Environment` but not the CLSIDs,
+  files and versions it named.
+  Validated 2026-10-01 on jjsong-dotnet-lab (real WhaTap .NET 2.5.7.0, CLRIE 1.0.45
+  raw hook), elevated, Windows PowerShell 5.1 and pwsh 7: both COMPLETE and pass
+  validate.sh --report. A third run with a temporary fake raw-hook CLSID, its DLL,
+  an uninstall entry and a ConfigPath file (removed afterwards, service Environment
+  restored and compared) printed each of them.
 - **0.6.2**: Move TcpProbe into the shared ps1 fact-helpers block
   (templates/groups/ps1.ps1); no behavior change.
 - **0.6.1**: Collection status (ps1 group `Emit-Time`): when a bounded call was slow, capped or not run, the per-command "where the time went" table gives way to the time log's own records, one line per such call in the order they ran (`<ms> ms  <outcome>  <command>`, the first 40, then `(N more in this run)`), as the shell collectors print; CONTRACT rule 1.
