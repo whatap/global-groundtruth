@@ -1,6 +1,6 @@
 # `collect-collmysql.sh`: the backend's MySQL
 
-> **Status:** validated at `collect-collmysql.sh` 0.13.0 on 2026-10-02: the lab
+> **Status:** validated at `collect-collmysql.sh` 0.14.0 on 2026-10-02: the lab
 > `collsrv` VM's own MySQL 8.4.11 (Ubuntu 26.04 package, `--stdout --binlog` as
 > root: section I decoded both files, J ran real `iostat`, `vmstat` and
 > `pidstat`), and the `mysql-ha` fixture's GTID async pair on 8.0 and its 5.7
@@ -50,6 +50,13 @@ One `.txt` report, sections `[1]` and A..K:
   when `SHOW BINARY LOGS` gives no list (refused, timed out) does that listing
   add a `total:` line summed over the `<basename>.NNNNNN` files. There is no
   `du`: with the logs in the datadir it would walk the whole datadir.
+  The oldest listed file's creation time closes the section: its first 8
+  bytes (the v4 magic, then the timestamp of the format description event,
+  written when the file is opened; checked against `mysqlbinlog` on 5.7.32,
+  8.0.46 and 8.4.11, at startup and after `FLUSH BINARY LOGS`). Set against
+  the report's timestamp it is the span the logs on disk cover, whatever the
+  growth rate of the moment. A file that does not start with the v4 magic
+  (an encrypted binary log, for one) is `n/a` with its first four bytes.
 - **D. Storage and I/O**: `df -hT`, mounts, the datadir's filesystem,
   `/proc/diskstats`, every process's `/proc/<pid>/io` (below), and the
   `Innodb_data_*`, `Innodb_os_log*`, `Innodb_buffer_pool_*`, `Innodb_rows_*`
@@ -57,11 +64,15 @@ One `.txt` report, sections `[1]` and A..K:
 - **E. InnoDB configuration**: page size, buffer pool size,
   `innodb_flush_log_at_trx_commit`, flush method, doublewrite, I/O capacity, log
   file settings, and `SHOW ENGINE INNODB STATUS`.
-- **F. Schema footprint**: per-schema table count and size, the 25 largest
-  tables, the tables whose names contain `lock` / `meter` / `event` / `audit`
-  in any case (`LOWER(table_name)`, so `MeteringDaily`, `AuditLog` and
-  `ReserveEvent` match),
-  and the columns of `DeniedIPAddress` and `ApmRegion`.
+- **F. Schema footprint**: per-schema table count and size; every table
+  outside the system schemas with its rows and sizes, largest first (at most
+  2000: a server shared with other applications; past it a line says how
+  many smallest were left out), so below the cap a table that is not listed
+  is not there; the tables whose
+  names contain `lock` / `meter` / `event` / `audit` in any case
+  (`LOWER(table_name)`, so `MeteringDaily`, `AuditLog` and `ReserveEvent`
+  match); the indexes of the 15 largest tables; and the columns of
+  `DeniedIPAddress` and `ApmRegion`.
 - **G. Per-table I/O and statement digests, from `performance_schema`**: the
   tables with the most I/O wait, the tables with the most rows written, the
   statement digests with the most latency and the most rows examined, and file
@@ -161,8 +172,9 @@ warning, and the default is used):
 | variable | default | what it bounds |
 |---|---|---|
 | `CMD_TIMEOUT` | 20 | each external command, seconds |
-| `RUN_DEADLINE` | 300 | the whole run, seconds; raised by the window + 30 s and by the `--binlog` decode unless set |
+| `RUN_DEADLINE` | 300 | the whole run, seconds; raised by the window + 30 s, by twice `DIGEST_TIMEOUT` and by the `--binlog` decode unless set |
 | `BINLOG_TIMEOUT` | 300 | the `--binlog` decode of one file, seconds |
+| `DIGEST_TIMEOUT` | 60 | each of G's two statement-digest queries, seconds (the digest table took 14 s and over 20 s on a busy field server) |
 
 `MYSQL_PWD` is a password source (below), not a cap.
 
@@ -316,6 +328,25 @@ the process table locally, and fall back to `n/a (...)` when run from elsewhere.
   as `### INSERT INTO`, `### UPDATE` and `### DELETE FROM`. A server running
   `binlog_format=STATEMENT` produces no such lines, and the section then reports
   only the transaction and statement counts.
+
+### Comparing two runs
+
+Two reports from one host are the strongest evidence this collector gives for
+a change over days (XLSMART: 09-23 and 10-01, eight days of diskstats). The
+collector does not take an earlier report as input and prints no differences:
+a delta across reports is a derived view (CONTRACT rule 1, "Derived views"),
+and finding the earlier file would be a step for the operator (rule 3). The
+difference is an analysis-side helper's job. What a helper can rely on:
+
+- D's `kernel diskstats` is `/proc/diskstats` verbatim in every version, and
+  the header's `Timestamp(UTC)` and `[1]`'s `host boot(UTC)` say whether the
+  host rebooted in between (the counters then restart).
+- D's per-process list (0.13.0+) is cumulative per process; a pid in both
+  reports with the same `started UTC` is the same process.
+- The window's scale is J's first line (`window: Ns ..., interval Ns, N
+  reports each`, 0.10.0+); before 0.10.0 the opt-in `--sample` ran the two
+  samplers one after the other and `[1]` said `sampling tier: on (5s x 6)`.
+  Compare the cumulative counters, not two windows of different lengths.
 
 ## What the report can contain
 

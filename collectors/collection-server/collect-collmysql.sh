@@ -27,7 +27,7 @@ export LC_ALL=C
 # ---- collector metadata -----------------------------------------------------
 # History: CHANGELOG.md, section collect-collmysql.sh (next to this file).
 COLLECTOR_NAME="whatap-collmysql"
-VERSION="0.13.0"
+VERSION="0.14.0"
 DOMAIN="collection-server"
 TARGET="collection-server-mysql/$(hostname 2>/dev/null || echo unknown)"
 
@@ -125,6 +125,7 @@ PROC_ROOT="${COLLMYSQL_PROC:-/proc}"
 # raised to fit a binlog decode and the window.
 _RUN_DEADLINE_ENV="${RUN_DEADLINE:-}"
 BINLOG_TIMEOUT="${BINLOG_TIMEOUT:-300}"   # per-file cap for the mysqlbinlog decode
+DIGEST_TIMEOUT="${DIGEST_TIMEOUT:-60}"    # cap on each of G's two statement-digest queries
 MYSQL_ARGS=""         # extra arguments handed to the mysql client
 DEFAULTS_FILE=""
 EXTRA_FILE=""
@@ -183,6 +184,8 @@ Environment (whole numbers 1..999999; another value is ignored with a warning):
   RUN_DEADLINE=N    cap on the whole run, seconds (default 300, raised for
                     the window and --binlog unless set)
   BINLOG_TIMEOUT=N  cap on the --binlog decode of one file, seconds (default 300)
+  DIGEST_TIMEOUT=N  cap on each of section G's two statement-digest queries,
+                    seconds (default 60)
   MYSQL_PWD         the password (read, then unset before any child starts)
 EOF
 }
@@ -1599,9 +1602,38 @@ _rep_c_dir() {
         elif [ -n "$_ls" ]; then _emit_labeled "newest binlog files (mtime, bytes)" "$_ls"
         elif [ "$_rc" -ne 0 ]; then fact "newest binlog files (mtime, bytes): n/a ($(_classify_err))"
         else fact "newest binlog files (mtime, bytes): n/a (empty output)"; fi
+        _rep_c_oldest
     else
         fact "binlog directory: $BINLOG_DIR (not readable by uid ${_priv_uid:-?} at $LDIR)"
     fi
+}
+
+# _rep_c_oldest -> C: when the oldest binary log SHOW BINARY LOGS lists was
+# created. A file's first event (the format description) is written when the
+# file is opened, so with the report's own timestamp it gives how many days the
+# logs on disk span, which no size or count does (XLSMART 2026-10-01: 22 to 42
+# days, by which window the rate was measured in). Eight bytes: the v4 magic
+# and that event's timestamp, little-endian; checked against mysqlbinlog on
+# 5.7.32, 8.0.46 (at startup and after FLUSH BINARY LOGS) and 8.4.11.
+_rep_c_oldest() {
+    local lab="oldest binary log created (its first event's timestamp)" name f out rc ts
+    name="${_bl_rows%%$'\n'*}"; name="${name%%$'\t'*}"; name="${name##*/}"
+    if [ -z "$name" ]; then fact "$lab: n/a (no SHOW BINARY LOGS list)"; return; fi
+    f="$LDIR/$name"
+    if [ ! -e "$f" ]; then fact "$lab: n/a ($name is not in $BINLOG_DIR)"; return; fi
+    if [ ! -r "$f" ]; then fact "$lab: n/a ($name is not readable by uid ${_priv_uid:-?})"; return; fi
+    if ! have od; then fact "$lab: n/a (command not found: od)"; return; fi
+    out="$(_bounded od -An -tu1 -N8 -- "$f" 2>"$_errfile")"; rc=$?
+    if [ "$rc" -eq 124 ]; then fact "$lab: n/a ($(_why_124))"; return; fi
+    if [ "$rc" -ne 0 ]; then fact "$lab: n/a ($(_classify_err))"; return; fi
+    # shellcheck disable=SC2086  # the eight byte values, split on purpose
+    set -- $out
+    if [ "$#" -lt 8 ]; then fact "$lab: n/a ($name holds $# bytes)"; return; fi
+    if [ "$1 $2 $3 $4" != "254 98 105 110" ]; then
+        fact "$lab: n/a ($name does not start with the binary log v4 magic: bytes $1 $2 $3 $4)"; return
+    fi
+    ts=$(( $5 + $6 * 256 + $7 * 65536 + $8 * 16777216 ))
+    fact "$lab: $name $(date -u -d "@$ts" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "epoch $ts (date -d unavailable)")"
 }
 
 # -- D. Storage and I/O ----------------------------------------------------
@@ -1761,8 +1793,19 @@ _rep_f() {
     section "F. Schema footprint"
     sql "schemas (name, tables, data MB, index MB)" \
         "SELECT table_schema, COUNT(*), ROUND(SUM(data_length)/1024/1024,1), ROUND(SUM(index_length)/1024/1024,1) FROM information_schema.tables GROUP BY table_schema ORDER BY SUM(data_length+index_length) DESC"
-    sql "largest 25 tables (schema, table, rows, data MB, index MB)" \
-        "SELECT table_schema, table_name, table_rows, ROUND(data_length/1024/1024,1), ROUND(index_length/1024/1024,1) FROM information_schema.tables WHERE table_schema NOT IN ('information_schema','performance_schema','mysql','sys') ORDER BY data_length+index_length DESC LIMIT 25"
+    # Every table, not the largest N: a table that is not listed is then not
+    # there, instead of either absent or below the cut (XLSMART 2026-10-01: a
+    # scheduler's table appeared in neither report). The backend's schemas
+    # hold a few hundred tables; the cap is for a server shared with other
+    # applications, and a count says when it cut (then "not listed" is not
+    # "not there").
+    sql "tables outside the system schemas, largest first, at most 2000 (schema, table, rows, data MB, index MB)" \
+        "SELECT table_schema, table_name, table_rows, ROUND(data_length/1024/1024,1), ROUND(index_length/1024/1024,1) FROM information_schema.tables WHERE table_schema NOT IN ('information_schema','performance_schema','mysql','sys') ORDER BY data_length+index_length DESC, table_schema, table_name LIMIT 2000"
+    _ntab="$(mysql_val "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema NOT IN ('information_schema','performance_schema','mysql','sys')")"
+    case "$_ntab" in
+        ''|*[!0-9]*) ;;
+        *) [ "$_ntab" -gt 2000 ] && sub "(cut at 2000 of $_ntab tables; the smallest $((_ntab - 2000)) are not listed)" ;;
+    esac
     # LOWER(): on 8.0 table_name compares case-sensitively (MeteringDaily,
     # AuditLog and ReserveEvent were missed); on 5.7 it did not.
     sql "tables whose name contains lock/metering/event/audit (any case)" \
@@ -1775,6 +1818,11 @@ _rep_f() {
         "SELECT table_schema, table_name, column_name, is_nullable, column_type FROM information_schema.columns WHERE table_name IN ('DeniedIPAddress','ApmRegion') ORDER BY table_schema, table_name, ordinal_position"
 }
 
+# _capped N CMD... -> CMD with CMD_TIMEOUT N for every bounded call inside it.
+# local, not an assignment before the call: older bash in POSIX mode keeps
+# that one after a function returns.
+_capped() { local CMD_TIMEOUT="$1"; shift; "$@"; }
+
 # -- G. Per-table I/O and index wait ---------------------------------------
 _rep_g() {
     section "G. Per-table I/O and index wait, from performance_schema"
@@ -1783,9 +1831,13 @@ _rep_g() {
         "SELECT OBJECT_SCHEMA, OBJECT_NAME, COUNT_STAR, SUM_TIMER_WAIT FROM performance_schema.table_io_waits_summary_by_table WHERE OBJECT_SCHEMA NOT IN ('mysql','performance_schema','information_schema') ORDER BY SUM_TIMER_WAIT DESC LIMIT 20"
     sql "top 20 tables by rows written (schema, table, inserts, updates, deletes)" \
         "SELECT OBJECT_SCHEMA, OBJECT_NAME, COUNT_INSERT, COUNT_UPDATE, COUNT_DELETE FROM performance_schema.table_io_waits_summary_by_table WHERE OBJECT_SCHEMA NOT IN ('mysql','performance_schema','information_schema') ORDER BY COUNT_INSERT+COUNT_UPDATE+COUNT_DELETE DESC LIMIT 20"
-    sql "top 15 statements by total latency (digest, count, latency ns, rows examined)" \
+    # The digest table took 14 s and over 20 s on a busy server whose run used
+    # 73 s of 945 (XLSMART 2026-10-01): these two get their own cap, and the
+    # run deadline is raised for it. Why that table was slow there is not known,
+    # so the queries stay as they were.
+    _capped "$DIGEST_TIMEOUT" sql "top 15 statements by total latency (digest, count, latency ns, rows examined)" \
         "SELECT LEFT(DIGEST_TEXT,120), COUNT_STAR, SUM_TIMER_WAIT, SUM_ROWS_EXAMINED FROM performance_schema.events_statements_summary_by_digest ORDER BY SUM_TIMER_WAIT DESC LIMIT 15"
-    sql "top 15 statements by rows examined (digest, count, rows examined, rows sent)" \
+    _capped "$DIGEST_TIMEOUT" sql "top 15 statements by rows examined (digest, count, rows examined, rows sent)" \
         "SELECT LEFT(DIGEST_TEXT,120), COUNT_STAR, SUM_ROWS_EXAMINED, SUM_ROWS_SENT FROM performance_schema.events_statements_summary_by_digest ORDER BY SUM_ROWS_EXAMINED DESC LIMIT 15"
     sql "file I/O by event (event, count read, bytes read, count write, bytes written)" \
         "SELECT EVENT_NAME, COUNT_READ, SUM_NUMBER_OF_BYTES_READ, COUNT_WRITE, SUM_NUMBER_OF_BYTES_WRITE FROM performance_schema.file_summary_by_event_name WHERE COUNT_STAR > 0 ORDER BY SUM_NUMBER_OF_BYTES_WRITE DESC LIMIT 15"
@@ -2050,6 +2102,7 @@ _need_int() {
 if (exec 3>&2); then exec 3>&2; else exec 3>/dev/null; fi
 # the caps (_run_init checks CMD_TIMEOUT); an ignored RUN_DEADLINE is not the caller's
 BINLOG_TIMEOUT="$(_cap_or BINLOG_TIMEOUT "$BINLOG_TIMEOUT" 300)"
+DIGEST_TIMEOUT="$(_cap_or DIGEST_TIMEOUT "$DIGEST_TIMEOUT" 60)"
 if [ -n "$_RUN_DEADLINE_ENV" ]; then
     RUN_DEADLINE="$(_cap_or RUN_DEADLINE "$RUN_DEADLINE" 300)"
     [ "$RUN_DEADLINE" = "$_RUN_DEADLINE_ENV" ] || _RUN_DEADLINE_ENV=""
@@ -2071,11 +2124,14 @@ if [ "$WIN_GIVEN" = 1 ]; then
 else
     WIN_SECS="$WIN_DEFAULT"
 fi
-# The decode is capped per file; the run deadline is raised to fit it and the
-# window (its two samplers run at the same time), unless the caller set one.
+# The decode is capped per file; the run deadline is raised to fit it, the
+# window (its samplers run at the same time) and G's two digest queries,
+# unless the caller set one.
 if [ -z "$_RUN_DEADLINE_ENV" ]; then
     [ "$OPT_BINLOG" = 1 ] && RUN_DEADLINE=$((RUN_DEADLINE + BINLOG_FILES * BINLOG_TIMEOUT))
-    RUN_DEADLINE=$((RUN_DEADLINE + WIN_SECS + 30))
+    RUN_DEADLINE=$((RUN_DEADLINE + WIN_SECS + 30 + 2 * DIGEST_TIMEOUT))
+    # past the caps' 999999 _run_init would refuse it and fall back to 300
+    [ "$RUN_DEADLINE" -gt 999999 ] && RUN_DEADLINE=999999
 fi
 
 # The private directory first, because the client option file goes into it.

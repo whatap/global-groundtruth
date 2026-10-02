@@ -399,6 +399,21 @@ one entry at the top of its section (docs/authoring-guide.md, step 2);
 
 ## collect-collmysql.sh
 
+- **0.14.0**: Three gaps the XLSMART 2026-10-01 reports left open. C adds
+  `oldest binary log created (its first event's timestamp)`: the oldest file
+  `SHOW BINARY LOGS` lists, its first 8 bytes read with `od` (the v4 magic,
+  then the format description event's timestamp, which is written when the
+  file is opened), so the days the logs on disk span no longer depend on the
+  window the growth was measured in. F lists every table outside the system
+  schemas, largest first, at most 2000 (past it, a line counts the tables
+  left out), instead of the 25 largest: a table
+  that is not listed is not there (`SmartMessageQuestion` was in neither
+  report and `DeniedIPAddress` only by its absence from the 25). G's two
+  statement-digest queries get their own cap, `DIGEST_TIMEOUT` (default 60
+  s; one stopped at the 20 s command cap on a run that used 73 s of 945),
+  and the run deadline is raised by twice it unless `RUN_DEADLINE` is set. A
+  raised deadline past 999999 now stays at 999999 instead of being refused
+  back to 300 (also for `BINLOG_TIMEOUT` with `--binlog`).
 - **0.13.0**: Per-process I/O, so the host-wide numbers D and J print can be
   set against who did the I/O (XLSMART 2026-10-01: the host wrote 27.5 GB a
   day and mysqld's own file I/O was 1.2% of it, with no way to name the rest).

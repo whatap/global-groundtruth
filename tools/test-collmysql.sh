@@ -67,6 +67,8 @@ fi
 [ -n "${STUBARGS:-}" ] && [ -n "${STUB_PWFILE:-}" ] && env | grep -qF -f "$STUB_PWFILE" && echo envseen >> "$STUBARGS"
 for a in "$@"; do q="$a"; done
 [ -n "${MYSQL_SLEEP:-}" ] && [ "$q" = "status" ] && sleep "$MYSQL_SLEEP"
+# SLEEP_PAT (an ERE) -> a statement matching it sleeps SLEEP_SECS (default 3)
+[ -n "${SLEEP_PAT:-}" ] && printf '%s' "$q" | grep -qE "$SLEEP_PAT" && sleep "${SLEEP_SECS:-3}"
 if [ -n "${MYSQL_FAIL:-}" ]; then
     # MYSQL_ERRMSG replaces the refusal, to test what each error earns.
     echo "${MYSQL_ERRMSG:-ERROR 1045 (28000): Access denied for user 'x'@'localhost' (using password: YES)}" >&2
@@ -93,6 +95,7 @@ case "$q" in
     "SHOW MASTER STATUS\\G") [ -n "${MASTERLOG:-}" ] && echo "master $*" >> "$MASTERLOG"; printf 'File: mysql-bin.000002\nPosition: 7\n'; exit 0 ;;
     status) printf 'mysql  Ver 8.0\n--------------\nConnection:\t\t%s\n' "${CONN_ANS:-Localhost via UNIX socket}"; exit 0 ;;
     *@@pid_file*) [ -n "${PIDFILE_ANS:-}" ] && echo "$PIDFILE_ANS"; exit 0 ;;
+    "SELECT COUNT(*) FROM information_schema.tables"*) echo "${TABCOUNT_ANS:-1}"; exit 0 ;;
     *"'Uptime'"*) [ -n "${SRV_START:-}" ] && { printf 'Uptime\t%s\n' "$(( $(date +%s) - SRV_START ))"; exit 0; }; echo 1; exit 0 ;;
     *) echo 1; exit 0 ;;
 esac
@@ -285,9 +288,9 @@ has "a leading zero is refused, and the warning says why" "$err" "CMD_TIMEOUT=00
 out="$(MYSQL_SLEEP=5 RUN_DEADLINE=2 PATH="$S" bash "$C" --stdout --mysql-args "-u x" </dev/null 2>/dev/null)"
 has "a login cut by the run deadline says so, not 'timed out: 20s'" "$out" "mysql connection: run deadline reached (2s) before the login"
 out="$(PATH="$S" bash "$C" --stdout </dev/null 2>/dev/null)"
-has "the default window raises the deadline by its length and 30s" "$out" "run deadline(s): 345"
+has "the default window raises the deadline by its length and 30s (and 0.14.0: twice DIGEST_TIMEOUT)" "$out" "run deadline(s): 465"
 out="$(PATH="$S" bash "$C" --stdout --window=1m </dev/null 2>/dev/null)"
-has "--window=1m: the deadline covers the window once (the samplers run together)" "$out" "run deadline(s): 390"
+has "--window=1m: the deadline covers the window once (the samplers run together)" "$out" "run deadline(s): 510"
 out="$(MYSQL_BL_DENY=1 MYSQLBINLOG_MODE=ok BINLOG_BASE_ANS="$D2/mysql-bin" PATH="$S" bash "$C" --stdout --binlog --mysql-args "-u x" </dev/null 2>/dev/null)"
 if printf '%s' "$out" | grep -qF "binary logs: n/a (SHOW BINARY LOGS: access denied)" \
    && printf '%s' "$out" | grep -qF "binary log content attribution — SHOW BINARY LOGS: access denied"; then
@@ -685,6 +688,49 @@ if [ -r /proc/self/io ]; then
         [ -n "$zn" ] && [ "$zn" -ge 1 ] && ok "an own zombie is counted apart ($zn)" || bad "an own zombie is counted apart" "zombies (no io): >= 1" "$zl"
     else skip "zombie count (root reads a zombie's io)"; fi
 else skip "per-process I/O (no /proc/self/io on this kernel)"; fi
+
+echo "== 20. 0.14.0: every table in F, the oldest binary log's creation in C, G's digest cap =="
+: >| "$A"
+out="$(STUBARGS="$A" PATH="$S" bash "$C" --stdout --mysql-args "-u x" </dev/null 2>/dev/null)"
+has "F lists every table, capped at 2000" "$(cat "$A")" "ORDER BY data_length+index_length DESC, table_schema, table_name LIMIT 2000"
+hasnt "and no longer the 25 largest" "$(cat "$A")" "ORDER BY data_length+index_length DESC LIMIT 25"
+has "with a label that says so" "$out" "tables outside the system schemas, largest first, at most 2000 (schema, table, rows, data MB, index MB): 1"
+hasnt "under the cap, no cut line" "$out" "(cut at 2000 of"
+out="$(TABCOUNT_ANS=2102 PATH="$S" bash "$C" --stdout --mysql-args "-u x" </dev/null 2>/dev/null)"
+has "past the cap, F says how many it left out" "$out" "(cut at 2000 of 2102 tables; the smallest 102 are not listed)"
+has "the run deadline is raised by twice DIGEST_TIMEOUT (300 + 15 + 30 + 120)" "$out" "run deadline(s): 465"
+# a binary log whose first event was written at 1790921495 (2026-10-02T06:11:35Z)
+S20="$ROOT/stub20"; stub_clone "$S" "$S20"; ln -sf "$(type -P od)" "$S20/od"
+# one directory per case: a file newer than the server's newest listed log
+# would stop the directory from being taken as the server's (_binlog_proc)
+mkbl() { mkdir -p "$1"; printf "$3" >| "$1/$2"; }
+FDE='\376bin\027\113\277\152\017\001\000\000'
+mkbl "$ROOT/bl20a" mysql-bin.000007 "$FDE"; mkbl "$ROOT/bl20a" mysql-bin.000008 '\376bin'
+out="$(MYSQL_BL_ROWS='mysql-bin.000007\t12\nmysql-bin.000008\t4' BINLOG_BASE_ANS="$ROOT/bl20a/mysql-bin" PATH="$S20" bash "$C" --stdout --mysql-args "-u x" </dev/null 2>/dev/null)"
+has "C: the oldest file's first event timestamp, in UTC" "$out" "oldest binary log created (its first event's timestamp): mysql-bin.000007 2026-10-02T06:11:35Z"
+mkbl "$ROOT/bl20b" mysql-bin.000008 '\376bin'
+out="$(MYSQL_BL_ROWS='mysql-bin.000008\t4' BINLOG_BASE_ANS="$ROOT/bl20b/mysql-bin" PATH="$S20" bash "$C" --stdout --mysql-args "-u x" </dev/null 2>/dev/null)"
+has "a file shorter than 8 bytes is n/a with its length" "$out" "oldest binary log created (its first event's timestamp): n/a (mysql-bin.000008 holds 4 bytes)"
+mkbl "$ROOT/bl20c" mysql-bin.000009 '\375bin\027\113\277\152'
+out="$(MYSQL_BL_ROWS='mysql-bin.000009\t8' BINLOG_BASE_ANS="$ROOT/bl20c/mysql-bin" PATH="$S20" bash "$C" --stdout --mysql-args "-u x" </dev/null 2>/dev/null)"
+has "another magic is n/a with the bytes" "$out" "n/a (mysql-bin.000009 does not start with the binary log v4 magic: bytes 253 98 105 110)"
+mkbl "$ROOT/bl20d" mysql-bin.000007 "$FDE"
+out="$(MYSQL_BL_ROWS='mysql-bin.000006\t8\nmysql-bin.000007\t12' BINLOG_BASE_ANS="$ROOT/bl20d/mysql-bin" PATH="$S20" bash "$C" --stdout --mysql-args "-u x" </dev/null 2>/dev/null)"
+has "a listed file not on disk is n/a, named" "$out" "n/a (mysql-bin.000006 is not in $ROOT/bl20d)"
+out="$(MYSQL_BL_ROWS='mysql-bin.000007\t12' BINLOG_BASE_ANS="$ROOT/bl20d/mysql-bin" PATH="$S" bash "$C" --stdout --mysql-args "-u x" </dev/null 2>/dev/null)"
+has "without od, n/a" "$out" "n/a (command not found: od)"
+P20='events_statements_summary_by_digest|information_schema.processlist'
+out="$(CMD_TIMEOUT=2 DIGEST_TIMEOUT=6 SLEEP_PAT="$P20" PATH="$S" bash "$C" --stdout --window=10 --mysql-args "-u x" </dev/null 2>/dev/null)"
+has "a digest query slower than CMD_TIMEOUT answers inside DIGEST_TIMEOUT" "$out" "top 15 statements by total latency (digest, count, latency ns, rows examined): 1"
+has "both of them" "$out" "top 15 statements by rows examined (digest, count, rows examined, rows sent): 1"
+has "and CMD_TIMEOUT is back for the statements after G" "$out" "processlist: n/a (timed out: 2s)"
+has "the deadline is raised by twice the cap given (300 + 10 + 30 + 12)" "$out" "run deadline(s): 352"
+out="$(DIGEST_TIMEOUT=1 SLEEP_PAT="$P20" PATH="$S" bash "$C" --stdout --window=10 --mysql-args "-u x" </dev/null 2>/dev/null)"
+has "past DIGEST_TIMEOUT it is n/a with that cap" "$out" "top 15 statements by total latency (digest, count, latency ns, rows examined): n/a (timed out: 1s)"
+out="$(DIGEST_TIMEOUT=500000 PATH="$S" bash "$C" --stdout --window=10 --mysql-args "-u x" </dev/null 2>/dev/null)"
+has "a raised deadline past 999999 stays at 999999, not 300" "$out" "run deadline(s): 999999"
+err="$(DIGEST_TIMEOUT=0x PATH="$S" bash "$C" --stdout --window=10 --mysql-args "-u x" </dev/null 2>&1 >/dev/null)"
+has "a DIGEST_TIMEOUT that is not a whole number is ignored with a warning" "$err" "DIGEST_TIMEOUT=0x ignored (not a whole number 1..999999 without leading zeros), using 60"
 
 echo; echo "PASS=$PASS FAIL=$FAIL SKIP=$SKIP"
 [ "$FAIL" -eq 0 ]
