@@ -618,7 +618,7 @@ has "a deadline that leaves under 10s: not run" "$out" "window: n/a (not run: th
 out="$(PATH="$S" bash "$C" --stdout --mysql-args "-u x" </dev/null 2>/dev/null)"
 has "neither sampler installed: a fact line each" "$out" "iostat -x: n/a (command not found: iostat, sysstat)"
 has "vmstat too" "$out" "vmstat: n/a (command not found: vmstat, procps)"
-hasnt "and no window goal is declared" "$out" "interval samples (iostat -x, vmstat)"
+hasnt "and no window goal is declared" "$out" "interval samples (iostat -x, vmstat, pidstat -d)"
 has "[1] says the window did not run" "$(printf '%s\n' "$out" | sed -n '/^\[1\]/,/^\[2\]/p')" "window: not run (no sampler installed)"
 S17b="$ROOT/stub17b"; stub_clone "$S17" "$S17b"; rm -f "$S17b/iostat"
 out="$(PATH="$S17b" bash "$C" --stdout --window=10 --mysql-args "-u x" </dev/null 2>/dev/null)"
@@ -629,7 +629,7 @@ stub_write "$S17b/vmstat" <<'EOF'
 echo "vmstat: broken" >&2; exit 1
 EOF
 out="$(PATH="$S17b" bash "$C" --stdout --window=10 --mysql-args "-u x" </dev/null 2>/dev/null)"
-has "every sampler present failed: the goal is blocked" "$out" "interval samples (iostat -x, vmstat) over the window — every sampler failed: vmstat: error: vmstat: broken"
+has "every sampler present failed: the goal is blocked" "$out" "interval samples (iostat -x, vmstat, pidstat -d) over the window — every sampler failed: vmstat: error: vmstat: broken"
 
 echo "== 18. 0.11.0: F matches table names in any case; A has the host's OS and kernel =="
 : >| "$A"
@@ -640,6 +640,51 @@ if [ -r /etc/os-release ] && [ -r /proc/sys/kernel/osrelease ]; then
     has "os-release is dumped raw" "$out" "$(head -n1 /etc/os-release)"
     has "kernel from /proc/sys/kernel" "$out" "kernel: $(cat /proc/sys/kernel/ostype) $(cat /proc/sys/kernel/osrelease)"
 else skip "os-release / kernel (not readable here)"; fi
+
+echo "== 19. 0.13.0: per-process I/O: /proc/<pid>/io in D, pidstat -d in the window =="
+S19="$ROOT/stub19"; stub_clone "$S17" "$S19"; cp "$S17/iostat" "$S19/pidstat"
+t0=$(date +%s)
+out="$(PATH="$S19" bash "$C" --stdout --window=10 --mysql-args "-u x" </dev/null 2>/dev/null)"
+t1=$(date +%s)
+has "pidstat -d runs in the window, one report fewer" "$out" "pidstat start"
+has "with -d, the interval and count" "$out" "args -d 2 5"
+if [ "$(id -u)" = 0 ]; then has "J labels it with what ran" "$out" "    pidstat -d 2 5:"
+else has "J labels it with what ran, and whose processes it sees" "$out" "    pidstat -d 2 5 (uid $(id -u): processes whose /proc/<pid>/io it may read):"; fi
+has "J's header line keeps its words and adds pidstat's count" "$out" "interval 2s, 6 reports each (pidstat -d: 5)"
+a19="$(printf '%s\n' "$out" | awk '/iostat start/{print $3}')"; b19="$(printf '%s\n' "$out" | awk '/pidstat start/{print $3}')"
+[ -n "$a19" ] && [ -n "$b19" ] && [ $((a19 - b19)) -le 1 ] && [ $((b19 - a19)) -le 1 ] \
+    && ok "it starts with iostat ($a19, $b19)" || bad "starts with iostat" "within 1s" "$a19 / $b19"
+[ $((t1 - t0)) -le 18 ] && ok "still one window ($((t1 - t0))s)" || bad "one window" "<= 18s" "$((t1 - t0))s"
+S19b="$ROOT/stub19b"; stub_clone "$S" "$S19b"; cp "$S17/iostat" "$S19b/pidstat"
+out="$(PATH="$S19b" bash "$C" --stdout --window=10 --mysql-args "-u x" </dev/null 2>/dev/null)"
+has "pidstat alone declares the window goal" "$(printf '%s\n' "$out" | grep '^    obtained:')" "interval samples (iostat -x, vmstat, pidstat -d) over the window"
+has "and the other two are fact lines" "$out" "iostat -x 2 6: n/a (command not found: iostat, sysstat)"
+has "[1] lists pidstat" "$(printf '%s\n' "$out" | sed -n '/^\[1\]/,/^\[2\]/p')" "pidstat      present"
+out="$(PATH="$S" bash "$C" --stdout --mysql-args "-u x" </dev/null 2>/dev/null)"
+has "none of the three: pidstat is a fact line too" "$out" "pidstat -d: n/a (command not found: pidstat, sysstat)"
+if [ -r /proc/self/io ]; then
+    d19="$(printf '%s\n' "$out" | sed -n '/^\[[0-9]*\] D\. /,/^\[[0-9]*\] E\. /p')"
+    has "D counts the processes it read, with pid 1's comm" "$d19" "processes in /proc (pid 1: "
+    has "D lists /proc/<pid>/io with its columns" "$d19" "(pid, ppid, uid, started UTC, read_bytes, write_bytes, cancelled_write_bytes, rchar, wchar, comm, args first 120 chars)"
+    # the stub PATH has no getconf: the start stays in ticks and says so
+    has "without getconf the start is in ticks, said so" "$d19" "ticks after boot"
+    n19="$(printf '%s\n' "$d19" | sed -n 's/.*; not readable by uid [0-9?]*: \([0-9]*\);.*/\1/p')"
+    if [ -n "$n19" ] && [ "$n19" -gt 0 ]; then
+        has "refused files block procio, with the privilege hint" "$out" "per-process I/O counters (/proc/<pid>/io) — /proc/<pid>/io of $n19 of "
+        has "and the hint" "$out" "not readable by uid $(id -u)$( [ "$(id -u)" = 0 ] || printf ' (not elevated: run again with sudo)')"
+    elif [ "$n19" = 0 ]; then
+        has "every file read: procio is obtained" "$(printf '%s\n' "$out" | grep '^    obtained:')" "per-process I/O counters (/proc/<pid>/io)"
+    else bad "D's count line" "a not-readable count" "$(printf '%s\n' "$d19" | grep 'per-process I/O:')"; fi
+    # a zombie's io is refused to a uid without CAP_SYS_PTRACE even when it owns
+    # it; it is counted apart, not as a refusal
+    if [ "$(id -u)" != 0 ]; then
+        sh -c 'true & exec sleep 30' & z19=$!; sleep 1
+        zl="$(PATH="$S" bash "$C" --stdout --window=10 --mysql-args "-u x" </dev/null 2>/dev/null | grep 'per-process I/O:')"
+        kill "$z19" 2>/dev/null; wait "$z19" 2>/dev/null
+        zn="$(printf '%s' "$zl" | sed -n 's/.*zombies (no io): \([0-9]*\);.*/\1/p')"
+        [ -n "$zn" ] && [ "$zn" -ge 1 ] && ok "an own zombie is counted apart ($zn)" || bad "an own zombie is counted apart" "zombies (no io): >= 1" "$zl"
+    else skip "zombie count (root reads a zombie's io)"; fi
+else skip "per-process I/O (no /proc/self/io on this kernel)"; fi
 
 echo; echo "PASS=$PASS FAIL=$FAIL SKIP=$SKIP"
 [ "$FAIL" -eq 0 ]

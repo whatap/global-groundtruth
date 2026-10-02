@@ -27,7 +27,7 @@ export LC_ALL=C
 # ---- collector metadata -----------------------------------------------------
 # History: CHANGELOG.md, section collect-collmysql.sh (next to this file).
 COLLECTOR_NAME="whatap-collmysql"
-VERSION="0.12.7"
+VERSION="0.13.0"
 DOMAIN="collection-server"
 TARGET="collection-server-mysql/$(hostname 2>/dev/null || echo unknown)"
 
@@ -108,8 +108,9 @@ OPT_QUIET=0
 OPT_BINLOG=0          # decode binary logs and attribute events per table
 BINLOG_FILES=2        # how many of the newest binary logs to decode
 OPT_OUT="."           # where --file writes
-# The window (section J) runs in every run: iostat -x and vmstat started
-# together, WIN_REPORTS reports each at a fifth of the window. No load on the
+# The window (section J) runs in every run: iostat -x, vmstat and pidstat -d
+# started together, WIN_REPORTS reports each (pidstat one fewer, its first
+# report already covers an interval) at a fifth of the window. No load on the
 # server, only wall clock. WIN_DEFAULT seconds unless --window=DUR sets it.
 WIN_DEFAULT=15
 WIN_SPEC=""
@@ -152,8 +153,9 @@ explicit action flag so nothing starts by accident.
                               table (default N=$BINLOG_FILES). Reads log files; off by default.
                               Each file is streamed once and capped at BINLOG_TIMEOUT seconds (below)
   --window=DUR                length of the interval samples every run takes
-                              (section J: iostat -x and vmstat together, $WIN_REPORTS reports
-                              each). DUR is N (seconds), Ns, Nm or Nh, 10s .. 24h;
+                              (section J: iostat -x, vmstat and pidstat -d together,
+                              $WIN_REPORTS reports each, pidstat one fewer). DUR is N (seconds),
+                              Ns, Nm or Nh, 10s .. 24h;
                               default ${WIN_DEFAULT}s. No load on the server, only wall clock.
   --quiet                     silence progress on stderr
 
@@ -1246,15 +1248,15 @@ _win_secs() {
 }
 # ---- end collection-server: window
 
-# _window -> section J. iostat -x and vmstat measure the same seconds only when
-# they run at the same time, so both start together as bounded background
+# _window -> section J. iostat -x, vmstat and pidstat -d measure the same seconds
+# only when they run at the same time, so all start together as bounded background
 # jobs, WIN_REPORTS reports each at a fifth of the window; their output, stderr
 # and exit status go to files in the private directory. A window the run
 # deadline would cut is shortened (WIN_RESERVE is kept for the sections after
 # it) and says so; one under 10s is not run. Either blocks the goal. The
 # samplers only add detail: one that is absent (no sysstat) or fails is a fact
 # line; the goal is blocked only when every sampler present failed, and is not
-# declared when neither is installed.
+# declared when none is installed.
 # _win_on_sig SIG -> while the window runs, the first INT / TERM / HUP stops
 # the samplers and ends the window; the report is still written with what
 # they wrote. A second one aborts, as outside the window.
@@ -1270,7 +1272,7 @@ _win_on_sig() {
     _WIN_SIG="$1"
 }
 
-# _win_run_samplers D IV CAP -> starts iostat -x and vmstat as background jobs
+# _win_run_samplers D IV CAP -> starts iostat -x, vmstat and pidstat -d as background jobs
 # writing into D, traps INT/TERM/HUP so the first one stops them and ends the
 # window (a second one aborts, as outside the window), waits for them, then
 # restores the run helpers' traps. Sets the caller's (_window's) t0/t1 (elapsed
@@ -1278,9 +1280,15 @@ _win_on_sig() {
 _win_run_samplers() {
     local d="$1" iv="$2" cap="$3" t p
     t0="$(_elapsed)"; _WIN_PIDS=""; _WIN_SIG=""
-    for t in iostat vmstat; do
+    for t in iostat vmstat pidstat; do
         have "$t" || continue
-        ( if [ "$t" = iostat ]; then set -- iostat -x "$iv" "$WIN_REPORTS"; else set -- vmstat "$iv" "$WIN_REPORTS"; fi
+        # pidstat's first report already covers an interval (iostat's and
+        # vmstat's are since boot), so one report fewer spans the same seconds
+        ( case "$t" in
+              iostat)  set -- iostat -x "$iv" "$WIN_REPORTS" ;;
+              vmstat)  set -- vmstat "$iv" "$WIN_REPORTS" ;;
+              pidstat) set -- pidstat -d "$iv" "$((WIN_REPORTS - 1))" ;;
+          esac
           CMD_TIMEOUT="$cap" _bounded "$@" > "$d/$t.out" 2> "$d/$t.err"
           echo $? > "$d/$t.rc" ) &
         _WIN_PIDS="$_WIN_PIDS $!"
@@ -1302,10 +1310,11 @@ _win_run_samplers() {
 
 _window() {
     local w="$WIN_SECS" left iv len cap d t lab rc cut="" rnd="" why="" pkg ok_n=0 t0 t1
-    if ! have iostat && ! have vmstat; then
+    if ! have iostat && ! have vmstat && ! have pidstat; then
         fact "window: not run (no sampler installed)"
         fact "iostat -x: n/a (command not found: iostat, sysstat)"
         fact "vmstat: n/a (command not found: vmstat, procps)"
+        fact "pidstat -d: n/a (command not found: pidstat, sysstat)"
         return
     fi
     left=$((RUN_DEADLINE - $(_elapsed) - WIN_RESERVE))
@@ -1328,16 +1337,21 @@ _window() {
         return
     fi
     d="$(_tmp win)"; mkdir -p "$d" 2>/dev/null
-    fact "window: ${len}s${cut:+ ($cut)}${rnd:+ ($rnd)}, from $(date '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null || echo n/a); interval ${iv}s, $WIN_REPORTS reports each"
-    progress "window: iostat -x and vmstat for ${len}s"
+    fact "window: ${len}s${cut:+ ($cut)}${rnd:+ ($rnd)}, from $(date '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null || echo n/a); interval ${iv}s, $WIN_REPORTS reports each$(have pidstat && printf ' (pidstat -d: %s)' "$((WIN_REPORTS - 1))")"
+    progress "window: iostat -x, vmstat and pidstat -d for ${len}s"
     _win_run_samplers "$d" "$iv" "$cap"
     if [ -n "$_WIN_SIG" ]; then
         fact "ended early: SIG$_WIN_SIG after $((t1 - t0))s of ${len}s; what follows is what the samplers wrote until then"
         warn "window: SIG$_WIN_SIG after $((t1 - t0))s of ${len}s; writing the report with what was collected (a second one aborts)"
     fi
-    for t in iostat vmstat; do
-        if [ "$t" = iostat ]; then lab="iostat -x $iv $WIN_REPORTS"; pkg=sysstat
-        else lab="vmstat $iv $WIN_REPORTS"; pkg=procps; fi
+    for t in iostat vmstat pidstat; do
+        case "$t" in
+            iostat)  lab="iostat -x $iv $WIN_REPORTS"; pkg=sysstat ;;
+            vmstat)  lab="vmstat $iv $WIN_REPORTS"; pkg=procps ;;
+            # it lists only the processes whose /proc/<pid>/io this uid reads
+            pidstat) lab="pidstat -d $iv $((WIN_REPORTS - 1))"; pkg=sysstat
+                     have pidstat && [ "${_priv_uid:-}" != 0 ] && lab="$lab (uid ${_priv_uid:-?}: processes whose /proc/<pid>/io it may read)" ;;
+        esac
         if ! have "$t"; then
             fact "$lab: n/a (command not found: $t, $pkg)"; continue
         fi
@@ -1376,7 +1390,7 @@ _rep_env() {
     # The whole run is bounded by this, raised for what this run was asked to do.
     fact "run deadline(s): $RUN_DEADLINE"
     fact "tools:"
-    _tool_rows mysql mysqlbinlog iostat vmstat ss findmnt timeout
+    _tool_rows mysql mysqlbinlog iostat vmstat pidstat ss findmnt timeout
     fact "mysql client: ${MYSQL_BIN:-n/a (command not found)}"
     # What the connection was attempted with: it survives a refused login, which
     # never reaches section A. The password is never printed, only its source.
@@ -1408,7 +1422,7 @@ _rep_env() {
     # collector; it does not claim that sudo would fix this login.
     else missed login "$MYSQL_WHY${_PW_WHY:+; $_PW_WHY}$(_priv_hint)"; fi
     fact "binlog decode tier: $([ "$OPT_BINLOG" = 1 ] && echo "on (newest $BINLOG_FILES files)" || echo "off")"
-    if have iostat || have vmstat; then
+    if have iostat || have vmstat || have pidstat; then
         fact "window: ${WIN_SECS}s$([ "$WIN_GIVEN" = 1 ] && echo " (--window)" || echo " (default)")"
     else fact "window: not run (no sampler installed)"; fi
 }
@@ -1602,12 +1616,130 @@ _rep_d() {
         fact "datadir: ${DATADIR:-n/a (not resolved)} (not present on this host)"
     fi
     read_proc "kernel diskstats" /proc/diskstats
+    _rep_d_procio
     sql "Innodb_data counters"        "SHOW GLOBAL STATUS LIKE 'Innodb_data_%'"
     sql "Innodb_os_log counters"      "SHOW GLOBAL STATUS LIKE 'Innodb_os_log%'"
     sql "Innodb_buffer_pool reads"    "SHOW GLOBAL STATUS LIKE 'Innodb_buffer_pool_read%'"
     sql "Innodb_buffer_pool pages"    "SHOW GLOBAL STATUS LIKE 'Innodb_buffer_pool_pages_%'"
     sql "Innodb_row operations"       "SHOW GLOBAL STATUS LIKE 'Innodb_rows_%'"
     sql "Com_ counters"               "SHOW GLOBAL STATUS WHERE Variable_name IN ('Com_select','Com_insert','Com_update','Com_delete','Com_commit','Queries')"
+}
+
+# _rep_d_procio -> D: every process's /proc/<pid>/io, beside the host-wide
+# diskstats above, so the host's totals can be set against who did the I/O.
+# The counters run from each process's start, and the kernel adds a reaped
+# child's to its parent's, so a finished job's I/O stays on whatever reaped it
+# (cron, the service manager). Bounded greps read every file at once: a read of
+# /proc/<pid>/io or cmdline can block on a process stuck in exec or D state.
+# A process whose stat was read and whose io was not is one this uid was
+# refused, unless it is a zombie (counted apart); one that exited before the
+# read is in neither.
+PROCIO_LIST=100   # rows listed at most; past it, the 50 largest by write_bytes and by read_bytes
+_rep_d_procio() {
+    local lab="per-process I/O since each process started (/proc/<pid>/io)" d rc tck cnt nseen nio nden nzomb pid1 nsel half cl
+    if [ ! -e /proc/self/io ]; then
+        fact "$lab: n/a (path not found: /proc/self/io)"
+        na procio "this kernel has no /proc/<pid>/io"
+        return
+    fi
+    if [ -z "$_tmp_dir" ]; then
+        fact "$lab: n/a (no private temp directory)"
+        missed procio "no private temp directory for the /proc/<pid>/io read"
+        return
+    fi
+    d="$(_tmp procio)"; mkdir -p "$d" 2>/dev/null
+    # without CLK_TCK the start stays in clock ticks since boot, said so
+    tck="$(getconf CLK_TCK 2>/dev/null)"; case "$tck" in ''|*[!0-9]*|0) tck="" ;; esac
+    # grep exits 2 when a file was refused; the lines it did read still count
+    _bounded sh -c 'cd /proc && exec grep -H -a -E "^(rchar|wchar|read_bytes|write_bytes|cancelled_write_bytes|PPid|Uid):|^[0-9]+ \(" [0-9]*/io [0-9]*/status [0-9]*/stat' \
+        > "$d/all" 2> "$d/err"
+    rc=$?
+    if [ "$rc" -eq 124 ]; then
+        fact "$lab: n/a ($(_why_124))"; missed procio "/proc/<pid>/io: $(_why_124)"; return
+    fi
+    if [ ! -s "$d/all" ]; then
+        _errfile="$d/err"; fact "$lab: n/a ($(_classify_err))"
+        missed procio "/proc/<pid>/io: $(_classify_err)"; _errfile="$(_tmp probe.err)"; return
+    fi
+    awk -v btime="${_boot_btime:-}" -v tck="$tck" -v cnt="$d/counts" '
+        function utc(t,   d, s, z, era, doe, yoe, y, doy, mp, m) {
+            d = int(t / 86400); s = t - d * 86400; z = d + 719468
+            era = int(z / 146097); doe = z - era * 146097
+            yoe = int((doe - int(doe / 1460) + int(doe / 36524) - int(doe / 146096)) / 365)
+            y = yoe + era * 400; doy = doe - (365 * yoe + int(yoe / 4) - int(yoe / 100))
+            mp = int((5 * doy + 2) / 153); m = mp < 10 ? mp + 3 : mp - 9
+            if (m <= 2) y++
+            return sprintf("%04d-%02d-%02dT%02d:%02d:%02dZ", y, m, doy - int((153 * mp + 2) / 5) + 1,
+                           int(s / 3600), int((s % 3600) / 60), s % 60)
+        }
+        {
+            i = index($0, ":"); split(substr($0, 1, i - 1), p, "/"); v = substr($0, i + 1)
+            pid = p[1]; kind = p[2]
+            if (kind == "stat") {
+                seen[pid] = 1; l = index(v, "("); r = 0; s = v
+                while ((k = index(s, ")")) > 0) { r += k; s = substr(s, k + 1) }
+                comm[pid] = substr(v, l + 1, r - l - 1)
+                split(substr(v, r + 2), a, " "); st[pid] = a[20]; state[pid] = a[1]
+            } else {
+                j = index(v, ":"); key = substr(v, 1, j - 1); split(substr(v, j + 1), a, " ")
+                val[pid, key] = a[1]
+                if (kind == "io") io[pid] = 1
+            }
+        }
+        END {
+            for (pid in seen) {
+                ns++
+                # a zombie keeps its stat, and its io is refused without
+                # CAP_SYS_PTRACE whoever owns it: not a refusal of a live process
+                if (!(pid in io)) { if (state[pid] == "Z" || state[pid] == "X") nz++; else nd++; continue }
+                ni++
+                rb = val[pid, "read_bytes"] + 0; wb = val[pid, "write_bytes"] + 0
+                if (rb == 0 && wb == 0) continue
+                if (st[pid] == "") t = "n/a"
+                else if (tck != "" && btime != "") t = utc(btime + int(st[pid] / tck))
+                else t = st[pid] " ticks after boot"
+                printf "%.0f\t%.0f\t%s\t%s\t%s\t%s\t%.0f\t%.0f\t%s\t%s\t%s\t%s\n", wb, rb, pid,
+                    val[pid, "PPid"], val[pid, "Uid"], t, rb, wb, val[pid, "cancelled_write_bytes"],
+                    val[pid, "rchar"], val[pid, "wchar"], comm[pid]
+            }
+            printf "%d %d %d %d %s\n", ns, ni, nd, nz, (("1" in seen) ? comm["1"] : "-") > cnt
+        }' "$d/all" > "$d/rows"
+    # PID 1's comm says whose /proc this is: a container's shows its own init
+    read -r nseen nio nden nzomb pid1 < "$d/counts" 2>/dev/null
+    cnt="$(wc -l < "$d/rows" | tr -d ' ')"
+    # past PROCIO_LIST: the union of the largest by each counter, so neither a
+    # heavy reader nor a heavy writer drops out; the count of the rest is said
+    half=$((PROCIO_LIST / 2))
+    if [ "$cnt" -le "$PROCIO_LIST" ]; then sort -t "$_tab" -k1,1nr "$d/rows" > "$d/sel"
+    else
+        sort -t "$_tab" -k2,2nr "$d/rows" | awk -v h="$half" '{ print (NR <= h ? 1 : 0) "\t" $0 }' \
+            | sort -t "$_tab" -k2,2nr | awk -F'\t' -v h="$half" 'NR <= h || $1 == 1' | cut -f2- > "$d/sel"
+    fi
+    nsel="$(wc -l < "$d/sel" | tr -d ' ')"
+    # the listed processes' command lines, in one more bounded read
+    : > "$d/cmd"
+    if [ "$nsel" -gt 0 ]; then
+        cut -f3 "$d/sel" | sed 's|$|/cmdline|' > "$d/cmdfiles"
+        _bounded sh -c 'cd /proc && exec grep -H -a "" $(cat "$1")' sh "$d/cmdfiles" 2>/dev/null \
+            | tr '\0' ' ' > "$d/cmd"
+    fi
+    fact "per-process I/O: ${nseen:-0} processes in /proc (pid 1: ${pid1:--}); io read for ${nio:-0}; not readable by uid ${_priv_uid:-?}: ${nden:-0}; zombies (no io): ${nzomb:-0}; $cnt with read_bytes or write_bytes above 0"
+    cl="$(awk -F'\t' -v cf="$d/cmd" '
+        BEGIN { while ((getline l < cf) > 0) { i = index(l, ":"); split(substr(l, 1, i - 1), p, "/")
+                    # busybox grep prints each NUL-separated argument as its own line
+                    # (an if: busybox awk makes c[k] before the right side asks "k in c")
+                    k = p[1]; v = substr(l, i + 1); if (k in c) c[k] = c[k] " " v; else c[k] = v } }
+        { a = (($3 in c) ? c[$3] : "[" $12 "]"); sub(/ +$/, "", a)
+          printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, substr(a, 1, 120) }' "$d/sel")"
+    if [ -n "$cl" ]; then
+        _emit_labeled "$lab (pid, ppid, uid, started UTC, read_bytes, write_bytes, cancelled_write_bytes, rchar, wchar, comm, args first 120 chars), largest write_bytes first" "$cl"
+        [ "$cnt" -gt "$nsel" ] && sub "($((cnt - nsel)) more with read_bytes or write_bytes above 0: among neither the $half largest by write_bytes nor by read_bytes)"
+    else
+        fact "$lab: none above 0 among the ${nio:-0} read"
+    fi
+    if [ "${nden:-0}" -gt 0 ]; then
+        missed procio "/proc/<pid>/io of ${nden} of ${nseen} processes not readable by uid ${_priv_uid:-?}$(_priv_hint)"
+    else got procio; fi
 }
 
 # -- E. InnoDB configuration -----------------------------------------------
@@ -1880,9 +2012,10 @@ run_report() {
     goal login  "mysql login"
     goal host   "host-side facts (process, sockets, disk)"
     [ "$OPT_BINLOG" = 1 ] && goal binlog "binary log content attribution"
-    # The samplers only add detail: with neither installed the window has no
+    # The samplers only add detail: with none installed the window has no
     # input, so no goal (J's fact lines say what is missing).
-    { have iostat || have vmstat; } && goal window "interval samples (iostat -x, vmstat) over the window"
+    goal procio "per-process I/O counters (/proc/<pid>/io)"
+    { have iostat || have vmstat || have pidstat; } && goal window "interval samples (iostat -x, vmstat, pidstat -d) over the window"
 
     _rep_env
     _rep_a

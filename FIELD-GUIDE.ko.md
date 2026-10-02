@@ -100,8 +100,8 @@ cd global-groundtruth/collectors/collection-server
 - 백엔드 데이터 경로의 **ZFS**가 쟁점이면 같은 디렉토리의 companion collector
   (`./collect-collzfs.sh --file`)도 함께 요청됩니다. 별도 리포트이므로 둘 다
   보내주십시오.
-- 백엔드의 **MySQL**이 쟁점이면 MySQL 호스트에서 `./collect-collmysql.sh --file`을
-  실행하십시오. 로그인이 필요하면 `--defaults-extra-file <my.cnf>`로 주거나
+- 백엔드의 **MySQL**이 쟁점이면 MySQL 호스트에서 `sudo ./collect-collmysql.sh --file`을
+  실행하십시오. binary log 와 모든 프로세스의 I/O 카운터는 root 만 읽습니다. 로그인이 필요하면 `--defaults-extra-file <my.cnf>`로 주거나
   `MYSQL_PWD`를 쓰십시오. 암호를 명령행에 직접 입력하지 마십시오.
   명령행은 그 호스트의 다른 사용자도 읽을 수 있습니다.
 

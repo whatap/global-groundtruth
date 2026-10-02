@@ -399,6 +399,21 @@ one entry at the top of its section (docs/authoring-guide.md, step 2);
 
 ## collect-collmysql.sh
 
+- **0.13.0**: Per-process I/O, so the host-wide numbers D and J print can be
+  set against who did the I/O (XLSMART 2026-10-01: the host wrote 27.5 GB a
+  day and mysqld's own file I/O was 1.2% of it, with no way to name the rest).
+  D adds `/proc/<pid>/io` of every process (pid, ppid, uid, start in UTC,
+  `read_bytes`, `write_bytes`, `cancelled_write_bytes`, `rchar`, `wchar`,
+  comm, the first 120 characters of the command line), largest `write_bytes`
+  first, every process above 0 up to 100 rows, past that the 50 largest by
+  `write_bytes` and the 50 largest by `read_bytes`, with the count of the rest;
+  a line before it counts the processes in `/proc` (with PID 1's comm), those
+  read, those this uid was refused, and zombies apart (their `io` is refused
+  without `CAP_SYS_PTRACE` whoever owns them). A new goal `procio` is blocked when any was refused (with
+  the privilege hint), and `n/a` on a kernel without `/proc/<pid>/io`. J runs
+  `pidstat -d` (sysstat) beside `iostat -x` and `vmstat` over the same
+  seconds (one report fewer: its first already covers an interval); [1]'s
+  tools list gains `pidstat`.
 - **0.12.7**: Run helpers (skeleton): the `--out` mkdir always gets the
   command cap (plus 1 s), so a second boundary crossed right after the
   deadline check no longer skips it and exits 1 with a false "not writable"

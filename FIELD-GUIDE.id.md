@@ -107,7 +107,8 @@ Catatan:
   akan meminta collector pendamping di direktori yang sama
   (`./collect-collzfs.sh --file`). Itu laporan terpisah; kirim keduanya.
 - Bila pertanyaannya tentang **MySQL** milik backend, jalankan
-  `./collect-collmysql.sh --file` di host MySQL. Jika database memerlukan login,
+  `sudo ./collect-collmysql.sh --file` di host MySQL (hanya root yang dapat
+  membaca binary log dan penghitung I/O setiap proses). Jika database memerlukan login,
   berikan lewat `--defaults-extra-file <my.cnf>` (atau `MYSQL_PWD`). Jangan
   pernah mengetik password di baris perintah: pengguna lain di host itu dapat
   membacanya.

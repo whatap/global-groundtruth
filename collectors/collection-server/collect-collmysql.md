@@ -1,12 +1,20 @@
 # `collect-collmysql.sh`: the backend's MySQL
 
-> **Status:** validated at `collect-collmysql.sh` 0.11.1 on 2026-09-28, the lab
-> `collsrv` VM's own MySQL 8.4.11 (`--stdout`, `--binlog` as root), COMPLETE,
-> `validate.sh --report` pass.
-> Not yet run on: a replicating pair, section I on 8.4 (the `mysql:8` image ships no
-> `mysqlbinlog`), section J against a real `iostat` (absent in the test images), the
-> MariaDB-specific replication and `performance_schema` differences. Owner: Global
-> team until handover to the collection-server (backend) team (CONTRACT rule 4).
+> **Status:** validated at `collect-collmysql.sh` 0.13.0 on 2026-10-02: the lab
+> `collsrv` VM's own MySQL 8.4.11 (Ubuntu 26.04 package, `--stdout --binlog` as
+> root: section I decoded both files, J ran real `iostat`, `vmstat` and
+> `pidstat`), and the `mysql-ha` fixture's GTID async pair on 8.0 and its 5.7
+> node (`--file --binlog`, monitoring account; the primary also as root over
+> the socket). All COMPLETE, `validate.sh --report` pass. On the pair, B gave
+> the replica's `SHOW REPLICA STATUS` with both threads running and the
+> primary's `SHOW REPLICAS` row for it. The field ran 0.12.7 (XLSMART, 8.0.42,
+> 2026-10-01, COMPLETE).
+> Not yet run on: an ONLINE Group Replication group (XLSMART's two nodes were
+> both `OFFLINE`), MariaDB's own replication and `performance_schema` (0.4.0
+> ran end to end on a single MariaDB 10.11.19), the per-process I/O on a field
+> host and on ZFS.
+> Owner: Global team until handover to the collection-server (backend) team
+> (CONTRACT rule 4).
 
 Part of the [collection-server family](README.md).
 
@@ -43,8 +51,9 @@ One `.txt` report, sections `[1]` and A..K:
   add a `total:` line summed over the `<basename>.NNNNNN` files. There is no
   `du`: with the logs in the datadir it would walk the whole datadir.
 - **D. Storage and I/O**: `df -hT`, mounts, the datadir's filesystem,
-  `/proc/diskstats`, and the `Innodb_data_*`, `Innodb_os_log*`,
-  `Innodb_buffer_pool_*`, `Innodb_rows_*` and `Com_*` counters.
+  `/proc/diskstats`, every process's `/proc/<pid>/io` (below), and the
+  `Innodb_data_*`, `Innodb_os_log*`, `Innodb_buffer_pool_*`, `Innodb_rows_*`
+  and `Com_*` counters.
 - **E. InnoDB configuration**: page size, buffer pool size,
   `innodb_flush_log_at_trx_commit`, flush method, doublewrite, I/O capacity, log
   file settings, and `SHOW ENGINE INNODB STATUS`.
@@ -59,11 +68,60 @@ One `.txt` report, sections `[1]` and A..K:
   I/O by event name. This is what attributes load to a caller.
 - **H. Current activity**: processlist, thread counters, `max_connections`.
 - **I. Binary log content attribution**: opt-in, see below.
-- **J. Interval samples**: every run: `iostat -x` and `vmstat` started
-  together over a 15 s window (`--window=DUR` sets it), six reports each. The
-  first report of each is the average since boot, the other five cover the
-  window.
+- **J. Interval samples**: every run: `iostat -x`, `vmstat` and `pidstat -d`
+  started together over a 15 s window (`--window=DUR` sets it). `iostat` and
+  `vmstat` give six reports each, the first the average since boot and the
+  other five the window; `pidstat -d` gives the same five intervals (its first
+  report already covers one).
 - **K. MySQL error log**: the resolved `log_error` tail, or the journal.
+
+### Per-process I/O (D and J)
+
+`/proc/diskstats` and `iostat -x` count the whole host; G's file I/O counts
+mysqld only. The per-process counters are what sets one against the other
+without another trip to the host, so they are in every run, not only on hosts
+where mysqld is the only writer. They are I/O counters only: no per-process
+CPU, memory or open files (collserver's process facts are another collector's
+question).
+
+- D reads every `/proc/<pid>/io` with one bounded `grep`, with the same
+  process's `stat` (comm, ppid, start) and `status` (uid). It lists each
+  process whose `read_bytes` or `write_bytes` is above 0, largest
+  `write_bytes` first, up to 100 rows; past 100, the 50 largest by
+  `write_bytes` and the 50 largest by `read_bytes` (a heavy reader is not
+  pushed out by writers), with a count of the rest. The line before the list
+  counts the processes in `/proc`, those read, those this uid was refused, and
+  the zombies, apart: a zombie's `stat` still reads, and its `io` is refused
+  without `CAP_SYS_PTRACE` whoever owns it, so it is not a refusal of a live
+  process. The command lines are a second read; a listed process that exited
+  in between shows `[comm]`, as a kernel thread does. The file names go to one
+  `grep` as arguments, which holds up to about 30,000 processes at the
+  default 8 MB stack; past that the read is `n/a` with the shell's
+  `Argument list too long` and the goal is blocked.
+- The counters run from each process's start (the `started UTC` column; the
+  clock-tick start is converted with `getconf CLK_TCK` and the boot time in
+  `[1]`, or printed in ticks when `getconf` is absent). When a parent reaps a
+  child, the kernel adds the child's counters to the parent's (checked on
+  Linux 6.8: a child's and a grandchild's `dd` both appeared in the parent
+  shell's `write_bytes` after they exited). So I/O of a finished job stays on
+  whatever reaped it: `cron`, or PID 1 for a systemd unit or timer. Summing
+  the list counts such I/O twice while the parent lives; the report does not
+  sum.
+- `read_bytes` / `write_bytes` are what reached the block layer
+  (`write_bytes` is charged when a page is dirtied, and
+  `cancelled_write_bytes` is what truncation then took back); `rchar` /
+  `wchar` are every `read()` / `write()`, page cache hits and sockets
+  included. A filesystem whose writes bypass the page cache accounting (ZFS)
+  has not been checked.
+- `/proc/<pid>/io` of another uid's process needs root (and, as root in a
+  container, `CAP_SYS_PTRACE`). A run that was refused any of them lists what
+  it read and blocks the `procio` goal with the count and the privilege hint.
+  `pidstat -d` reads the same files, so under another uid its label says it
+  lists only the processes that uid may read.
+- `pidstat -d` gives the window's rates per process (`kB_rd/s`, `kB_wr/s`,
+  `kB_ccwr/s`, and `iodelay` on sysstat 11+). It lists only the processes
+  that did I/O in each interval, by comm; the pid joins it to D's command
+  line.
 
 ## (b) Delivery mechanism
 
@@ -188,18 +246,19 @@ the process table locally, and fall back to `n/a (...)` when run from elsewhere.
   `information_schema` and `performance_schema` queries, and near-instant local
   reads. No table scan of user data, no log decode.
 - **The window** (every run, section J): it puts no load on the server, only
-  wall clock, so it is in the default run. `iostat -x` and `vmstat` start
-  together as bounded background jobs, six reports each at a fifth of the
-  window (15 s: 3 s intervals). The samplers only add detail, so one
+  wall clock, so it is in the default run. `iostat -x`, `vmstat` and
+  `pidstat -d` start together as bounded background jobs, at a fifth of the
+  window (15 s: 3 s intervals; six reports of iostat and vmstat, five of
+  pidstat). The samplers only add detail, so one
   that is absent (`iostat -x 3 6: n/a (command not found: iostat, sysstat)`) or
   fails is a fact line in J; the goal is blocked only when the deadline cuts or
-  skips the window or when every sampler present failed. With neither installed
-  the goal is not declared and `[1]` says `window: not run (no sampler
+  skips the window or when every sampler present failed. With none of the three
+  installed the goal is not declared and `[1]` says `window: not run (no sampler
   installed)`. A caller's `RUN_DEADLINE` that would cut the window shortens it
   (30 s are kept for section K and the status) and says so in J, on the terminal
   and in the status, with the real length (whole intervals of a fifth); one that
   leaves it under 10 s means it is not run. A first `INT`, `TERM` or `HUP`
-  during the window stops both samplers and the report is still written: J says
+  during the window stops the samplers and the report is still written: J says
   `ended early: SIG... after Xs of Ys`, keeps what the samplers had written, and
   the goal is blocked with the same words. A second signal aborts the run.
 - **Tier 2**: `--binlog[=N]` decodes the N newest binary logs (default 2) with
@@ -278,7 +337,12 @@ something sensitive:
   prints the whole `--mysql-args` string as the operator gave it (a password
   or a bare `-p` in it ends the run first).
 - **Section I** prints table names and event counts, not the decoded rows.
-- **Section J** prints the block device names `iostat -x` lists.
+- **Section J** prints the block device names `iostat -x` lists, and the
+  pid, uid and comm of each process `pidstat -d` lists.
+- **Section D's per-process list**: pid, uid and the first 120 characters of
+  each listed process's command line, any process on the host. A password
+  given on some program's command line is in it (it is in `ps` for every
+  account too).
 
 - **The password** this collector was given is never printed; `[1]` says only
   where it came from. It exists, for the run, in the mode-600 option file of the

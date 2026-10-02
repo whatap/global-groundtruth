@@ -102,7 +102,8 @@ Notes:
   path, WhaTap will ask for the companion collector in the same directory
   (`./collect-collzfs.sh --file`) as well. It is a separate report; send both.
 - When the question is about the backend's **MySQL**, run
-  `./collect-collmysql.sh --file` on the MySQL host. If the database needs a
+  `sudo ./collect-collmysql.sh --file` on the MySQL host (root reads the binary
+  logs and every process's I/O counters). If the database needs a
   login, give it with `--defaults-extra-file <my.cnf>` (or `MYSQL_PWD`). Never
   type a password into the command line: other users of the host can read it
   there.

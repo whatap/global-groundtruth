@@ -100,8 +100,8 @@ cd global-groundtruth/collectors/collection-server
 - หากคำถามเจาะจงเรื่อง **ZFS** ใต้ data path ของ backend ทาง WhaTap จะขอ
   collector คู่กันในไดเรกทอรีเดียวกัน (`./collect-collzfs.sh --file`) ด้วย
   เป็นรายงานคนละฉบับ กรุณาส่งทั้งสองไฟล์
-- หากคำถามเกี่ยวกับ **MySQL** ของ backend ให้รัน `./collect-collmysql.sh --file`
-  บนโฮสต์ MySQL หากฐานข้อมูลต้องล็อกอิน ให้ระบุผ่าน `--defaults-extra-file <my.cnf>`
+- หากคำถามเกี่ยวกับ **MySQL** ของ backend ให้รัน `sudo ./collect-collmysql.sh --file`
+  บนโฮสต์ MySQL (มีเพียง root ที่อ่าน binary log และตัวนับ I/O ของทุกโปรเซสได้) หากฐานข้อมูลต้องล็อกอิน ให้ระบุผ่าน `--defaults-extra-file <my.cnf>`
   (หรือ `MYSQL_PWD`) ห้ามพิมพ์รหัสผ่านลงในบรรทัดคำสั่ง
   เพราะผู้ใช้อื่นบนโฮสต์นั้นอ่านได้
 

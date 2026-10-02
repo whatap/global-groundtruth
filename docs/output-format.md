@@ -253,10 +253,10 @@ such a tool's absence, failure or cap is a fact line and never blocks that goal:
 collzfs's window rests on the txgs, the kstat deltas and `zpool iostat`, and
 an `iostat -x` that is absent or failed is `not delivered: iostat -x: command
 not found (sysstat)` in section O. Where a goal's only inputs are such tools,
-as collmysql's window (`iostat -x` and `vmstat`), the goal is declared only
-when at least one of them is installed. It is blocked only when every installed
-one failed or the run deadline cut the window; one absent or failed tool of
-two is a fact line (`iostat -x 3 6: n/a (command not found: iostat,
+as collmysql's window (`iostat -x`, `vmstat` and `pidstat -d`), the goal is
+declared only when at least one of them is installed. It is blocked only when
+every installed one failed or the run deadline cut the window; one absent or
+failed tool among them is a fact line (`iostat -x 3 6: n/a (command not found: iostat,
 sysstat)`). So a default run is not INCOMPLETE merely because the host lacks an
 optional package. Name each goal's inputs in the collector's README.
 
