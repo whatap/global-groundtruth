@@ -72,7 +72,7 @@ param(
 
 $COLLECTOR_NAME = "whatap-apmdotnet"
 # History: CHANGELOG.md (next to this file).
-$VERSION        = "0.8.0"
+$VERSION        = "0.9.0"
 $DOMAIN         = "apm"
 $CompName = $env:COMPUTERNAME; if (-not $CompName) { $CompName = [Environment]::MachineName }
 $TARGET         = "host/$CompName"
@@ -1221,18 +1221,46 @@ foreach ($k in ($iePaths.Keys | Sort-Object)) {
     FileFacts "$var file" $iePaths[$k]
     HeadFile "$var content" $iePaths[$k] 80
 }
-# uninstall entries of other profiler products: CLR Instrumentation Engine by
-# name, and any entry whose InstallLocation contains a profiler DLL seen above
-$profDlls = @($cfgPaths.Values) + @($clsidDlls | ForEach-Object { ($_ -split '\|', 2)[1] })
+# uninstall entries of other profiler products: the CLR Instrumentation Engine
+# by name (a shared host, its DLL lives in its own folder), and any entry whose
+# InstallLocation contains a profiler DLL, a registered CLSID DLL or a CLRIE
+# configuration file seen above -- found from the configuration, not from a
+# product name, so any vendor's product is caught the same way
+$profDlls = @($cfgPaths.Values) + @($clsidDlls | ForEach-Object { ($_ -split '\|', 2)[1] }) + @($iePaths.Values)
 $otherEntries = @($uninstallAll | Where-Object {
     $u = $_
     ($u.DisplayName -notmatch '[Ww]ha[Tt]ap') -and (
         ($u.DisplayName -match 'Instrumentation Engine') -or
         ($u.InstallLocation -and @($profDlls | Where-Object { $_ -and $_.StartsWith($u.InstallLocation.TrimEnd('\'), [StringComparison]::OrdinalIgnoreCase) }).Count -gt 0))
 })
-Fact "uninstall entries of other profiler products (CLR Instrumentation Engine, or InstallLocation holding a profiler DLL above): $($otherEntries.Count)"
+Fact "uninstall entries of other profiler products (CLR Instrumentation Engine by name, or InstallLocation holding a profiler DLL, CLSID DLL or CLRIE configuration file above): $($otherEntries.Count)"
 foreach ($u in $otherEntries) {
     Fact "  DisplayName=$($u.DisplayName)  DisplayVersion=$($u.DisplayVersion)  Publisher=$($u.Publisher)  InstallDate=$($u.InstallDate)  InstallLocation=$($u.InstallLocation)"
+}
+# paths section D treats as profiler modules besides its vendor-name list: every
+# profiler DLL and CLRIE configuration folder named above, and the install
+# folders of the products found above
+$profPrefixes = @(@($profDlls | Where-Object { $_ } | ForEach-Object { if ($_ -imatch '\.xml$') { Split-Path -Parent $_ } else { $_ } }) +
+    @($otherEntries | ForEach-Object { "$($_.InstallLocation)".TrimEnd('\') } | Where-Object { $_ })) | Select-Object -Unique
+# Windows Installer history of those products: when each was installed,
+# updated or removed, to the second. The WhaTap installer is not an MSI; its
+# last run is the mtime of unins000.dat in section B. Not bounded by the 7-day
+# window of section I: the newest 200 MsiInstaller product events, whatever age
+# the Application log still holds.
+$msiNames = @(@($otherEntries | ForEach-Object { [regex]::Escape("$($_.DisplayName)") } | Where-Object { $_ }) + 'Instrumentation Engine') -join '|'
+TryFact "Application log: Windows Installer product events (1033 installed, 1034 removed, 1035 reconfigured, 1036 updated) naming the products above (newest 20 of the newest 200)" {
+    $raw = @(); try { $raw = @(Invoke-BoundedBlock { Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'MsiInstaller'; Id = 1033, 1034, 1035, 1036 } -MaxEvents 200 -ErrorAction Stop }) }
+    catch { if ("$($_.Exception.Message)" -notmatch 'No events were found') { throw } }
+    $ev = @($raw | Where-Object { "$($_.Message)" -match $msiNames } | Select-Object -First 20)
+    if ($raw.Count -gt 0) { "oldest MsiInstaller product event read: $($raw[-1].TimeCreated.ToString('yyyy-MM-dd HH:mm:ss'))" }
+    if ($ev.Count -eq 0) { $(if ($isAdmin) { "none naming the products above" } else { "none naming the products above among the events this account can read (not elevated)" }) }
+    else {
+        $ev | ForEach-Object {
+            $msg = ("$($_.Message)" -replace '\s+', ' ').Trim()
+            if ($msg.Length -gt 300) { $msg = $msg.Substring(0, 300) + " ..." }
+            "{0}  id={1}  {2}" -f $_.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss'), $_.Id, $msg
+        }
+    }
 }
 Emit ""
 Fact "-- Fusion assembly-binding log settings (HKLM\SOFTWARE\Microsoft\Fusion; read-only report) --"
@@ -1254,7 +1282,8 @@ Section "D. WhaTap service & runtime processes"
 # Core / 5+), aspnetcorev2*.dll (the ASP.NET Core Module and its in-process
 # handler); their FileVersion is the runtime build actually running
 $RUNTIME_MODULES  = '\\(clr|coreclr|aspnetcorev2[^\\]*)\.dll$'
-$PROFILER_MODULES = 'whatap|clrprofiler|InstrumentationEngine|secupi|datadog|dynatrace|newrelic|appdynamics|instana|elastic.apm|contrast|scouter|jennifer'
+$PROFILER_MODULES = 'whatap|clrprofiler|InstrumentationEngine|datadog|dynatrace|newrelic|appdynamics|instana|elastic.apm|contrast|scouter|jennifer'
+if ($profPrefixes.Count -gt 0) { $PROFILER_MODULES += '|' + (@($profPrefixes | ForEach-Object { [regex]::Escape($_) }) -join '|') }
 # Module lists of the w3wp and the first 10 dotnet.exe processes, read once.
 # A live process always has modules (ntdll at least): an empty list is one
 # this run could not read, which 0.4.0 printed as "none". Windows PowerShell

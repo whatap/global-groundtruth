@@ -5,6 +5,27 @@ newest first. Every change to the script bumps its `VERSION` and adds one
 entry at the top of this list (docs/authoring-guide.md, step 2);
 `tools/validate.sh` checks that the newest entry is the script's `VERSION`.
 
+- **0.9.0**: Other profiler products are found from the configuration, not from
+  a product name. Section C lists an uninstall entry when its `InstallLocation`
+  holds a configured profiler DLL, a CLSID-registered DLL or a CLR Instrumentation
+  Engine configuration file (the Instrumentation Engine itself still by name), and
+  then prints the Windows Installer events (MsiInstaller 1033/1034/1035/1036) that
+  name those products, to the second: the newest 20 matching among the newest 200,
+  with the oldest event read, outside section I's 7-day window. Section D's loaded
+  profiler modules also take every module under a profiler DLL path, CLRIE
+  configuration folder or install folder found in section C; `secupi` leaves the
+  vendor-name list. Why: to tell in what order WhaTap (its last run is
+  `unins000.dat`'s mtime in section B) and another profiler product were installed or
+  updated, next to the `Environment` they left (DOTNET-431), for any vendor.
+  Validated 2026-10-06 on jjsong-dotnet-lab (real WhaTap .NET 2.5.7.0, CLRIE 1.0.45
+  raw hook), elevated, Windows PowerShell 5.1 and pwsh 7: all COMPLETE and pass
+  validate.sh --report. A fake product with no vendor word in its name, whose
+  `InstallLocation` held the CLRIE configuration file set on an app pool, was listed;
+  its MsiInstaller 1036 event and the real CLRIE 1.0.45 install event (1033,
+  2026-10-01 07:41:23) were printed, and an event naming a product with no such
+  entry was not. A copy of the WhaTap profiler DLL renamed `LabHook64.dll` in a
+  lab folder, set as the raw-hook path, was listed among the w3wp's loaded modules.
+  The VM was reverted to its pre-test snapshot.
 - **0.8.0**: Section C reads a fourth environment scope, the per-app-pool
   `<environmentVariables>` of `applicationHost.config` (`app pool env: pool=<name>
   <var>=<value>`, the first 80 matching the environment filter). Those values join
