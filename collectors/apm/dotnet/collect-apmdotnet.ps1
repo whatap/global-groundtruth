@@ -72,7 +72,7 @@ param(
 
 $COLLECTOR_NAME = "whatap-apmdotnet"
 # History: CHANGELOG.md (next to this file).
-$VERSION        = "0.9.0"
+$VERSION        = "0.9.1"
 $DOMAIN         = "apm"
 $CompName = $env:COMPUTERNAME; if (-not $CompName) { $CompName = [Environment]::MachineName }
 $TARGET         = "host/$CompName"
@@ -1157,12 +1157,14 @@ elseif ($ahcState -eq "absent") { Fact "app pool env: n/a (path not found: $ahc)
 else {
     try {
         [xml]$ahcXml = Get-Content -LiteralPath $ahc -Raw -Encoding UTF8 -ErrorAction Stop
-        $poolVars = @($ahcXml.SelectNodes("//applicationPools/add/environmentVariables/add"))
+        # <applicationPoolDefaults> holds what every pool inherits; it is shown as pool=(defaults)
+        $poolVars = @($ahcXml.SelectNodes("//applicationPools/add/environmentVariables/add | //applicationPools/applicationPoolDefaults/environmentVariables/add"))
         $shown = 0
         foreach ($v in $poolVars) {
             $n = $v.GetAttribute("name")
             if ($n -notmatch $ENV_NAME_PATTERN) { continue }
-            $pool = $v.ParentNode.ParentNode.GetAttribute("name")
+            $owner = $v.ParentNode.ParentNode
+            $pool = $(if ($owner.LocalName -eq 'applicationPoolDefaults') { '(defaults)' } else { $owner.GetAttribute("name") })
             $poolEnvPairs += "$n=$($v.GetAttribute('value'))"
             if ($shown -lt 80) { Fact "app pool env: pool=$pool $n=$($v.GetAttribute('value'))" }
             $shown++
@@ -1226,12 +1228,23 @@ foreach ($k in ($iePaths.Keys | Sort-Object)) {
 # InstallLocation contains a profiler DLL, a registered CLSID DLL or a CLRIE
 # configuration file seen above -- found from the configuration, not from a
 # product name, so any vendor's product is caught the same way
+# an InstallLocation as a folder prefix ending in '\', so C:\Foo does not match
+# C:\FooBar; none for a drive root or a Program Files / Windows folder itself,
+# which would match every file under it. Quotes and spaces around it are dropped.
+function Install-Prefix($loc) {
+    $p = "$loc".Trim().Trim('"').Trim().TrimEnd('\')
+    if (-not $p -or $p -match '^[A-Za-z]:$') { return $null }
+    foreach ($r in @($env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:ProgramW6432, $env:SystemRoot)) {
+        if ($r -and $p -ieq "$r".TrimEnd('\')) { return $null }
+    }
+    return $p + '\'
+}
 $profDlls = @($cfgPaths.Values) + @($clsidDlls | ForEach-Object { ($_ -split '\|', 2)[1] }) + @($iePaths.Values)
 $otherEntries = @($uninstallAll | Where-Object {
     $u = $_
     ($u.DisplayName -notmatch '[Ww]ha[Tt]ap') -and (
         ($u.DisplayName -match 'Instrumentation Engine') -or
-        ($u.InstallLocation -and @($profDlls | Where-Object { $_ -and $_.StartsWith($u.InstallLocation.TrimEnd('\'), [StringComparison]::OrdinalIgnoreCase) }).Count -gt 0))
+        (($loc = Install-Prefix $u.InstallLocation) -and @($profDlls | Where-Object { $_ -and "$_".Trim().Trim('"').StartsWith($loc, [StringComparison]::OrdinalIgnoreCase) }).Count -gt 0))
 })
 Fact "uninstall entries of other profiler products (CLR Instrumentation Engine by name, or InstallLocation holding a profiler DLL, CLSID DLL or CLRIE configuration file above): $($otherEntries.Count)"
 foreach ($u in $otherEntries) {
@@ -1240,17 +1253,23 @@ foreach ($u in $otherEntries) {
 # paths section D treats as profiler modules besides its vendor-name list: every
 # profiler DLL and CLRIE configuration folder named above, and the install
 # folders of the products found above
-$profPrefixes = @(@($profDlls | Where-Object { $_ } | ForEach-Object { if ($_ -imatch '\.xml$') { Split-Path -Parent $_ } else { $_ } }) +
-    @($otherEntries | ForEach-Object { "$($_.InstallLocation)".TrimEnd('\') } | Where-Object { $_ })) | Select-Object -Unique
+$profPrefixes = @(@($profDlls | Where-Object { $_ } | ForEach-Object { $d = "$_".Trim().Trim('"'); if ($d -imatch '\.xml$') { Install-Prefix (Split-Path -Parent $d) } else { $d } }) +
+    @($otherEntries | ForEach-Object { Install-Prefix $_.InstallLocation })) | Where-Object { $_ } | Select-Object -Unique
 # Windows Installer history of those products: when each was installed,
 # updated or removed, to the second. The WhaTap installer is not an MSI; its
 # last run is the mtime of unins000.dat in section B. Not bounded by the 7-day
 # window of section I: the newest 200 MsiInstaller product events, whatever age
 # the Application log still holds.
 $msiNames = @(@($otherEntries | ForEach-Object { [regex]::Escape("$($_.DisplayName)") } | Where-Object { $_ }) + 'Instrumentation Engine') -join '|'
-TryFact "Application log: Windows Installer product events (1033 installed, 1034 removed, 1035 reconfigured, 1036 updated) naming the products above (newest 20 of the newest 200)" {
-    $raw = @(); try { $raw = @(Invoke-BoundedBlock { Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'MsiInstaller'; Id = 1033, 1034, 1035, 1036 } -MaxEvents 200 -ErrorAction Stop }) }
-    catch { if ("$($_.Exception.Message)" -notmatch 'No events were found') { throw } }
+TryFact "Application log: Windows Installer product events (1033 installed, 1034 removed, 1035 reconfigured, 1036 updated) naming the products above or the Instrumentation Engine (newest 20 of the MsiInstaller ones among the newest 200 events with these ids)" {
+    # filtered by id only, the provider picked afterwards: a ProviderName key
+    # reads provider metadata that a non-elevated account cannot (Get-WinEvent
+    # then reports no such provider), and an XPath or XML filter is refused to a
+    # non-elevated network logon, while this form reads the same events
+    $raw = @(Invoke-BoundedBlock {
+        try { Get-WinEvent -FilterHashtable @{ LogName = 'Application'; Id = 1033, 1034, 1035, 1036 } -MaxEvents 200 -ErrorAction Stop | Where-Object { $_.ProviderName -eq 'MsiInstaller' } }
+        catch { if ($_.FullyQualifiedErrorId -notlike 'NoMatchingEventsFound*') { throw } }
+    })
     $ev = @($raw | Where-Object { "$($_.Message)" -match $msiNames } | Select-Object -First 20)
     if ($raw.Count -gt 0) { "oldest MsiInstaller product event read: $($raw[-1].TimeCreated.ToString('yyyy-MM-dd HH:mm:ss'))" }
     if ($ev.Count -eq 0) { $(if ($isAdmin) { "none naming the products above" } else { "none naming the products above among the events this account can read (not elevated)" }) }
@@ -1313,7 +1332,7 @@ foreach ($i in @(PIDS)) {
     catch { "$i|!|$($_.Exception.Message.Split("`n")[0])" }
 }
 '@
-        $src = $src.Replace('PIDS', ($wowPids -join ',')).Replace('PATTERN', "$PROFILER_MODULES|$RUNTIME_MODULES")
+        $src = $src.Replace('PIDS', ($wowPids -join ',')).Replace('PATTERN', "$PROFILER_MODULES|$RUNTIME_MODULES".Replace("'", "''"))
         $enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($src))
         try {
             $got = @{}
@@ -1554,9 +1573,12 @@ function Event-Text([string]$m) {
 }
 Section "I. Windows event logs (bounded, last 7 days)"
 TryFact "Application log: .NET/ASP.NET/crash/WhaTap events (newest 15 of last 300 err+warn)" {
-    # Get-WinEvent throws "No events were found" for an empty window: that is none
-    $raw = @(); try { $raw = @(Invoke-BoundedBlock { Get-WinEvent -FilterHashtable @{ LogName = 'Application'; Level = 1,2,3; StartTime = (Get-Date).AddDays(-7) } -MaxEvents 300 -ErrorAction Stop }) }
-    catch { if ("$($_.Exception.Message)" -notmatch 'No events were found') { throw } }
+    # Get-WinEvent throws NoMatchingEventsFound for an empty window: that is none
+    # (matched by its error id; the message text is localized)
+    $raw = @(Invoke-BoundedBlock {
+        try { Get-WinEvent -FilterHashtable @{ LogName = 'Application'; Level = 1,2,3; StartTime = (Get-Date).AddDays(-7) } -MaxEvents 300 -ErrorAction Stop }
+        catch { if ($_.FullyQualifiedErrorId -notlike 'NoMatchingEventsFound*') { throw } }
+    })
     $ev = @($raw |
         Where-Object { $_.ProviderName -match '\.NET Runtime|ASP\.NET|AspNetCore|Application Error|Windows Error Reporting|[Ww]ha[Tt]ap' } |
         Select-Object -First 15)
@@ -1569,9 +1591,12 @@ TryFact "Application log: .NET/ASP.NET/crash/WhaTap events (newest 15 of last 30
     }
 }
 TryFact "System log: WAS/W3SVC/HTTP events (newest 10 of last 300 err+warn)" {
-    # Get-WinEvent throws "No events were found" for an empty window: that is none
-    $raw = @(); try { $raw = @(Invoke-BoundedBlock { Get-WinEvent -FilterHashtable @{ LogName = 'System'; Level = 1,2,3; StartTime = (Get-Date).AddDays(-7) } -MaxEvents 300 -ErrorAction Stop }) }
-    catch { if ("$($_.Exception.Message)" -notmatch 'No events were found') { throw } }
+    # Get-WinEvent throws NoMatchingEventsFound for an empty window: that is none
+    # (matched by its error id; the message text is localized)
+    $raw = @(Invoke-BoundedBlock {
+        try { Get-WinEvent -FilterHashtable @{ LogName = 'System'; Level = 1,2,3; StartTime = (Get-Date).AddDays(-7) } -MaxEvents 300 -ErrorAction Stop }
+        catch { if ($_.FullyQualifiedErrorId -notlike 'NoMatchingEventsFound*') { throw } }
+    })
     $ev = @($raw |
         Where-Object { $_.ProviderName -match 'WAS|W3SVC|IIS|HTTP' } |
         Select-Object -First 10)

@@ -5,6 +5,32 @@ newest first. Every change to the script bumps its `VERSION` and adds one
 entry at the top of this list (docs/authoring-guide.md, step 2);
 `tools/validate.sh` checks that the newest entry is the script's `VERSION`.
 
+- **0.9.1**: Fixes from a deep verification of 0.8.0-0.9.0 on jjsong-dotnet-lab.
+  An uninstall entry counts only when its `InstallLocation` is a folder holding
+  the file (`C:\Foo\`, so `C:\FooBar` no longer matches); quotes and spaces
+  around it are dropped, and a drive root or the Program Files / Windows folder
+  itself never counts (an entry at `C:\` had made section D list every loaded
+  module, 335 lines under 5.1). A profiler path containing `'` no longer breaks
+  the 32-bit module read (a `C:\Lab O'Hook\lab.xml` ConfigPath had turned the
+  32-bit w3wp's profiler and runtime modules into n/a). Section C also reads
+  `applicationPoolDefaults` environment variables, as `pool=(defaults)`. The
+  Windows Installer events are read by id and picked by provider afterwards: the
+  provider-name filter failed for a non-elevated account ("There is not an event
+  provider ... MsiInstaller"), and an XPath filter is refused to a non-elevated
+  network logon; the label now says the Instrumentation Engine's events are
+  always included, as they were in 0.9.0. An empty event log is told by the
+  `NoMatchingEventsFound` error id, not the English message, here and in section I.
+  Validated 2026-10-06 on jjsong-dotnet-lab, Windows PowerShell 5.1 and pwsh 7,
+  0.9.0 and 0.9.1 side by side, every report passing validate.sh --report:
+  elevated as found (both list the CLRIE 1.0.45 install event, 1033 2026-10-01
+  07:41:23); elevated with entries at `C:\` and `C:\Program Files\Microsoft CLR`,
+  the `'` ConfigPath on Classic32 and a defaults variable (0.9.1: neither entry
+  listed, 3 loaded-module lines instead of 335/453, Classic32's clr.dll listed,
+  the defaults variable shown); elevated after clearing the Application log
+  (none); not elevated over OpenSSH (0.9.0: provider error; 0.9.1: "none ...
+  among the events this account can read (not elevated)", COMPLETE; that logon
+  reads no Application events at all). A non-elevated local logon was not run.
+  The VM was reverted to its pre-test snapshot.
 - **0.9.0**: Other profiler products are found from the configuration, not from
   a product name. Section C lists an uninstall entry when its `InstallLocation`
   holds a configured profiler DLL, a CLSID-registered DLL or a CLR Instrumentation
