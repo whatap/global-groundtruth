@@ -72,7 +72,7 @@ param(
 
 $COLLECTOR_NAME = "whatap-apmdotnet"
 # History: CHANGELOG.md (next to this file).
-$VERSION        = "0.9.1"
+$VERSION        = "0.9.2"
 $DOMAIN         = "apm"
 $CompName = $env:COMPUTERNAME; if (-not $CompName) { $CompName = [Environment]::MachineName }
 $TARGET         = "host/$CompName"
@@ -1261,13 +1261,15 @@ $profPrefixes = @(@($profDlls | Where-Object { $_ } | ForEach-Object { $d = "$_"
 # window of section I: the newest 200 MsiInstaller product events, whatever age
 # the Application log still holds.
 $msiNames = @(@($otherEntries | ForEach-Object { [regex]::Escape("$($_.DisplayName)") } | Where-Object { $_ }) + 'Instrumentation Engine') -join '|'
-TryFact "Application log: Windows Installer product events (1033 installed, 1034 removed, 1035 reconfigured, 1036 updated) naming the products above or the Instrumentation Engine (newest 20 of the MsiInstaller ones among the newest 200 events with these ids)" {
+TryFact "Application log: Windows Installer product events (1033 installed, 1034 removed, 1035 reconfigured, 1036 updated) naming the products above or the Instrumentation Engine (newest 20 of the newest 200 MsiInstaller events)" {
     # filtered by id only, the provider picked afterwards: a ProviderName key
     # reads provider metadata that a non-elevated account cannot (Get-WinEvent
     # then reports no such provider), and an XPath or XML filter is refused to a
-    # non-elevated network logon, while this form reads the same events
+    # non-elevated network logon, while this form reads the same events. The cap
+    # is on MsiInstaller events, not on the read: the ASP.NET Core Module also
+    # logs id 1033 at every app shutdown and would push them out of a 200 window.
     $raw = @(Invoke-BoundedBlock {
-        try { Get-WinEvent -FilterHashtable @{ LogName = 'Application'; Id = 1033, 1034, 1035, 1036 } -MaxEvents 200 -ErrorAction Stop | Where-Object { $_.ProviderName -eq 'MsiInstaller' } }
+        try { Get-WinEvent -FilterHashtable @{ LogName = 'Application'; Id = 1033, 1034, 1035, 1036 } -ErrorAction Stop | Where-Object { $_.ProviderName -eq 'MsiInstaller' } | Select-Object -First 200 }
         catch { if ($_.FullyQualifiedErrorId -notlike 'NoMatchingEventsFound*') { throw } }
     })
     $ev = @($raw | Where-Object { "$($_.Message)" -match $msiNames } | Select-Object -First 20)
@@ -1332,7 +1334,7 @@ foreach ($i in @(PIDS)) {
     catch { "$i|!|$($_.Exception.Message.Split("`n")[0])" }
 }
 '@
-        $src = $src.Replace('PIDS', ($wowPids -join ',')).Replace('PATTERN', "$PROFILER_MODULES|$RUNTIME_MODULES".Replace("'", "''"))
+        $src = $src.Replace('PIDS', ($wowPids -join ',')).Replace('PATTERN', [System.Management.Automation.Language.CodeGeneration]::EscapeSingleQuotedStringContent("$PROFILER_MODULES|$RUNTIME_MODULES"))
         $enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($src))
         try {
             $got = @{}

@@ -5,6 +5,19 @@ newest first. Every change to the script bumps its `VERSION` and adds one
 entry at the top of this list (docs/authoring-guide.md, step 2);
 `tools/validate.sh` checks that the newest entry is the script's `VERSION`.
 
+- **0.9.2**: Fixes from a deep verification of 0.9.1. The Windows Installer
+  events are the newest 200 MsiInstaller events again: 0.9.1 took the newest 200
+  events with ids 1033-1036 before picking the provider, and the ASP.NET Core
+  Module logs id 1033 at every app shutdown, so on a busy IIS + ASP.NET Core host
+  those filled the window and the MSI events were lost. The 32-bit module read
+  escapes every quote PowerShell treats as a single quote (`’` too, not only `'`).
+  Validated 2026-10-06 on jjsong-dotnet-lab, elevated, Windows PowerShell 5.1 and
+  pwsh 7, 0.9.1 and 0.9.2 side by side, all reports COMPLETE and passing
+  validate.sh --report. As found: both list the CLRIE 1.0.45 install event (1033
+  2026-10-01 07:41:23). With 200 more ANCM id-1033 events and a
+  `C:\Lab O’Curly\lab.xml` ConfigPath on Classic32: 0.9.1 printed none and, under
+  5.1, n/a for Classic32's modules; 0.9.2 printed the CLRIE event and Classic32's
+  clr.dll and aspnetcorev2.dll. The VM was reverted to its pre-test snapshot.
 - **0.9.1**: Fixes from a deep verification of 0.8.0-0.9.0 on jjsong-dotnet-lab.
   An uninstall entry counts only when its `InstallLocation` is a folder holding
   the file (`C:\Foo\`, so `C:\FooBar` no longer matches); quotes and spaces
