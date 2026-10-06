@@ -5,6 +5,23 @@ newest first. Every change to the script bumps its `VERSION` and adds one
 entry at the top of this list (docs/authoring-guide.md, step 2);
 `tools/validate.sh` checks that the newest entry is the script's `VERSION`.
 
+- **0.9.3**: Fix from a deep verification of 0.9.2. Elevated, the MsiInstaller
+  events are read with the provider filtered by the event log service
+  (`ProviderName` key, `-MaxEvents 200`). 0.9.2 read every event with ids
+  1033-1036 and picked the provider afterwards, so with fewer than 200
+  MsiInstaller events it scanned the whole Application log: about 11-15 s on a
+  full default 20 MB log and over the 20 s cap on a 100k-event log, where the
+  line became `n/a (timed out: 20s)`. Its "newest 200 MsiInstaller events again"
+  held only when the scan finished. Not elevated keeps the 0.9.2 read (the
+  `ProviderName` key fails for that account), which can still reach the cap.
+  Validated 2026-10-06 on jjsong-dotnet-lab, elevated, Windows PowerShell 5.1 and
+  pwsh 7, 0.9.2 and 0.9.3 side by side, all reports COMPLETE and passing
+  validate.sh --report. As found: both list the CLRIE 1.0.45 install event (1033
+  2026-10-01 07:41:23). With the log raised to 100 MB and 100,000 ANCM id-1033
+  events added (104,890 records): 0.9.2 printed `n/a (timed out: 20s)` and ran
+  29 s / 27 s; 0.9.3 printed the CLRIE event and ran 9 s / 8 s. Not elevated
+  over OpenSSH, 0.9.3 printed the same "none ... (not elevated)" line as 0.9.2.
+  The VM was reverted to its pre-test snapshot.
 - **0.9.2**: Fixes from a deep verification of 0.9.1. The Windows Installer
   events are the newest 200 MsiInstaller events again: 0.9.1 took the newest 200
   events with ids 1033-1036 before picking the provider, and the ASP.NET Core

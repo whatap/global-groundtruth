@@ -72,7 +72,7 @@ param(
 
 $COLLECTOR_NAME = "whatap-apmdotnet"
 # History: CHANGELOG.md (next to this file).
-$VERSION        = "0.9.2"
+$VERSION        = "0.9.3"
 $DOMAIN         = "apm"
 $CompName = $env:COMPUTERNAME; if (-not $CompName) { $CompName = [Environment]::MachineName }
 $TARGET         = "host/$CompName"
@@ -1262,16 +1262,24 @@ $profPrefixes = @(@($profDlls | Where-Object { $_ } | ForEach-Object { $d = "$_"
 # the Application log still holds.
 $msiNames = @(@($otherEntries | ForEach-Object { [regex]::Escape("$($_.DisplayName)") } | Where-Object { $_ }) + 'Instrumentation Engine') -join '|'
 TryFact "Application log: Windows Installer product events (1033 installed, 1034 removed, 1035 reconfigured, 1036 updated) naming the products above or the Instrumentation Engine (newest 20 of the newest 200 MsiInstaller events)" {
-    # filtered by id only, the provider picked afterwards: a ProviderName key
-    # reads provider metadata that a non-elevated account cannot (Get-WinEvent
-    # then reports no such provider), and an XPath or XML filter is refused to a
-    # non-elevated network logon, while this form reads the same events. The cap
-    # is on MsiInstaller events, not on the read: the ASP.NET Core Module also
-    # logs id 1033 at every app shutdown and would push them out of a 200 window.
-    $raw = @(Invoke-BoundedBlock {
-        try { Get-WinEvent -FilterHashtable @{ LogName = 'Application'; Id = 1033, 1034, 1035, 1036 } -ErrorAction Stop | Where-Object { $_.ProviderName -eq 'MsiInstaller' } | Select-Object -First 200 }
-        catch { if ($_.FullyQualifiedErrorId -notlike 'NoMatchingEventsFound*') { throw } }
-    })
+    # elevated: the provider is filtered by the event log service (under a second
+    # on a 100k-event log). Not elevated, a ProviderName key fails (it reads
+    # provider metadata the account cannot: "There is not an event provider")
+    # and an XPath filter is refused to a network logon, so the events are read
+    # by id and the provider picked afterwards; that reads the whole log when
+    # there are fewer than 200 MsiInstaller events and may hit the time cap
+    if ($isAdmin) {
+        $sb = {
+            try { Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'MsiInstaller'; Id = 1033, 1034, 1035, 1036 } -MaxEvents 200 -ErrorAction Stop }
+            catch { if ($_.FullyQualifiedErrorId -notlike 'NoMatchingEventsFound*') { throw } }
+        }
+    } else {
+        $sb = {
+            try { Get-WinEvent -FilterHashtable @{ LogName = 'Application'; Id = 1033, 1034, 1035, 1036 } -ErrorAction Stop | Where-Object { $_.ProviderName -eq 'MsiInstaller' } | Select-Object -First 200 }
+            catch { if ($_.FullyQualifiedErrorId -notlike 'NoMatchingEventsFound*') { throw } }
+        }
+    }
+    $raw = @(Invoke-BoundedBlock $sb)
     $ev = @($raw | Where-Object { "$($_.Message)" -match $msiNames } | Select-Object -First 20)
     if ($raw.Count -gt 0) { "oldest MsiInstaller product event read: $($raw[-1].TimeCreated.ToString('yyyy-MM-dd HH:mm:ss'))" }
     if ($ev.Count -eq 0) { $(if ($isAdmin) { "none naming the products above" } else { "none naming the products above among the events this account can read (not elevated)" }) }
