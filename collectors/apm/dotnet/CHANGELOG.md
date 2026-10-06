@@ -5,6 +5,26 @@ newest first. Every change to the script bumps its `VERSION` and adds one
 entry at the top of this list (docs/authoring-guide.md, step 2);
 `tools/validate.sh` checks that the newest entry is the script's `VERSION`.
 
+- **0.8.0**: Section C reads a fourth environment scope, the per-app-pool
+  `<environmentVariables>` of `applicationHost.config` (`app pool env: pool=<name>
+  <var>=<value>`, the first 80 matching the environment filter). Those values join
+  the profiler-path, CLSID and `MicrosoftInstrumentationEngine_ConfigPath*` probes, so
+  a ConfigPath set on one pool gets its file facts and first 80 lines as one set in
+  W3SVC/WAS does. The `applicationHost.config` line grep also takes
+  `InstrumentationEngine`. Section D's loaded profiler-module pattern takes
+  `InstrumentationEngine` and `secupi`. Why: a SecuPi + CLRIE case (DOTNET-431),
+  where SecuPi set its CLRIE variables on the DefaultAppPool; 0.7.0 printed the
+  pool's `COR_PROFILER` line but not its ConfigPath, and listed neither the CLRIE
+  nor another vendor's DLL loaded in w3wp.
+  Validated 2026-10-06 on jjsong-dotnet-lab (real WhaTap .NET 2.5.7.0, CLRIE 1.0.45
+  raw hook), elevated, Windows PowerShell 5.1 and pwsh 7: all COMPLETE and pass
+  validate.sh --report. With a ConfigPath variable on the ClassicApp pool, both
+  printed the pool value, the file's facts and its content. With
+  `MicrosoftInstrumentationEngine_UserBuffer=1` added and the pool serving HTTP 200,
+  both listed `MicrosoftInstrumentationEngine_x64.dll` and `Whatap.ClrProfiler.dll`
+  among the w3wp's loaded modules. Without it, the pool answered HTTP 500 and the
+  w3wp the collector found had no profiler module loaded. The VM was reverted to
+  its pre-test snapshot.
 - **0.7.0**: Section C reads the CLR Instrumentation Engine (CLRIE) setup:
   `MicrosoftInstrumentationEngine_*` joins the environment filter; every CLSID
   named by `COR_PROFILER`, `CORECLR_PROFILER` or

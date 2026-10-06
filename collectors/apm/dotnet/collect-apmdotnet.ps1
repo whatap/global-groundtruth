@@ -72,7 +72,7 @@ param(
 
 $COLLECTOR_NAME = "whatap-apmdotnet"
 # History: CHANGELOG.md (next to this file).
-$VERSION        = "0.7.0"
+$VERSION        = "0.8.0"
 $DOMAIN         = "apm"
 $CompName = $env:COMPUTERNAME; if (-not $CompName) { $CompName = [Environment]::MachineName }
 $TARGET         = "host/$CompName"
@@ -1144,10 +1144,37 @@ foreach ($svc in @("W3SVC", "WAS")) {
 $liveHits = @(Get-ChildItem Env: | Where-Object { $_.Name -match $ENV_NAME_PATTERN })
 if ($liveHits.Count -eq 0) { Fact "collector process env: no WHATAP_*/COR_*/CORECLR_*/DOTNET_STARTUP_HOOKS values" }
 foreach ($p in $liveHits) { Fact "collector process env: $($p.Name)=$($p.Value)" }
+# scope 4: per-app-pool env (applicationHost.config
+# <applicationPools><add name=POOL><environmentVariables><add name= value=>) --
+# IIS hands these to that pool's w3wp only; another profiler product may
+# register here instead of in W3SVC/WAS
+$ahc = "$WinDir\System32\inetsrv\config\applicationHost.config"
+$poolEnvPairs = @()
+Fact "-- scope: app pool environmentVariables ($ahc) --"
+$ahcState = Path-State $ahc
+if ($ahcState -eq "denied") { Fact "app pool env: n/a (access denied: $ahc)" }
+elseif ($ahcState -eq "absent") { Fact "app pool env: n/a (path not found: $ahc)" }
+else {
+    try {
+        [xml]$ahcXml = Get-Content -LiteralPath $ahc -Raw -Encoding UTF8 -ErrorAction Stop
+        $poolVars = @($ahcXml.SelectNodes("//applicationPools/add/environmentVariables/add"))
+        $shown = 0
+        foreach ($v in $poolVars) {
+            $n = $v.GetAttribute("name")
+            if ($n -notmatch $ENV_NAME_PATTERN) { continue }
+            $pool = $v.ParentNode.ParentNode.GetAttribute("name")
+            $poolEnvPairs += "$n=$($v.GetAttribute('value'))"
+            if ($shown -lt 80) { Fact "app pool env: pool=$pool $n=$($v.GetAttribute('value'))" }
+            $shown++
+        }
+        if ($shown -eq 0) { Fact "app pool env: no WHATAP_*/COR_*/CORECLR_*/DOTNET_STARTUP_HOOKS/MicrosoftInstrumentationEngine_* values in any pool" }
+        elseif ($shown -gt 80) { Fact "(further app pool env values omitted: $($shown - 80) more)" }
+    } catch { Fact "app pool env: n/a (error: $($_.Exception.Message.Split("`n")[0]))" }
+}
 Emit ""
 # every configured profiler/hook path -> does that exact file exist, and what is it
 $cfgPaths = @{}
-foreach ($line in ($svcEnvLines + $machineEnvPairs + @($liveHits | ForEach-Object { "$($_.Name)=$($_.Value)" }))) {
+foreach ($line in ($svcEnvLines + $machineEnvPairs + $poolEnvPairs + @($liveHits | ForEach-Object { "$($_.Name)=$($_.Value)" }))) {
     if ($line -match '^(COR_PROFILER_PATH(_32|_64)?|CORECLR_PROFILER_PATH(_32|_64)?|DOTNET_STARTUP_HOOKS|MicrosoftInstrumentationEngine_RawProfilerHookPath(_32|_64)?)=(.+)$') {
         $cfgPaths[$Matches[1] + "=" + $Matches[5]] = $Matches[5]
     }
@@ -1160,7 +1187,7 @@ foreach ($k in ($cfgPaths.Keys | Sort-Object)) {
 Emit ""
 # every profiler CLSID named in any scope (COR_PROFILER, CORECLR_PROFILER, the
 # CLR Instrumentation Engine raw profiler hook) plus the two WhaTap CLSIDs
-$envLinesAll = @($svcEnvLines + $machineEnvPairs + @($liveHits | ForEach-Object { "$($_.Name)=$($_.Value)" }))
+$envLinesAll = @($svcEnvLines + $machineEnvPairs + $poolEnvPairs + @($liveHits | ForEach-Object { "$($_.Name)=$($_.Value)" }))
 $clsids = [ordered]@{}
 $clsids[$CLSID_CURRENT] = "WhaTap current 2.5.x line"
 $clsids[$CLSID_LEGACY]  = "WhaTap legacy 450/core line"
@@ -1212,13 +1239,12 @@ Fact "-- Fusion assembly-binding log settings (HKLM\SOFTWARE\Microsoft\Fusion; r
 foreach ($n in @("EnableLog", "ForceLog", "LogFailures", "LogResourceBinds", "LogPath")) {
     RegValue "Fusion $n" "HKLM:\SOFTWARE\Microsoft\Fusion" $n
 }
-$ahc = "$WinDir\System32\inetsrv\config\applicationHost.config"
-TryFact "applicationHost.config lines matching COR/CORECLR/WHATAP/STARTUP_HOOKS (with line numbers)" {
+TryFact "applicationHost.config lines matching COR/CORECLR/WHATAP/STARTUP_HOOKS/InstrumentationEngine (with line numbers)" {
     $st = Path-State $ahc
     if ($st -eq "denied") { "n/a (access denied: $ahc)" }
     elseif ($st -eq "absent") { "n/a (path not found: $ahc)" }
     else {
-        $m = @(Select-String -LiteralPath $ahc -Pattern 'CORECLR|COR_|WHATAP|STARTUP_HOOKS' -Encoding UTF8 -ErrorAction Stop | Select-Object -First 40)
+        $m = @(Select-String -LiteralPath $ahc -Pattern 'CORECLR|COR_|WHATAP|STARTUP_HOOKS|InstrumentationEngine' -Encoding UTF8 -ErrorAction Stop | Select-Object -First 40)
         if ($m.Count -eq 0) { "no matching lines" } else { $m | ForEach-Object { "{0}: {1}" -f $_.LineNumber, $_.Line.Trim() } }
     }
 }
@@ -1228,7 +1254,7 @@ Section "D. WhaTap service & runtime processes"
 # Core / 5+), aspnetcorev2*.dll (the ASP.NET Core Module and its in-process
 # handler); their FileVersion is the runtime build actually running
 $RUNTIME_MODULES  = '\\(clr|coreclr|aspnetcorev2[^\\]*)\.dll$'
-$PROFILER_MODULES = 'whatap|clrprofiler|datadog|dynatrace|newrelic|appdynamics|instana|elastic.apm|contrast|scouter|jennifer'
+$PROFILER_MODULES = 'whatap|clrprofiler|InstrumentationEngine|secupi|datadog|dynatrace|newrelic|appdynamics|instana|elastic.apm|contrast|scouter|jennifer'
 # Module lists of the w3wp and the first 10 dotnet.exe processes, read once.
 # A live process always has modules (ntdll at least): an empty list is one
 # this run could not read, which 0.4.0 printed as "none". Windows PowerShell
