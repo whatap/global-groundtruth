@@ -134,6 +134,29 @@ one entry at the top of its section (docs/authoring-guide.md, step 2);
 
 ## windows/collect-db-mssql.ps1
 
+- **0.8.0**: The collector requires an elevated PowerShell
+  (`#Requires -RunAsAdministrator`), as collect-apmdotnet.ps1 does since 0.10.0.
+  A run that is not elevated is refused by PowerShell before any line executes,
+  `-Help` included, and the script checks the same itself before reading its
+  arguments, since PowerShell applies `#Requires` only to a script run as a
+  file; either way it exits 1 and writes no report. Why: not elevated, Windows
+  hides another account's java command line, so the DBX process went unfound;
+  the operator's decision (2026-10-07) is to refuse such a run. Removed with it,
+  as only a run that is not elevated reached them: the "none among the tasks
+  this account can see (not elevated)" scheduled-task line, the install goal's
+  "java process(es) with an unreadable command line" reason, the privilege gap
+  appended to the install and instance goal reasons, and the non-elevated
+  `$PRIV_GAP` value. The README, the help text and FIELD-GUIDE say elevation is
+  required.
+  Validated 2026-10-07 on jjsong-dotnet-lab (SQL Server Express instances
+  SQLEXPRESS and DBX2 running, no DBX agent), Windows PowerShell 5.1 and pwsh 7:
+  elevated, the 0.7.3 and 0.8.0 reports differ only in digits, all COMPLETE and
+  passing validate.sh --report; not elevated (OpenSSH as ggtuser), `-File` is
+  refused by `#Requires` and a scriptblock run prints `collect-db-mssql.ps1 must
+  run in a PowerShell started with "Run as Administrator"; ...`, both exit 1.
+  The DBX-agent paths (install and instance goals obtained) were not run; their
+  elevated output is unchanged by the code (only `$isAdmin`-false terms and an
+  empty Priv-Hint were removed). The VM was reverted to its pre-test snapshot.
 - **0.7.3**: Comments only, in the shared ps1 blocks (templates/groups/ps1.ps1):
   versions, dates and lab measurements are replaced by the design reason they
   supported (the measurements are in collectors/apm/dotnet/CHANGELOG.md 0.5.0

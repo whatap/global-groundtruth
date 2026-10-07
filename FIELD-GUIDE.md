@@ -62,7 +62,7 @@ Your WhaTap contact will name the collector to run:
 | The backend's **MySQL** (`account` / `notihub` metadata; asked for separately) | `collectors/collection-server/collect-collmysql.sh` | on the MySQL host, or any host whose `mysql` client reaches it |
 | **Kubernetes** monitoring (operator, node agent, master agent, ...) | `collectors/k8s/collect-k8s.sh` | any machine where `kubectl` (or `oc`) reaches the cluster (a bastion or your workstation), **not** on a cluster node |
 | The **NMS Control Manager** (network monitoring) | `collectors/nms/collect-nms.sh` | directly on the NMS Control Manager host |
-| **Database monitoring** (DBX/XOS/DMX agents and the monitored DB) | `collectors/db/collect-db.sh` (Windows/MSSQL: `collectors/db/windows/collect-db-mssql.ps1`) | on the DB agent host; for a split install, once on each host |
+| **Database monitoring** (DBX/XOS/DMX agents and the monitored DB) | `collectors/db/collect-db.sh` (Windows/MSSQL: `collectors/db/windows/collect-db-mssql.ps1`, in a PowerShell started with "Run as Administrator") | on the DB agent host; for a split install, once on each host |
 | **Java** application monitoring | `collectors/apm/java/collect-apmjava.sh` | on the host or container where the Java application runs |
 | **Python** application monitoring | `collectors/apm/python/collect-apmpython.sh` | on the host or container where the Python application runs |
 | **Node.js** application monitoring | `collectors/apm/nodejs/collect-apmnodejs.sh` | on the host or container where the Node.js application runs |

@@ -5,6 +5,12 @@
 # the SQL Server host may differ; DB-internal facts come from the companion
 # windows/mssql.sql pack (run via sqlcmd with the monitoring account).
 #
+# Requires Windows PowerShell 5.1+ in a PowerShell started with "Run as
+# Administrator". A run that is not elevated is refused by PowerShell before any
+# line executes (the #Requires line below), and by the script itself when its
+# text is run another way; no report is written.
+#Requires -RunAsAdministrator
+#
 # Usage (PowerShell 5.1+):
 #   .\collect-db-mssql.ps1                 print this help (no collection)
 #   .\collect-db-mssql.ps1 -File          write report -> .\whatap-db-mssql-<host>-<UTC>.txt
@@ -47,9 +53,19 @@ param(
     [string[]]$Rest = @()
 )
 
+# The same test as #Requires -RunAsAdministrator, for a run that skips it:
+# PowerShell checks #Requires only when it runs the script as a file, not when
+# the text is run as a scriptblock
+$_elevated = $false
+try { $_elevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator) } catch { }
+if (-not $_elevated) {
+    [Console]::Error.WriteLine("collect-db-mssql.ps1 must run in a PowerShell started with ""Run as Administrator""; this one is not elevated. No report was written.")
+    exit 1
+}
+
 $COLLECTOR_NAME = "whatap-db-mssql"
 # History: ../CHANGELOG.md, section windows/collect-db-mssql.ps1 (next to the db README).
-$VERSION        = "0.7.3"
+$VERSION        = "0.8.0"
 $DOMAIN         = "db"
 $CompName = $env:COMPUTERNAME; if (-not $CompName) { $CompName = [Environment]::MachineName }
 $TARGET         = "db-host/$CompName"
@@ -57,7 +73,8 @@ $TARGET         = "db-host/$CompName"
 function Usage {
     return @"
 $COLLECTOR_NAME $VERSION -- a WhaTap Global Groundtruth collector (facts only).
-Target: a Windows host running the WhaTap DBX agent for SQL Server.
+Target: a Windows host running the WhaTap DBX agent for SQL Server. Run it in
+a PowerShell started with "Run as Administrator"; it refuses to start otherwise.
 A collection needs an explicit action flag so nothing starts by accident.
 
   .\collect-db-mssql.ps1                 print this help (no collection)
@@ -795,9 +812,9 @@ function Log-Lines($lines, [string]$scope, $specs) {
 }
 
 # ---- discovery ---------------------------------------------------------------
-# Win32_Process.CommandLine is empty for another user's process when the run is
-# not elevated, so an agent process can be invisible to the scan; java
-# processes whose command line could not be read are counted for that reason.
+# Win32_Process.CommandLine is empty for a process WMI cannot read, which
+# would hide an agent process from the scan; java processes whose command line
+# could not be read are counted for that reason.
 $agentProcs = @(); $procErr = ""; $javaUnread = @()
 try {
     $allProc = @(Get-CimBounded Win32_Process)
@@ -870,14 +887,11 @@ Fact "user: $UserId"
 # unelevated process still lists Administrators, as a deny-only SID, so asking
 # by membership reports an unelevated run as elevated. Not TryFact either: a
 # throw there would drop the line, and section 0 always states the privilege.
+# The #Requires line and the check above make PowerShell refuse a run without
+# that token, so the line reads elevated; it is still read from the token.
 $isAdmin = $false
 try { $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator) } catch { }
-if ($isAdmin) {
-    $PRIV_WHY = "elevated ($UserId)"; $script:PRIV_GAP = ""
-} else {
-    $PRIV_WHY = "not elevated ($UserId)"
-    $script:PRIV_GAP = "run PowerShell as Administrator"
-}
+$PRIV_WHY = if ($isAdmin) { "elevated ($UserId)" } else { "not elevated ($UserId)" }
 Fact "privilege: $PRIV_WHY"
 Note-Boot
 
@@ -999,7 +1013,7 @@ TryFact "services matching whatap/dbx (name, state, start mode, account, path)" 
 # "folder\name","next run time","status", localized by Windows.
 TryFact "scheduled tasks matching whatap/dbx (schtasks /query /fo csv)" {
     $m = @(Invoke-Bounded schtasks @("/query", "/fo", "csv", "/nh") | Where-Object { $_ -match 'whatap|dbx' })
-    if ($m.Count -eq 0) { $(if ($isAdmin) { "none" } else { "none among the tasks this account can see (not elevated)" }) } else { $m }
+    if ($m.Count -eq 0) { "none" } else { $m }
 }
 
 Section "F. Agent logs"
@@ -1064,16 +1078,14 @@ if ($homeBad.Count -gt 0) {
 } elseif ($unresolved.Count -gt 0) {
     Set-Missed install (($unresWhy -join '; ') + " (pass -AgentHome <dir>)" + $(if ($homes.Count -eq 0) { "" } else { "; found: $($homes -join ', ')" }))
 } elseif ($homes.Count -gt 0) { Set-Got install }
-elseif ($null -eq $allProc) { Set-Missed install ("Win32_Process query failed: $procErr" + $(if ($procErr -match 'denied') { Priv-Hint } else { "" })) }
-elseif ($javaUnread.Count -gt 0 -and -not $isAdmin) {
-    Set-Missed install ("no whatap agent process in the command lines read; $($javaUnread.Count) java process(es) with an unreadable command line" + (Priv-Hint))
-} else { Set-Na install "no whatap agent process in any process command line, no -AgentHome given" }
-if ($unreadConf.Count -gt 0) { Set-Missed instance ("not readable: " + (@($unreadConf | ForEach-Object { Join-Path $_ "whatap.conf" }) -join ', ') + (Priv-Hint)) }
+elseif ($null -eq $allProc) { Set-Missed install "Win32_Process query failed: $procErr" }
+else { Set-Na install "no whatap agent process in any process command line, no -AgentHome given" }
+if ($unreadConf.Count -gt 0) { Set-Missed instance ("not readable: " + (@($unreadConf | ForEach-Object { Join-Path $_ "whatap.conf" }) -join ', ')) }
 elseif ($confFailed.Count -gt 0) { Set-Missed instance ("search for whatap.conf did not finish: " + ($confFailed -join ', ')) }
-elseif ($confDenied.Count -gt 0) { Set-Missed instance ("search for whatap.conf hit an unreadable entry under: $($confDenied -join ', ')" + (Priv-Hint)) }
+elseif ($confDenied.Count -gt 0) { Set-Missed instance ("search for whatap.conf hit an unreadable entry under: $($confDenied -join ', ')") }
 elseif ($instances.Count -gt 0) { Set-Got instance }
 elseif ($homes.Count -gt 0) { Set-Missed instance "install dir discovered but no whatap.conf within depth 2" }
-elseif ($homeBad.Count -gt 0 -or $unresolved.Count -gt 0 -or $null -eq $allProc -or ($javaUnread.Count -gt 0 -and -not $isAdmin)) { Set-Missed instance "no install dir resolved (see the install goal)" }
+elseif ($homeBad.Count -gt 0 -or $unresolved.Count -gt 0 -or $null -eq $allProc) { Set-Missed instance "no install dir resolved (see the install goal)" }
 else { Set-Na instance "no install dir on this host to hold a whatap.conf" }
 Emit-Status
 Emit ""

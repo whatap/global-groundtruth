@@ -3,7 +3,7 @@
 > **Status:** validated at `collect-db.sh` 0.9.1 on 2026-09-28, live
 > `jjsong-ggt-postgres` container (DB host, PostgreSQL 16, no DBX agent installed
 > there); COMPLETE, `validate.sh --report` pass.
-> Validated at `collect-db-mssql.ps1` 0.7.0 on 2026-09-27, Windows Server 2022.
+> Validated at `collect-db-mssql.ps1` 0.8.0 on 2026-10-07, Windows Server 2022, elevated (no DBX agent on that host; the simulated DBX agent was last run at 0.7.0).
 > Not yet run on: a real DBX agent host (the mock DBX tree was last run at 0.9.0).
 > Owner: Global team until handover to the DB domain team (CONTRACT rule 4).
 
@@ -73,12 +73,16 @@ block `host: helpers` ([templates/groups/host.sh](../../templates/groups/host.sh
    Send the `-File` report: it is UTF-8 without a BOM with LF line ends under
    either PowerShell. `-Stdout` hands the lines to the PowerShell host (CRLF,
    console code page, UTF-16LE for a `>` redirection under 5.1), and
-   `tools/validate.sh --report` rejects such a copy. Run it elevated: not
-   elevated, another account's java command line is empty, so the DBX process is
-   not found and the install goal is `missed` with the privilege hint. Over
-   OpenSSH a non-administrator gets a network logon that WMI refuses ("Access
-   denied" on every CIM read); the same account in a local logon reads the
-   process list.
+   `tools/validate.sh --report` rejects such a copy.
+
+   **Run it in a PowerShell started with "Run as Administrator".** The script
+   carries `#Requires -RunAsAdministrator`: a PowerShell that is not elevated
+   refuses to start it, `-Help` included, with `The script
+   'collect-db-mssql.ps1' cannot be run because it contains a "#requires"
+   statement for running as Administrator`, and the script checks the same
+   itself when its text is run another way; no report is written. Elevation
+   is needed because Windows hides another account's java command line, so the
+   DBX process would not be found.
 
    Section B also gives each SQL Server instance installed on the host where
    it runs: `Version`, `PatchLevel` and `Edition` from
@@ -261,8 +265,8 @@ Collection-server-side facts (server version, metrics categories) belong to
 - `collect-db-mssql.ps1`: Windows Server 2022 Standard Evaluation 10.0.20348, Windows
   PowerShell 5.1 and pwsh 7.6, SQL Server 2022 Express with two instances and a
   **simulated** DBX agent (a java process, two `whatap.conf` instances, a log with
-  WA codes; the DBX package is not publicly downloadable): elevated, not elevated
-  in a local logon, and over OpenSSH.
+  WA codes; the DBX package is not publicly downloadable), elevated; since 0.8.0
+  a run that is not elevated is refused.
 
 ## What the report can contain
 
