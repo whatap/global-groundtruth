@@ -38,7 +38,8 @@
 #   .\collect-apmdotnet.ps1                 print this help (no collection)
 #   .\collect-apmdotnet.ps1 -File           write report -> .\whatap-apmdotnet-<host>-<UTC>.txt
 #   .\collect-apmdotnet.ps1 -Stdout         print report to stdout
-#   .\collect-apmdotnet.ps1 -AgentHome <dir>  add an agent install dir the discovery cannot see
+#   .\collect-apmdotnet.ps1 -Home <dir>     add an agent install dir the discovery cannot see
+#   .\collect-apmdotnet.ps1 -File -Out <dir>  write the report into <dir>
 #   powershell -ExecutionPolicy Bypass -File .\collect-apmdotnet.ps1 -File
 #
 # Saved as UTF-8 with a BOM and kept ASCII in every emitted string, so Windows
@@ -50,10 +51,6 @@ param(
     [switch]$Stdout,
     [switch]$Quiet,
     [switch]$Help,
-    # Not "$Home": PowerShell variables are case-insensitive, so a parameter
-    # named Home is the read-only automatic $HOME and every run died with
-    # "Cannot overwrite variable Home" (collect-db-mssql.ps1 0.2.0).
-    [string[]]$AgentHome = @(),
     # -Out DIR: a switch, and its directory is read from the arguments below.
     # Not a string parameter: then a -Out with no value is PowerShell's
     # "Missing an argument", not this script's usage. It must be declared:
@@ -63,18 +60,31 @@ param(
     [Alias("Out")]
     [switch]$OutFlag,
     # everything else, read below: -Home DIR (not declared, so that -h means
-    # -Help alone and a -Home with no value is a usage error), the directory
-    # of -Out, the shell collectors' spellings (--stdout, --file, --quiet,
-    # --help, -h, --home DIR, --out DIR, --home=DIR, --out=DIR), and anything
-    # unknown, which stops the run with usage on stderr and exit 2, as the
-    # shell CLI does
+    # -Help alone and a -Home with no value is a usage error; a parameter
+    # named Home would also be the read-only automatic $HOME, since PowerShell
+    # variables are case-insensitive), the directory of -Out, the shell
+    # collectors' spellings (--stdout, --file, --quiet, --help, -h, --home DIR,
+    # --out DIR, --home=DIR, --out=DIR), the removed -AgentHome, which exits 2
+    # naming -Home, and anything unknown, which stops the run with usage on
+    # stderr and exit 2, as the shell CLI does. An undeclared -Name reaches
+    # this list as the string "-Name", its value as the next element.
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$Rest = @()
 )
 
+# The same test as #Requires -RunAsAdministrator, for a run that skips it:
+# PowerShell checks #Requires only when it runs the script as a file, not when
+# the text is run as a scriptblock
+$_elevated = $false
+try { $_elevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator) } catch { }
+if (-not $_elevated) {
+    [Console]::Error.WriteLine("collect-apmdotnet.ps1 must run in a PowerShell started with ""Run as Administrator""; this one is not elevated. No report was written.")
+    exit 1
+}
+
 $COLLECTOR_NAME = "whatap-apmdotnet"
 # History: CHANGELOG.md (next to this file).
-$VERSION        = "0.10.0"
+$VERSION        = "0.11.0"
 $DOMAIN         = "apm"
 $CompName = $env:COMPUTERNAME; if (-not $CompName) { $CompName = [Environment]::MachineName }
 $TARGET         = "host/$CompName"
@@ -91,7 +101,7 @@ A collection needs an explicit action flag so nothing starts by accident.
   .\collect-apmdotnet.ps1 -File            write report -> .\$COLLECTOR_NAME-<host>-<UTC>.txt
   .\collect-apmdotnet.ps1 -Stdout          print report to stdout
   .\collect-apmdotnet.ps1 -Quiet ...       silence progress narration
-  .\collect-apmdotnet.ps1 -Home <dir>      add an agent install dir the discovery cannot see (also -AgentHome)
+  .\collect-apmdotnet.ps1 -Home <dir>      add an agent install dir the discovery cannot see
   .\collect-apmdotnet.ps1 -File -Out <dir> write the report into <dir> (default: the current directory)
   .\collect-apmdotnet.ps1 -Help | -h       print this help
 The shell spellings --file, --stdout, --quiet, --home <dir>, --out <dir> and --help work too.
@@ -109,18 +119,20 @@ foreach ($_ra in @($Rest)) {
     elseif ($_rl -ge 0 -and $_rs -match '^[\\/]' -and $_rest[$_rl] -match '^--?(out|home)=[A-Za-z]:$') { $_rest[$_rl] += $_rs }
     else { $_rest.Add($_rs) }
 }
-$OutPath = ""; $wantHelp = $false; $badArg = @(); $_loose = @()
+$OutPath = ""; $wantHelp = $false; $badArg = @(); $_loose = @(); $HomeDirs = @(); $_removed = @()
 for ($_ci = 0; $_ci -lt $_rest.Count; $_ci++) {
     $_ca = $_rest[$_ci]
     if ($_ca -in @('--help', '-help', '-h', '/?')) { $wantHelp = $true }
     elseif ($_ca -eq '--file')   { $File = [switch]$true }
     elseif ($_ca -eq '--stdout') { $Stdout = [switch]$true }
     elseif ($_ca -eq '--quiet')  { $Quiet = [switch]$true }
+    # -AgentHome and every prefix of it PowerShell bound to that parameter
+    elseif ($_ca -match '^--?a(g(e(n(t(h(o(m(e)?)?)?)?)?)?)?)?([=:].*)?$') { $_removed += "-AgentHome is no longer an option: use -Home <dir>" }
     elseif ($_ca -in @('--home', '-home')) {
         if ($_ci + 1 -ge $_rest.Count) { $badArg += "$_ca (needs a directory)"; continue }
-        $_ci++; $AgentHome += $_rest[$_ci]
+        $_ci++; $HomeDirs += $_rest[$_ci]
     }
-    elseif ($_ca -match '^--?home[=:](.+)$') { $AgentHome += $Matches[1] }
+    elseif ($_ca -match '^--?home[=:](.+)$') { $HomeDirs += $Matches[1] }
     elseif ($_ca -match '^--?out[=:](.+)$') { $OutPath = $Matches[1] }
     elseif ($_ca -notmatch '^-') { $_loose += $_ca }
     else { $badArg += $_ca }
@@ -129,6 +141,10 @@ for ($_ci = 0; $_ci -lt $_rest.Count; $_ci++) {
 if ($OutFlag -and -not $OutPath) {
     if ($_loose.Count -ge 1) { $OutPath = $_loose[0]; $_loose = @($_loose | Select-Object -Skip 1) }
     else { $badArg += "-Out (needs a directory)" }
+}
+if ($_removed.Count -gt 0) {
+    $_removed | Select-Object -Unique | ForEach-Object { [Console]::Error.WriteLine($_) }
+    exit 2
 }
 $badArg += $_loose
 if ($badArg.Count -gt 0) {
@@ -762,8 +778,7 @@ function TcpProbe([string]$label, [string]$dsthost, [int]$port, [int]$timeoutSec
 # ---- reasoned-absence helpers -------------------------------------------------
 # Path-State PATH -> "present", "absent", or "denied" when the run may not look
 # (Test-Path answers $false and writes an error for a path under a directory
-# this account cannot list, which read as "path not found": 0.4.0 said that of
-# applicationHost.config for a not elevated run)
+# this account cannot list, which would read as "path not found")
 function Path-State([string]$p) {
     try { if (Test-Path -LiteralPath $p -ErrorAction Stop) { return "present" } return "absent" }
     catch { if ($_.Exception -is [System.UnauthorizedAccessException] -or "$($_.Exception.Message)" -match 'denied') { return "denied" } return "absent" }
@@ -843,9 +858,9 @@ function OwnerOf([string]$path) {
 # Reg-Open "HKLM:\..." | "HKCU:\..." -> a read-only RegistryKey, or $null when
 # the key does not exist; throws when it exists but cannot be opened. The .NET
 # registry API, not Test-Path / Get-ItemProperty: on Windows Server 2022 the
-# registry provider took 1.2-1.5 s to answer for each absent key under
-# HKLM:\SOFTWARE\Classes, and the six CLSID reads cost 8 s of a 22 s run on a
-# host without the agent (0.4.0). The key's owner closes it.
+# registry provider takes 1.2-1.5 s to answer for each absent key under
+# HKLM:\SOFTWARE\Classes, and on a host without the agent most CLSID keys
+# read here are absent. The key's owner closes it.
 function Reg-Open([string]$key) {
     if ($key -notmatch '^(HKLM|HKCU):\\(.*)$') { throw "unsupported registry path: $key" }
     $hive = if ($Matches[1] -eq 'HKLM') { [Microsoft.Win32.Registry]::LocalMachine } else { [Microsoft.Win32.Registry]::CurrentUser }
@@ -888,11 +903,9 @@ $ENV_NAME_PATTERN = '^(WHATAP_|COR_ENABLE_PROFILING|COR_PROFILER|CORECLR_|DOTNET
 $homeCandidates = New-Object System.Collections.Generic.List[string]
 # A discovery read that failed (not one whose key is simply absent) means an
 # empty candidate list is not an answer; the agent goal is then missed.
-$script:DiscErr = @(); $script:DiscDenied = $false
+$script:DiscErr = @()
 function Note-DiscErr([string]$what, $err) {
     if ($err.Exception -is [System.Management.Automation.ItemNotFoundException]) { return }
-    if ($err.Exception -is [System.UnauthorizedAccessException] -or $err.Exception -is [System.Security.SecurityException] -or
-        "$($err.Exception.Message)" -match 'denied|not allowed') { $script:DiscDenied = $true }
     $script:DiscErr += ("{0}: {1}" -f $what, $err.Exception.Message.Split("`n")[0])
 }
 function AddHome([string]$p, [string]$src) {
@@ -904,7 +917,7 @@ function AddHome([string]$p, [string]$src) {
     $homeCandidates.Add("$p|$src")
 }
 $homeBad = @()
-foreach ($h in $AgentHome) { AddHome $h "parameter -AgentHome"; if (-not (Test-Path -LiteralPath $h)) { $homeBad += $h } }
+foreach ($h in $HomeDirs) { AddHome $h "parameter -Home"; if (-not (Test-Path -LiteralPath $h)) { $homeBad += $h } }
 if ($env:WHATAP_DOTNET_HOME) { AddHome $env:WHATAP_DOTNET_HOME "collector process env WHATAP_DOTNET_HOME" }
 try {
     $me = Get-ItemProperty -LiteralPath $MACHINE_ENV_KEY -ErrorAction Stop
@@ -913,8 +926,8 @@ try {
 # Home-Of FILE -> the agent home a profiler or startup-hook path names: the
 # directory above its core\ / net6.0\ / net461\ folder, however deep the file
 # sits below it (core\x86\Whatap.ClrProfiler.dll), else the parent of its
-# parent. Parent-of-parent alone made ...\WhaTap .NET\core a second home
-# from a COR_PROFILER_PATH_32 under core\x86 (0.4.0, seen on a lab host).
+# parent. Parent-of-parent alone would make ...\WhaTap .NET\core a second
+# home from a COR_PROFILER_PATH_32 under core\x86.
 function Home-Of([string]$f) {
     $f = $f.Trim('"')
     if ($f -match '^(.+?)\\(core|net6\.0|net461)\\') { return $Matches[1] }
@@ -1004,15 +1017,12 @@ Fact "user: $UserId"
 #
 # IsInRole is the test, not group membership. Under UAC's split token an
 # unelevated process still lists Administrators, as a deny-only SID, so asking
-# by membership reports an unelevated run as elevated.
+# by membership reports an unelevated run as elevated. The #Requires line makes
+# PowerShell refuse a run without that token, so the line reads elevated; it
+# is still read from the token, not written as a constant.
 $isAdmin = $false
 try { $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator) } catch { }
-if ($isAdmin) {
-    $PRIV_WHY = "elevated ($UserId)"; $script:PRIV_GAP = ""
-} else {
-    $PRIV_WHY = "not elevated ($UserId)"
-    $script:PRIV_GAP = "run PowerShell as Administrator"
-}
+$PRIV_WHY = if ($isAdmin) { "elevated ($UserId)" } else { "not elevated ($UserId)" }
 Fact "privilege: $PRIV_WHY"
 Note-Boot
 Fact "64-bit OS: $([Environment]::Is64BitOperatingSystem)   64-bit collector process: $([Environment]::Is64BitProcess)"
@@ -1264,27 +1274,20 @@ $profPrefixes = @(@($profDlls | Where-Object { $_ } | ForEach-Object { $d = "$_"
 # the Application log still holds.
 $msiNames = @(@($otherEntries | ForEach-Object { [regex]::Escape("$($_.DisplayName)") } | Where-Object { $_ }) + 'Instrumentation Engine') -join '|'
 TryFact "Application log: Windows Installer product events (1033 installed, 1034 removed, 1035 reconfigured, 1036 updated) naming the products above or the Instrumentation Engine (newest 20 of the newest 200 MsiInstaller events)" {
-    # elevated: the provider is filtered by the event log service (under a second
-    # on a 100k-event log). Not elevated, a ProviderName key fails (it reads
-    # provider metadata the account cannot: "There is not an event provider")
-    # and an XPath filter is refused to a network logon, so the events are read
-    # by id and the provider picked afterwards; that reads the whole log when
-    # there are fewer than 200 MsiInstaller events and may hit the time cap
-    if ($isAdmin) {
-        $sb = {
-            try { Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'MsiInstaller'; Id = 1033, 1034, 1035, 1036 } -MaxEvents 200 -ErrorAction Stop }
-            catch { if ($_.FullyQualifiedErrorId -notlike 'NoMatchingEventsFound*') { throw } }
-        }
-    } else {
-        $sb = {
-            try { Get-WinEvent -FilterHashtable @{ LogName = 'Application'; Id = 1033, 1034, 1035, 1036 } -ErrorAction Stop | Where-Object { $_.ProviderName -eq 'MsiInstaller' } | Select-Object -First 200 }
-            catch { if ($_.FullyQualifiedErrorId -notlike 'NoMatchingEventsFound*') { throw } }
-        }
+    # the provider is filtered by the event log service (ProviderName key), under
+    # a second on a 100k-event log. Reading by id and picking the provider
+    # afterwards scans the whole log when it holds fewer than 200 MsiInstaller
+    # events, and can reach the time cap; taking the newest 200 by id first
+    # loses the MSI events behind the ASP.NET Core Module's id-1033 shutdown
+    # events on a busy IIS host
+    $sb = {
+        try { Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'MsiInstaller'; Id = 1033, 1034, 1035, 1036 } -MaxEvents 200 -ErrorAction Stop }
+        catch { if ($_.FullyQualifiedErrorId -notlike 'NoMatchingEventsFound*') { throw } }
     }
     $raw = @(Invoke-BoundedBlock $sb)
     $ev = @($raw | Where-Object { "$($_.Message)" -match $msiNames } | Select-Object -First 20)
     if ($raw.Count -gt 0) { "oldest MsiInstaller product event read: $($raw[-1].TimeCreated.ToString('yyyy-MM-dd HH:mm:ss'))" }
-    if ($ev.Count -eq 0) { $(if ($isAdmin) { "none naming the products above" } else { "none naming the products above among the events this account can read (not elevated)" }) }
+    if ($ev.Count -eq 0) { "none naming the products above" }
     else {
         $ev | ForEach-Object {
             $msg = ("$($_.Message)" -replace '\s+', ' ').Trim()
@@ -1317,12 +1320,10 @@ $PROFILER_MODULES = 'whatap|clrprofiler|InstrumentationEngine|datadog|dynatrace|
 if ($profPrefixes.Count -gt 0) { $PROFILER_MODULES += '|' + (@($profPrefixes | ForEach-Object { [regex]::Escape($_) }) -join '|') }
 # Module lists of the w3wp and the first 10 dotnet.exe processes, read once.
 # A live process always has modules (ntdll at least): an empty list is one
-# this run could not read, which 0.4.0 printed as "none". Windows PowerShell
-# 5.1 (.NET Framework) lists only the WOW64 layer of a 32-bit process (ntdll,
-# wow64*.dll): the 32-bit Classic32 pool read "none" for both lists while
-# pwsh 7 listed its clr.dll (0.5.1, lab host, 2026-09-27). The lists of such
-# processes are read again by the 32-bit Windows PowerShell, in one bounded
-# call for all of them.
+# this run could not read, not "none". Windows PowerShell 5.1 (.NET Framework)
+# lists only the WOW64 layer of a 32-bit process (ntdll, wow64*.dll), where
+# pwsh 7 lists its clr.dll, so the lists of such processes are read again by
+# the 32-bit Windows PowerShell, in one bounded call for all of them.
 $ModList = @{}; $ModErr = @{}; $ModNote = @{}; $wowPids = @()
 foreach ($p in @($procW3wp) + @($procDotnet | Select-Object -First 10)) {
     $id = [int]$p.ProcessId
@@ -1379,8 +1380,9 @@ foreach ($p in $procWhatap) {
 Emit ""
 Fact "w3wp.exe worker processes: $($procW3wp.Count)"
 foreach ($p in $procW3wp) {
-    # CommandLine and ExecutablePath are empty for another account's process
-    # when the run is not elevated; 0.4.0 then printed "exe= [64-bit path]"
+    # CommandLine and ExecutablePath are empty when WMI cannot read them for
+    # this process; the pool and the exe are then n/a, not a bitness guessed
+    # from an empty path
     $pool = if ($p.CommandLine) { "n/a (no -ap in the command line)" } else { "n/a (command line not readable)" }
     if ($p.CommandLine -match '-ap\s+"([^"]+)"') { $pool = $Matches[1] }
     if ($p.ExecutablePath) {
@@ -1548,9 +1550,9 @@ if ($env:WT_TRACE_LOG_PATH) { Fact "WT_TRACE_LOG_PATH (collector process env): $
 Section "H. Network endpoints"
 # tracer -> UDP 127.0.0.1:6600 -> whatap_dotnet.exe -> TCP 6600 -> collection server
 # netstat -ano, one call for TCP and UDP with the owning pid. Not
-# Get-NetTCPConnection / Get-NetUDPEndpoint: the same rows, but importing their
-# module took 1.9 s and each bounded runspace imports it again (0.4.0, Windows
-# Server 2022); netstat took 0.2 s.
+# Get-NetTCPConnection / Get-NetUDPEndpoint: the same rows, but on Windows
+# Server 2022 importing their module takes 1.9 s and each bounded runspace
+# imports it again, where netstat takes 0.2 s.
 TryFact "netstat -ano lines with :6600 (proto, local, remote, state, pid)" {
     $m = @(Invoke-Bounded netstat @("-ano") | Select-String -Pattern ':6600\s' | Select-Object -First 40)
     if ($m.Count -eq 0) { "none" } else { $m | ForEach-Object { $_.Line.Trim() } }
@@ -1572,8 +1574,8 @@ foreach ($h in $existingHomes) {
 # " | ". A message over 400 characters keeps its first line and the lines that
 # name what failed (Event message, Exception type/message, the application
 # path, the process): an ASP.NET 1310 event separates its 70 lines with bare
-# CRs, and three lines of it dropped the "Could not load file or assembly"
-# text that section J is read against (0.5.0 lab check).
+# CRs, and its first three lines do not hold the "Could not load file or
+# assembly" text that section J is read against.
 function Event-Text([string]$m) {
     $ls = @("$m" -split "`r`n|`r|`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
     if ($ls.Count -eq 0) { return "" }
@@ -1594,7 +1596,7 @@ TryFact "Application log: .NET/ASP.NET/crash/WhaTap events (newest 15 of last 30
     $ev = @($raw |
         Where-Object { $_.ProviderName -match '\.NET Runtime|ASP\.NET|AspNetCore|Application Error|Windows Error Reporting|[Ww]ha[Tt]ap' } |
         Select-Object -First 15)
-    if ($ev.Count -eq 0) { $(if ($isAdmin) { "none matching in window" } else { "none matching among the events this account can read (not elevated)" }) }
+    if ($ev.Count -eq 0) { "none matching in window" }
     else {
         $ev | ForEach-Object {
             $msg = Event-Text $_.Message
@@ -1612,7 +1614,7 @@ TryFact "System log: WAS/W3SVC/HTTP events (newest 10 of last 300 err+warn)" {
     $ev = @($raw |
         Where-Object { $_.ProviderName -match 'WAS|W3SVC|IIS|HTTP' } |
         Select-Object -First 10)
-    if ($ev.Count -eq 0) { $(if ($isAdmin) { "none matching in window" } else { "none matching among the events this account can read (not elevated)" }) }
+    if ($ev.Count -eq 0) { "none matching in window" }
     else {
         $ev | ForEach-Object {
             $msg = Event-Text $_.Message
@@ -1635,7 +1637,6 @@ if (Test-Path -LiteralPath $appcmd) {
 }
 if ($appPaths.Count -eq 0) {
     if (-not (Test-Path -LiteralPath $appcmd)) { Fact "IIS application physical paths: n/a (path not found: $appcmd)" }
-    elseif (-not $isAdmin) { Fact "IIS application physical paths: n/a (appcmd returned no vdir lines; run not elevated)" }
     else { Fact "IIS application physical paths: n/a (appcmd returned no vdir lines)" }
 }
 $appShown = 0
@@ -1685,17 +1686,17 @@ foreach ($ap in $appPaths) {
     $appShown++
 }
 
-if ($homeBad.Count -gt 0) { Set-Missed agent ("-AgentHome path not found: " + ($homeBad -join ', ')) }
+if ($homeBad.Count -gt 0) { Set-Missed agent ("-Home path not found: " + ($homeBad -join ', ')) }
 elseif ($existingHomes.Count -gt 0 -or $uninstallEntries.Count -gt 0) { Set-Got agent }
 elseif ($uninstallRead -eq 0 -or $script:DiscErr.Count -gt 0) {
     $dw = @($script:DiscErr); if ($uninstallRead -eq 0 -and $dw.Count -eq 0) { $dw = @("HKLM uninstall registry not read") }
-    Set-Missed agent ("no agent home found, and discovery reads failed: " + ($dw -join "; ") + $(if ($script:DiscDenied) { Priv-Hint } else { "" }))
+    Set-Missed agent ("no agent home found, and discovery reads failed: " + ($dw -join "; "))
 }
 else { Set-Na agent "no agent home in any candidate (parameter, env, service env, CLSID, uninstall registry, installer defaults) and no whatap uninstall entry" }
-if ($confUnread.Count -gt 0) { Set-Missed conf ("whatap.conf not readable: $($confUnread -join ', ')" + (Priv-Hint)) }
+if ($confUnread.Count -gt 0) { Set-Missed conf "whatap.conf not readable: $($confUnread -join ', ')" }
 elseif ($confRead.Count -gt 0) { Set-Got conf }
 elseif ($existingHomes.Count -eq 0 -and ($homeBad.Count -gt 0 -or $uninstallRead -eq 0 -or $script:DiscErr.Count -gt 0) -and $uninstallEntries.Count -eq 0) { Set-Missed conf "no agent home resolved (see the agent goal)" }
-elseif ($existingHomes.Count -eq 0 -and $uninstallEntries.Count -gt 0) { Set-Missed conf "an uninstall entry names the agent but no agent home directory exists to read a whatap.conf from (pass -AgentHome <dir>)" }
+elseif ($existingHomes.Count -eq 0 -and $uninstallEntries.Count -gt 0) { Set-Missed conf "an uninstall entry names the agent but no agent home directory exists to read a whatap.conf from (pass -Home <dir>)" }
 elseif ($existingHomes.Count -eq 0) { Set-Na conf "no agent home exists to hold a whatap.conf" }
 else { Set-Missed conf "agent home discovered but no whatap.conf in it" }
 Emit-Status
@@ -1708,8 +1709,8 @@ if ($Stdout) {
 } else {
     # UTF-8 without a BOM and LF line ends, the bytes a shell collector writes.
     # Not Set-Content -Encoding UTF8: Windows PowerShell 5.1 prefixes a BOM and
-    # both editions end lines with CRLF, and validate.sh --report then fails
-    # the footer and header lines (seen on Windows Server 2022, 0.4.0). The
+    # both editions end lines with CRLF, and validate.sh --report fails the
+    # footer and header lines of such a file. The
     # directory is -Out, else the current file-system location, resolved
     # above because .NET resolves a relative path against the process
     # directory, which Set-Location does not change.

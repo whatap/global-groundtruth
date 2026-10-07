@@ -5,6 +5,41 @@ newest first. Every change to the script bumps its `VERSION` and adds one
 entry at the top of this list (docs/authoring-guide.md, step 2);
 `tools/validate.sh` checks that the newest entry is the script's `VERSION`.
 
+- **0.11.0**: Cleanup after 0.10.0's elevated requirement, at the operator's
+  request (2026-10-07) to simplify the options and the code and to rewrite the
+  docs to the current state. `-AgentHome` is no longer an option: `-Home <dir>`
+  (`--home`) did the same, and two options for one thing break the options
+  convention. `-AgentHome`, and every prefix of it PowerShell bound to it (`-A`
+  to `-AgentHom`, also with `:value`), exits 2 with `-AgentHome is no longer an
+  option: use -Home <dir>`. Removed, as only a run that is not elevated reached
+  it: the MsiInstaller read by event id with the provider picked afterwards,
+  the "among the events this account can read (not elevated)" form of the
+  "none" lines in section C's Windows Installer events and section I, section
+  J's "run not elevated" reason, the privilege gap appended to the `agent` and
+  `conf` goal reasons, and the comments describing non-elevated output. The
+  `privilege:` line is still read from the process token. The script also
+  checks elevation itself before reading its arguments, with the test
+  `#Requires` uses, because PowerShell applies `#Requires` only to a script run
+  as a file: run as a scriptblock (`& ([scriptblock]::Create((Get-Content -Raw
+  ...)))`), 0.10.0 collected without elevation. Such a run now prints
+  `collect-apmdotnet.ps1 must run in a PowerShell started with "Run as
+  Administrator"; ...` and exits 1. Comments that carried
+  versions, dates or lab runs now give the design reason only, and the README
+  describes the current behaviour only. An elevated run's report is unchanged
+  apart from the version lines and the three lines that named `-AgentHome`,
+  which now name `-Home`: the discovery source `parameter -Home`, and the goal
+  reasons `-Home path not found` and `pass -Home <dir>`.
+  Validated 2026-10-07 on jjsong-dotnet-lab, elevated, Windows PowerShell 5.1
+  and pwsh 7: 0.10.0 and 0.11.0 reports of a run without -Home differ only in digits (version, times,
+  sizes), all COMPLETE and passing validate.sh --report. `-AgentHome C:\x`,
+  `-A C:\x`, `-agenthome:C:\x` and `--agenthome=C:\x` print the line above and
+  exit 2; `-Bogus` exits 2 and `-Help` 0 as before. `-Home C:\nope` and
+  `--home=C:\nope` give `parameter -Home` and `-Home path not found: C:\nope`
+  (INCOMPLETE), `-Home "C:\Program Files\WhaTap .NET"` COMPLETE. The VM was
+  reverted to its pre-test snapshot. A deep verification the same day found the
+  scriptblock path; with the check added, a non-elevated scriptblock run (OpenSSH
+  as ggtuser, both shells) exits 1 with that line and an elevated one still
+  reports, and `-File` is refused by `#Requires` as before.
 - **0.10.0**: The collector requires an elevated PowerShell
   (`#Requires -RunAsAdministrator`). A run that is not elevated is refused by
   PowerShell before any line executes, exits 1 and writes no report; `-Help` is
@@ -178,12 +213,19 @@ entry at the top of this list (docs/authoring-guide.md, step 2);
   unknown argument or a --home/--out without a value prints usage to
   stderr and exits 2.
   Registry values are read through the .NET API (each absent key under
-  HKLM:\SOFTWARE\Classes cost 1.3 s through the provider); port 6600 comes
-  from one netstat -ano; a profiler path under core\x86 no longer makes
+  HKLM:\SOFTWARE\Classes cost 1.3 s through the provider, and the six CLSID
+  reads 8 s of a 22 s 0.4.0 run on a host without the agent); port 6600 comes
+  from one netstat -ano (importing the Get-NetTCPConnection /
+  Get-NetUDPEndpoint module took 1.9 s, again in each bounded runspace;
+  netstat took 0.2 s); a profiler path under core\x86 no longer makes
   core\ a second agent home; an unreadable w3wp says so instead of
-  "64-bit path" and "none".
+  "64-bit path" and "none"; a path under a directory the account cannot
+  list is "access denied", not "path not found" (0.4.0 said "path not found"
+  of applicationHost.config in a non-elevated run).
   An event message keeps the lines that name the failure (an ASP.NET
-  1310 event's "Exception message") when it is cut at 400 characters.
+  1310 event's "Exception message") when it is cut at 400 characters
+  (0.4.0 kept three lines, which dropped the "Could not load file or
+  assembly" text of a 1310 event, whose 70 lines are separated by bare CRs).
   Validated on Windows Server 2022 Standard Evaluation 10.0.20348 (lab VM
   jjsong-ggt-win), Windows PowerShell 5.1.20348.558 and pwsh 7.6.6, with the
   agent simulated (install dir, uninstall entry, machine and W3SVC/WAS

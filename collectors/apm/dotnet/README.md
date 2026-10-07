@@ -1,11 +1,11 @@
 # collectors/apm/dotnet: WhaTap .NET APM agent collector (Windows)
 
-> **Status:** validated at `collect-apmdotnet.ps1` 0.10.0 on 2026-10-07, Windows Server
+> **Status:** validated at `collect-apmdotnet.ps1` 0.11.0 on 2026-10-07, Windows Server
 > 2022 (lab VM jjsong-dotnet-lab, real WhaTap .NET 2.5.7.0 under the CLR
 > Instrumentation Engine 1.0.45 raw profiler hook; Windows PowerShell 5.1 and pwsh 7,
 > elevated; `validate.sh --report` pass).
-> Not elevated: refused by `#Requires -RunAsAdministrator` since 0.10.0. Not yet run on: Linux .NET hosts (not covered, see "Not covered"). Owner: Global team until handover to the .NET agent developers (CONTRACT
-> rule 4).
+> Not yet run on: Linux .NET hosts (not covered, see "Not covered"). Owner: Global
+> team until handover to the .NET agent developers (CONTRACT rule 4).
 
 Collects the hidden facts a remote WhaTap .NET-agent developer repeatedly asks
 a field engineer for, from the Windows host where the instrumented application runs.
@@ -19,8 +19,8 @@ managed DLLs ship with FileVersion pinned at `1.0.0.0` across product
 releases, and the GAC folder names (`v4.0_1.0.0.0__…`) never change. The only
 trustworthy product-version markers on a host are the uninstall registry
 (`HKLM\...\Uninstall\WhaTap .NET_is1` → `DisplayVersion`) and the
-mtime/SHA256 of the profiler DLL copies, so the collector captures all of
-them, plus the version lines the agent writes into its own logs. Multiple
+mtime/SHA256 of the profiler DLL copies, so section B captures all of
+them, and section G the version lines the agent writes into its own logs. Multiple
 support threads hinged on "reported version ≠ version actually on disk".
 
 **How the agent attaches (what the sections verify).** The installer writes
@@ -38,10 +38,13 @@ and "actually attached".
 
 Run **on the Windows host where the application runs**, in a **64-bit
 PowerShell started with "Run as Administrator"** (5.1+, the Windows Server 2016+
-default). **The collector requires it** (`#Requires -RunAsAdministrator`): a
-PowerShell that is not elevated refuses to start it and prints
+default). The script carries `#Requires -RunAsAdministrator`: a PowerShell that
+is not elevated refuses to start it, `-Help` included, and prints
 `The script 'collect-apmdotnet.ps1' cannot be run because it contains a
-"#requires" statement for running as Administrator`, and no report is written.
+"#requires" statement for running as Administrator`; no report is written.
+The script checks the same itself, so running its text another way (as a
+scriptblock) without elevation stops with `must run in a PowerShell started
+with "Run as Administrator"` and exit 1.
 Open PowerShell again with "Run as Administrator" and run the same command.
 
 ```powershell
@@ -51,36 +54,38 @@ Open PowerShell again with "Run as Administrator" and run the same command.
 # if script execution is blocked by policy
 powershell -ExecutionPolicy Bypass -File .\collect-apmdotnet.ps1 -File
 
-# extra install dir the discovery cannot see (-AgentHome works too)
+# extra install dir the discovery cannot see
 .\collect-apmdotnet.ps1 -File -Home "D:\WhaTap .NET"
 
 # write the report into another directory (checked before the run starts)
 .\collect-apmdotnet.ps1 -File -Out "D:\case files"
 ```
 
-Paste or attach the entire output. No arguments prints usage; nothing runs by accident.
-Progress goes to the console (`-Quiet` silences it); the report goes to the `.txt` (or
-stdout with `-Stdout`). The shell collectors' spellings work too (`--file`, `--stdout`,
-`--quiet`, `--help`, `--home <dir>`, `--out <dir>`, `--out=<dir>`); `-Help` and `-h` print
-the usage; an unknown argument, or `--home`/`--out` without a directory, prints usage to
-stderr and exits 2. There is no opt-in: every probe is Tier 0 and runs by default.
+Options: `-File` or `-Stdout` (a run needs one; no arguments prints usage, so
+nothing runs by accident), `-Quiet`, `-Home <dir>`, `-Out <dir>`, `-Help` / `-h`.
+The shell collectors' spellings work too (`--file`, `--stdout`, `--quiet`, `--help`,
+`--home <dir>`, `--home=<dir>`, `--out <dir>`, `--out=<dir>`). An unknown argument, or
+`-Home`/`-Out` without a directory, prints usage to stderr and exits 2. There is no
+opt-in: every probe is Tier 0 and runs by default.
 
-**Send the `-File` report.** It is written as UTF-8 without a BOM with LF line
-ends, the bytes a shell collector writes, whichever PowerShell ran it.
-`-Stdout` hands the lines to the PowerShell host, which ends them with CRLF,
-converts them to the console code page (non-ASCII text in a verbatim
-`whatap.conf` arrives as `?`), and under Windows PowerShell 5.1 writes a `>`
-redirection as UTF-16LE; `tools/validate.sh --report` rejects such a copy.
+**Send the `-File` report**, the entire file. It is written as UTF-8 without a
+BOM with LF line ends, the bytes a shell collector writes, whichever PowerShell
+ran it. Operator messages (`>>` progress, which `-Quiet` silences, `!!`
+warnings, the status roll-up) go to stderr, so `-Stdout > file` holds the report
+only, but the PowerShell host ends its lines with CRLF, converts them to the
+console code page (non-ASCII text in a verbatim `whatap.conf` arrives as `?`),
+and under Windows PowerShell 5.1 writes a `>` redirection as UTF-16LE;
+`tools/validate.sh --report` rejects such a copy.
 
 ## Facts collected (report sections)
 
 | # | Section | Answers the recurring question |
 | --- | --- | --- |
-| 1 | Collection environment | PowerShell version, user, `privilege:` (elevated / not elevated), host boot time and uptime, 32/64-bit OS and process, which query tools exist |
+| 1 | Collection environment | PowerShell version, user, `privilege:` (`elevated (DOMAIN\user)`, read from the process token), host boot time and uptime, 32/64-bit OS and process, execution policy, which query tools exist |
 | 2 | A. Host & platform | OS build, memory, clock+timezone, IIS version, .NET Framework `NDP\v4\Full` Release/Version, `dotnet --list-runtimes` / `--list-sdks` |
 | 3 | B. Agent installation on disk | uninstall registry entries (**DisplayVersion** = the product version), agent-home candidates from every discovery source with existence+marker flags, per-home inventory (`core\`, `net461\`, `net6.0\` with sizes/mtimes/FileVersions), **native profiler DLL mtime+SHA256**, net461 facade assembly versions, `VERSION` file, GAC_MSIL inventory of the 9 installer-set assemblies, machine `Path` (registry) leftovers, ISAPI filter dll presence |
-| 4 | C. Profiler registration & environment scopes | machine env registry vs **W3SVC/WAS service `Environment` (multi-sz, verbatim)** vs collector-process env vs **per-app-pool `environmentVariables` in `applicationHost.config`** (and `applicationPoolDefaults`, as `pool=(defaults)`); for every configured `*_PROFILER_PATH` / `DOTNET_STARTUP_HOOKS` / `MicrosoftInstrumentationEngine_RawProfilerHookPath*` value: does that exact file exist (+ its facts and SHA256); InProcServer32 in both registry views for WhaTap `{21CAE18A-…}`, legacy `{D76F1D76-…}` and **every CLSID named by `COR_PROFILER`, `CORECLR_PROFILER` or `MicrosoftInstrumentationEngine_RawProfilerHook`** (+ the registered DLL's facts for non-WhaTap CLSIDs); **CLR Instrumentation Engine configuration files** named by `MicrosoftInstrumentationEngine_ConfigPath*` (facts + first 80 lines); uninstall entries of other profiler products (the Instrumentation Engine by name, or an entry whose `InstallLocation` folder holds a profiler DLL, CLSID DLL or CLRIE configuration file found above; a drive root or the Program Files / Windows folder itself never counts) and **their and the Instrumentation Engine's Windows Installer install/update/remove events with timestamps** (newest 20 of the newest 200 MsiInstaller events with ids 1033-1036, any age; needs elevation); Fusion log settings (read-only); `applicationHost.config` lines naming COR/WHATAP/InstrumentationEngine variables |
-| 5 | D. WhaTap service & runtime processes | `WhaTap .NET` service state/account/binpath/pid, whatap-named processes, per w3wp: pid ↔ app pool (from `-ap`), exe path bitness marker, **loaded profiler-related modules** (WhaTap and other APM vendors by name, plus any module under a profiler DLL path, CLRIE configuration folder or install folder found in section C; surfaces profiler-slot conflicts as facts), **loaded runtime modules** (`clr.dll`, `coreclr.dll`, `aspnetcorev2*.dll` with FileVersion: the runtime build actually running), dotnet.exe processes with their loaded runtime modules |
+| 4 | C. Profiler registration & environment scopes | machine env registry vs **W3SVC/WAS service `Environment` (multi-sz, verbatim)** vs collector-process env vs **per-app-pool `environmentVariables` in `applicationHost.config`** (and `applicationPoolDefaults`, as `pool=(defaults)`); for every configured `*_PROFILER_PATH` / `DOTNET_STARTUP_HOOKS` / `MicrosoftInstrumentationEngine_RawProfilerHookPath*` value: does that exact file exist (+ its facts and SHA256); InProcServer32 in both registry views for WhaTap `{21CAE18A-…}`, legacy `{D76F1D76-…}` and **every CLSID named by `COR_PROFILER`, `CORECLR_PROFILER` or `MicrosoftInstrumentationEngine_RawProfilerHook`** (+ the registered DLL's facts for non-WhaTap CLSIDs); **CLR Instrumentation Engine configuration files** named by `MicrosoftInstrumentationEngine_ConfigPath*` (facts + first 80 lines); uninstall entries of other profiler products (the Instrumentation Engine by name, or an entry whose `InstallLocation` folder holds a profiler DLL, CLSID DLL or CLRIE configuration file found above; a drive root or the Program Files / Windows folder itself never counts) and **their and the Instrumentation Engine's Windows Installer install/update/remove events with timestamps** (newest 20 of the newest 200 MsiInstaller events with ids 1033-1036, any age); Fusion log settings (read-only); `applicationHost.config` lines naming COR/WHATAP/InstrumentationEngine variables |
+| 5 | D. WhaTap service & runtime processes | `WhaTap .NET` service state/account/binpath/pid, whatap-named processes, per w3wp: pid ↔ app pool (from `-ap`), exe path bitness marker, **loaded profiler-related modules** (WhaTap and other APM vendors by name, plus any module under a profiler DLL path, CLRIE configuration folder or install folder found in section C; surfaces profiler-slot conflicts as facts), **loaded runtime modules** (`clr.dll`, `coreclr.dll`, `aspnetcorev2*.dll` with FileVersion: the runtime build actually running), dotnet.exe processes (the first 10) with their loaded WhaTap and runtime modules |
 | 6 | E. IIS topology | app pools (state, CLR version, pipeline, `enable32BitAppOnWin64`, identity), sites/apps/vdirs with physical paths, ISAPI filters, via appcmd, WebAdministration, or applicationHost.config fallback |
 | 7 | F. Agent configuration | `whatap.conf` verbatim per home **plus byte facts (first bytes/BOM, CR count)** |
 | 8 | G. Agent logs | both log dirs (`C:\ProgramData\WhaTap\dotnet\logs` fixed + `<home>\logs` legacy): inventory with **file owners**, native `core-YYYYMMDD.log` banner+head+tail and its CLR Instrumentation Engine / loader-injection lines (first 20 of the last 5000), newest tracer log version/identity lines+head+tail, exception-line count, **PID-named log files cross-referenced against currently running PIDs** (PID-reuse leftovers owned by another pool's identity have caused w3wp CPU spins), audit dir presence/size only, `WT_TRACE_LOG_PATH` override |
@@ -90,9 +95,6 @@ redirection as UTF-16LE; `tools/validate.sh --report` rejects such a copy.
 
 ## Reading the report (explanations kept out of the report)
 
-- The agent's DLL FileVersions are pinned at `1.0.0.0` across product
-  releases; the uninstall registry `DisplayVersion` and the file mtime/SHA256
-  in section B identify the installed build.
 - A 32-bit collector process on a 64-bit OS sees WOW64-redirected
   `HKLM\SOFTWARE` and Program Files views; section [1] states both bitnesses.
 - whatap.conf resolution order in the managed tracer (`ConfigObserver.cs`):
@@ -115,7 +117,7 @@ redirection as UTF-16LE; `tools/validate.sh --report` rejects such a copy.
   `JITCompilationStartedOnNetFramework() - LOADER INJECTION ... StartupHook.Initialize()`
   is the Framework loader injected into a .NET (Core) process; requests to that app
   fail. `AddIISPreStartInitFlags() failed` and `ILRewriter.Import() failed` appear under
-  CLRIE on every start and do not stop collection (DOTNET-431).
+  CLRIE on every start and do not stop collection.
 - Windows PowerShell 5.1 (.NET Framework) lists only the WOW64 layer of a
   32-bit process (ntdll, wow64*.dll). For a 32-bit w3wp (an app pool with
   `enable32BitAppOnWin64`) the collector then reads the module list again
@@ -133,11 +135,8 @@ redirection as UTF-16LE; `tools/validate.sh --report` rejects such a copy.
   collectors. `CMD_TIMEOUT` and `RUN_DEADLINE` are read from the environment.
 
 Goals: `agent` (a home or an uninstall entry; `missed` when the HKLM
-uninstall registry could not be read) and `conf` (a readable `whatap.conf`;
-an unreadable one is `missed` with the privilege gap).
-
-Operator messages (`>>` progress, `!!` warnings, the status roll-up) go to stderr, so
-`-Stdout > file` holds the report only.
+uninstall registry could not be read or a `-Home` directory does not exist)
+and `conf` (a readable `whatap.conf`; an unreadable one is `missed`).
 
 ## What the report can contain
 
