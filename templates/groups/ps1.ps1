@@ -22,10 +22,9 @@
 # every member; one that differs (DumpFile) stays in its collector.
 #
 # What the blocks rely on the members to define: the -Quiet switch ($Quiet,
-# read by Progress) and $script:PRIV_GAP (read by Priv-Hint; a member that
-# runs without elevation sets it in its privilege line in [1], a member that
-# requires elevation leaves it empty). Everything else they use they set
-# themselves.
+# read by Progress). Everything else they use they set themselves. Every
+# member requires an elevated PowerShell (#Requires -RunAsAdministrator and its
+# own check), so no helper here words a reason for a run that is not elevated.
 # Saved as UTF-8 with a BOM like the members, so Windows PowerShell 5.1 reads
 # the em dash of the banners as one character.
 # -----------------------------------------------------------------------------
@@ -390,13 +389,6 @@ if (Get-Command Get-CimInstance -ErrorAction SilentlyContinue) {
     try { $script:CimOS = @(Get-CimBounded Win32_OperatingSystem "" 10)[0] } catch { }
 }
 $script:Load0 = Host-Load
-
-# Priv-Hint -> " (not elevated: <gap>)", or "" when the run is elevated. Append
-# it to the reason of any goal that the missing elevation blocked, as the shell
-# collectors do with _priv_hint. $PRIV_GAP is set by the member's privilege line
-# in [1] when the run is not elevated, and stays empty otherwise.
-$script:PRIV_GAP = ""
-function Priv-Hint { if ($script:PRIV_GAP) { return " (not elevated: $($script:PRIV_GAP))" } return "" }
 
 # Note-Boot -> the two boot facts of [1], worded as the shell _note_boot. Most
 # of what a report carries is cumulative since boot; without the boot time it

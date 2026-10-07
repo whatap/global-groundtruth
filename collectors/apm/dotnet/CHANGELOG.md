@@ -5,6 +5,12 @@ newest first. Every change to the script bumps its `VERSION` and adds one
 entry at the top of this list (docs/authoring-guide.md, step 2);
 `tools/validate.sh` checks that the newest entry is the script's `VERSION`.
 
+- **0.11.2**: The shared ps1 run-helpers block (templates/groups/ps1.ps1) drops
+  `$PRIV_GAP` and `Priv-Hint`: both members now require elevation, so no goal
+  reason carries a privilege gap and nothing called them. Report unchanged:
+  on jjsong-dotnet-lab (2026-10-07, elevated, Windows PowerShell 5.1 and pwsh
+  7) the 0.11.1 and 0.11.2 reports differ only in digits, all COMPLETE and
+  passing validate.sh --report.
 - **0.11.1**: Comments only, in the shared ps1 blocks (templates/groups/ps1.ps1):
   versions, dates and lab measurements are replaced by the design reason they
   supported, and the `$PRIV_GAP` comments say that a member requiring

@@ -1,6 +1,6 @@
 # collectors/apm/dotnet: WhaTap .NET APM agent collector (Windows)
 
-> **Status:** validated at `collect-apmdotnet.ps1` 0.11.0 on 2026-10-07, Windows Server
+> **Status:** validated at `collect-apmdotnet.ps1` 0.11.2 on 2026-10-07, Windows Server
 > 2022 (lab VM jjsong-dotnet-lab, real WhaTap .NET 2.5.7.0 under the CLR
 > Instrumentation Engine 1.0.45 raw profiler hook; Windows PowerShell 5.1 and pwsh 7,
 > elevated; `validate.sh --report` pass).

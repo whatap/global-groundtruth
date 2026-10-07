@@ -134,6 +134,24 @@ one entry at the top of its section (docs/authoring-guide.md, step 2);
 
 ## windows/collect-db-mssql.ps1
 
+- **0.9.0**: `-AgentHome` is no longer an option: `-Home <dir>` (`--home`)
+  did the same, and two options for one thing break the options convention
+  (docs/collector-engineering.md). `-AgentHome`, and every prefix of it
+  PowerShell bound to it (`-A` to `-AgentHom`, also with `:value`), exits 2 with
+  `-AgentHome is no longer an option: use -Home <dir>`. The report lines that
+  named it now name `-Home`: `-Home given: <dir> (exists: ...)`, the install dir
+  n/a reasons `... and no -Home given`, and the install goal reasons `-Home path
+  not found`, `(pass -Home <dir>)` and `... no -Home given`. The shared ps1
+  run-helpers block drops `$PRIV_GAP` and `Priv-Hint`, which nothing called
+  since 0.8.0.
+  Validated 2026-10-07 on jjsong-dotnet-lab (no DBX agent), elevated, Windows
+  PowerShell 5.1 and pwsh 7: the 0.8.0 and 0.9.0 reports differ only in digits
+  and in the two `no -Home given` lines, all COMPLETE and passing validate.sh
+  --report. `-AgentHome C:\x -File`, `-A C:\x`, `-agenthome:C:\x`,
+  `--agenthome=C:\x` and `-Ag` exit 2 with the line above; `-Bogus` and a bare
+  `-Home` exit 2, `-Help` 0. `-Home C:\nope` and `--home=C:\nope` give `-Home
+  given: C:\nope (exists: False)` and `-Home path not found` (INCOMPLETE). The VM
+  was reverted to its pre-test snapshot.
 - **0.8.0**: The collector requires an elevated PowerShell
   (`#Requires -RunAsAdministrator`), as collect-apmdotnet.ps1 does since 0.10.0.
   A run that is not elevated is refused by PowerShell before any line executes,

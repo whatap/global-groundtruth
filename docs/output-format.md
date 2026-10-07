@@ -157,8 +157,11 @@ The environment section carries one `privilege:` line.
 
 What a collection can read is decided by the privilege it was given, so a report
 that leaves it out gives the reader no way to tell an absent value from an
-unreadable one. Four shapes on a shell collector, and the Windows pair ports
-the same line with `elevated` / `not elevated (DOMAIN\user)`:
+unreadable one. Four shapes on a shell collector. The Windows collectors
+(collect-apmdotnet.ps1, collect-db-mssql.ps1) require an elevated PowerShell
+and refuse any other run (`#Requires -RunAsAdministrator` and their own check),
+so their line reads `privilege: elevated (DOMAIN\user)` and they have no gap
+to append:
 
 | Line | What it says |
 |---|---|

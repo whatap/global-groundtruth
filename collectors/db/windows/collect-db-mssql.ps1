@@ -15,7 +15,8 @@
 #   .\collect-db-mssql.ps1                 print this help (no collection)
 #   .\collect-db-mssql.ps1 -File          write report -> .\whatap-db-mssql-<host>-<UTC>.txt
 #   .\collect-db-mssql.ps1 -Stdout        print report to stdout
-#   .\collect-db-mssql.ps1 -AgentHome <dir>  add an agent install dir the process scan cannot see
+#   .\collect-db-mssql.ps1 -Home <dir>     add an agent install dir the process scan cannot see
+#   .\collect-db-mssql.ps1 -File -Out <dir>  write the report into <dir>
 #
 # CONTRACT (../../CONTRACT.md): facts only -- no conclusion in any emitted line;
 # discover, never assume; one field command -> paste. Config files are dumped
@@ -31,10 +32,6 @@ param(
     [switch]$Stdout,
     [switch]$Quiet,
     [switch]$Help,
-    # Not "$Home": PowerShell variables are case-insensitive, so a parameter
-    # named Home is the read-only automatic $HOME and every run died with
-    # "Cannot overwrite variable Home" (collect-db-mssql.ps1 0.2.0).
-    [string[]]$AgentHome = @(),
     # -Out DIR: a switch, and its directory is read from the arguments below.
     # Not a string parameter: then a -Out with no value is PowerShell's
     # "Missing an argument", not this script's usage. It must be declared:
@@ -44,11 +41,14 @@ param(
     [Alias("Out")]
     [switch]$OutFlag,
     # everything else, read below: -Home DIR (not declared, so that -h means
-    # -Help alone and a -Home with no value is a usage error), the directory
-    # of -Out, the shell collectors' spellings (--stdout, --file, --quiet,
-    # --help, -h, --home DIR, --out DIR, --home=DIR, --out=DIR), and anything
-    # unknown, which stops the run with usage on stderr and exit 2, as the
-    # shell CLI does
+    # -Help alone and a -Home with no value is a usage error; a parameter
+    # named Home would also be the read-only automatic $HOME, since PowerShell
+    # variables are case-insensitive), the directory of -Out, the shell
+    # collectors' spellings (--stdout, --file, --quiet, --help, -h, --home DIR,
+    # --out DIR, --home=DIR, --out=DIR), the removed -AgentHome, which exits 2
+    # naming -Home, and anything unknown, which stops the run with usage on
+    # stderr and exit 2, as the shell CLI does. An undeclared -Name reaches
+    # this list as the string "-Name", its value as the next element.
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$Rest = @()
 )
@@ -65,7 +65,7 @@ if (-not $_elevated) {
 
 $COLLECTOR_NAME = "whatap-db-mssql"
 # History: ../CHANGELOG.md, section windows/collect-db-mssql.ps1 (next to the db README).
-$VERSION        = "0.8.0"
+$VERSION        = "0.9.0"
 $DOMAIN         = "db"
 $CompName = $env:COMPUTERNAME; if (-not $CompName) { $CompName = [Environment]::MachineName }
 $TARGET         = "db-host/$CompName"
@@ -81,7 +81,7 @@ A collection needs an explicit action flag so nothing starts by accident.
   .\collect-db-mssql.ps1 -File           write report -> .\$COLLECTOR_NAME-<host>-<UTC>.txt
   .\collect-db-mssql.ps1 -Stdout         print report to stdout
   .\collect-db-mssql.ps1 -Quiet ...      silence progress narration
-  .\collect-db-mssql.ps1 -Home <dir>     add an agent install dir, repeatable (also -AgentHome)
+  .\collect-db-mssql.ps1 -Home <dir>     add an agent install dir, repeatable
   .\collect-db-mssql.ps1 -File -Out <dir> write the report into <dir> (default: the current directory)
   .\collect-db-mssql.ps1 -Help | -h      print this help
 The shell spellings --file, --stdout, --quiet, --home <dir>, --out <dir> and --help work too.
@@ -99,18 +99,20 @@ foreach ($_ra in @($Rest)) {
     elseif ($_rl -ge 0 -and $_rs -match '^[\\/]' -and $_rest[$_rl] -match '^--?(out|home)=[A-Za-z]:$') { $_rest[$_rl] += $_rs }
     else { $_rest.Add($_rs) }
 }
-$OutPath = ""; $wantHelp = $false; $badArg = @(); $_loose = @()
+$OutPath = ""; $wantHelp = $false; $badArg = @(); $_loose = @(); $HomeDirs = @(); $_removed = @()
 for ($_ci = 0; $_ci -lt $_rest.Count; $_ci++) {
     $_ca = $_rest[$_ci]
     if ($_ca -in @('--help', '-help', '-h', '/?')) { $wantHelp = $true }
     elseif ($_ca -eq '--file')   { $File = [switch]$true }
     elseif ($_ca -eq '--stdout') { $Stdout = [switch]$true }
     elseif ($_ca -eq '--quiet')  { $Quiet = [switch]$true }
+    # -AgentHome and every prefix of it PowerShell bound to that parameter
+    elseif ($_ca -match '^--?a(g(e(n(t(h(o(m(e)?)?)?)?)?)?)?)?([=:].*)?$') { $_removed += "-AgentHome is no longer an option: use -Home <dir>" }
     elseif ($_ca -in @('--home', '-home')) {
         if ($_ci + 1 -ge $_rest.Count) { $badArg += "$_ca (needs a directory)"; continue }
-        $_ci++; $AgentHome += $_rest[$_ci]
+        $_ci++; $HomeDirs += $_rest[$_ci]
     }
-    elseif ($_ca -match '^--?home[=:](.+)$') { $AgentHome += $Matches[1] }
+    elseif ($_ca -match '^--?home[=:](.+)$') { $HomeDirs += $Matches[1] }
     elseif ($_ca -match '^--?out[=:](.+)$') { $OutPath = $Matches[1] }
     elseif ($_ca -notmatch '^-') { $_loose += $_ca }
     else { $badArg += $_ca }
@@ -119,6 +121,10 @@ for ($_ci = 0; $_ci -lt $_rest.Count; $_ci++) {
 if ($OutFlag -and -not $OutPath) {
     if ($_loose.Count -ge 1) { $OutPath = $_loose[0]; $_loose = @($_loose | Select-Object -Skip 1) }
     else { $badArg += "-Out (needs a directory)" }
+}
+if ($_removed.Count -gt 0) {
+    $_removed | Select-Object -Unique | ForEach-Object { [Console]::Error.WriteLine($_) }
+    exit 2
 }
 $badArg += $_loose
 if ($badArg.Count -gt 0) {
@@ -517,13 +523,6 @@ if (Get-Command Get-CimInstance -ErrorAction SilentlyContinue) {
 }
 $script:Load0 = Host-Load
 
-# Priv-Hint -> " (not elevated: <gap>)", or "" when the run is elevated. Append
-# it to the reason of any goal that the missing elevation blocked, as the shell
-# collectors do with _priv_hint. $PRIV_GAP is set by the member's privilege line
-# in [1] when the run is not elevated, and stays empty otherwise.
-$script:PRIV_GAP = ""
-function Priv-Hint { if ($script:PRIV_GAP) { return " (not elevated: $($script:PRIV_GAP))" } return "" }
-
 # Note-Boot -> the two boot facts of [1], worded as the shell _note_boot. Most
 # of what a report carries is cumulative since boot; without the boot time it
 # has no denominator. Win32_OperatingSystem first; where CIM is absent (pwsh on
@@ -829,7 +828,7 @@ try {
 # listed as unresolved.
 $homes = New-Object System.Collections.Generic.List[string]
 $unresolved = @(); $unresWhy = @(); $homeBad = @()
-foreach ($h in $AgentHome) {
+foreach ($h in $HomeDirs) {
     if (Test-Path -LiteralPath $h) { $homes.Add((Resolve-Path -LiteralPath $h).Path) }
     else { $homeBad += $h }
 }
@@ -965,10 +964,10 @@ foreach ($sv in $sqlViews) {
     $names.Close(); $base.Close()
 }
 foreach ($u in $unresWhy) { Fact "install dir of $($u -replace ':.*$', ''): n/a ($($u -replace '^[^:]*: ', ''))" }
-foreach ($h in $AgentHome) { Fact "-AgentHome given: $h (exists: $(Test-Path -LiteralPath $h))" }
-if ($homes.Count -eq 0 -and $unresolved.Count -eq 0 -and $AgentHome.Count -eq 0) {
-    if ($null -eq $allProc) { Fact "agent install dir: n/a (process inventory not read and no -AgentHome given)" }
-    else { Fact "agent install dir: n/a (no whatap agent process found and no -AgentHome given)" }
+foreach ($h in $HomeDirs) { Fact "-Home given: $h (exists: $(Test-Path -LiteralPath $h))" }
+if ($homes.Count -eq 0 -and $unresolved.Count -eq 0 -and $HomeDirs.Count -eq 0) {
+    if ($null -eq $allProc) { Fact "agent install dir: n/a (process inventory not read and no -Home given)" }
+    else { Fact "agent install dir: n/a (no whatap agent process found and no -Home given)" }
 }
 foreach ($h in $homes) { Fact "install dir candidate: $h" }
 if ($confDenied.Count -gt 0) { Fact "whatap.conf search incomplete (an entry was not readable) under: $($confDenied -join ', ')" }
@@ -1074,12 +1073,12 @@ $unreadConf = @($instances | Where-Object {
     $f = Join-Path $_ "whatap.conf"
     try { $null = Get-Content -LiteralPath $f -TotalCount 1 -ErrorAction Stop; $false } catch { $true } })
 if ($homeBad.Count -gt 0) {
-    Set-Missed install ("-AgentHome path not found: " + ($homeBad -join ', '))
+    Set-Missed install ("-Home path not found: " + ($homeBad -join ', '))
 } elseif ($unresolved.Count -gt 0) {
-    Set-Missed install (($unresWhy -join '; ') + " (pass -AgentHome <dir>)" + $(if ($homes.Count -eq 0) { "" } else { "; found: $($homes -join ', ')" }))
+    Set-Missed install (($unresWhy -join '; ') + " (pass -Home <dir>)" + $(if ($homes.Count -eq 0) { "" } else { "; found: $($homes -join ', ')" }))
 } elseif ($homes.Count -gt 0) { Set-Got install }
 elseif ($null -eq $allProc) { Set-Missed install "Win32_Process query failed: $procErr" }
-else { Set-Na install "no whatap agent process in any process command line, no -AgentHome given" }
+else { Set-Na install "no whatap agent process in any process command line, no -Home given" }
 if ($unreadConf.Count -gt 0) { Set-Missed instance ("not readable: " + (@($unreadConf | ForEach-Object { Join-Path $_ "whatap.conf" }) -join ', ')) }
 elseif ($confFailed.Count -gt 0) { Set-Missed instance ("search for whatap.conf did not finish: " + ($confFailed -join ', ')) }
 elseif ($confDenied.Count -gt 0) { Set-Missed instance ("search for whatap.conf hit an unreadable entry under: $($confDenied -join ', ')") }

@@ -84,7 +84,7 @@ if (-not $_elevated) {
 
 $COLLECTOR_NAME = "whatap-apmdotnet"
 # History: CHANGELOG.md (next to this file).
-$VERSION        = "0.11.1"
+$VERSION        = "0.11.2"
 $DOMAIN         = "apm"
 $CompName = $env:COMPUTERNAME; if (-not $CompName) { $CompName = [Environment]::MachineName }
 $TARGET         = "host/$CompName"
@@ -541,13 +541,6 @@ if (Get-Command Get-CimInstance -ErrorAction SilentlyContinue) {
     try { $script:CimOS = @(Get-CimBounded Win32_OperatingSystem "" 10)[0] } catch { }
 }
 $script:Load0 = Host-Load
-
-# Priv-Hint -> " (not elevated: <gap>)", or "" when the run is elevated. Append
-# it to the reason of any goal that the missing elevation blocked, as the shell
-# collectors do with _priv_hint. $PRIV_GAP is set by the member's privilege line
-# in [1] when the run is not elevated, and stays empty otherwise.
-$script:PRIV_GAP = ""
-function Priv-Hint { if ($script:PRIV_GAP) { return " (not elevated: $($script:PRIV_GAP))" } return "" }
 
 # Note-Boot -> the two boot facts of [1], worded as the shell _note_boot. Most
 # of what a report carries is cumulative since boot; without the boot time it

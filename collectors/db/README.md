@@ -3,7 +3,7 @@
 > **Status:** validated at `collect-db.sh` 0.9.1 on 2026-09-28, live
 > `jjsong-ggt-postgres` container (DB host, PostgreSQL 16, no DBX agent installed
 > there); COMPLETE, `validate.sh --report` pass.
-> Validated at `collect-db-mssql.ps1` 0.8.0 on 2026-10-07, Windows Server 2022, elevated (no DBX agent on that host; the simulated DBX agent was last run at 0.7.0).
+> Validated at `collect-db-mssql.ps1` 0.9.0 on 2026-10-07, Windows Server 2022, elevated (no DBX agent on that host; the simulated DBX agent was last run at 0.7.0).
 > Not yet run on: a real DBX agent host (the mock DBX tree was last run at 0.9.0).
 > Owner: Global team until handover to the DB domain team (CONTRACT rule 4).
 
@@ -64,8 +64,8 @@ block `host: helpers` ([templates/groups/host.sh](../../templates/groups/host.sh
    ```
 
    Leave `-P` out so sqlcmd asks for the password; a `-P <password>` argument
-   is visible in the process list. `-AgentHome <dir>` (or `-Home`, `--home`)
-   adds an install dir the process scan cannot see; `-Out <dir>` writes the report
+   is visible in the process list. `-Home <dir>` (`--home`, repeatable) adds an
+   install dir the process scan cannot see; `-Out <dir>` writes the report
    elsewhere (checked for writing before the run); `-Help` / `-h` print the usage.
    The shell spellings `--file`, `--stdout`, `--quiet`, `--help` and `--out` work;
    an unknown argument prints usage to stderr and exits 2. It has no opt-in.
