@@ -5,6 +5,12 @@ newest first. Every change to the script bumps its `VERSION` and adds one
 entry at the top of this list (docs/authoring-guide.md, step 2);
 `tools/validate.sh` checks that the newest entry is the script's `VERSION`.
 
+- **0.11.1**: Comments only, in the shared ps1 blocks (templates/groups/ps1.ps1):
+  versions, dates and lab measurements are replaced by the design reason they
+  supported, and the `$PRIV_GAP` comments say that a member requiring
+  elevation, as this one does, leaves it empty. The measurements are in the
+  0.5.0 entry. Checked with the PowerShell parser: apart from comments and line
+  breaks, the 0.11.0 and 0.11.1 tokens differ only in the `VERSION` string.
 - **0.11.0**: Cleanup after 0.10.0's elevated requirement, at the operator's
   request (2026-10-07) to simplify the options and the code and to rewrite the
   docs to the current state. `-AgentHome` is no longer an option: `-Home <dir>`
@@ -226,6 +232,14 @@ entry at the top of this list (docs/authoring-guide.md, step 2);
   1310 event's "Exception message") when it is cut at 400 characters
   (0.4.0 kept three lines, which dropped the "Could not load file or
   assembly" text of a 1310 event, whose 70 lines are separated by bare CRs).
+  Measured on that host before these fixes: formatted with the current
+  culture, a timestamp on a Korean Windows carried non-ASCII AM/PM words; the
+  Korean comment of a BOM-less UTF-8 whatap.conf came out garbled in the
+  verbatim dump; one Win32_Processor read took 4.2-5.5 s on the 4-vCPU VM; the
+  host load's 4 s ran out before WMI's refusal of a network logon and said
+  "Timed out"; that refusal took 5 s per query, 25 s of a 36 s run; and two
+  unanswered collection-server probes spent 10 s of a 16 s run outside every
+  time-log line.
   Validated on Windows Server 2022 Standard Evaluation 10.0.20348 (lab VM
   jjsong-ggt-win), Windows PowerShell 5.1.20348.558 and pwsh 7.6.6, with the
   agent simulated (install dir, uninstall entry, machine and W3SVC/WAS

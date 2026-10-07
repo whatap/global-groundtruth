@@ -134,6 +134,12 @@ one entry at the top of its section (docs/authoring-guide.md, step 2);
 
 ## windows/collect-db-mssql.ps1
 
+- **0.7.3**: Comments only, in the shared ps1 blocks (templates/groups/ps1.ps1):
+  versions, dates and lab measurements are replaced by the design reason they
+  supported (the measurements are in collectors/apm/dotnet/CHANGELOG.md 0.5.0
+  and in the 0.3.0 entry below). Checked with the PowerShell parser: apart from
+  comments and line breaks, the 0.7.2 and 0.7.3 tokens differ only in the
+  `VERSION` string.
 - **0.7.2**: Move TcpProbe into the shared ps1 fact-helpers block
   (templates/groups/ps1.ps1); no behavior change.
 - **0.7.1**: Collection status (ps1 group `Emit-Time`): when a bounded call was slow, capped or not run, the per-command "where the time went" table gives way to the time log's own records, one line per such call in the order they ran (`<ms> ms  <outcome>  <command>`, the first 40, then `(N more in this run)`), as the shell collectors print; CONTRACT rule 1.
@@ -196,3 +202,6 @@ one entry at the top of its section (docs/authoring-guide.md, step 2);
   and where the time went, as the shell collectors do. CIM queries go
   through Get-CimBounded; CMD_TIMEOUT and RUN_DEADLINE are read from the
   environment.
+- **0.3.0**: Operator messages go to stderr through `[Console]::Error.WriteLine`,
+  not Write-Host: run as `pwsh -File ... > out`, Write-Host reached stdout and
+  13 `>>` progress lines landed in a report (found 2026-09-25).

@@ -22,8 +22,10 @@
 # every member; one that differs (DumpFile) stays in its collector.
 #
 # What the blocks rely on the members to define: the -Quiet switch ($Quiet,
-# read by Progress) and $script:PRIV_GAP (set by the member's privilege line in
-# [1], read by Priv-Hint). Everything else they use they set themselves.
+# read by Progress) and $script:PRIV_GAP (read by Priv-Hint; a member that
+# runs without elevation sets it in its privilege line in [1], a member that
+# requires elevation leaves it empty). Everything else they use they set
+# themselves.
 # Saved as UTF-8 with a BOM like the members, so Windows PowerShell 5.1 reads
 # the em dash of the banners as one character.
 # -----------------------------------------------------------------------------
@@ -38,7 +40,7 @@ function Emit([string]$s) { $script:Lines.Add(($s -replace "`r", "")) }
 # Fmt-Time DATETIME -> yyyy-MM-dd HH:mm:ss (local time), the one format of every
 # timestamp in the report. A DateTime interpolated into a string comes out as
 # MM/dd/yyyy, and one formatted with -f in the current culture: on a Korean
-# Windows that puts non-ASCII AM/PM words in the report (0.4.0 mixed both).
+# Windows that puts non-ASCII AM/PM words in the report.
 function Fmt-Time($d) { if ($d -is [DateTime]) { return $d.ToString('yyyy-MM-dd HH:mm:ss') } return "n/a" }
 function Fact([string]$s) { Emit ("    " + $s) }
 function Section([string]$t) {
@@ -56,9 +58,8 @@ function Section([string]$t) {
 #
 # Operator streams. Progress (silenced by -Quiet), Warn and Notice (never
 # silenced) go to stderr through [Console]::Error.WriteLine. Write-Host reaches
-# stdout when the script runs as `pwsh -File ... > out`, and 13 ">>" lines once
-# landed in a report that way (found 2026-09-25). docs/output-format.md,
-# operator streams table.
+# stdout when the script runs as `pwsh -File ... > out`, so its lines would
+# land in the report. docs/output-format.md, operator streams table.
 #
 # Emitted strings stay ASCII: Windows PowerShell 5.1 reads a script without a
 # BOM as the ANSI code page, and a UTF-8 dash then arrives garbled.
@@ -307,10 +308,10 @@ function Invoke-BoundedBlock([scriptblock]$sb, [object[]]$argList = @(), [int]$s
 # Fail fast: once WMI has refused this run ("Access denied") before any query
 # of it succeeded, later queries throw the same refusal without asking again;
 # a refusal after a success is that class's own (Win32_Service is refused to
-# a not elevated local logon that reads every other class). A non-administrator
-# logged on over OpenSSH (a network logon) waited 5 s for each refusal, 25 s of
-# a 36 s run, while the same account in a local logon read every class (0.4.0,
-# Windows Server 2022). The first query is the probe below.
+# a not elevated local logon that reads every other class). WMI refuses every
+# class to a non-administrator's network logon (OpenSSH), about 5 s per
+# refusal, where the same account in a local logon reads them. The first query
+# is the probe below.
 $script:CimDenied = ""; $script:CimOk = $false
 function Get-CimBounded([string]$class, [string]$filter = "", [int]$sec = 0) {
     if ($script:CimDenied) { throw "$($script:CimDenied) (WMI refused this run earlier; not asked again)" }
@@ -337,8 +338,8 @@ function Get-CimBounded([string]$class, [string]$filter = "", [int]$sec = 0) {
 #   Win32_PerfRawData_PerfOS_Processor(_Total).PercentProcessorTime, read twice
 #     250 ms apart: busy = 100 * (1 - d(idle ticks) / d(Timestamp_Sys100NS)).
 #     Not Win32_Processor.LoadPercentage: WMI samples each processor for about
-#     a second in turn, and on a 4-vCPU Windows Server 2022 VM one read took
-#     4.2-5.5 s, used up the shared budget and left every field n/a (0.5.0);
+#     a second in turn, so on a 4-vCPU host one read takes several seconds,
+#     uses up the shared budget and leaves every field n/a;
 #   Win32_PerfRawData_PerfOS_System.ProcessorQueueLength and
 #   Win32_PerfRawData_PerfDisk_PhysicalDisk(_Total).CurrentDiskQueueLength,
 #     raw gauges, so the raw class is exact and skips the formatted class's
@@ -379,8 +380,8 @@ function Host-Load {
     return ($parts -join "; ")
 }
 # Cim-Probe: one Win32_OperatingSystem read before anything else asks WMI,
-# with room for WMI's refusal of a network logon (about 5 s; the host load's
-# 4 s ran out first and said "Timed out", 0.5.0 lab check). A refusal of this
+# with room for WMI's refusal of a network logon (about 5 s, more than the
+# host load's 4 s, which would end as "Timed out" first). A refusal of this
 # basic class is WMI refusing the logon, so later CIM reads fail at once; a
 # host that refuses only some classes is not affected. The instance is kept
 # for the boot time, so the probe costs no extra round trip.
@@ -392,7 +393,8 @@ $script:Load0 = Host-Load
 
 # Priv-Hint -> " (not elevated: <gap>)", or "" when the run is elevated. Append
 # it to the reason of any goal that the missing elevation blocked, as the shell
-# collectors do with _priv_hint. $PRIV_GAP is set by the privilege line in [1].
+# collectors do with _priv_hint. $PRIV_GAP is set by the member's privilege line
+# in [1] when the run is not elevated, and stays empty otherwise.
 $script:PRIV_GAP = ""
 function Priv-Hint { if ($script:PRIV_GAP) { return " (not elevated: $($script:PRIV_GAP))" } return "" }
 
@@ -554,9 +556,9 @@ function TryFact([string]$label, [scriptblock]$sb) {
 # Read-Lines PATH -> the file's lines, decoded as UTF-8 (a BOM is dropped),
 # else, when the bytes are not valid UTF-8, in the ANSI code page, with
 # $script:ReadNote saying so. Not Get-Content's default: Windows PowerShell 5.1
-# decodes a file without a BOM in the ANSI code page, and the Korean comment of
-# a BOM-less UTF-8 whatap.conf arrived garbled in the verbatim dump (0.5.0 lab
-# check). Reads at most 1 MiB, the size of no conf file.
+# decodes a file without a BOM in the ANSI code page, which garbles the
+# non-ASCII text (a Korean comment) of a BOM-less UTF-8 whatap.conf in the
+# verbatim dump. Reads at most 1 MiB, the size of no conf file.
 $script:ReadNote = ""
 function Read-Lines([string]$path) {
     $script:ReadNote = ""
@@ -591,8 +593,7 @@ function ConfGet([string]$path, [string]$key) {
 }
 # TcpProbe: one TCP connect, bounded like any other call. It is timed and
 # logged as "tcp-connect", honours RUN_DEADLINE, and a connect that gets no
-# answer is logged as capped: two unanswered probes spent 10 s of a 16 s run
-# outside every other log line (0.4.0, Windows Server 2022 lab host). An
+# answer is logged as capped, so the time it spent shows in the time log. An
 # endpoint is probed once per run; a second conf naming it gets the first
 # answer (Windows retries a refused connect, about 2 s each).
 $script:TcpSeen = @{}
