@@ -5,6 +5,21 @@ newest first. Every change to the script bumps its `VERSION` and adds one
 entry at the top of this list (docs/authoring-guide.md, step 2);
 `tools/validate.sh` checks that the newest entry is the script's `VERSION`.
 
+- **0.10.0**: The collector requires an elevated PowerShell
+  (`#Requires -RunAsAdministrator`). A run that is not elevated is refused by
+  PowerShell before any line executes, exits 1 and writes no report; `-Help` is
+  refused the same way. Why: a non-elevated run ended `status: COMPLETE` with
+  the IIS, event-log and module facts `n/a`, and was sent as if complete; the
+  operator's decision (2026-10-07) is to refuse it rather than mark it. The
+  not-elevated branches stay in the code, unreachable through `-File`. The help
+  text and README say so; the README notes on not-elevated output are removed.
+  Validated 2026-10-07 on jjsong-dotnet-lab, Windows PowerShell 5.1 and pwsh 7:
+  elevated, 0.9.3 and 0.10.0 reports differ only in digits (version, times,
+  sizes), all COMPLETE and passing validate.sh --report; not elevated (OpenSSH as
+  ggtuser), both shells exit 1 with "The script ... cannot be run because it
+  contains a "#requires" statement for running as Administrator" and no report
+  file. The help sentence was reworded after that run. The VM was reverted to
+  its pre-test snapshot.
 - **0.9.3**: Fix from a deep verification of 0.9.2. Elevated, the MsiInstaller
   events are read with the provider filtered by the event log service
   (`ProviderName` key, `-MaxEvents 200`). 0.9.2 read every event with ids

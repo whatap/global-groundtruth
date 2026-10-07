@@ -1,11 +1,10 @@
 # collectors/apm/dotnet: WhaTap .NET APM agent collector (Windows)
 
-> **Status:** validated at `collect-apmdotnet.ps1` 0.9.3 on 2026-10-06, Windows Server
+> **Status:** validated at `collect-apmdotnet.ps1` 0.10.0 on 2026-10-07, Windows Server
 > 2022 (lab VM jjsong-dotnet-lab, real WhaTap .NET 2.5.7.0 under the CLR
 > Instrumentation Engine 1.0.45 raw profiler hook; Windows PowerShell 5.1 and pwsh 7,
 > elevated; `validate.sh --report` pass).
-> Not elevated (0.9.1, OpenSSH as a local user): COMPLETE, each probe it cannot
-> read says so. Not yet run on: Linux .NET hosts (not covered, see "Not covered"). Owner: Global team until handover to the .NET agent developers (CONTRACT
+> Not elevated: refused by `#Requires -RunAsAdministrator` since 0.10.0. Not yet run on: Linux .NET hosts (not covered, see "Not covered"). Owner: Global team until handover to the .NET agent developers (CONTRACT
 > rule 4).
 
 Collects the hidden facts a remote WhaTap .NET-agent developer repeatedly asks
@@ -39,10 +38,11 @@ and "actually attached".
 
 Run **on the Windows host where the application runs**, in a **64-bit
 PowerShell started with "Run as Administrator"** (5.1+, the Windows Server 2016+
-default). The collector is written for that; without
-elevation the IIS/event-log/module probes degrade to reasoned `n/a` lines, and
-a `whatap.conf` the account cannot read makes the run INCOMPLETE with the hint
-`not elevated: run PowerShell as Administrator`.
+default). **The collector requires it** (`#Requires -RunAsAdministrator`): a
+PowerShell that is not elevated refuses to start it and prints
+`The script 'collect-apmdotnet.ps1' cannot be run because it contains a
+"#requires" statement for running as Administrator`, and no report is written.
+Open PowerShell again with "Run as Administrator" and run the same command.
 
 ```powershell
 # PowerShell (administrator)
@@ -116,8 +116,6 @@ redirection as UTF-16LE; `tools/validate.sh --report` rejects such a copy.
   is the Framework loader injected into a .NET (Core) process; requests to that app
   fail. `AddIISPreStartInitFlags() failed` and `ILRewriter.Import() failed` appear under
   CLRIE on every start and do not stop collection (DOTNET-431).
-- Reading IIS configuration through appcmd needs elevation; section J says
-  whether the run was elevated when appcmd returned no vdir lines.
 - Windows PowerShell 5.1 (.NET Framework) lists only the WOW64 layer of a
   32-bit process (ntdll, wow64*.dll). For a 32-bit w3wp (an app pool with
   `enable32BitAppOnWin64`) the collector then reads the module list again
@@ -127,14 +125,6 @@ redirection as UTF-16LE; `tools/validate.sh --report` rejects such a copy.
   itself. `clr.dll` is .NET Framework 4.x, `coreclr.dll` .NET (Core),
   `aspnetcorev2.dll` the ASP.NET Core Module and
   `aspnetcorev2_inprocess.dll` its in-process handler.
-- Not elevated, Windows hides another account's process details: a w3wp line
-  then reads `apppool=n/a (command line not readable)` and `exe=n/a (not
-  readable)`, and its module lists `n/a (module list not readable)`.
-- Over OpenSSH a non-administrator gets a network logon, and WMI refuses every
-  CIM read of such a logon ("Access denied"): the boot time, OS, memory,
-  process and service facts are then `n/a`. The same account logged on
-  locally (console, RDP, a scheduled task) reads them. After the first
-  refusal the run stops asking WMI.
 - A collection-server endpoint is probed once; a second conf naming it shows
   the first answer with `(probed once above)`. Windows retries a refused
   connect, so a refused probe takes about 2 s, an unanswered one its 5 s cap.

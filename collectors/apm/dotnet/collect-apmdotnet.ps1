@@ -28,9 +28,11 @@
 # list, dotnet --list-runtimes, netstat). No app pool is recycled, no
 # registry value is set.
 #
-# Requires Windows PowerShell 5.1+ (default on Windows Server 2016+). Run it
-# in a 64-bit elevated PowerShell for full coverage; without elevation the
-# probes that need it degrade to reasoned n/a lines instead of failing.
+# Requires Windows PowerShell 5.1+ (default on Windows Server 2016+), in a
+# 64-bit PowerShell started with "Run as Administrator". A run that is not
+# elevated is refused by PowerShell before any line executes (the #Requires
+# line below), so no partial report is written; -Help is refused the same way.
+#Requires -RunAsAdministrator
 #
 # Usage:
 #   .\collect-apmdotnet.ps1                 print this help (no collection)
@@ -72,7 +74,7 @@ param(
 
 $COLLECTOR_NAME = "whatap-apmdotnet"
 # History: CHANGELOG.md (next to this file).
-$VERSION        = "0.9.3"
+$VERSION        = "0.10.0"
 $DOMAIN         = "apm"
 $CompName = $env:COMPUTERNAME; if (-not $CompName) { $CompName = [Environment]::MachineName }
 $TARGET         = "host/$CompName"
@@ -81,8 +83,8 @@ function Usage {
     return @"
 $COLLECTOR_NAME $VERSION -- a WhaTap Global Groundtruth collector (facts only).
 Target: a Windows host where the WhaTap .NET agent and the instrumented
-application (IIS / .NET Core) run. Run in a 64-bit elevated PowerShell for
-full coverage; without elevation some probes degrade to reasoned n/a lines.
+application (IIS / .NET Core) run. Run it in a 64-bit PowerShell started with
+"Run as Administrator"; PowerShell refuses to start it otherwise.
 A collection needs an explicit action flag so nothing starts by accident.
 
   .\collect-apmdotnet.ps1                  print this help (no collection)

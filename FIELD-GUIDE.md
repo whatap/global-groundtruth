@@ -181,7 +181,8 @@ docker exec -i <container> sh -s -- --stdout --quiet \
 ```
 
 On Windows, the .NET collector is a PowerShell script; run it in a **64-bit
-elevated** PowerShell:
+PowerShell started with "Run as Administrator"**. It refuses to start
+otherwise (`#Requires -RunAsAdministrator`) and writes no report:
 
 ```powershell
 cd global-groundtruth\collectors\apm\dotnet
