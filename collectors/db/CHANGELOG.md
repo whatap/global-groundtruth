@@ -134,6 +134,26 @@ one entry at the top of its section (docs/authoring-guide.md, step 2);
 
 ## windows/collect-db-mssql.ps1
 
+- **0.10.1**: In a parent process's command line, a quoted span or an
+  unquoted token holding `<`, `>` or `|` is cut there and the path before it
+  is kept (`cmd /c "C:\dbx1\start_service.bat > C:\log.txt"` gives
+  `C:\dbx1`); 0.10.0 dropped the whole span or token, so a DBX started by another
+  wrapper with a redirection or pipe was found only if a higher parent named
+  its folder or `-Home` was given. A `whatap.conf` folder found under two
+  install dir candidates in different case is listed once as an instance.
+  Why: a review of 0.10.0.
+  Validated 2026-10-07 on jjsong-ggt-win, elevated, Windows PowerShell 5.1 and
+  pwsh 7, with three real DBX 2.64.03 installs of the same version: the two
+  services as in 0.10.0, and `C:\whatap-dbx3` started by a scheduled task
+  (SYSTEM, working dir `C:\whatap-dbx3`) as `cmd.exe /c
+  "C:\whatap-dbx3\start_service.bat --service whatap.conf > C:\ggtf\dbx3.out
+  2>&1"`, whose parent is the Task Scheduler's svchost.exe. 0.10.0: INCOMPLETE,
+  `install dir of pid N: n/a` for the third; 0.10.1: COMPLETE, `found in
+  C:\whatap-dbx3 (parent pid M cmd.exe)`, three instances. With `-Home C:\
+  -Home c:\WHATAP-DBX2`, 0.10.0 in Windows PowerShell 5.1 listed
+  `C:\WHATAP-DBX2` and `C:\whatap-dbx2` as two instances (6; pwsh 7 gave 5);
+  0.10.1 gives 5 in both shells. Every report passes validate.sh --report. The
+  VM was reverted to its pre-test snapshot.
 - **0.10.0**: A DBX process whose command line names its jar without a folder
   is matched to the folders that hold that jar: first the folders its parent
   processes name (executable path, absolute command-line paths and their parent

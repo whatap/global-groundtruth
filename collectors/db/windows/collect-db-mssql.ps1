@@ -65,7 +65,7 @@ if (-not $_elevated) {
 
 $COLLECTOR_NAME = "whatap-db-mssql"
 # History: ../CHANGELOG.md, section windows/collect-db-mssql.ps1 (next to the db README).
-$VERSION        = "0.10.0"
+$VERSION        = "0.10.1"
 $DOMAIN         = "db"
 $CompName = $env:COMPUTERNAME; if (-not $CompName) { $CompName = [Environment]::MachineName }
 $TARGET         = "db-host/$CompName"
@@ -870,8 +870,9 @@ foreach ($p in $agentProcs) {
             $paths = @([regex]::Matches("$($q.CommandLine)", '"([A-Za-z]:\\[^"]+)"') | ForEach-Object { $_.Groups[1].Value })
             $paths += @([regex]::Matches("$($q.CommandLine)", '(?<!")\b[A-Za-z]:\\[^"\s]+') | ForEach-Object { $_.Value })
             foreach ($a in $paths) {
-                $a = $a.TrimEnd('\')
-                if ($a -match '[<>|*?]') { continue }   # a redirection or pipe inside quotes, not a path
+                # a redirection or pipe ends the path before it, quoted or not
+                $a = ($a -split '[<>|]', 2)[0].Trim().TrimEnd('\')
+                if ($a -match '[*?]') { continue }
                 if ($a) { $cands.Add("$a|$src"); $up = Split-Path -Parent $a; if ($up) { $cands.Add("$up|$src") } }
             }
         }
@@ -904,7 +905,7 @@ foreach ($h in $homes) {
     } catch { $confFailed += "$h ($($_.Exception.Message.Split("`n")[0]))" }
     foreach ($d in $found) {
         if ($d -eq "!ERR") { if (-not ($confDenied -contains $h)) { $confDenied += $h }; continue }
-        if (-not $instances.Contains($d)) { $instances.Add($d) }
+        if ($instances -notcontains $d) { $instances.Add($d) }   # Windows paths ignore case
     }
 }
 

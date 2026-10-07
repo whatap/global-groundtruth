@@ -3,7 +3,7 @@
 > **Status:** validated at `collect-db.sh` 0.9.1 on 2026-09-28, live
 > `jjsong-ggt-postgres` container (DB host, PostgreSQL 16, no DBX agent installed
 > there); COMPLETE, `validate.sh --report` pass.
-> Validated at `collect-db-mssql.ps1` 0.10.0 on 2026-10-07, Windows Server 2022, elevated, with two real DBX 2.64.03 agents of the same version as Windows services.
+> Validated at `collect-db-mssql.ps1` 0.10.1 on 2026-10-07, Windows Server 2022, elevated, with three real DBX 2.64.03 agents of the same version: two Windows services and one started by a scheduled task through `cmd /c "... > file"`.
 > `collect-db.sh` not yet run on a real DBX agent host (the mock DBX tree was last run at 0.9.0).
 > Owner: Global team until handover to the DB domain team (CONTRACT rule 4).
 
@@ -281,8 +281,9 @@ Collection-server-side facts (server version, metrics categories) belong to
   `whatap.conf` instances, a log with WA codes) and the real DBX 2.64.03 for
   MSSQL (`https://service.whatap.io/download/dbx_agent?type=mssql&format=zip`)
   registered as a Windows service with its `install_WindowsService.bat` (two
-  installs of the same version, `C:\whatap-dbx` and `C:\whatap-dbx2`),
-  elevated; since 0.8.0 a run that is not elevated is refused.
+  installs of the same version, `C:\whatap-dbx` and `C:\whatap-dbx2`) and a
+  third install started by a scheduled task through `cmd /c` with a
+  redirection, elevated; since 0.8.0 a run that is not elevated is refused.
 
 ## What the report can contain
 
