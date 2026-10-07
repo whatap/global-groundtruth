@@ -3,8 +3,8 @@
 > **Status:** validated at `collect-db.sh` 0.9.1 on 2026-09-28, live
 > `jjsong-ggt-postgres` container (DB host, PostgreSQL 16, no DBX agent installed
 > there); COMPLETE, `validate.sh --report` pass.
-> Validated at `collect-db-mssql.ps1` 0.9.0 on 2026-10-07, Windows Server 2022, elevated (no DBX agent on that host; the simulated DBX agent was last run at 0.7.0).
-> Not yet run on: a real DBX agent host (the mock DBX tree was last run at 0.9.0).
+> Validated at `collect-db-mssql.ps1` 0.10.0 on 2026-10-07, Windows Server 2022, elevated, with two real DBX 2.64.03 agents of the same version as Windows services.
+> `collect-db.sh` not yet run on a real DBX agent host (the mock DBX tree was last run at 0.9.0).
 > Owner: Global team until handover to the DB domain team (CONTRACT rule 4).
 
 The fact list comes from a full read of #ext-db-모니터링-기술문의 (2025-04 to
@@ -83,6 +83,19 @@ block `host: helpers` ([templates/groups/host.sh](../../templates/groups/host.sh
    itself when its text is run another way; no report is written. Elevation
    is needed because Windows hides another account's java command line, so the
    DBX process would not be found.
+
+   The install dir of each DBX process comes from an absolute
+   `whatap.agent.*.jar` path or `-Dwhatap.home=` in its command line. The
+   agent's Windows service (`install_WindowsService.bat`: `nssm.exe` running
+   `start_service.bat`) names the jar without a folder; the jar is then looked
+   for in the folders the parent processes name (executable path, absolute
+   command-line paths and their parent folders, up to three levels up, stopping
+   at a parent created after its child, i.e. a reused pid), then in the `-Home`
+   dirs, and
+   the report lists every folder that holds it with its source (`jar named
+   without a folder by pid N: whatap.agent.dbx-<ver>.jar found in <dir>
+   (parent pid M cmd.exe)`). When no parent names the folder, the report
+   says so: pass `-Home <dir>`.
 
    Section B also gives each SQL Server instance installed on the host where
    it runs: `Version`, `PatchLevel` and `Edition` from
@@ -264,9 +277,12 @@ Collection-server-side facts (server version, metrics categories) belong to
   sysadmin and as a login with only VIEW SERVER STATE and VIEW ANY DEFINITION.
 - `collect-db-mssql.ps1`: Windows Server 2022 Standard Evaluation 10.0.20348, Windows
   PowerShell 5.1 and pwsh 7.6, SQL Server 2022 Express with two instances and a
-  **simulated** DBX agent (a java process, two `whatap.conf` instances, a log with
-  WA codes; the DBX package is not publicly downloadable), elevated; since 0.8.0
-  a run that is not elevated is refused.
+  **simulated** DBX agent (a java process with an absolute jar path, two
+  `whatap.conf` instances, a log with WA codes) and the real DBX 2.64.03 for
+  MSSQL (`https://service.whatap.io/download/dbx_agent?type=mssql&format=zip`)
+  registered as a Windows service with its `install_WindowsService.bat` (two
+  installs of the same version, `C:\whatap-dbx` and `C:\whatap-dbx2`),
+  elevated; since 0.8.0 a run that is not elevated is refused.
 
 ## What the report can contain
 

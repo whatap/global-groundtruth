@@ -134,6 +134,51 @@ one entry at the top of its section (docs/authoring-guide.md, step 2);
 
 ## windows/collect-db-mssql.ps1
 
+- **0.10.0**: A DBX process whose command line names its jar without a folder
+  is matched to the folders that hold that jar: first the folders its parent
+  processes name (executable path, absolute command-line paths and their parent
+  folders, also inside quotes, up to three levels up, stopping at a "parent"
+  created after its child), then the `-Home` dirs. Every folder that holds the
+  jar becomes an install dir candidate, and the report lists them with their
+  source (`jar named without a folder by pid N: <jar> found in <dir>
+  (<source>)[; <dir> (-Home)]`). Why: the real DBX 2.64.03 for MSSQL,
+  registered as a Windows service with its own `install_WindowsService.bat`,
+  runs `"java" ... -cp ".;.\jdbc\...;whatap.agent.dbx-2.64.03.jar"` from
+  `nssm.exe` → `cmd.exe /c ""C:\whatap-dbx\start_service.bat" --service
+  whatap.conf"`; 0.9.0 left it unresolved, so both goals were blocked, and
+  passing `-Home <dir>` as the reason advised still left the install goal
+  blocked. The simulated agent used so far had an absolute jar path, so the
+  runs before did not show it.
+  Validated 2026-10-07 on jjsong-ggt-win, elevated, Windows PowerShell 5.1 and
+  pwsh 7, with the real DBX 2.64.03 (MSSQL package from
+  service.whatap.io/download/dbx_agent, MS JDBC 12.8.1 in `jdbc\`, whatap.conf
+  pointing at SQL Server on 127.0.0.1 and a collection server on 127.0.0.1, so
+  nothing left the VM) running as the service `WhatapDBXAgent` (LocalSystem):
+  0.9.0 INCOMPLETE (2 blocked), also with `-Home C:\whatap-dbx`; the change
+  COMPLETE, the jar found in `C:\whatap-dbx` (parent pid of `cmd.exe`), and
+  with `-Home` too; with the simulated agent running as well, 0.9.0 INCOMPLETE
+  and the change COMPLETE with three instances. Every report passes
+  validate.sh --report. The `-File` reports of the simulated agent's cp1252
+  whatap.conf also pass (a verifier's failing copy came from its own
+  redirection). That run searched `-Home` first and named the line `install
+  dir of pid N`; a review then found a second install of the same version
+  reported under the first one's dir as `(-Home)`, so the order became parents
+  first and only the dirs given with `-Home` last, with the reused-pid stop and
+  the paths inside quotes. The final code was run the same day on the same VM
+  with two real DBX 2.64.03 services of the same version (`C:\whatap-dbx` as
+  `WhatapDBXAgent`, `C:\whatap-dbx2` as `WhatapDBXAgent2`), both shells, all
+  COMPLETE: each pid found in its own folder (parent pid of `cmd.exe`) and both
+  folders listed as install dir candidates; with `-Home C:\whatap-dbx`, the
+  second pid lists `C:\whatap-dbx2 (parent pid ... cmd.exe); C:\whatap-dbx
+  (-Home)`; with one service, with and without `-Home`, one candidate. Every
+  report passes validate.sh --report. The reused parent pid and `cmd /c "cd /d
+  C:\whatap-dbx-2.64.03 && start.bat"` were checked in pwsh 7 with a mocked
+  process table. The VM was reverted to its pre-test snapshot after each run.
+  After that run, two changes that do not alter those results: a folder is
+  listed once as an install dir candidate whatever its case or trailing `\`
+  (`-Home c:\dbx1\` and a parent naming `C:\dbx1` gave two candidates), and a
+  quoted span holding `<`, `>`, `|`, `*` or `?` (a redirection or pipe, not a
+  path) is not tried as a folder; both checked with the mocked process table.
 - **0.9.0**: `-AgentHome` is no longer an option: `-Home <dir>` (`--home`)
   did the same, and two options for one thing break the options convention
   (docs/collector-engineering.md). `-AgentHome`, and every prefix of it

@@ -65,7 +65,7 @@ if (-not $_elevated) {
 
 $COLLECTOR_NAME = "whatap-db-mssql"
 # History: ../CHANGELOG.md, section windows/collect-db-mssql.ps1 (next to the db README).
-$VERSION        = "0.9.0"
+$VERSION        = "0.10.0"
 $DOMAIN         = "db"
 $CompName = $env:COMPUTERNAME; if (-not $CompName) { $CompName = [Environment]::MachineName }
 $TARGET         = "db-host/$CompName"
@@ -823,15 +823,27 @@ try {
 
 # Install dirs come from an absolute whatap.agent jar path in the command line,
 # or a -Dwhatap.home= property. The java.exe path is the runtime, not the agent
-# home, so it is not used. A relative -jar path resolves against the process
-# working directory, which Win32_Process does not expose: such a process is
-# listed as unresolved.
+# home, so it is not used. A relative jar path resolves against the process
+# working directory, which Win32_Process does not expose: that is how the
+# agent's Windows service (nssm.exe running start_service.bat) launches it.
+# Such a jar is looked for in the folders the parent processes name (their
+# executable path, the absolute paths in their command lines and those paths'
+# parent folders, up to three levels up, stopping at a "parent" created after
+# its child, i.e. a reused pid), then in the -Home dirs. Every folder that holds
+# the jar is reported with where it came from; a process with none is listed as
+# unresolved.
+# Windows paths ignore case and a trailing \, so one folder is listed once
 $homes = New-Object System.Collections.Generic.List[string]
-$unresolved = @(); $unresWhy = @(); $homeBad = @()
+function Add-Home([string]$dir) {
+    $dir = $dir.TrimEnd('\'); if ($dir -match '^[A-Za-z]:$') { $dir += '\' }
+    if (-not ($homes | Where-Object { $_ -eq $dir })) { $homes.Add($dir) }
+}
+$unresolved = @(); $unresWhy = @(); $homeBad = @(); $resolvedFrom = @()
 foreach ($h in $HomeDirs) {
-    if (Test-Path -LiteralPath $h) { $homes.Add((Resolve-Path -LiteralPath $h).Path) }
+    if (Test-Path -LiteralPath $h) { Add-Home (Resolve-Path -LiteralPath $h).Path }
     else { $homeBad += $h }
 }
+$givenHomes = @($homes)
 foreach ($p in $agentProcs) {
     $d = $null; $why = "no absolute whatap.agent jar path or -Dwhatap.home in the command line"
     # a quoted path may hold spaces (C:\Program Files\...); an unquoted one may not
@@ -839,8 +851,44 @@ foreach ($p in $agentProcs) {
     elseif ($p.CommandLine -match '([A-Za-z]:\\[^"\s]*whatap\.agent\.[a-z]+[^"\s]*\.jar)') { $d = Split-Path -Parent $Matches[1] }
     elseif ($p.CommandLine -match '-Dwhatap\.home="([A-Za-z]:\\[^"]+)"') { $d = $Matches[1].TrimEnd('\') }
     elseif ($p.CommandLine -match '-Dwhatap\.home=([A-Za-z]:\\[^"\s]+)') { $d = $Matches[1].TrimEnd('\') }
-    if ($d -and (Test-Path -LiteralPath $d)) { if (-not $homes.Contains($d)) { $homes.Add($d) }; continue }
+    if ($d -and (Test-Path -LiteralPath $d)) { Add-Home $d; continue }
     if ($d) { $why = "path from the command line not found: $d" }
+    elseif ($p.CommandLine -match '(?:^|[;"\s=])(?:\.\\)?(whatap\.agent\.[a-z]+[^;"\s\\]*\.jar)') {
+        $jar = $Matches[1]
+        $cands = New-Object System.Collections.Generic.List[string]
+        $q = $p; $seen = @($p.ProcessId)
+        for ($lvl = 1; $lvl -le 3; $lvl++) {
+            $child = $q
+            $q = @($allProc | Where-Object { $_.ProcessId -eq $child.ParentProcessId })[0]
+            if (-not $q -or $seen -contains $q.ProcessId) { break }
+            if ($q.CreationDate -and $child.CreationDate -and $q.CreationDate -gt $child.CreationDate) { break }
+            $seen += $q.ProcessId
+            $src = "parent pid $($q.ProcessId) $($q.Name)"
+            if ($q.ExecutablePath) { $cands.Add((Split-Path -Parent $q.ExecutablePath) + "|$src") }
+            # a quoted path may hold spaces (C:\Program Files\...); an unquoted one may
+            # not, and is also looked for inside quotes ("cd /d C:\x && start.bat")
+            $paths = @([regex]::Matches("$($q.CommandLine)", '"([A-Za-z]:\\[^"]+)"') | ForEach-Object { $_.Groups[1].Value })
+            $paths += @([regex]::Matches("$($q.CommandLine)", '(?<!")\b[A-Za-z]:\\[^"\s]+') | ForEach-Object { $_.Value })
+            foreach ($a in $paths) {
+                $a = $a.TrimEnd('\')
+                if ($a -match '[<>|*?]') { continue }   # a redirection or pipe inside quotes, not a path
+                if ($a) { $cands.Add("$a|$src"); $up = Split-Path -Parent $a; if ($up) { $cands.Add("$up|$src") } }
+            }
+        }
+        foreach ($h in $givenHomes) { $cands.Add("$h|-Home") }
+        $hits = New-Object System.Collections.Generic.List[string]; $hitDirs = @()
+        foreach ($c in $cands) {
+            $cd, $cs = $c -split '\|', 2
+            if ($cd -and $hitDirs -notcontains $cd.TrimEnd('\') -and (Test-Path -LiteralPath (Join-Path $cd $jar) -PathType Leaf)) {
+                $hitDirs += $cd.TrimEnd('\'); $hits.Add("$cd ($cs)")
+            }
+        }
+        if ($hits.Count -gt 0) {
+            foreach ($hd in $hitDirs) { Add-Home $hd }
+            $resolvedFrom += "pid $($p.ProcessId): $jar found in $($hits -join '; ')"; continue
+        }
+        $why = "the command line names $jar without a folder, and neither a -Home dir nor a folder of its parent processes holds it"
+    }
     $unresolved += "pid $($p.ProcessId)"; $unresWhy += "pid $($p.ProcessId): $why"
 }
 $instances = New-Object System.Collections.Generic.List[string]
@@ -963,6 +1011,7 @@ foreach ($sv in $sqlViews) {
     }
     $names.Close(); $base.Close()
 }
+foreach ($u in $resolvedFrom) { Fact "jar named without a folder by $($u -replace ':.*$', ''): $($u -replace '^[^:]*: ', '')" }
 foreach ($u in $unresWhy) { Fact "install dir of $($u -replace ':.*$', ''): n/a ($($u -replace '^[^:]*: ', ''))" }
 foreach ($h in $HomeDirs) { Fact "-Home given: $h (exists: $(Test-Path -LiteralPath $h))" }
 if ($homes.Count -eq 0 -and $unresolved.Count -eq 0 -and $HomeDirs.Count -eq 0) {
