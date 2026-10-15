@@ -25,7 +25,7 @@ costs, not by how long the task is.
 
 | Work | Agent | Model | Use for |
 |---|---|---|---|
-| Lab targets | `gg-lab-builder` | sonnet | Build or repair a permanent lab target (VM, docker image/container on `jjsong-ggt-docker`, fixture) and prove it with a collector run. |
+| Lab targets | `gg-lab-builder` | sonnet | Build or repair a permanent lab target (VM, docker image/container on `global-ggt-docker`, fixture) and prove it with a collector run. |
 | Reading | `gg-reader` | sonnet | Read Slack channels, case folders or docs and return a candidate table, each candidate grepped against the current collectors. |
 | Design audit | general-purpose | opus | A survey whose answer is a trade-off (what to cut, what a rule should say), not a list of facts. |
 | Report-changing authoring | general-purpose | opus | Writing a D-tier change whose design is open (a new mechanism, signals/timeouts, parsing). Removals, stubs and changes whose design the caller has fixed in the prompt: general-purpose with `model: sonnet` (gg-verify-deep still verifies them). Mechanical edits and A-tier additions: sonnet. |

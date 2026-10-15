@@ -49,7 +49,7 @@ with a clean tree) to see the noise floor, as with capture-compare.
 - Targets are **permanent**. `run.sh` never tears one down; `--up` is the
   first start (or restart), `--down` only a manual escape hatch.
   Containers run with `--restart unless-stopped`.
-- Docker targets run on the lab VM **jjsong-ggt-docker** (ssh alias
+- Docker targets run on the lab VM **global-ggt-docker** (ssh alias
   `ggt-docker`, see `~/.claude/lab-environment.md`): `run.sh` uses
   `DOCKER_HOST` when set, else `ssh://ggt-docker` when it answers, else the
   local daemon with a warning. The analysis machine is short of memory:
